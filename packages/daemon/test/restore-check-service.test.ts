@@ -103,6 +103,14 @@ function mockDeps(overrides?: Partial<RestoreCheckDeps & {
       } as NodeInventoryEntry,
     ],
     hasSnapshot: () => true,
+    // Independent fixture for the newly shared snapshot pre-validation.
+    getRestoreInputs: (rigId) => ({
+      snapshot: { id: "snap-1", kind: "full", data: {
+        rig: { id: rigId, name: "test-rig", createdAt: "", updatedAt: "" },
+        nodes: [], sessions: [], edges: [], checkpoints: {},
+      } },
+      servicesRecord: null,
+    }),
     getLatestSnapshot: () => null,
     probeDaemonHealth: () => ({ healthy: true, evidence: "Daemon running on port 7433" }),
     exists: () => true,
