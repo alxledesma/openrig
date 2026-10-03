@@ -355,8 +355,10 @@ export class CoordinatorAuthorityService {
  assertManagedSend(source:string|undefined,destination:string,queueAssignmentId?:string):void {
    if(!this.scope(source,destination))return;
    if(queueAssignmentId){
-     const a=this.db.prepare(`SELECT a.destination,a.owner_session,a.body_hash,q.body,q.state FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.queue_id=? UNION ALL SELECT a.destination,a.source AS owner_session,a.body_hash,q.body,q.state FROM coordinator_stage_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.queue_id=?`).get(queueAssignmentId,queueAssignmentId) as {destination:string;owner_session:string;body_hash:string;body:string;state:string}|undefined;
+     const a=this.db.prepare(`SELECT a.rig_id,a.destination,a.owner_session,a.body_hash,q.body,q.state FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.queue_id=? UNION ALL SELECT a.rig_id,a.destination,a.source AS owner_session,a.body_hash,q.body,q.state FROM coordinator_stage_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.queue_id=?`).get(queueAssignmentId,queueAssignmentId) as {rig_id:string;destination:string;owner_session:string;body_hash:string;body:string;state:string}|undefined;
      if(a && a.destination===destination && a.owner_session===source && a.body_hash===digest(a.body) && ["pending","in-progress","blocked"].includes(a.state))return;
+     const holder=a?this.get(a.rig_id):undefined;
+     if(a&&a.destination===destination&&a.body_hash===digest(a.body)&&a.state==='pending'&&holder?.state==='active'&&holder.owner_session===source&&holder.owner_generation===this.generation(source!)&&holder.lease_until>this.now())return;
      reject("coordinator_wake_receipt_invalid","Internal wake does not match immutable committed assignment");
    }
    this.assertRawSend(source,destination);

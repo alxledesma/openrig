@@ -28,6 +28,15 @@ import {
 import { WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
 import { armQueueWait, backOffQueueWait, refreshQueueWaits, evaluateQueueWait, retargetQueueWait } from "./queue-wait-backoff.js";
 
+interface CoordinatorWakeProof {rigId:string;epoch:number;generation:string;recipientGeneration:string;}
+function coordinatorWakeProof(raw:unknown):CoordinatorWakeProof|null {
+  if(!raw||typeof raw!=='object'||Array.isArray(raw))return null;
+  const p=raw as Record<string,unknown>;
+  if(Object.keys(p).length!==4||Object.keys(p).some(k=>!['rigId','epoch','generation','recipientGeneration'].includes(k)))return null;
+  if(!Number.isSafeInteger(p.epoch)||(p.epoch as number)<1||['rigId','generation','recipientGeneration'].some(k=>typeof p[k]!=='string'||!(p[k] as string).trim()||(p[k] as string).length>256))return null;
+  return p as unknown as CoordinatorWakeProof;
+}
+
 export const QUEUE_STATES = [
   "pending",
   "in-progress",
@@ -853,6 +862,27 @@ export class QueueRepository {
     });
   }
 
+  /** Restage a known resolved wake for the SAME immutable pending assignment.
+   * Called only after current holder + exact recipient admission/idle proof.
+   * Ambiguous/in-flight/retained effects are never retried. */
+  stageCoordinatorAssignmentWake(input:{rigId:string;epoch:number;generation:string;actor:string;queueId:string;recipient:string;recipientGeneration:string;now:number}):boolean {
+    return this.db.transaction(()=>{
+      this.coordinatorAuthority.assertCurrentOwner(input.actor,{rigId:input.rigId,epoch:input.epoch,generation:input.generation});
+      const row=this.db.prepare("SELECT a.destination,a.body_hash,a.disposition_id,q.body,q.state,q.claimed_by_generation_uuid FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.queue_id=?").get(input.rigId,input.queueId) as {destination:string;body_hash:string;disposition_id:string|null;body:string;state:string;claimed_by_generation_uuid:string|null}|undefined;
+      if(!row||row.destination!==input.recipient||row.body_hash!==createHash('sha256').update(row.body).digest('hex')||row.state!=='pending'||row.claimed_by_generation_uuid||row.disposition_id||this.coordinatorAuthority.generation(input.recipient)!==input.recipientGeneration)return false;
+      if(!this.outbox)return false;
+      if(this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(input.recipient,input.recipient))return false;
+      const effects=this.db.prepare("SELECT delivery_state,tags,ts_dispatched FROM outbox_entries WHERE audit_pointer=? AND substr(outbox_id,1,?)=?").all(input.queueId,WAKE_INTENT_PREFIX.length,WAKE_INTENT_PREFIX) as Array<{delivery_state:string;tags:string|null;ts_dispatched:string}>;
+      if(effects.some(e=>!['delivered','failed','retired'].includes(e.delivery_state)))return false;
+      if(effects.some(e=>{let p;try{p=JSON.parse(e.tags??'[]');}catch{return true;}if(!Array.isArray(p))return true;if(!p.includes('queue:coordinator-resume'))return false;let proof;try{proof=coordinatorWakeProof(JSON.parse(p[1]));}catch{return true;}if(!proof)return true;const at=Date.parse(e.ts_dispatched);return !Number.isFinite(at)||at>input.now||(proof.epoch===input.epoch&&input.now-at<30000);}))return false;
+      const bucket=Math.floor(input.now/30000);
+      const key=`${WAKE_INTENT_PREFIX}coordinator-${input.queueId}-${input.epoch}-${input.generation}-${bucket}`;
+      if(this.outbox.getById(key))return false;
+      this.recordWakeIntent({outboxId:key,auditPointer:input.queueId,fromSession:input.actor,toSession:input.recipient,identityProvenance:'system:operator-authorized-coordination',bareBody:`Resume the existing pending assignment ${input.queueId}; verify current coordinator authority and native identity before claiming. This wake creates no new assignment or acceptance.`,tags:['queue:coordinator-resume',JSON.stringify({rigId:input.rigId,epoch:input.epoch,generation:input.generation,recipientGeneration:input.recipientGeneration})]});
+      return true;
+    }).immediate();
+  }
+
   private recordWakeIntent(input: {
     outboxId: string;
     auditPointer: string;
@@ -989,6 +1019,12 @@ export class QueueRepository {
     const actionable = (entry: import("./outbox-handler.js").OutboxEntry): boolean => {
       const row = entry.auditPointer ? this.db.prepare("SELECT state FROM queue_items WHERE qitem_id = ?").get(entry.auditPointer) as { state: string } | undefined : undefined;
       let current = row?.state === "pending";
+      if(current&&entry.tags?.includes('queue:coordinator-resume')){
+        let proof:CoordinatorWakeProof|null=null;try{proof=coordinatorWakeProof(JSON.parse(entry.tags[1]??'null'));}catch{}
+        const authority=proof?this.coordinatorAuthority.get(proof.rigId):null;
+        const reservation=this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(entry.destinationSession,entry.destinationSession);
+        current=!reservation&&!!proof&&!!authority&&authority.state==='active'&&authority.epoch===proof.epoch&&authority.owner_session===entry.senderSession&&authority.owner_generation===proof.generation&&authority.lease_until>Date.now()&&this.coordinatorAuthority.generation(entry.senderSession)===proof.generation&&this.coordinatorAuthority.generation(entry.destinationSession)===proof.recipientGeneration;
+      }
       const resumePrefix = `${WAKE_INTENT_PREFIX}blocker-`;
       if (current && entry.outboxId.startsWith(resumePrefix)) {
         const expected = Number(entry.outboxId.slice(resumePrefix.length));
