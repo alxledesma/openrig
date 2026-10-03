@@ -184,6 +184,7 @@ describe("Restore check routes", () => {
     const rig = rigRepo.createRig("ready-poll");
     const node = rigRepo.addNode(rig.id, "seat", { runtime: "terminal" });
     const session = sessionRegistry.registerSession(node.id, "seat@ready-poll");
+    sessionRegistry.updateStatus(session.id, "running");
     sessionRegistry.updateStartupStatus(session.id, "ready");
     insertStartupContextRow(db, node.id, { runtime: "terminal" });
     seedCurrentSnapshot(rig.id);
