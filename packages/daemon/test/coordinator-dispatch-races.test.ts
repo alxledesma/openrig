@@ -1,6 +1,6 @@
 import { describe,it,expect } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync,rmSync,writeFileSync } from "node:fs";
+import { mkdtempSync,mkdirSync,rmSync,writeFileSync } from "node:fs";
 import { join,resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
@@ -37,6 +37,7 @@ describe("real commit ordering across independent processes/connections",()=>{
    expect(outcomes.filter(r=>r.ok)).toHaveLength(1);expect(outcomes.filter(r=>r.code==="coordinator_cas_lost")).toHaveLength(1);
    expect(f.svc.get("xv")?.epoch).toBe(2);expect(f.repo.getById("baton")?.destinationSession).toBe("peer@xv");
    expect(f.db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='transfer'").get()).toEqual({n:1});
+   mkdirSync(new URL("../../../artifacts/",import.meta.url),{recursive:true});
    writeFileSync(new URL("../../../artifacts/r07-cas-records.json",import.meta.url),JSON.stringify({before,outcomes,after:{authority:f.svc.get("xv"),baton:f.repo.getById("baton"),assignments:f.svc.obligations("xv"),operations:f.db.prepare("SELECT * FROM coordinator_operations ORDER BY operation_id").all()}},null,2));
   }finally{f.close();}
  });

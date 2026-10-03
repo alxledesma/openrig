@@ -1,3 +1,4 @@
+import {RuntimeOutcomeAssessment} from "./domain/runtime-outcome-assessment.js";
 import { CoordinationRecoveryService } from "./domain/coordination-recovery-service.js";
 import {makeCoordinatorRuntimeObserver} from "./domain/coordinator-runtime-availability.js";
 import {makeCoordinatorContinuityPolicy} from "./domain/policies/coordinator-continuity.js";
@@ -435,6 +436,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     const identityVerified=identity?.verdict==='verified'&&identity.session_name===session&&observed<=Date.now()&&Date.now()-observed<=3000;
     return {generation,identityVerified,state,witness:seatActivityService.getRotationActivityWitness(state.seatNodeId)};
   });
+  queueRepoInstance.coordinatorAuthority.runtimeOutcomeAssessment = new RuntimeOutcomeAssessment(queueRepoInstance);
   // OPR.0.4.3.19 — SeatIdentityReconciler owns the liveness identity verdict
   // (the THIRD axis). Reconciles each running seat's pane PID/command against
   // the registered binding and persists the verdict so node-inventory can gate

@@ -40,6 +40,7 @@ function canonical(value: unknown): string {
 export class CoordinatorAuthorityService {
  constructor(readonly db: Database.Database, private bus?: EventBus, private transitions?: QueueTransitionLog,
    private now: () => number = Date.now) {}
+ runtimeOutcomeAssessment?: import("./runtime-outcome-assessment.js").RuntimeOutcomeAssessment;
  coordinationRecovery?: import("./coordination-recovery-service.js").CoordinationRecoveryService;
  private runtimeObserver?: (session:string)=>Promise<RuntimeAvailability|null>;
  private runtimeEvidence=new Map<string,RuntimeAvailability>();
@@ -179,6 +180,7 @@ export class CoordinatorAuthorityService {
    if (r!.state!=="active" && !(allowReconcile && r!.state==="reconciling")) reject("coordinator_not_acknowledged","Transferred authority has not reconciled and acknowledged custody");
    return r!;
  }
+ assertCurrentOperator(actor:string,generation:string):void {this.operator(actor,generation);}
  assertCurrentOwner(actor:string,token:CoordinatorToken):void {this.assertOwner(actor,token);}
  obligations(rigId:string): unknown[] {
    const assignments=this.db.prepare(`SELECT a.package_key,a.queue_id,a.disposition_id,q.state,q.destination_session,q.claimed_at,q.claimed_by_generation_uuid,q.last_nudge_attempt,q.last_nudge_result,a.body_hash FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? ORDER BY a.package_key`).all(rigId);
@@ -383,6 +385,7 @@ export class CoordinatorAuthorityService {
      this.db.prepare("UPDATE coordinator_assignments SET disposition_id=? WHERE rig_id=? AND package_key=?").run(dispositionId,rigId,packageKey);
      this.db.prepare("DELETE FROM coordinator_resources WHERE rig_id=? AND package_key=?").run(rigId,packageKey);
      this.log(rigId,dispositionId,"disposition",{packageKey,actor,generation});
+     this.runtimeOutcomeAssessment?.enqueueDisposed(actor,generation,rigId,packageKey,dispositionId);
    }).immediate();
  }
  /** Read-only exclusion observation. A stale/unknown activity verdict never excludes an owner. */

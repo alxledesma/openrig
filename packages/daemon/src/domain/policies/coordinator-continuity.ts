@@ -6,6 +6,7 @@ export function makeCoordinatorContinuityPolicy(service:CoordinatorAuthorityServ
   if(job.registeredBySession!=="operator-agent@kernel"||job.target.session!=="operator-agent@kernel"||typeof job.context.rigId!=="string")return {action:"skip",reason:"observer-not-authorized"};
   // Persisted opt-in recovery reconciles real queue transitions, not reminder replies.
   service.coordinationRecovery?.supervise(job.context.rigId,job.jobId);
+  await service.runtimeOutcomeAssessment?.drain(job.context.rigId);
   await service.coordinationRecovery?.deliverCommitted();
   await service.refreshRuntimeAvailability(job.context.rigId);
   const recovery=service.observeContinuity(job.context.rigId);

@@ -22,6 +22,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
    const svc=(c.get("queueRepo" as never) as QueueRepository).coordinatorAuthority;
    try {
      const operation=c.req.param("operation");
+     if(operation==="outcome-configure"){if(!svc.runtimeOutcomeAssessment)throw new CoordinatorFenceError("runtime_outcome_unavailable","Service not wired");svc.runtimeOutcomeAssessment.configure(actor,generation,await c.req.json());return c.json({ok:true});}
      if(operation==="coordination-plan"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');return c.json(svc.coordinationRecovery.configure(actor,generation,b));}
      if(operation==="coordination-reconcile"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');const result=svc.coordinationRecovery.reconcile(actor,generation,b.rigId);await svc.coordinationRecovery.deliverCommitted();return c.json(result);}
      if(operation==="coordination-continue-custody"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");const result=svc.coordinationRecovery.continueCustody(actor,generation,await c.req.json());await svc.coordinationRecovery.deliverCommitted();return c.json(result);}
@@ -42,7 +43,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
        const b=await c.req.json();svc.admit(actor,generation,b.rigId,b.packageKey,b.contract);return c.json({ok:true});
      }
      if(operation==="dispose"){
-       const b=await c.req.json();svc.dispose(actor,generation,b.rigId,b.packageKey,b.dispositionId);return c.json({ok:true});
+       const b=await c.req.json();svc.dispose(actor,generation,b.rigId,b.packageKey,b.dispositionId);await svc.runtimeOutcomeAssessment?.drain(b.rigId);return c.json({ok:true});
      }
      if(operation==="recover"){
        const b=await c.req.json();await svc.refreshRuntimeAvailability(b.rigId);return c.json(svc.recordOutage(actor,generation,b.rigId,b.evidenceId));
