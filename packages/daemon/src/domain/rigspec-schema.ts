@@ -46,7 +46,7 @@ const VALID_WORKSPACE_KINDS = new Set<string>(WORKSPACE_KINDS as readonly string
 
 const RIG_KEYS = new Set([
   "version", "name", "summary", "culture_file", "permission_policy", "managed_blocks", "docs",
-  "startup", "services", "workspace", "pods", "edges",
+  "startup", "services", "workspace", "pods", "edges", "resilience_policy",
 ]);
 const POD_KEYS = new Set(["id", "label", "summary", "continuity_policy", "startup", "members", "edges"]);
 const MEMBER_KEYS = new Set([
@@ -113,6 +113,8 @@ export class RigSpecSchema {
     // Required fields
     if (!obj["name"] || typeof obj["name"] !== "string") errors.push("name: required non-empty string");
     if (!obj["version"] || typeof obj["version"] !== "string") errors.push("version: required non-empty string");
+
+    if(obj['resilience_policy']!==undefined&&obj['resilience_policy']!=='builtin:standard')errors.push('resilience_policy: only builtin:standard is supported; no provider/private/paid permissions may be inherited');
 
     // culture_file path safety
     if (obj["culture_file"] !== undefined && obj["culture_file"] !== null) {
@@ -243,6 +245,7 @@ export class RigSpecSchema {
       version: raw["version"] as string,
       name: raw["name"] as string,
       summary: raw["summary"] as string | undefined,
+      resiliencePolicy: 'builtin:standard',
       cultureFile: raw["culture_file"] as string | undefined,
       permissionPolicy: raw["permission_policy"] as string | undefined,
       managedBlocks: raw["managed_blocks"] as RigSpec["managedBlocks"],

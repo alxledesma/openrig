@@ -1,0 +1,23 @@
+# Standard resilience rollout
+
+Every nonarchived project rig uses the shared `builtin:standard` desired policy. This is a generic daemon mechanism; no project name, model, provider, qualification, deadline or private/paid routing permission is inherited. The Conveyor RigSpec serializes `resilience_policy: builtin:standard`; omitted pod-aware specs normalize to the same reference. Legacy and existing rigs are included by runtime inventory even without a RigSpec field. The nonsecret shipped template is `dist/builtins/resilience-policy.json`.
+
+## Actual activation, not desired-policy credit
+
+Birth and daemon boot reconcile every project into an authoritative inventory. A daemon-native `resilience-rollout` audit repeats this every 30 seconds. Its role-bound registrar is `daemon@kernel`; it may create recovery custody but cannot enroll coordinators, approve reviewers or configure providers. Stopping that audit is respected across restart and exposed as `defaultAuditState`; a stopped/unregistered audit does not promise continuous monitoring.
+
+`covered` means current persisted control coverage: actual distinct registered Lead/Peer, active current holder with valid lease, current Operator-admitted dependency/recovery plan, current-generation nonexpired exact task admissions, explicit enforce OutcomePolicy with fresh configuration-bound qualification, and actual current-generation `coordinator-continuity` watchdog registration. It does not certify native process health, semantic review independence, successful work pickup or acceptance; existing fresh native dispatch/continuity gates still decide each operation.
+
+Missing prerequisites create one deduplicated actual Operator queue item per rig/generation/reason set, with a concrete action, 60-second deadline and exact queue completion/failure receipt path. Unenrolled projects with no holder explicitly record `missingHolder`; the Operator returns evidence or blocks that same claimed item with the exact missing-owner/access boundary. Merely closing a notice does not count as coverage: the inventory rechecks real state and creates a linked successor recovery obligation when still missing. No actual Operator means `operator-unavailable` inventory, no invented actor or assignment. Malformed persisted data becomes a bounded per-rig recovery reason without leaking its raw contents or parking independent rigs.
+
+Recovery notice and wake intent commit in one SQLite transaction. Intended recipient generation is frozen even when boot has not yet attached transport. Existing delivery drains and typing/reservation guards apply; a later generation mismatch suppresses that wake without resolving or accepting its queue obligation. Ambiguous sends are not retried by this materializer. A staged item is not proof of pickup: actual Operator claim and its evidence-bearing return remain required.
+
+## Supported controls
+
+Authenticated `GET /api/coordinator/resilience-inventory` returns all project receipts, including pending/missing Operator and audit state. `POST /api/coordinator/resilience-materialize` takes the normal explicit OutcomePolicy body with `rigId`, current Operator generation, configuration-bound nonexpired qualification and strict provider/data permissions. Caller identity is the existing trusted managed transport plus current generation. It refuses unapproved prerequisites; otherwise it configures the shared outcome service and registers a generation-bound continuity observer atomically, returning the actual receipt. Observation alone is not enforce materialization.
+
+The Operator first uses existing supported exact legacy enrollment, reconciliation/acknowledgment, package admission and coordination-plan APIs. Existing claims/effect debt, independent review, current route capacity and owner/privacy boundaries are preserved. The template never supplies paid or hosted-private permission, qualification credit, a fabricated Peer or a successor-generation deadline. Missing Conveyor Peer is accountable Operator recovery, not a synthetic role or a team-wide stop.
+
+## Verification and limits
+
+Real SQLite workflow tests exercise independent projects, malformed records, absent/current/successor Operator, actual watchdog registrations, expiry, birth catch-up, strict RigSpec defaults, authenticated materialization, durable transport delivery to Operator claim, return/closing-without-success, and no duplicate wake. These are source/isolated tests; production rollout inventory, live native pickup and actual provider qualification must be retained separately by deployment. This change does not enable automatic seat rotation, replace running agents or grant new product/data authority.

@@ -61,3 +61,8 @@ When a prerequisite is missing, the Lead records an owned recovery task, perform
 Escalate only an actual credential/access/security/protected-resource/destructive-action boundary, purchase beyond an authorized budget, deployment, or new scope; name its evidence, affected slice, owner and next action. This instruction does not create a broad dependency-install approval gate.
 
 Future work packages must include dependency/tool versions and source, setup location and command, Lead/recovery executor, verification command and expected result, worker resumption/return path, and any concrete boundary. A missing Playwright browser is ordinary dependency recovery under this rule.
+
+
+## Shared resilience defaults
+
+This starter inherits `builtin:standard`. A blocked seat must return concrete recovery work while independent dependency-ready assignments continue. Kernel Operator owns actual current route/admission/enrollment/observer setup; Lead and Planner own the ready frontier, technical authority and independent review remain explicit. This compact starter has no Peer: selecting and enrolling an actual qualified Peer is an accountable Operator recovery assignment, not an implied role or a reason to park all work. Model assessment may request only bounded admitted recovery; it never grants acceptance. Public/private and paid provider permissions must be configured explicitly from current evidence, never inherited from this template.

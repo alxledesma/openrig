@@ -9,6 +9,7 @@ import { CoordinatorFenceError } from "../domain/coordinator-authority-service.j
 export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
  const app=new Hono();
  app.use("*",authBearerTokenMiddleware({expectedToken:opts.bearerToken}));
+ app.get("/resilience-inventory",c=>{const svc=(c.get("queueRepo" as never) as QueueRepository).coordinatorAuthority;return svc.resilienceRollout?c.json(svc.resilienceRollout.inventory()):c.json({error:"resilience_unavailable"},503);});
  app.get("/:rigId",c=>{
    const svc=(c.get("queueRepo" as never) as QueueRepository).coordinatorAuthority;
    const rigId=c.req.param("rigId"), authority=svc.get(rigId);
@@ -22,6 +23,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
    const svc=(c.get("queueRepo" as never) as QueueRepository).coordinatorAuthority;
    try {
      const operation=c.req.param("operation");
+     if(operation==="resilience-materialize"){if(!svc.resilienceRollout)throw new CoordinatorFenceError("resilience_unavailable","Service not wired");const receipt=svc.resilienceRollout.materialize(actor,generation,await c.req.json());await svc.resilienceRollout.deliver();return c.json(receipt);}
      if(operation==="outcome-configure"){if(!svc.runtimeOutcomeAssessment)throw new CoordinatorFenceError("runtime_outcome_unavailable","Service not wired");svc.runtimeOutcomeAssessment.configure(actor,generation,await c.req.json());return c.json({ok:true});}
      if(operation==="coordination-plan"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');return c.json(svc.coordinationRecovery.configure(actor,generation,b));}
      if(operation==="coordination-reconcile"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');const result=svc.coordinationRecovery.reconcile(actor,generation,b.rigId);await svc.coordinationRecovery.deliverCommitted();return c.json(result);}

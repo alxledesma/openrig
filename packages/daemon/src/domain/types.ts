@@ -1165,6 +1165,8 @@ export interface WorkspaceSpec {
 }
 
 export interface RigSpec {
+  /** Nonsecret shared workflow defaults; runtime admission/provider policy stays current and per rig. */
+  resiliencePolicy?: 'builtin:standard';
   version: string;
   name: string;
   summary?: string;

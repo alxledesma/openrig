@@ -40,6 +40,7 @@ function canonical(value: unknown): string {
 export class CoordinatorAuthorityService {
  constructor(readonly db: Database.Database, private bus?: EventBus, private transitions?: QueueTransitionLog,
    private now: () => number = Date.now) {}
+ resilienceRollout?: import('./resilience-rollout-service.js').ResilienceRolloutService;
  runtimeOutcomeAssessment?: import("./runtime-outcome-assessment.js").RuntimeOutcomeAssessment;
  coordinationRecovery?: import("./coordination-recovery-service.js").CoordinationRecoveryService;
  private runtimeObserver?: (session:string)=>Promise<RuntimeAvailability|null>;
@@ -337,7 +338,7 @@ export class CoordinatorAuthorityService {
  scope(source:string|undefined,destination:string): Authority | undefined {
    if(!this.available())return undefined;
    const from=source && this.local(source), to=this.local(destination);
-   const origin=(from && this.get(from.rig_id)) || (source ? this.db.prepare("SELECT * FROM coordinator_authority WHERE EXISTS(SELECT 1 FROM json_each(coordinators) WHERE value=?)").get(source) as Authority|undefined : undefined), target=to && this.get(to.rig_id);
+   const origin=(from && this.get(from.rig_id)) || (source ? this.db.prepare("SELECT * FROM coordinator_authority WHERE EXISTS(SELECT 1 FROM json_each(CASE WHEN json_valid(coordinators) THEN CASE WHEN json_type(coordinators)='array' THEN coordinators ELSE '[]' END ELSE '[]' END) WHERE value=?)").get(source) as Authority|undefined : undefined), target=to && this.get(to.rig_id);
    if(origin && (JSON.parse(origin.coordinators) as string[]).includes(source!)) {
      // Informational messages to registered coordinators/Kernel remain available, no text classification.
      if((JSON.parse(origin.coordinators) as string[]).includes(destination)||destination.endsWith("@kernel"))return undefined;

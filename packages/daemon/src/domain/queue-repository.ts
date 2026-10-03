@@ -845,6 +845,7 @@ export class QueueRepository {
     toSession: string,
     identityProvenance: string | null,
     nudge: boolean | undefined,
+    recipientGeneration?: string,
   ): void {
     // No wake intended (nudge:false) ⇒ no durable intent to make durable. The
     // W1-c guard is nudge-aware for the same reason: absence of an intent is a
@@ -857,8 +858,9 @@ export class QueueRepository {
       toSession,
       identityProvenance,
       bareBody: `Queue handoff: ${successorQitemId} - check your queue.`,
-      tags: this.getById(successorQitemId)?.handedOffFrom
-        ? [`queue:return:${this.getByIdOrThrow(successorQitemId).handedOffFrom}`] : undefined,
+      tags: [...(this.getById(successorQitemId)?.handedOffFrom
+        ? [`queue:return:${this.getByIdOrThrow(successorQitemId).handedOffFrom}`] : []),
+        ...(recipientGeneration ? [`queue:recipient-generation:${recipientGeneration}`] : [])],
     });
   }
 
@@ -1021,6 +1023,11 @@ export class QueueRepository {
       if (this.outbox!.isHistoricalQuarantined(entry.outboxId)) return false;
       const row = entry.auditPointer ? this.db.prepare("SELECT state FROM queue_items WHERE qitem_id = ?").get(entry.auditPointer) as { state: string } | undefined : undefined;
       let current = row?.state === "pending";
+      const tagsValid=entry.tags==null||(Array.isArray(entry.tags)&&entry.tags.every(tag=>typeof tag==='string'));
+      const safeTags=tagsValid?(entry.tags??[]):[];
+      if(!tagsValid)current=false;
+      const recipientGenerations=safeTags.filter(tag=>tag.startsWith('queue:recipient-generation:')).map(tag=>tag.slice('queue:recipient-generation:'.length));
+      if(recipientGenerations.length && (recipientGenerations.length!==1||!recipientGenerations[0]||recipientGenerations[0]!==this.resolveOccupantGeneration?.(entry.destinationSession)))current=false;
       if(current&&entry.tags?.includes('queue:coordinator-resume')){
         let proof:CoordinatorWakeProof|null=null;try{proof=coordinatorWakeProof(JSON.parse(entry.tags[1]??'null'));}catch{}
         const authority=proof?this.coordinatorAuthority.get(proof.rigId):null;
@@ -1042,7 +1049,7 @@ export class QueueRepository {
         // the explicit tag distinguishes supersession from a transport attempt.
         // Do not stamp last_nudge_result or delivered_at: neither happened.
         const changed = this.db.prepare("UPDATE outbox_entries SET delivery_state = 'failed', tags = ? WHERE outbox_id = ? AND delivery_state = 'pending'")
-          .run(JSON.stringify([...(entry.tags ?? []), "queue:wake-superseded"]), entry.outboxId);
+          .run(JSON.stringify([...safeTags, "queue:wake-superseded"]), entry.outboxId);
         superseded ||= changed.changes > 0;
       }
       return current;

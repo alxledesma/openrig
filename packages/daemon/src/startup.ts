@@ -1,3 +1,5 @@
+import {makeResilienceRolloutPolicy} from './domain/policies/resilience-rollout.js';
+import {ResilienceRolloutService} from './domain/resilience-rollout-service.js';
 import {RuntimeOutcomeAssessment} from "./domain/runtime-outcome-assessment.js";
 import { applyHistoricalStartupRecovery } from "./domain/historical-effect-disposition.js";
 import { CoordinationRecoveryService } from "./domain/coordination-recovery-service.js";
@@ -440,6 +442,16 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     return {generation,identityVerified,state,witness:seatActivityService.getRotationActivityWitness(state.seatNodeId)};
   });
   queueRepoInstance.coordinatorAuthority.runtimeOutcomeAssessment = new RuntimeOutcomeAssessment(queueRepoInstance);
+  const resilienceRollout = new ResilienceRolloutService(queueRepoInstance,watchdogJobsRepoInstance);
+  queueRepoInstance.coordinatorAuthority.resilienceRollout = resilienceRollout;
+  const recordResilienceInventory=(rigId?:string)=>{
+    try {const receipts=resilienceRollout.reconcile(rigId);for(const receipt of receipts)if(receipt.state!=='covered')console.warn('resilience-rollout-pending',JSON.stringify(receipt));}
+    catch(error){console.warn('resilience-rollout-inventory-error','bounded-inventory-failed');}
+  };
+  const precedingRigCreated=rigRepo.onRigCreated;
+  rigRepo.onRigCreated=rig=>{precedingRigCreated?.(rig);recordResilienceInventory(rig.id);};
+  try {resilienceRollout.armDefaultAudit();}catch(error){console.warn('resilience-rollout-audit-registration-error','audit-registration-failed');}
+  recordResilienceInventory();
   // OPR.0.4.3.19 — SeatIdentityReconciler owns the liveness identity verdict
   // (the THIRD axis). Reconciles each running seat's pane PID/command against
   // the registered binding and persists the verdict so node-inventory can gate
@@ -1902,6 +1914,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       // rendered by public surfaces
       // into one bounded wake. Wakes/flags only; cooldown via engine throttle.
       additionalPolicies: [
+        makeResilienceRolloutPolicy(resilienceRollout),
         makeCoordinatorContinuityPolicy(queueRepoInstance.coordinatorAuthority),
         makeWorkflowKeepalivePolicy({
           db,
@@ -2050,7 +2063,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       // R2 repair — born-armed (advisor-ruled): a rig created after startup gets
       // its supervisor job in the same act that creates it, never at the next
       // daemon restart.
-      rigRepo.onRigCreated = (rig) => ensureParkedOwnerJob(rig.name);
+      const precedingRigCreated=rigRepo.onRigCreated;
+      rigRepo.onRigCreated = (rig) => {precedingRigCreated?.(rig);ensureParkedOwnerJob(rig.name);};
     }
 
     // OPR.0.5.6.1 — the two digest windows as idempotent watchdog jobs (AM-F1:

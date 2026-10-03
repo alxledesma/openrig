@@ -8,6 +8,9 @@ const workflowSpecExtensions = new Set([".yaml", ".yml"]);
 rmSync(targetDir, { recursive: true, force: true });
 mkdirSync(targetDir, { recursive: true });
 
+// Ship the reusable nonsecret policy alongside workflow specifications.
+copyFileSync(join(process.cwd(), "src", "builtins", "resilience-policy.json"), join(process.cwd(), "dist", "builtins", "resilience-policy.json"));
+
 if (!existsSync(sourceDir)) {
   process.exit(0);
 }

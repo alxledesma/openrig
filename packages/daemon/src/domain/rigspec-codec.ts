@@ -99,6 +99,7 @@ export class RigSpecCodec {
       name: spec.name,
     };
     if (spec.summary) doc["summary"] = spec.summary;
+    doc['resilience_policy'] = spec.resiliencePolicy ?? 'builtin:standard';
     if (spec.cultureFile) doc["culture_file"] = spec.cultureFile;
     // OPR.0.4.8.3 Seam B: rig-level permission_policy ref round-trips through serialization.
     if (spec.permissionPolicy) doc["permission_policy"] = spec.permissionPolicy;

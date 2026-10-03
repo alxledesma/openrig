@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "ref": "builtin:standard",
+  "desiredMode": "enforce",
+  "observerIntervalSeconds": 30,
+  "recoveryDeadlineMs": 60000,
+  "allowPaid": false,
+  "allowUnqualifiedNegativeAdvice": false,
+  "privateHostedRouting": false,
+  "missingPrerequisite": "durable-current-Operator-recovery-assignment",
+  "parallelism": "continue-independent-ready-frontier",
+  "authority": "current-native-identities-and-explicit-admissions",
+  "inheritQualifications": false
+}

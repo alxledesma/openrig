@@ -6,6 +6,7 @@ summary: >
   through handoffs without inheriting any internal release coupling.
 
 culture_file: CULTURE.md
+resilience_policy: builtin:standard
 
 pods:
   - id: intake
