@@ -303,6 +303,34 @@ export class CoordinatorAuthorityService {
    this.log(input.rigId,'idle-stall:'+epoch,'idle-stall-transfer',{...input,epoch},input);return this.get(input.rigId)!;
   }).immediate();
  }
+ /** Watchdog may exclude only positive fresh native absence, never expiry or unknown alone. */
+ hasFreshUnavailableOwner(rigId:string):boolean {const a=this.get(rigId);return !!a&&a.lease_until<=this.now()&&this.excluded(a.owner_session,a.owner_generation);}
+ transferObservedUnavailable(jobId:string,input:{rigId:string;expectedEpoch:number;expectedOwner:string;expectedOwnerGeneration:string;planRevision:string;recipient:string;recipientGeneration:string;leaseMs:number}):Authority {
+  return this.db.transaction(()=>{
+   const a=this.get(input.rigId);if(!a||!['active','recovery'].includes(a.state)||a.epoch!==input.expectedEpoch||a.owner_session!==input.expectedOwner||a.owner_generation!==input.expectedOwnerGeneration)reject('coordinator_cas_lost','Unavailable predecessor changed');
+   const job=this.db.prepare('SELECT * FROM watchdog_jobs WHERE job_id=?').get(jobId) as {policy:string;state:string;target_session:string;registered_by_session:string;registered_by_generation_uuid:string}|undefined;
+   if(!job||job.policy!=='coordinator-continuity'||job.state!=='active'||job.target_session!=='operator-agent@kernel'||job.registered_by_session!=='operator-agent@kernel')reject('coordination_observer_not_authorized','Explicit current Operator watchdog required');
+   this.operator(job!.registered_by_session,job!.registered_by_generation_uuid);
+   const plan=this.coordinationRecovery?.plan(input.rigId);
+   if(!plan||plan.operatorGeneration!==job!.registered_by_generation_uuid||plan.revision!==input.planRevision||plan.allowUnavailablePeerTransfer!==true)reject('coordination_unavailable_not_admitted','Current exact Operator plan must opt in');
+   if(a!.lease_until>this.now()||!this.excluded(a!.owner_session,a!.owner_generation))reject('coordinator_outage_unproven','Expired lease and fresh generation-bound native absence required');
+   const members=this.coordinatorMembers(a!);if(!this.coordinatorMembersValid(input.rigId,a!.owner_session,members)||!members.includes(input.recipient)||input.recipient===a!.owner_session)reject('coordinator_ineligible_recipient','Actual distinct current same-rig Peer required');
+   this.caller(input.recipient,input.recipientGeneration);this.validLease(input.leaseMs);
+   if(!this.coordinationRecovery?.canTransferUnavailable(input.rigId,input.recipient,input.recipientGeneration))reject('coordination_unavailable_not_ready','Fresh idle unoccupied Peer and current nonexpired task admissions required');
+   const rigName=(this.db.prepare('SELECT name FROM rigs WHERE id=?').get(input.rigId) as {name:string}).name;
+   const touches=(session:string)=>this.local(session)?.rig_id===input.rigId||session.split('@')[1]===rigName;
+   const effects=this.db.prepare("SELECT sender_session,destination_session FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired')").all() as {sender_session:string;destination_session:string}[];
+   if(effects.some(e=>touches(e.sender_session)||touches(e.destination_session)))reject('coordinator_uncertain_effects','Uncertain effects require exact recovery before takeover');
+   const baton=this.db.prepare('SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(a!.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string}|undefined;
+   if(!baton||baton.destination_session!==a!.owner_session||baton.state!=='in-progress'||baton.claimed_by_generation_uuid!==a!.owner_generation)reject('coordinator_baton_mismatch','Exact predecessor claimed canonical baton required');
+   const epoch=a!.epoch+1,ts=new Date(this.now()).toISOString(),operationId='unavailable-owner:'+epoch;
+   this.db.prepare("UPDATE coordinator_authority SET owner_session=?,owner_generation=?,epoch=?,lease_until=?,state='reconciling',operation_id=?,recovery_queue_id=NULL WHERE rig_id=?").run(input.recipient,input.recipientGeneration,epoch,this.now()+input.leaseMs,operationId,input.rigId);
+   this.db.prepare("UPDATE queue_items SET destination_session=?,state='pending',claimed_at=NULL,claimed_by_generation_uuid=NULL,ts_updated=? WHERE qitem_id=?").run(input.recipient,ts,a!.baton_id);
+   this.transitions?.append({qitemId:a!.baton_id,state:'pending',actorSession:'watchdog@system',transitionNote:'Admitted fresh native unavailable-owner transfer; genuine Peer acknowledgment required',identityProvenance:'system:operator-authorized-coordination'});
+   this.bus?.persistWithinTransaction({type:'queue.updated',qitemId:a!.baton_id,fromState:'in-progress',toState:'pending',actorSession:'watchdog@system',closureReason:null,closureTarget:null,summary:null});
+   this.log(input.rigId,operationId,'unavailable-owner-transfer',{...input,epoch},input);return this.get(input.rigId)!;
+  }).immediate();
+ }
  admit(actor:string,generation:string,rigId:string,packageKey:string,contract:PackageContract): void {
    this.db.transaction(() => {
      this.operator(actor,generation); if(!this.get(rigId)) reject("coordinator_not_enabled","Enable rig before admitting packages");

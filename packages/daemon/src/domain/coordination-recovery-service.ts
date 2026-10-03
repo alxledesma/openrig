@@ -11,7 +11,7 @@ export interface CoordinationTask {
  /** Owner boundary affects this slice only. Recovery work is a separate admitted task. */
  boundary?:"owner-access"|"owner-credential"|"owner-material"|"owner-irreversible";
 }
-export interface CoordinationPlan { rigId:string; revision:string; operatorGeneration:string; stallMs:number; allowIdlePeerTransfer:boolean; acknowledgmentWindowMs?:number; tasks:CoordinationTask[] }
+export interface CoordinationPlan { rigId:string; revision:string; operatorGeneration:string; stallMs:number; allowIdlePeerTransfer:boolean; allowUnavailablePeerTransfer?:boolean; acknowledgmentWindowMs?:number; tasks:CoordinationTask[] }
 export interface CoordinationResult { key:string; state:string; queueId?:string; reason?:string; deadline:number }
 const successfulReturn=(state:string,disposition:string|null):boolean=>!!disposition&&['done','handed-off'].includes(state);
 /** Only the exact migration091 refusal is normalized, never arbitrary SQL failures. */
@@ -43,6 +43,7 @@ export class CoordinationRecoveryService {
    if(!this.authority.get(plan.rigId))fail("coordinator_not_enabled","Explicit legacy enrollment/admission required");
    if(!Number.isSafeInteger(plan.stallMs)||plan.stallMs<10000||plan.stallMs>3600000||typeof plan.allowIdlePeerTransfer!=="boolean"||!plan.revision||!plan.tasks.length||new Set(plan.tasks.map(t=>t.key)).size!==plan.tasks.length||new Set(plan.tasks.map(t=>t.packageKey)).size!==plan.tasks.length)fail("coordination_invalid_plan","Unique immutable tasks/packages required");
    if(plan.acknowledgmentWindowMs!==undefined&&(!Number.isSafeInteger(plan.acknowledgmentWindowMs)||plan.acknowledgmentWindowMs<10000||plan.acknowledgmentWindowMs>900000))fail("coordination_invalid_ack_window","Acknowledgment window must be 10 seconds to 15 minutes");
+   if(plan.allowUnavailablePeerTransfer!==undefined&&typeof plan.allowUnavailablePeerTransfer!=='boolean')fail('coordination_invalid_unavailable_optin','Unavailable-owner transfer requires strict explicit boolean');
    const prior=this.plan(plan.rigId);
    const stable=(t:CoordinationTask)=>JSON.stringify({...t,admission:undefined,deadline:undefined});
    const keys=new Set(plan.tasks.map(t=>t.key));
@@ -189,6 +190,19 @@ export class CoordinationRecoveryService {
   if(this.db.prepare("SELECT 1 FROM queue_items WHERE destination_session IN (?,?) AND state IN ('pending','in-progress','blocked') AND qitem_id<>?").get(...rotationLocalAddresses(this.db,recipient),a.baton_id))return false;
   return coordinationIdle(this.activity(recipient),recipientGeneration,this.now())&&coordinationIdle(this.activity(a.owner_session),a.owner_generation,this.now());
  }
+ canTransferUnavailable(rigId:string,recipient:string,recipientGeneration:string):boolean {
+  const a=this.authority.get(rigId),plan=this.plan(rigId);if(!a||!plan||plan.allowUnavailablePeerTransfer!==true||this.authority.generation(recipient)!==recipientGeneration)return false;
+  if(plan.tasks.some(t=>t.admission.generation!==this.authority.generation(t.owner)||t.admission.configurationDigest!==this.configurationDigest(t.owner)||!Number.isFinite(t.admission.validUntil)||t.admission.validUntil<=this.now()))return false;
+  if(this.db.prepare("SELECT 1 FROM queue_items WHERE destination_session IN (?,?) AND state IN ('pending','in-progress','blocked') AND qitem_id<>?").get(...rotationLocalAddresses(this.db,recipient),a.baton_id))return false;
+  return coordinationIdle(this.activity(recipient),recipientGeneration,this.now());
+ }
+ private stageCoordinatorRecovery(rigId:string,epoch:number,operatorGeneration:string,action:string,reason:string,deadline:number):string {
+  const recoveryKey=digest(rigId+':'+epoch+':'+operatorGeneration+':'+action+':'+reason);
+  const previous=this.db.prepare("SELECT qitem_id,state FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_valid(body) AND json_extract(body,'$.recoveryKey')=? ORDER BY rowid DESC LIMIT 1").get(recoveryKey) as {qitem_id:string;state:string}|undefined;
+  const queueId=previous&&['pending','in-progress','blocked'].includes(previous.state)?previous.qitem_id:'qitem-coordination-recovery-'+digest(recoveryKey+':'+(previous?.qitem_id??'initial')).slice(0,24);
+  if(!this.repo.getById(queueId))this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',body:JSON.stringify({action,reason,recoveryKey,previousQueueId:previous?.qitem_id??null,rigId,epoch,recipientGeneration:operatorGeneration,deadline,nextAction:'Revalidate exact current native holder/Peer, plan and baton custody. A living holder may perform supported voluntary transfer; admit fresh idle or positive-absence recovery only when proven. Repair expired admissions or uncertain effects through their existing supported paths. Preserve workers and return a concrete protected boundary when evidence is unknown; do not fabricate extension or acknowledgment.',returnPath:{queueId,actor:'operator-agent@kernel',required:'Claim exact recovery item and return supported evidence or concrete protected boundary. Do not declare pickup/ACK or native absence from a role label.'}}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
+  this.repo.stageWakeIntent(queueId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,operatorGeneration);return queueId;
+ }
  /** Separately admitted feedback preserves the exact existing parent custody. */
  continueCustody(actor:string,generation:string,input:{rigId:string;epoch:number;parentPackageKey:string;parentQueueId:string;workerGeneration:string;feedbackPackageKey:string;body:string}):{queueId:string} {
   return this.db.transaction(()=>{
@@ -218,7 +232,18 @@ export class CoordinationRecoveryService {
    if(!plan||!a)return null;
    if(!job||job.policy!=='coordinator-continuity'||job.state!=='active'||job.target_session!=='operator-agent@kernel'||job.registered_by_session!=='operator-agent@kernel'||job.registered_by_generation_uuid!==plan.operatorGeneration||this.authority.generation('operator-agent@kernel')!==plan.operatorGeneration)fail('coordination_observer_not_authorized','Current Operator job and plan required');
    const progress=this.recordProgress(rigId);
-   if(a.state==='active'&&this.now()-progress.at>=plan.stallMs&&plan.allowIdlePeerTransfer){
+   if((a.state==='active'||a.state==='recovery')&&a.lease_until<=this.now()&&plan.allowUnavailablePeerTransfer===true&&this.authority.hasFreshUnavailableOwner(rigId)){
+    const peer=(JSON.parse(a.coordinators) as string[]).find(s=>s!==a.owner_session),peerGeneration=peer?this.authority.generation(peer):null;
+    try{
+     if(!peer||!peerGeneration)fail('coordinator_ineligible_recipient','Actual current Peer required');
+     return this.db.transaction(()=>{const transferred=this.authority.transferObservedUnavailable(jobId,{rigId,expectedEpoch:a.epoch,expectedOwner:a.owner_session,expectedOwnerGeneration:a.owner_generation,planRevision:plan.revision,recipient:peer!,recipientGeneration:peerGeneration!,leaseMs:plan.acknowledgmentWindowMs??300000});
+     const queueId='qitem-coordination-peer-'+digest(rigId+':'+transferred.epoch).slice(0,24);
+     this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:peer!,body:JSON.stringify({action:'reconcile-transferred-baton',rigId,epoch:transferred.epoch,batonId:transferred.baton_id,deadline:transferred.lease_until,recipientGeneration:peerGeneration,required:'Read actual obligations and native identity; claim notice, then genuine Peer acknowledgment claims canonical baton. No product dispatch until acknowledgment.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
+     this.repo.stageWakeIntent(queueId,'watchdog@system',peer!,'system:operator-authorized-coordination',true,peerGeneration!);
+     return [{key:'coordinator',state:'pending-peer-acknowledgment',queueId,reason:'fresh-native-unavailable-owner',deadline:transferred.lease_until}];})();
+    }catch(error){const code=heldDispatchCode(error)??(error instanceof CoordinatorFenceError?error.code:undefined);if(!code)throw error;const deadline=this.now()+plan.stallMs;const queueId=this.stageCoordinatorRecovery(rigId,a.epoch,plan.operatorGeneration,'recover-unavailable-coordinator',code,deadline);return [{key:'coordinator',state:'held',queueId,reason:code,deadline}];}
+   }
+   if(a.state==='active'&&this.now()-progress.at>=plan.stallMs&&plan.allowIdlePeerTransfer&&!this.authority.hasFreshUnavailableOwner(rigId)){
     const peers=(JSON.parse(a.coordinators) as string[]).filter(s=>s!==a.owner_session),peer=peers[0],peerGeneration=peer?this.authority.generation(peer):null;
     // No live working process or unknown telemetry is overridden. Transfer keeps
     // old worker claims/resources intact and requires genuine successor pickup.
@@ -226,8 +251,10 @@ export class CoordinationRecoveryService {
      try {
       return this.db.transaction(()=>{
        const transferred=this.authority.transferIdleStalled(jobId,{rigId,expectedEpoch:a.epoch,progressDigest:progress.digest,planRevision:plan.revision,recipient:peer,recipientGeneration:peerGeneration,leaseMs:plan.acknowledgmentWindowMs??300000});
-       this.repo.createWithinTransaction({qitemId:'qitem-coordination-peer-'+digest(rigId+':'+transferred.epoch).slice(0,24),sourceSession:'watchdog@system',destinationSession:peer,body:JSON.stringify({action:'reconcile-transferred-baton',rigId,epoch:transferred.epoch,batonId:transferred.baton_id,recipientGeneration:peerGeneration,required:'Read exact obligations and native current identity; acknowledge authority through supported coordinator API, then reconcile admitted frontier. This notice is not acknowledgment.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
-       return [{key:'coordinator',state:'pending-peer-acknowledgment',deadline:transferred.lease_until}];
+       const queueId='qitem-coordination-peer-'+digest(rigId+':'+transferred.epoch).slice(0,24);
+       this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:peer,body:JSON.stringify({action:'reconcile-transferred-baton',rigId,epoch:transferred.epoch,batonId:transferred.baton_id,deadline:transferred.lease_until,recipientGeneration:peerGeneration,required:'Read exact obligations and native current identity; acknowledge authority through supported coordinator API, then reconcile admitted frontier. This notice is not acknowledgment.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
+       this.repo.stageWakeIntent(queueId,'watchdog@system',peer,'system:operator-authorized-coordination',true,peerGeneration);
+       return [{key:'coordinator',state:'pending-peer-acknowledgment',queueId,deadline:transferred.lease_until}];
       })();
      } catch(error) {
       const code=(error as {code?:string}).code,hold=heldDispatchCode(error)??(['coordination_stall_unproven','coordinator_uncertain_effects'].includes(code??'')?code:undefined);
@@ -235,7 +262,8 @@ export class CoordinationRecoveryService {
       // A safe takeover refusal is not a global work gate. Re-read authority before
       // fallback; never use a stale cached holder/epoch or imply successor pickup.
       const current=this.authority.get(rigId);
-      if(!current||current.owner_session!==a.owner_session||current.owner_generation!==a.owner_generation||current.epoch!==a.epoch||current.state!=='active'||current.lease_until<=this.now()||this.authority.generation(current.owner_session)!==current.owner_generation)throw error;
+      if(!current||current.owner_session!==a.owner_session||current.owner_generation!==a.owner_generation||current.epoch!==a.epoch||current.state!=='active'||this.authority.generation(current.owner_session)!==current.owner_generation)throw error;
+      if(current.lease_until<=this.now()){const deadline=this.now()+plan.stallMs,queueId=this.stageCoordinatorRecovery(rigId,a.epoch,plan.operatorGeneration,'recover-expired-idle-transfer',hold,deadline);return [{key:'coordinator',state:'held',queueId,reason:hold,deadline}];}
       const receipt={rigId,epoch:a.epoch,peer,reason:hold,owner:'operator-agent@kernel',action:'Reconcile exact Peer custody/transport/lifecycle fence and retry only after eligibility is proven',deadline:this.now()+plan.stallMs};
       this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'coordination-takeover-hold:'+digest(JSON.stringify({revision:plan.revision,epoch:a.epoch,hold})), 'coordination-takeover-hold',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
       return [...this.reconcile(current.owner_session,current.owner_generation,rigId),{key:'coordinator',state:'held',reason:hold,deadline:receipt.deadline}];
@@ -246,9 +274,10 @@ export class CoordinationRecoveryService {
     const queueId='qitem-coordination-ack-recovery-'+digest(rigId+':'+a.epoch).slice(0,24);
     const existing=this.repo.getById(queueId);
     if(!existing)this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',body:JSON.stringify({action:'recover-expired-reconciliation',rigId,epoch:a.epoch,recipient:a.owner_session,recipientGeneration:a.owner_generation,batonId:a.baton_id,required:'Inspect current native recipient and exact obligations; invoke reconciliation-recover once with current token and custody digest, then require genuine recipient acknowledge. If exhausted or identity uncertain, return concrete supported recovery boundary; do not fabricate lease or acknowledgment.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
+    this.repo.stageWakeIntent(queueId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,plan.operatorGeneration);
     return [{key:'coordinator',state:'pending-reconciliation-recovery',queueId,reason:'expired-unacknowledged-transfer',deadline:a.lease_until+(plan.acknowledgmentWindowMs??300000)}];
    }
-   if(a.state!=='active'||a.lease_until<=this.now())return [{key:'coordinator',state:'recovery-required',reason:'current-holder-acknowledgment-or-lease',deadline:this.now()+plan.stallMs}];
+   if(a.state!=='active'||a.lease_until<=this.now()){const deadline=this.now()+plan.stallMs,reason='current-holder-acknowledgment-or-lease';const queueId=this.stageCoordinatorRecovery(rigId,a.epoch,plan.operatorGeneration,'reconcile-current-coordinator-lease',reason,deadline);return [{key:'coordinator',state:'recovery-required',queueId,reason,deadline}];}
    return this.reconcile(a.owner_session,a.owner_generation,rigId);
   }).immediate();
  }
