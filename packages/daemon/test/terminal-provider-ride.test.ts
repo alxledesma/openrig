@@ -661,6 +661,17 @@ describe("cmux provider — ONE gridded workspace per page (never a window per s
     pages: [[pane, paneB]],
   };
 
+  it("managed local cmux panes acquire sizing policy while SSH panes remain unchanged",async()=>{
+    const {layoutService,builds}=fakeLayoutService();
+    const adapter=new CmuxProviderAdapter({cmuxAdapter:fakeCmuxAdapter(true),layoutService});
+    const local={...pane,localTmuxSession:"a@r"};
+    const remote={...paneB,paneCommand:"ssh 'host' tmux attach -r -t 'b@r'"};
+    await adapter.openView({...view,opened:[local,remote],pages:[[local,remote]]});
+    expect(builds[0]!.commands[0]).toContain("window-size latest");
+    expect(builds[0]!.commands[0]).toContain("fill-character ' '");
+    expect(builds[0]!.commands[1]).toBe(remote.paneCommand);
+  });
+
   it("renders the page as ONE workspace; paneCommands carried verbatim; absents/degrades carried", async () => {
     const { layoutService, builds } = fakeLayoutService();
     const adapter = new CmuxProviderAdapter({

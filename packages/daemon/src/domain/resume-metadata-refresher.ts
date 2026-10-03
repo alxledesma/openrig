@@ -1,3 +1,4 @@
+import { readOpenCodexRollout } from "./codex-open-rollout.js";
 import os from "node:os";
 import nodePath from "node:path";
 import { execFile } from "node:child_process";
@@ -73,7 +74,7 @@ export class ResumeMetadataRefresher {
     // S10 follow-on: identity is REQUIRED on resolve(); an identity-less read routes EXPLICITLY
     // through the named ungated escape hatch — never a silent fallback (r1 owed item 3).
     this.readCodexThreadIdByPid = deps.readCodexThreadIdByPid
-      ?? ((pid, identity) => identity === undefined ? threadIdResolver.resolveUngatedLegacy(pid) : threadIdResolver.resolve(pid, identity));
+      ?? (async (pid, identity) => await (identity === undefined ? threadIdResolver.resolveUngatedLegacy(pid) : threadIdResolver.resolve(pid, identity)) ?? await readOpenCodexRollout(pid, undefined, identity));
     this.probeClaudeResume = deps.probeClaudeResume ?? ((sessionName, resumeToken, cwd) => this.defaultProbeClaudeResume(sessionName, resumeToken, cwd));
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.homeDir = deps.homeDir ?? os.homedir();
@@ -216,8 +217,9 @@ export class ResumeMetadataRefresher {
       const shellPid = await this.tmuxAdapter.getPanePid(sessionTarget);
       if (shellPid) {
         const rows = await listProcesses();
-        const codexPids = findCodexDescendantPids(rows, shellPid);
-        for (const codexPid of codexPids) {
+        const codexPids = findCodexDescendantPids(rows, shellPid).filter(pid => nodePath.basename(rows.find(row => row.pid === pid)?.command.trim().split(/\s+/)[0] ?? "") === "codex");
+        if (codexPids.length === 1) {
+          const codexPid = codexPids[0]!;
           // pid+start-time identity from the SAME census (r1's reuse guard).
           const identity = (rows.find((r) => r.pid === codexPid) as { startedAt?: string } | undefined)?.startedAt;
           const threadId = await this.readCodexThreadIdByPid(codexPid, identity);

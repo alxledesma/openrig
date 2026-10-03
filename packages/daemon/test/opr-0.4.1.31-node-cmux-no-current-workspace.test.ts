@@ -68,4 +68,15 @@ describe("OPR.0.4.1.31 part A — NodeCmuxService no-current-workspace handling 
     expect(result.ok).toBe(false);
     expect((result as { error?: string }).error).toContain("cmux workspace.create failed");
   });
+  it("closed bound surface falls through to recreation before custom-title rename",async()=>{
+    const order:string[]=[];
+    const adapter=makeAdapter({focusSurface:async(surface:string)=>{order.push(`focus:${surface}`);return surface==="closed"?{ok:false,code:"not_found",message:"surface closed"}:{ok:true,data:undefined};},renameSurface:vi.fn(async(surface:string)=>{order.push(`rename:${surface}`);return {ok:true,data:undefined};})});
+    const rigRepo={getRig:()=>({nodes:[{id:"n1",logicalId:"dev.impl",binding:{attachmentType:"tmux",tmuxSession:"dev-impl@rig",cmuxSurface:"closed",cmuxWorkspace:"old"}}]})};
+    const registry={updateBinding:vi.fn()};
+    const svc=new NodeCmuxService(rigRepo as never,registry as never,adapter as never,{hasSession:async()=>true} as never);
+    const result=await svc.openOrFocusNodeSurface("rig-1","dev.impl");
+    expect(result).toEqual({ok:true,action:"created_new"});
+    expect(order[0]).toBe("focus:closed");expect(order).not.toContain("rename:closed");expect(order).toContain("rename:surface-1");expect(registry.updateBinding).toHaveBeenCalled();
+  });
+
 });

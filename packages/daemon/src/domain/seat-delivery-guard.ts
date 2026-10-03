@@ -14,6 +14,7 @@ interface Lease {
   active: boolean;
   origin: "automatic" | "human";
   lifecycle?: boolean;
+  reservationId?: string;
 }
 
 export class DeliveryGuardError extends Error {
@@ -114,7 +115,7 @@ export class SeatDeliveryGuard {
 
   /** fn must include lifecycle preflight, effects and last write. Retention callbacks
    * execute under this same lease, before any pane capture/paste/submit branch. */
-  async operation<T>(name: string, fn: () => Promise<T>, held?: (target: GuardTarget) => Promise<T>): Promise<T> {
+  async operation<T>(name: string, fn: () => Promise<T>, held?: (target: GuardTarget) => Promise<T>, reservationId?: string): Promise<T> {
     const bound = this.target(name);
     const inherited = this.scope.getStore()?.get(bound.nodeId);
     if (inherited?.active && inherited.target.nodeId === bound.nodeId) {
@@ -124,12 +125,17 @@ export class SeatDeliveryGuard {
     return this.serial(bound.nodeId, async () => {
       const current = this.target(name);
       if (!this.same(bound, current)) throw new DeliveryGuardError("guard_target_changed", "Input target changed while waiting; no input written.");
+      const reservation = this.activeReservation(bound.nodeId);
+      if (reservation && reservation.reservation_id !== reservationId) {
+        if (held) return held(bound);
+        throw new DeliveryGuardError("seat_dispatch_reserved", "Seat has a durable cutover reservation; input/lifecycle retained until exact disposition.");
+      }
       const pref = this.preference(bound.nodeId);
       if (pref.effective || pref.desired) {
         if (held) return held(bound);
         throw new DeliveryGuardError("typing_guard_enabled", "Automatic input is paused for this seat. Disable its typing guard explicitly before this writing operation.");
       }
-      const lease: Lease = { target: bound, active: true, origin: "automatic" };
+      const lease: Lease = { target: bound, active: true, origin: "automatic", reservationId };
       try { return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [lease.target.nodeId, lease]]), fn); }
       finally { lease.active = false; }
     });
@@ -144,7 +150,7 @@ export class SeatDeliveryGuard {
 
   /** Multi-seat restore takes leases in stable order before any rig mutation.
    * Nested per-seat launch joins these leases; it must not reacquire them. */
-  async lifecycle<T>(nodeIds: string[], fn: () => Promise<T>): Promise<T> {
+  async lifecycle<T>(nodeIds: string[], fn: () => Promise<T>, reservationId?: string): Promise<T> {
     const ids = [...new Set(nodeIds)].sort();
     const acquire = async (index: number): Promise<T> => {
       const id = ids[index]; if (!id) return fn();
@@ -153,7 +159,7 @@ export class SeatDeliveryGuard {
         const lease = this.scope.getStore()!.get(id)!;
         lease.lifecycle = true;
         return acquire(index + 1);
-      });
+      }, undefined, reservationId);
     };
     return acquire(0);
   }
@@ -166,7 +172,14 @@ export class SeatDeliveryGuard {
     lease.target = this.target(nodeId);
   }
 
+  private activeReservation(nodeId: string): { reservation_id: string } | null {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='seat_dispatch_reservations'").get()) return null;
+    return this.db.prepare("SELECT reservation_id FROM seat_dispatch_reservations WHERE node_id=? AND state!='released'").get(nodeId) as {reservation_id:string} | undefined ?? null;
+  }
+
   private assertCurrent(name: string, lease: Lease): void {
+    const reservation = this.activeReservation(lease.target.nodeId);
+    if (reservation && reservation.reservation_id !== lease.reservationId) throw new DeliveryGuardError("seat_dispatch_reserved", "Durable reservation excludes this operation; no input written.");
     if (!lease.active || !this.same(lease.target, this.target(name))) {
       throw new DeliveryGuardError("guard_target_changed", "Input target/occupant changed; no input written.");
     }

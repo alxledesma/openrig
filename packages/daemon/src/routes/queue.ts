@@ -1,3 +1,4 @@
+import { CoordinatorFenceError, AssignmentReplay, type DispatchEnvelope } from "../domain/coordinator-authority-service.js";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { EventBus } from "../domain/event-bus.js";
@@ -9,11 +10,11 @@ import type {
 import { QueueRepositoryError, newQitemId, deriveCrossHostSuccessorId, stampSelfHostSuffix, classifyNudgeFailure } from "../domain/queue-repository.js";
 import type { QueueItem } from "../domain/queue-repository.js";
 import { parseSessionName, isHumanSeatSessionRef } from "../domain/session-name.js";
-import { requireSenderIdentity, resolveRecordedProvenance, ORIGIN_UNKNOWN_HEADER } from "./require-sender-identity.js";
+import { requireSenderIdentity, resolveRecordedProvenance, ORIGIN_UNKNOWN_HEADER, transportSenderSession } from "./require-sender-identity.js";
 import { hostname as osHostname } from "node:os";
 import type { InboxHandler } from "../domain/inbox-handler.js";
 import { InboxHandlerError } from "../domain/inbox-handler.js";
-import { type OutboxHandler } from "../domain/outbox-handler.js";
+import { OutboxHandlerError, type OutboxHandler } from "../domain/outbox-handler.js";
 import { aggregateAttention } from "../domain/feed/attention-aggregator.js";
 import type { AttentionItem } from "../domain/feed/attention-aggregator.js";
 import { loadHostRegistry, resolveHost } from "../domain/hosts/hosts-registry-reader.js";
@@ -114,6 +115,10 @@ export function queueRoutes(): Hono {
   }
 
   function errorResponse(c: { json: (body: unknown, status?: number) => Response }, err: unknown): Response {
+    if (err instanceof Error && err.message === "seat_dispatch_reserved") return c.json({ error: "seat_dispatch_reserved", message: "Target has a durable cutover fence; retry only after matched disposition. No queue mutation committed.", retryable: true }, 409);
+    if (err instanceof CoordinatorFenceError || err instanceof AssignmentReplay) {
+      return c.json({ error: err instanceof AssignmentReplay ? "coordinator_assignment_exists" : err.code, message: err.message, ...(err instanceof AssignmentReplay ? {queueId:err.queueId} : {}) }, 409);
+    }
     if (err instanceof QueueRepositoryError) {
       const status = err.code === "qitem_not_found" ? 404
         : err.code === "missing_closure_reason" ? 400
@@ -388,6 +393,7 @@ export function queueRoutes(): Hono {
   // POST /create
   app.post("/create", async (c) => {
     const body = await c.req.json<{
+      dispatch?: DispatchEnvelope;
       qitemId?: string;
       sourceSession?: string;
       destinationSession?: string;
@@ -418,6 +424,9 @@ export function queueRoutes(): Hono {
     const sourceSession = identity.session;
     if (!body.destinationSession) return c.json({ error: "destinationSession is required" }, 400);
     if (!body.body) return c.json({ error: "body is required" }, 400);
+
+    if (body.dispatch && body.dispatch.token?.generation !== c.req.header("X-OpenRig-Occupant-Generation")) return c.json({error:"coordinator_generation_mismatch",message:"Dispatch generation must match immutable caller environment"},409);
+    if (body.hostId && body.hostId !== LOCAL_HOST_ID && getRepo(c).coordinatorAuthority.scope(sourceSession,body.destinationSession!)) return c.json({error:"coordinator_cross_host_refused",message:"Enabled rig dispatch fence is local only"},409);
 
     // OPR.0.4.6.MH3 FR-2 (C1): cross-host CREATE. A registered remote host id
     // forwards the write to that host's daemon; the qitem lives in the origin
@@ -456,7 +465,7 @@ export function queueRoutes(): Hono {
 
     try {
       const item = await getRepo(c).create({
-        qitemId: body.qitemId,
+        dispatch: body.dispatch,        qitemId: body.qitemId,
         sourceSession,
         destinationSession: body.destinationSession,
         body: body.body,
@@ -587,6 +596,7 @@ export function queueRoutes(): Hono {
   app.post("/:qitemId/handoff", async (c) => {
     const qitemId = c.req.param("qitemId");
     const body = await c.req.json<{
+      dispatch?: DispatchEnvelope;
       fromSession?: string;
       toSession?: string;
       body?: string;
@@ -607,6 +617,9 @@ export function queueRoutes(): Hono {
     if (!identity.ok) return identity.response;
     const fromSession = identity.session;
     if (!body.toSession) return c.json({ error: "toSession is required" }, 400);
+
+    if (body.dispatch && body.dispatch.token?.generation !== c.req.header("X-OpenRig-Occupant-Generation")) return c.json({error:"coordinator_generation_mismatch",message:"Dispatch generation must match immutable caller environment"},409);
+    if (body.hostId && body.hostId !== LOCAL_HOST_ID && getRepo(c).coordinatorAuthority.scope(fromSession,body.toSession!)) return c.json({error:"coordinator_cross_host_refused",message:"Enabled rig dispatch fence is local only"},409);
 
     // PL-007 — GUARD FIXBACK (Finding 1): an EXPLICIT targetRepo validates
     // against the SOURCE host's authority BEFORE the cross-host branch (see
@@ -635,7 +648,7 @@ export function queueRoutes(): Hono {
 
     try {
       const result = await getRepo(c).handoff({
-        qitemId,
+        dispatch: body.dispatch,        qitemId,
         fromSession,
         toSession: body.toSession,
         body: body.body,
@@ -662,6 +675,7 @@ export function queueRoutes(): Hono {
   app.post("/:qitemId/handoff-and-complete", async (c) => {
     const qitemId = c.req.param("qitemId");
     const body = await c.req.json<{
+      dispatch?: DispatchEnvelope;
       fromSession?: string;
       toSession?: string;
       body?: string;
@@ -681,6 +695,9 @@ export function queueRoutes(): Hono {
     if (!identity.ok) return identity.response;
     const fromSession = identity.session;
     if (!body.toSession) return c.json({ error: "toSession is required" }, 400);
+
+    if (body.dispatch && body.dispatch.token?.generation !== c.req.header("X-OpenRig-Occupant-Generation")) return c.json({error:"coordinator_generation_mismatch",message:"Dispatch generation must match immutable caller environment"},409);
+    if (body.hostId && body.hostId !== LOCAL_HOST_ID && getRepo(c).coordinatorAuthority.scope(fromSession,body.toSession!)) return c.json({error:"coordinator_cross_host_refused",message:"Enabled rig dispatch fence is local only"},409);
 
     // PL-007 — GUARD FIXBACK (Finding 1): same source-host-authority ordering
     // as handoff — explicit targetRepo validates BEFORE the cross-host branch.
@@ -707,7 +724,7 @@ export function queueRoutes(): Hono {
 
     try {
       const result = await getRepo(c).handoffAndComplete({
-        qitemId,
+        dispatch: body.dispatch,        qitemId,
         fromSession,
         toSession: body.toSession,
         body: body.body,
@@ -1098,6 +1115,29 @@ export function queueRoutes(): Hono {
       identityProvenance: resolveRecordedProvenance(c, identity), // P21 §4 era-stamp: transport:v1 if the header proved it here, else claimed:v1 (resolveRecordedProvenance degrades)
     });
     return c.json(entry, 201);
+  });
+
+  app.post("/outbox/abandon-uncertain", async(c)=>{
+    const body:Record<string,unknown> = await c.req.json<Record<string,unknown>>().catch(()=>({}));
+    const actor = transportSenderSession(c), generation = c.req.header("X-OpenRig-Occupant-Generation");
+    if (!actor || !generation || ["outboxId","bodySha256","operationId","authorizationId","reason","evidenceRef"].some(k=>typeof body[k]!=="string")
+      || (body.expectedState!=="pending" && body.expectedState!=="indeterminate")) return c.json({error:"outbox_abandon_contract_required"},400);
+    try {
+      const adapter=c.get("tmuxAdapter" as never) as import("../adapters/tmux.js").TmuxAdapter|undefined;
+      return c.json(await getOutbox(c).abandonUncertain({outboxId:body.outboxId as string,bodySha256:body.bodySha256 as string,
+        operationId:body.operationId as string,authorizationId:body.authorizationId as string,reason:body.reason as string,evidenceRef:body.evidenceRef as string,
+        expectedState:body.expectedState,actor,generation},adapter?.deliveryGuard));
+    } catch(err) { if(err instanceof OutboxHandlerError)return c.json({error:err.code,message:err.message},409);throw err; }
+  });
+
+  app.post("/outbox/reconcile-delivery", async (c) => {
+    const body: Record<string, unknown> = await c.req.json<Record<string, unknown>>().catch(() => ({}));
+    const actor = transportSenderSession(c), generation = c.req.header("X-OpenRig-Occupant-Generation");
+    if (!actor || !generation || typeof body.outboxId !== "string" || typeof body.receiptId !== "string" || typeof body.reason !== "string") {
+      return c.json({error:"outbox_recipient_receipt_required"},400);
+    }
+    try { return c.json(getOutbox(c).reconcileRecipientDelivery({outboxId:body.outboxId,receiptId:body.receiptId,reason:body.reason,actor,generation})); }
+    catch (err) { if (err instanceof OutboxHandlerError) return c.json({error:err.code,message:err.message},409); throw err; }
   });
 
   app.get("/outbox/list", (c) => {

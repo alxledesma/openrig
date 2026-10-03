@@ -93,6 +93,13 @@ export class CmuxAdapter {
     return this.status.available;
   }
 
+  /** Native custom tab title persists over terminal OSC title updates. */
+  async renameSurface(surfaceId:string,title:string,workspaceId?:string):Promise<CmuxResult<void>> {
+    if(!this.transport)return {ok:false,code:"unavailable",message:"cmux is not connected"};
+    try{await this.transport.request("surface.rename",{surfaceId,title,...(workspaceId?{workspaceId}:{})});return {ok:true,data:undefined};}
+    catch(err){return {ok:false,code:"request_failed",message:err instanceof Error?err.message:String(err)};}
+  }
+
   async listWorkspaces(): Promise<CmuxResult<CmuxWorkspace[]>> {
     if (!this.transport) {
       return { ok: false, code: "unavailable", message: "cmux is not connected" };

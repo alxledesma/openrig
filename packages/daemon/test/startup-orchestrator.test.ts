@@ -131,6 +131,21 @@ describe("StartupOrchestrator", () => {
     };
   }
 
+  it("captures native identity after initial prompt without a launch token", async () => {
+    const seed = seedSession();
+    const capture = vi.fn(async () => {
+      expect(tmux.sendText).toHaveBeenCalled();
+      return { token: "00000000-0000-7000-8000-000000000001", resumeType: "codex_id" };
+    });
+    const result = await createOrchestrator().startNode(makeInput(seed, {
+      adapter: mockAdapter({ runtime: "codex", captureNativeResumeToken: capture }),
+      startupActions: [makeIdentityAction()],
+    }));
+    expect(result.ok).toBe(true);
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(sessionRegistry.getSessionsForRig(seed.rigId).find(row => row.id === seed.sessionId)?.resumeToken).toBe("00000000-0000-7000-8000-000000000001");
+  });
+
   it("deliberate fresh replacement appends the named durable obligation read without an extra message", async () => {
     const seed = seedSession();
     await createOrchestrator().startNode(makeInput(seed, { startupActions: [makeIdentityAction()], includeDurableObligations: true }));

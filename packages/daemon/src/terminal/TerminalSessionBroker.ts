@@ -58,6 +58,7 @@ export interface BrokerTmux {
   humanInput?<T>(name: string, fn: () => Promise<T>): Promise<T>;
   hasSession(name: string): Promise<boolean>;
   setWindowOption(name: string, option: string, value: string): Promise<TmuxResult>;
+  shouldPreserveWindowSizing?(name:string):Promise<boolean>;
   resizeWindow(name: string, cols: number, rows: number): Promise<TmuxResult>;
   startPipePane(name: string, outputPath: string): Promise<TmuxResult>;
   stopPipePane(name: string): Promise<TmuxResult>;
@@ -382,8 +383,11 @@ export class TerminalSessionBroker {
     // FR-7 fixed geometry: window-size manual so tmux will NOT auto-shrink the
     // window to the smallest attached client; then the canonical width/height
     // ONCE. Deliberately NOT aggressive-resize, which does the opposite.
-    await this.tmux.setWindowOption(this.sessionName, "window-size", "manual").catch(() => {});
-    await this.tmux.resizeWindow(this.sessionName, this.cols, this.rows).catch(() => {});
+    const preserveSizing=await this.tmux.shouldPreserveWindowSizing?.(this.sessionName).catch(()=>true) ?? false;
+    if(!preserveSizing){
+      await this.tmux.setWindowOption(this.sessionName, "window-size", "manual").catch(() => {});
+      await this.tmux.resizeWindow(this.sessionName, this.cols, this.rows).catch(() => {});
+    }
 
     const outputPath = path.join(
       os.tmpdir(),

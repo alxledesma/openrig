@@ -1,3 +1,5 @@
+import { dispatchReservationRoutes } from "./routes/dispatch-reservation.js";
+import { coordinatorRoutes } from "./routes/coordinator.js";
 import { healthDiagnosisRoutes } from "./routes/health-diagnosis.js";
 import type { HealthDiagnosisService } from "./domain/health-diagnosis.js";
 import type { HealthPolicyStore } from "./domain/health-policy.js";
@@ -564,6 +566,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("terminalService" as never, deps.terminalService);
     c.set("filesAllowlist" as never, deps.filesAllowlist);
     c.set("settingsStore" as never, deps.settingsStore);
+    c.set("terminalBearerToken" as never, deps.terminalBearerToken ?? null);
     c.set("previewRateLimiter" as never, deps.previewRateLimiter);
     c.set("fileWriteService" as never, deps.fileWriteService);
     c.set("progressIndexer" as never, deps.progressIndexer);
@@ -745,9 +748,11 @@ export function createApp(deps: AppDeps): Hono {
   // is not set in context until the collection/service seam (C) wires it (until then -> 503).
   app.route("/api/provider", providerRoutes());
   app.route("/api/seat", seatRoutes);
+  app.route("/api/dispatch-reservation", dispatchReservationRoutes({bearerToken:deps.terminalBearerToken ?? null}));
   app.route("/api/rigs/:rigId/chat", chatRoutes());
   app.route("/api/stream", streamRoutes());
   app.route("/api/queue", queueRoutes());
+  app.route("/api/coordinator", coordinatorRoutes({bearerToken:deps.terminalBearerToken ?? null}));
   app.route("/api/workspace", workspaceRoutes());
   app.route("/api/projects", projectsRoutes());
   app.route("/api/views", viewsRoutes());

@@ -17,6 +17,12 @@ import type { OccupantInvalidator } from "./occupant-invalidator.js";
 import { rebindAndVerifyPaneIdentity } from "./seat-attention-reconciler.js";
 import { observeSolePane } from "./pane-binding-observation.js";
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
+import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, resolve } from "node:path";
+import { promisify } from "node:util";
+import { parse as parseToml } from "smol-toml";
 import { NativePermissionStore } from "./native-permission-store.js";
 import { validateNativePermissionSelection, unresolvedClaudePermissionModes } from "./native-permission-selection.js";
 
@@ -52,6 +58,10 @@ export interface SeatLifecycleDeps {
   runtimeAdapters?: Record<string, RuntimeAdapter>;
   occupantInvalidator?: OccupantInvalidator;
   activityOracle?: { declareOccupantSwap(nodeId: string, generation: string): void };
+  /** Test seam; production reads the installed Codex profile directory. */
+  codexProfileHome?: string;
+  /** Test seam; production asks Codex's own loader to accept the named profile. */
+  codexProfileProbe?: (profile: string) => Promise<unknown>;
 }
 
 interface ResolvedSeat {
@@ -67,6 +77,18 @@ export interface SeatRefusal {
     | "seat_ambiguous"
     | "missing_model"
     | "missing_reason"
+    | "missing_actor"
+    | "invalid_cwd"
+    | "cwd_selection_conflict"
+    | "cwd_guard_unavailable"
+    | "invalid_codex_profile"
+    | "profile_not_installed"
+    | "profile_load_failed"
+    | "profile_model_mismatch"
+    | "profile_posture_mismatch"
+    | "profile_selection_conflict"
+    | "profile_guard_unavailable"
+    | "runtime_mismatch"
     | "permission_selection_refused"
     | "no_session"
     | "claimed_session"
@@ -100,6 +122,52 @@ export interface SeatDescriptor {
 export type SetModelResult =
   | { ok: true; seat: SeatDescriptor; from: string | null; to: string; changed: boolean }
   | SeatRefusal;
+
+type CodexProfileEffective = { model: string; provider: string; effort: string; approval: string; sandbox: string };
+export type SetCodexProfileResult =
+  | { ok: true; seat: SeatDescriptor; from: string | null; to: string; changed: boolean; effective: CodexProfileEffective; profileSha256: string; effect: string }
+  | SeatRefusal;
+
+const runCodex = promisify(execFile);
+const CODEX_PROFILE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const CODEX_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const CODEX_APPROVALS = new Set(["never", "untrusted", "on-failure", "on-request"]);
+const CODEX_SANDBOXES = new Set(["read-only", "workspace-write", "danger-full-access"]);
+
+function readInstalledCodexProfile(home: string, name: string, requireExplicit = true): { effective: CodexProfileEffective; sha256: string } | SeatRefusal {
+  const path = resolve(home, `${name}.config.toml`);
+  let bytes: Buffer;
+  try {
+    if (!lstatSync(path).isFile()) throw new Error("not a regular file");
+    bytes = readFileSync(path);
+  } catch {
+    return { ok: false, code: "profile_not_installed", message: `Named Codex profile '${name}' is not an installed regular file.` };
+  }
+  try {
+    const config = parseToml(bytes.toString("utf8")) as Record<string, unknown>;
+    let global: Record<string, unknown> = {};
+    if (!requireExplicit) {
+      try { global = parseToml(readFileSync(resolve(home, "config.toml"), "utf8")) as Record<string, unknown>; }
+      catch { /* Missing or invalid global config leaves required values unresolved below. */ }
+    }
+    const model = config["model"] ?? global["model"];
+    const provider = config["model_provider"] ?? global["model_provider"] ?? (!requireExplicit ? "openai" : undefined);
+    const effort = config["model_reasoning_effort"] ?? global["model_reasoning_effort"];
+    const approval = config["approval_policy"] ?? global["approval_policy"];
+    const sandbox = config["sandbox_mode"] ?? global["sandbox_mode"];
+    // The proposed successor must be explicit; the predecessor is compared
+    // using Codex's global layering, while refusing any unresolved posture.
+    if (typeof model !== "string" || !model.trim() || typeof provider !== "string" || !provider.trim()
+      || typeof effort !== "string" || !CODEX_EFFORTS.has(effort)
+      || typeof approval !== "string" || !CODEX_APPROVALS.has(approval)
+      || typeof sandbox !== "string" || !CODEX_SANDBOXES.has(sandbox)) {
+      throw new Error("incomplete or invalid nonsecret native tuple");
+    }
+    return { effective: { model, provider, effort, approval, sandbox }, sha256: createHash("sha256").update(bytes).digest("hex") };
+  } catch {
+    return { ok: false, code: "invalid_codex_profile", message: `Named Codex profile '${name}' has invalid TOML or lacks an explicit valid native tuple.` };
+  }
+}
 
 export type StopSeatResult =
   | { ok: true; seat: SeatDescriptor; sessionName: string; sessionId: string }
@@ -162,6 +230,8 @@ export class SeatLifecycleService {
   private readonly runtimeAdapters: Record<string, RuntimeAdapter>;
   private readonly occupantInvalidator: OccupantInvalidator | null;
   private readonly activityOracle: SeatLifecycleDeps["activityOracle"] | null;
+  private readonly codexProfileHome: string;
+  private readonly codexProfileProbe: (profile: string) => Promise<unknown>;
 
   constructor(deps: SeatLifecycleDeps) {
     if (deps.db !== deps.rigRepo.db) throw new Error("SeatLifecycleService: rigRepo must share the same db handle");
@@ -178,6 +248,154 @@ export class SeatLifecycleService {
     this.runtimeAdapters = deps.runtimeAdapters ?? {};
     this.occupantInvalidator = deps.occupantInvalidator ?? null;
     this.activityOracle = deps.activityOracle ?? null;
+    this.codexProfileHome = deps.codexProfileHome ?? process.env["CODEX_HOME"] ?? resolve(homedir(), ".codex");
+    this.codexProfileProbe = deps.codexProfileProbe ?? (async (profile) => {
+      // argv is fixed and the name is allowlisted; no shell or model turn.
+      await runCodex("codex", ["-p", profile, "mcp", "list"], { timeout: 10_000, maxBuffer: 1024 * 1024 });
+    });
+  }
+
+  /** Audited future-launch directory selection; never sends input or restarts a seat. */
+  async setCwd(input: { seatRef: string; cwd: string; reason: string; actor: string }): Promise<
+    { ok: true; seat: SeatDescriptor; from: string | null; to: string; changed: boolean; effect: string } | SeatRefusal> {
+    const required = this.requireReason(input.reason);
+    if (required) return required;
+    if (!input.actor?.trim()) return { ok: false, code: "missing_actor", message: "Transport sender identity is required for the directory audit." };
+    if (typeof input.cwd !== "string" || !isAbsolute(input.cwd) || input.cwd.includes("\0")) {
+      return { ok: false, code: "invalid_cwd", message: "An absolute existing directory is required." };
+    }
+    const target = this.resolveSeat(input.seatRef);
+    if ("code" in target) return target;
+    const guard = this.tmuxAdapter.deliveryGuard;
+    if (!guard || guard.db !== this.db) return { ok: false, code: "cwd_guard_unavailable", message: "Same-database lifecycle guard is required; no directory changed." };
+    const snapshot = JSON.stringify(this.db.prepare("SELECT * FROM nodes WHERE id=?").get(target.nodeId));
+    const change = async () => {
+      if (!guard.ownsLifecycle(target.nodeId)) return { ok: false as const, code: "cwd_guard_unavailable" as const, message: "Lifecycle lease is required." };
+      const resolved = this.resolveSeat(input.seatRef);
+      if ("code" in resolved) return resolved;
+      if (resolved.nodeId !== target.nodeId || JSON.stringify(this.db.prepare("SELECT * FROM nodes WHERE id=?").get(target.nodeId)) !== snapshot) {
+        return { ok: false as const, code: "cwd_selection_conflict" as const, message: "Seat configuration changed while waiting; reconcile and retry." };
+      }
+      let cwd: string, identity: { dev: number; ino: number };
+      try {
+        cwd = realpathSync(input.cwd);
+        const stat = statSync(cwd);
+        if (!stat.isDirectory()) throw new Error("not directory");
+        identity = { dev: stat.dev, ino: stat.ino };
+      } catch { return { ok: false as const, code: "invalid_cwd" as const, message: "An absolute existing directory is required; no seat changed." }; }
+      const seat = this.describe(resolved);
+      let persisted: PersistedEvent | null = null;
+      const result = this.db.transaction(() => {
+        if (JSON.stringify(this.db.prepare("SELECT * FROM nodes WHERE id=?").get(target.nodeId)) !== snapshot) {
+          return { ok: false as const, code: "cwd_selection_conflict" as const, message: "Seat configuration changed before commit; no directory changed." };
+        }
+        try {
+          const stat = statSync(cwd);
+          if (realpathSync(input.cwd) !== cwd || !stat.isDirectory() || stat.dev !== identity.dev || stat.ino !== identity.ino) throw new Error("changed directory");
+        } catch { return { ok: false as const, code: "cwd_selection_conflict" as const, message: "Directory changed before commit; no seat changed." }; }
+        const from = resolved.entry.cwd ?? null;
+        if (from !== cwd) {
+          this.rigRepo.setNodeCwd(target.nodeId, cwd);
+          persisted = this.eventBus.persistWithinTransaction({ type: "node.cwd_changed", rigId: seat.rigId, nodeId: seat.nodeId,
+            logicalId: seat.logicalId, from, to: cwd, reason: input.reason.trim(), operator: input.actor.trim(), effect: "future_launches_only" });
+        }
+        return { ok: true as const, seat, from, to: cwd, changed: from !== cwd,
+          effect: "Future managed launches only; native process, history, queue, generation, model, profile and permissions are unchanged." };
+      })();
+      if (persisted) this.eventBus.notifySubscribers(persisted);
+      return result;
+    };
+    return guard.ownsLifecycle(target.nodeId) ? change() : guard.lifecycle([target.nodeId], change);
+  }
+
+  async setCodexProfile(input: { seatRef: string; profile: string; reason: string; actor: string }): Promise<SetCodexProfileResult> {
+    const required = this.requireReason(input.reason);
+    if (required) return required;
+    if (!input.actor?.trim()) return { ok: false, code: "missing_actor", message: "A transport-derived seat identity is required for profile pin audit." };
+    const profile = input.profile?.trim() ?? "";
+    if (!CODEX_PROFILE_NAME.test(profile)) {
+      return { ok: false, code: "invalid_codex_profile", message: "A safe named Codex profile is required (--profile)." };
+    }
+    // Resolve only the node identity before waiting. All mutable seat/profile
+    // facts are re-read and validated under the same lifecycle lease used by
+    // rotation, handover, restore, and managed launch.
+    const target = this.resolveSeat(input.seatRef);
+    if ("code" in target) return target;
+    const guard = this.tmuxAdapter.deliveryGuard;
+    if (!guard || guard.db !== this.db) return { ok: false, code: "profile_guard_unavailable", message: "Seat lifecycle guard is unavailable for this database; no profile pin changed." };
+    if (guard.ownsLifecycle(target.nodeId)) return this.setCodexProfileUnderLease(input, target.nodeId);
+    return guard.lifecycle([target.nodeId], () => this.setCodexProfileUnderLease(input, target.nodeId));
+  }
+
+  private async setCodexProfileUnderLease(
+    input: { seatRef: string; profile: string; reason: string; actor: string }, expectedNodeId: string,
+  ): Promise<SetCodexProfileResult> {
+    const guard = this.tmuxAdapter.deliveryGuard;
+    if (!guard || guard.db !== this.db || !guard.ownsLifecycle(expectedNodeId)) {
+      return { ok: false, code: "profile_guard_unavailable", message: "Seat lifecycle lease was not held; no profile pin changed." };
+    }
+    const profile = input.profile.trim();
+    const resolved = this.resolveSeat(input.seatRef);
+    if ("code" in resolved) return resolved;
+    if (resolved.nodeId !== expectedNodeId) {
+      return { ok: false, code: "profile_selection_conflict", message: "Seat identity changed while waiting for its lifecycle lease; no profile pin changed." };
+    }
+    if (resolved.entry.runtime !== "codex") {
+      return { ok: false, code: "runtime_mismatch", message: "Only an existing Codex seat can select a Codex profile." };
+    }
+    const installed = readInstalledCodexProfile(this.codexProfileHome, profile);
+    if ("code" in installed) return installed;
+    if (installed.effective.model !== resolved.entry.model) {
+      return { ok: false, code: "profile_model_mismatch", message: "Profile model differs from the persisted seat model; reconcile the model with rig seat set-model first." };
+    }
+    const priorName = resolved.entry.codexConfigProfile;
+    if (!priorName || !CODEX_PROFILE_NAME.test(priorName)) {
+      return { ok: false, code: "profile_selection_conflict", message: "Existing Codex profile is not a safe named pin; its provider and launch posture cannot be compared." };
+    }
+    const prior = readInstalledCodexProfile(this.codexProfileHome, priorName, false);
+    if ("code" in prior) {
+      return { ok: false, code: "profile_selection_conflict", message: "Existing Codex profile cannot be read; its provider and launch posture cannot be compared." };
+    }
+    if (prior.effective.provider !== installed.effective.provider || prior.effective.approval !== installed.effective.approval
+      || prior.effective.sandbox !== installed.effective.sandbox) {
+      return { ok: false, code: "profile_posture_mismatch", message: "New profile would change provider, approval policy or sandbox mode; no seat state changed." };
+    }
+    try {
+      await this.codexProfileProbe(profile);
+    } catch {
+      // Do not surface CLI stderr: profiles may include private integration data.
+      return { ok: false, code: "profile_load_failed", message: `Codex did not load named profile '${profile}'. No seat state changed.` };
+    }
+    const confirmed = readInstalledCodexProfile(this.codexProfileHome, profile);
+    const priorConfirmed = readInstalledCodexProfile(this.codexProfileHome, priorName, false);
+    if ("code" in confirmed || confirmed.sha256 !== installed.sha256 || "code" in priorConfirmed
+      || priorConfirmed.sha256 !== prior.sha256 || JSON.stringify(priorConfirmed.effective) !== JSON.stringify(prior.effective)) {
+      return { ok: false, code: "profile_selection_conflict", message: "Profile file changed during validation; no seat state changed." };
+    }
+    const seat = this.describe(resolved);
+    let persisted: PersistedEvent | null = null;
+    const result = this.db.transaction(() => {
+      const current = this.db.prepare("SELECT runtime, model, codex_config_profile FROM nodes WHERE id = ?").get(seat.nodeId) as
+        | { runtime: string | null; model: string | null; codex_config_profile: string | null }
+        | undefined;
+      if (!current || current.runtime !== "codex" || current.model !== installed.effective.model || current.codex_config_profile !== priorName) {
+        return { ok: false as const, code: "profile_selection_conflict" as const, message: "Seat runtime, model or prior profile changed during validation; no seat state changed." };
+      }
+      const from = current.codex_config_profile;
+      if (from !== profile) {
+        this.rigRepo.setNodeCodexConfigProfile(seat.nodeId, profile);
+        persisted = this.eventBus.persistWithinTransaction({
+          type: "node.codex_profile_changed", rigId: seat.rigId, nodeId: seat.nodeId, logicalId: seat.logicalId,
+          from, to: profile, effective: installed.effective, profileSha256: installed.sha256,
+          reason: input.reason.trim(), operator: input.actor.trim(), effect: "future_launches_only",
+        });
+      }
+      return { ok: true as const, seat, from, to: profile, changed: from !== profile,
+        effective: installed.effective, profileSha256: installed.sha256,
+        effect: "Future managed launches only. Native process, history, queue, permissions and work posture are unchanged." };
+    })();
+    if (persisted) this.eventBus.notifySubscribers(persisted);
+    return result;
   }
 
   async setModel(input: { seatRef: string; model: string; reason: string; operator?: string | null }): Promise<SetModelResult> {

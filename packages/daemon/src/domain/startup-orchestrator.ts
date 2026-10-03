@@ -448,6 +448,15 @@ export class StartupOrchestrator {
       }
     }
 
+    // Fresh launches can create the native rollout only after initial context delivery.
+    // Capture is read-only and best-effort; missing provenance remains unknown.
+    if (input.adapter.captureNativeResumeToken) {
+      try {
+        const observed = await input.adapter.captureNativeResumeToken(input.binding);
+        if (observed && this.sessionRegistry.currentOccupantTenure(input.nodeId)?.generationUuid === launchGeneration) this.sessionRegistry.updateResumeToken(input.sessionId, observed.resumeType, observed.token, "scrape");
+      } catch { /* no invented token on missing or ambiguous evidence */ }
+    }
+
     // 8. Mark ready
     this.sessionRegistry.updateStartupStatus(input.sessionId, "ready", new Date().toISOString());
     this.eventBus.emit({ type: "node.startup_ready", rigId: input.rigId, nodeId: input.nodeId });

@@ -128,6 +128,10 @@ export type RigEvent =
   // S5 (OPR.0.5.4.7) — seat-lifecycle audit trail: the three supported seat verbs each persist
   // their mutation with actor + reason in the same transaction as the mutation itself.
   | { type: "node.model_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; reason: string; operator: string | null }
+  | { type: "outbox.uncertain_abandoned"; schemaVersion: 1; outboxId: string; operationId: string; requestDigest: string; originalState: "pending" | "indeterminate"; deliveryConclusion: "unknown"; sender: string; senderGeneration: string; operatorGeneration: string; recipientGeneration: string; authorizationId: string; bodySha256: string; reason: string; evidenceRef: string; originalAuditPointer: string | null }
+  | { type: "outbox.direct_attempt"; schemaVersion: 1; outboxId: string; sender: string; destination: string; bodySha256: string; outcome: "delivered" | "failed" | "indeterminate"; dispatchedAt: string }
+  | { type: "node.cwd_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; reason: string; operator: string; effect: "future_launches_only" }
+  | { type: "node.codex_profile_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; effective: { model: string; provider: string; effort: string; approval: string; sandbox: string }; profileSha256: string; reason: string; operator: string | null; effect: "future_launches_only" }
   | { type: "node.permissions_changed"; rigId: string; nodeId: string; from: unknown; to: unknown; actor: string; reason: string; source: "seat_selection"; effect: "future_launches_only" }
   | { type: "session.stopped"; rigId: string; nodeId: string; sessionName: string; reason: string; operator: string | null }
   | { type: "session.cleaned"; rigId: string; nodeId: string; sessionName: string | null; reason: string; operator: string | null; actions: { sessionsExited: string[]; bindingCleared: boolean } }

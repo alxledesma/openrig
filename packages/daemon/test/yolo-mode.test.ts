@@ -86,11 +86,11 @@ describe("OPR.0.4.8.2 YOLO mode — opt-in, default OFF, launch-flag surface onl
     expect(on).toContain("-s danger-full-access");
   });
 
-  it("Codex resume ON overrides even a named config profile (every seat -s danger-full-access)", () => {
+  it("Codex resume ON preserves named provider profile while adding sandbox posture", () => {
     process.env.OPENRIG_YOLO = "1";
     const on = buildCodexResumeCore("tok-1", "my-profile", false);
     expect(on).toContain("-s danger-full-access");
-    expect(on).not.toContain("-p 'my-profile'");
+    expect(on).toContain("-p 'my-profile'");
   });
 
   // ── The three managed launch paths the fresh-only wiring missed (guard finding) ──
@@ -141,7 +141,7 @@ describe("OPR.0.4.8.2 YOLO mode — opt-in, default OFF, launch-flag surface onl
   it("codexPostureArg: OFF no-profile -> explicit -s workspace-write floor; OFF profile passes through; ON -> -s danger-full-access", () => {
     expect(codexPostureArg(" -p 'x'", {} as NodeJS.ProcessEnv)).toBe(" -p 'x'");
     expect(codexPostureArg("", {} as NodeJS.ProcessEnv)).toBe(" -s workspace-write");
-    expect(codexPostureArg(" -p 'x'", { OPENRIG_YOLO: "1" } as NodeJS.ProcessEnv)).toBe(" -s danger-full-access");
+    expect(codexPostureArg(" -p 'x'", { OPENRIG_YOLO: "1" } as NodeJS.ProcessEnv)).toBe(" -p 'x' -s danger-full-access");
   });
 
   it("piTrust (RESOURCE TRUST, not permission policy): OFF keeps configured/no-approve; ON forces approve", () => {

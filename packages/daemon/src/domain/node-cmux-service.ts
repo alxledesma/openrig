@@ -1,3 +1,5 @@
+import {managedCmuxCommand,managedSeatTitle} from "./managed-cmux-window.js";
+import {shellQuote} from "../adapters/shell-quote.js";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
 import type { CmuxAdapter, CmuxResult } from "../adapters/cmux.js";
@@ -42,9 +44,17 @@ export class NodeCmuxService {
     }
 
     // Focus existing surface if already bound
+    if(isTmux && this.tmuxAdapter?.configureManagedCmuxWindow){
+      const sizing=await this.tmuxAdapter.configureManagedCmuxWindow(binding!.tmuxSession!);
+      if(!sizing.ok)return {ok:false,error:sizing.message,code:sizing.code};
+    }
+
     if (binding?.cmuxSurface) {
       const result = await this.cmuxAdapter.focusSurface(binding.cmuxSurface, binding.cmuxWorkspace ?? undefined);
-      if (result.ok) return { ok: true, action: "focused_existing" };
+      if (result.ok) {
+        if(this.cmuxAdapter.renameSurface){const title=await this.cmuxAdapter.renameSurface(binding.cmuxSurface,managedSeatTitle(binding.tmuxSession??logicalId),binding.cmuxWorkspace??undefined);if(!title.ok)return {ok:false,error:title.message,code:title.code};}
+        return { ok: true, action: "focused_existing" };
+      }
       if (result.code === "unavailable") {
         return { ok: false, error: result.message, code: result.code };
       }
@@ -87,7 +97,8 @@ export class NodeCmuxService {
     // focused_existing without re-attaching.
     const isTmux = binding?.attachmentType === "tmux" && binding?.tmuxSession;
     if (isTmux) {
-      const sendResult = await this.cmuxAdapter.sendText(newSurfaceId, `tmux attach -t ${binding.tmuxSession}\n`, wsResult.data);
+      const sendResult = await this.cmuxAdapter.sendText(newSurfaceId, managedCmuxCommand(binding.tmuxSession!, `tmux attach -t ${shellQuote(binding.tmuxSession!)}\n`), wsResult.data);
+      if(this.cmuxAdapter.renameSurface){const title=await this.cmuxAdapter.renameSurface(newSurfaceId,managedSeatTitle(sessionName),wsResult.data);if(!title.ok)return {ok:false,error:title.message,code:title.code};}
       if (!sendResult.ok) return { ok: false, error: sendResult.message, code: sendResult.code };
       const focusResult = await this.cmuxAdapter.focusSurface(newSurfaceId, wsResult.data);
       if (!focusResult.ok) return { ok: false, error: focusResult.message, code: focusResult.code };

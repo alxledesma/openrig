@@ -1,0 +1,27 @@
+{
+  "schema": "assessment.v1",
+  "rubricId": "openrig-outcome-v1",
+  "dataClass": "public",
+  "state": "Synthetic test: a worker lacks a browser test tool. The recorded approved policy allows the Lead to install ordinary dependencies. No credential, purchase or protected-resource boundary is recorded.",
+  "context": {
+    "qitemId": "synthetic-qitem",
+    "operationId": "synthetic-observation",
+    "generation": "synthetic-generation-a",
+    "currentGeneration": "synthetic-generation-a",
+    "stateRevision": "synthetic-state-1",
+    "currentStateRevision": "synthetic-state-1",
+    "authorized": true,
+    "deterministicEvidenceSufficient": true
+  },
+  "questions": {
+    "cause": {
+      "type": "choice",
+      "instructions": "Which cause is supported by the recorded policy and evidence?",
+      "criteria": {
+        "dependency": "An ordinary missing dependency with Lead-owned recovery",
+        "boundary": "An explicit credential, purchase or protected-resource boundary",
+        "unknown": "Insufficient recorded evidence"
+      }
+    }
+  }
+}

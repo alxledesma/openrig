@@ -1,4 +1,8 @@
-// The canonical ordered migration list (001 → 089). SINGLE SOURCE: the daemon boot path
+import { reservationAttemptLocksSchema } from "./migrations/093_reservation_attempt_locks.js";
+import { seatDispatchReservationsSchema } from "./migrations/091_seat_dispatch_reservations.js";
+import { reservedClaimReleaseSchema } from "./migrations/092_reserved_claim_release.js";
+import { coordinatorAuthoritySchema } from "./migrations/090_coordinator_authority.js";
+// The canonical ordered migration list (001 → 092). SINGLE SOURCE: the daemon boot path
 // (startup.ts) and any test/tool that needs a schema-faithful DB both migrate from THIS array,
 // so a reader DB is never seeded from a stale hand-copied subset (the perf-fixture-migration-parity
 // trap). Append new migrations to the END, in order.
@@ -185,4 +189,8 @@ export const ALL_MIGRATIONS: Migration[] = [
   seatDeliveryGuardSchema,
   nodePermissionSelectionsSchema,
   classificationIdentityProvenanceSchema,
+  coordinatorAuthoritySchema,
+  seatDispatchReservationsSchema,
+  reservedClaimReleaseSchema,
+  reservationAttemptLocksSchema,
 ];

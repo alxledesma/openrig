@@ -129,6 +129,11 @@ function buildCommand(
     };
   }
 
+  if(method==="surface.rename" && params?.surfaceId && typeof params.title==="string"){
+    const workspace=params.workspaceId?` --workspace ${shellQuote(String(params.workspaceId))}`:"";
+    return {cmd:`cmux rename-tab --surface ${shellQuote(String(params.surfaceId))}${workspace} ${shellQuote(params.title)}`,json:false};
+  }
+
   if (method === "surface.sendText" && params?.surfaceId && params?.text != null) {
     const workspaceArg = params.workspaceId
       ? ` --workspace ${shellQuote(String(params.workspaceId))}`

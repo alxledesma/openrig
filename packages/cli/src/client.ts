@@ -29,7 +29,7 @@ export function senderIdentityHeaders(originSelfHostId?: string): Record<string,
     originSelfHostId && originSelfHostId.length > 0 && session.split("@").length < 3
       ? `${session}@${originSelfHostId}`
       : session;
-  return { [SENDER_IDENTITY_HEADER]: value };
+  return { [SENDER_IDENTITY_HEADER]: value, ...(process.env.OPENRIG_OCCUPANT_GENERATION ? {"X-OpenRig-Occupant-Generation":process.env.OPENRIG_OCCUPANT_GENERATION} : {}) };
 }
 
 /** Construct registered remote clients with the origin derived from this instance's durable store. */

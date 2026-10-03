@@ -155,6 +155,9 @@ export interface RuntimeAdapter {
     opts: { name: string; resumeToken?: string; forkSource?: ForkSource },
   ): Promise<HarnessLaunchResult>;
 
+  /** Pure native identity observation after the first prompt created its rollout. */
+  captureNativeResumeToken?(binding: NodeBinding): Promise<{ token: string; resumeType: string } | undefined>;
+
   /** Check if the runtime harness is responsive and ready. */
   checkReady(binding: NodeBinding): Promise<ReadinessResult>;
 }

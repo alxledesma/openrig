@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { Command } from "commander";
 import { DaemonClient, terminalAuthHeaders } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
@@ -467,7 +468,7 @@ Examples:
   // Thin CLI over the daemon's SeatLifecycleService; refusals print message +
   // guidance + match list exactly as the daemon named them.
   const runLifecycleVerb = async (
-    path: "set-model" | "set-permissions" | "launch" | "stop" | "clean",
+    path: "set-cwd" | "set-model" | "set-codex-profile" | "set-permissions" | "launch" | "stop" | "clean",
     seat: string,
     body: Record<string, unknown>,
     opts: { json?: boolean },
@@ -477,10 +478,10 @@ Examples:
     const daemon = await getDaemonStatus(deps.lifecycleDeps);
     if (!daemonStatusGuard(daemon)) return;
     const client = deps.clientFactory(getDaemonUrl(daemon));
-    const res = await client.post<Record<string, unknown>>(
-      `/api/seat/${path}/${encodeURIComponent(seat)}`,
-      body,
-    );
+    const endpoint = `/api/seat/${path}/${encodeURIComponent(seat)}`;
+    const res = (path === "set-codex-profile" || path === "set-cwd")
+      ? await client.post<Record<string, unknown>>(endpoint, body, { headers: terminalAuthHeaders() })
+      : await client.post<Record<string, unknown>>(endpoint, body);
     if (opts.json) {
       console.log(JSON.stringify(res.data, null, 2));
       if (res.status >= 400) process.exitCode = res.status >= 500 ? 2 : 1;
@@ -532,6 +533,45 @@ resume/successor launch reads it at call time. Examples:
         }
         console.log(`Model for ${s?.logicalId}@${s?.rigName}: ${String(data["from"] ?? "none")} -> ${String(data["to"])} (audited).`);
         console.log("The next managed resume/successor launch composes the new model.");
+      });
+    });
+
+  const reservation = cmd.command("dispatch-reservation").description("Exact persistent cutover exclusion and disposition contracts");
+  for (const operation of ["reserve", "attest", "release"]) {
+    reservation.command(`${operation} <contractFile>`).action(async (file: string) => {
+      const body = JSON.parse(fs.readFileSync(file, "utf8"));
+      const response = await new DaemonClient().post(`/api/dispatch-reservation/${operation}`, body, {headers:terminalAuthHeaders()});
+      console.log(JSON.stringify(response.data,null,2)); if(response.status>=400)process.exitCode=1;
+    });
+  }
+
+  cmd.command("set-cwd").argument("<seat>", "Existing managed seat")
+    .requiredOption("--cwd <directory>", "Absolute existing working directory")
+    .requiredOption("--reason <text>", "Audit reason")
+    .option("--json", "JSON output")
+    .description("Select an existing seat's future working directory without launching or replacing it")
+    .addHelpText("after", "\nThe active native process is unchanged. Transport identity is audit attribution, not occupant-generation authentication or a new authority grant.")
+    .action(async (seat: string, opts: { cwd: string; reason: string; json?: boolean }) => {
+      await runLifecycleVerb("set-cwd", seat, { cwd: opts.cwd, reason: opts.reason }, opts, data => {
+        console.log(`Working directory: ${String(data["from"] ?? "none")} -> ${String(data["to"])} (audited).`);
+        console.log(String(data["effect"]));
+      });
+    });
+
+  cmd
+    .command("set-codex-profile")
+    .argument("<seat>", "Canonical session name or logical seat ref")
+    .requiredOption("--profile <name>", "Installed named Codex profile (for example xv-sol61-low-continuity)")
+    .requiredOption("--reason <text>", "Audit reason for changing future managed launches")
+    .option("--json", "JSON output for agents")
+    .description("Pin an installed Codex profile on an existing Codex seat; no launch or queue change")
+    .addHelpText("after", "\nThe profile must explicitly declare model, provider, effort, approval and sandbox. Its model must match the seat's persisted model. The active native process is untouched. The transport sender is recorded for audit; this command does not authenticate occupant generation or grant Operator authority.")
+    .action(async (seat: string, opts: { profile: string; reason: string; json?: boolean }) => {
+      await runLifecycleVerb("set-codex-profile", seat, { profile: opts.profile, reason: opts.reason }, opts, (data) => {
+        const s = data["seat"] as { logicalId?: string; rigName?: string } | undefined;
+        const state = data["changed"] === false ? "already pinned" : "pinned (audited)";
+        console.log(`Codex profile for ${s?.logicalId}@${s?.rigName}: ${String(data["to"])} ${state}.`);
+        console.log(String(data["effect"]));
       });
     });
 

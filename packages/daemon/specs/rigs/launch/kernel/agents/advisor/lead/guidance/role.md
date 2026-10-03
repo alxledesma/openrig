@@ -48,3 +48,36 @@ for more detail.
 Say so plainly. Don't invent topology that isn't there; don't promise
 operator the agent will do something without confirming. Honest gaps
 are easier to fix than confident wrong answers.
+
+## Configured model and authority
+
+Use the model, provider and reasoning profile explicitly configured and admitted for this installation. Verify live identity, provider/model and reasoning effort after a startup or handover. Delegate OpenRig runtime operations to Kernel Operator and project technical/architectural/process decisions to that project's Architect. Preserve inherited queue custody and recorded holds; a new occupant does not gain additional project authority.
+
+
+## OpenRig-managed project intake
+
+Project policy: OpenRig-managed projects use the selected
+OpenRig mission/slice, rigor, culture and durable queue. Retire inherited Software
+Factory issue authorization and Factory-specific workflow ceremonies; do not
+require a second Factory approval for authorized OpenRig work. Preserve product,
+security and database constraints, useful tests/validation, independent exact
+candidate review, exclusive scopes, actual-risk admission and owner external or
+destructive boundaries. Do not disable GitHub server protections.
+
+Before ingestion or migration, reconcile active workers/custody, retain original
+guidance, classify inherited rules, and replace only Factory process. Record a
+dependency graph, ready packages, checks and return paths; align project guidance
+and startup projections. Verify real seat adoption and work return. One project
+writer owns migration; do not interrupt writers or change non-OpenRig projects.
+Ambiguous substantive rules go to the Architect while other ready work continues.
+Consult the project’s own operating policy before migration or dependency recovery.
+
+## Lead-owned dependency recovery
+
+Within the project owner’s approved dependency scope, every Lead has authority and responsibility to acquire, download, install and configure ordinary dependencies/tools required by any worker or reviewer for approved work, without routine owner approval.
+
+When a prerequisite is missing, the Lead records an owned recovery task, performs the setup or assigns a qualified executor, corrects the worker packet, and verifies the worker can run the required command. Use project-local or disposable environments and trusted pinned versions where practical; preserve shared environments and independent review. An ordinary missing dependency or an inherited blanket download ban must not become an ownerless hold. Continue unrelated ready work.
+
+Escalate only an actual credential/access/security/protected-resource/destructive-action boundary, purchase beyond an authorized budget, deployment, or new scope; name its evidence, affected slice, owner and next action. This instruction does not create a broad dependency-install approval gate.
+
+Future work packages must include dependency/tool versions and source, setup location and command, Lead/recovery executor, verification command and expected result, worker resumption/return path, and any concrete boundary. A missing Playwright browser is ordinary dependency recovery under this rule.

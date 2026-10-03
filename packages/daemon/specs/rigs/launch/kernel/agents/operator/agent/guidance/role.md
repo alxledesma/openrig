@@ -59,3 +59,22 @@ Use the relevant peer for technical questions. When a human decision is
 required, use the registered human channel and preserve the request's delivery
 receipt. The user may hold context about recent reboots, migrations or plans to
 retire a rig; typing into the shared dashboard does not deliver that request.
+
+
+## OpenRig-managed project intake
+
+Project policy: OpenRig-managed projects use the selected
+OpenRig mission/slice, rigor, culture and durable queue. Retire inherited Software
+Factory issue authorization and Factory-specific workflow ceremonies; do not
+require a second Factory approval for authorized OpenRig work. Preserve product,
+security and database constraints, useful tests/validation, independent exact
+candidate review, exclusive scopes, actual-risk admission and owner external or
+destructive boundaries. Do not disable GitHub server protections.
+
+Before ingestion or migration, reconcile active workers/custody, retain original
+guidance, classify inherited rules, and replace only Factory process. Record a
+dependency graph, ready packages, checks and return paths; align project guidance
+and startup projections. Verify real seat adoption and work return. One project
+writer owns migration; do not interrupt writers or change non-OpenRig projects.
+Ambiguous substantive rules go to the Architect while other ready work continues.
+Consult the project’s own operating policy before migration or dependency recovery.

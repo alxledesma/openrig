@@ -1,3 +1,5 @@
+import type { SeatDispatchReservationService, DispatchReservation } from "./seat-dispatch-reservation.js";
+import { RotationPreconditionRefusal } from "./rotation-precondition.js";
 import type Database from "better-sqlite3";
 import { NativePermissionStore } from "./native-permission-store.js";
 import { permissionBindingOverride } from "./native-permission-selection.js";
@@ -117,6 +119,9 @@ interface BindingOwnerRow {
 }
 
 interface SeatHandoverServiceDeps {
+  dispatchReservations?: SeatDispatchReservationService;
+  /** Guarded automatic cutover verifier. Runs inside lifecycle lock and again immediately before process replacement. Missing verifier refuses automatic cutover. */
+  rotationPrecondition?: (seatRef: string, expected: Record<string, unknown>) => Promise<void>;
   db: Database.Database;
   rigRepo: RigRepository;
   sessionRegistry: SessionRegistry;
@@ -215,7 +220,7 @@ export class SeatHandoverService {
   private appliedLaunchObservations: AppliedLaunchObservationStore;
   private now: () => Date;
 
-  constructor(deps: SeatHandoverServiceDeps) {
+  constructor(private readonly deps: SeatHandoverServiceDeps) {
     if (deps.db !== deps.rigRepo.db) throw new Error("SeatHandoverService: rigRepo must share the same db handle");
     if (deps.db !== deps.sessionRegistry.db) throw new Error("SeatHandoverService: sessionRegistry must share the same db handle");
     if (deps.db !== deps.discoveryRepo.db) throw new Error("SeatHandoverService: discoveryRepo must share the same db handle");
@@ -258,6 +263,9 @@ export class SeatHandoverService {
     source?: string | null;
     operator?: string | null;
     dryRun?: boolean;
+    rotationExpected?: Record<string, unknown>;
+    rotationActor?: string;
+    rotationActorGeneration?: string;
   }): Promise<SeatHandoverResult> {
     if (input.dryRun) {
       const planResult = this.planner.plan({ ...input, dryRun: true });
@@ -301,6 +309,7 @@ export class SeatHandoverService {
     if (!parsed.ok) {
       return parsed;
     }
+    if (input.rotationExpected && parsed.source.mode !== "fresh") throw new RotationPreconditionRefusal("Automatic reserved rotation requires fresh source; no process replaced.");
     // OPR.0.5.5.5 — execution dispatches on the SAME capability table the
     // dry-run plan renders from, so the plan can never promise a source the
     // executor refuses. Every current mode executes; a future non-executing
@@ -328,9 +337,26 @@ export class SeatHandoverService {
     }
 
     const node = this.lookupNode(statusResult.status);
+    if (input.rotationExpected && this.deps.dispatchReservations) {
+      const id=String(input.rotationExpected["reservationId"]??"");
+      if(!this.deps.dispatchReservations.ownsAttemptLock(id))return this.deps.dispatchReservations.withAttemptLock(id,input.rotationActor??"",input.rotationActorGeneration??"",()=>this.handover(input));
+    }
     const guard = this.tmuxAdapter.deliveryGuard;
     if (guard && !guard.ownsLifecycle(node.id)) {
-      return guard.lifecycle([node.id], () => this.handover(input));
+      return guard.lifecycle([node.id], async () => {
+        try {return await this.handover(input);}
+        catch(error) {
+          if(input.rotationExpected)this.deps.dispatchReservations?.recordUnexpectedFailure(String(input.rotationExpected["reservationId"]??""),input.rotationActor??"",input.rotationActorGeneration??"");
+          throw error;
+        }
+      }, typeof input.rotationExpected?.["reservationId"] === "string" ? input.rotationExpected["reservationId"] : undefined);
+    }
+    let dispatchReservation: DispatchReservation | undefined;
+    if (input.rotationExpected) {
+      if (!this.deps.dispatchReservations) throw new RotationPreconditionRefusal("Durable dispatch reservation verifier unavailable; no process replaced.");
+      dispatchReservation = this.deps.dispatchReservations.assertHandover(String(input.rotationExpected["reservationId"] ?? ""), String(input.rotationExpected["operationId"] ?? ""), node.id, input.rotationActor ?? "", input.rotationActorGeneration ?? "", input.rotationExpected);
+      if (!guard || !this.deps.rotationPrecondition) throw new RotationPreconditionRefusal("Atomic rotation precondition verifier unavailable; no process replaced.");
+      try {await this.deps.rotationPrecondition(input.seatRef, input.rotationExpected);}catch(error){throw new RotationPreconditionRefusal((error as Error).message);}
     }
     const latestSession = this.lookupLatestSession(node.id);
     if (!latestSession) {
@@ -396,6 +422,9 @@ export class SeatHandoverService {
         occupantGeneration: null,
         appliedLaunch: null,
         cleanup: null,
+        dispatchReservation,
+        rotationActor: input.rotationActor,
+        rotationActorGeneration: input.rotationActorGeneration,
       });
     }
 
@@ -438,9 +467,19 @@ export class SeatHandoverService {
       permissionOverride = permissionBindingOverride(selection);
     } catch (error) { return { ok: false, code: "successor_create_failed", message: `Permission selection: ${(error as Error).message}`,
       guidance: "No successor was created. Inspect the seat permission selection before a separately authorized retry." }; }
+    if (input.rotationExpected) {
+      const contract=input.rotationExpected["runtimeContract"] as {permissions?:{sandbox?:{type?:string};approval?:string}}|undefined;
+      const effectivePosture=permissionOverride.launchPosture ?? successorPosture;
+      const nativeSandbox=contract?.permissions?.sandbox?.type;
+      if ((effectivePosture==="full_bypass" && (nativeSandbox!=="danger-full-access" || contract?.permissions?.approval!=="never")) ||
+          (effectivePosture==="floor" && nativeSandbox!=="workspace-write")) throw new RotationPreconditionRefusal("Successor launch posture would change native permissions; no process replaced.");
+    }
     // The successor must carry its own generation from its first byte. This reservation writes no
     // ledger row; commit consumes it, while every failed pre-commit branch remains unregistered.
     const occupantGeneration = this.sessionRegistry.reserveOccupantGeneration();
+    if (input.rotationExpected) {try{await this.deps.rotationPrecondition!(input.seatRef, input.rotationExpected);}catch(error){throw new RotationPreconditionRefusal((error as Error).message);}}
+    if (dispatchReservation) this.deps.dispatchReservations!.start(dispatchReservation, input.rotationActor ?? "", input.rotationActorGeneration ?? "");
+    if (dispatchReservation) this.deps.dispatchReservations!.recordPrepared(dispatchReservation,input.rotationActor??"",input.rotationActorGeneration??"",occupantGeneration??"");
     const launch = await this.successorLauncher.createSuccessor({
       // Seam B: the successor is the SAME seat continuing — persisted policy posture carries.
       // 0.5.2-07 model fidelity: carry the seat's SPEC-pinned model so the successor launch reads the
@@ -458,6 +497,7 @@ export class SeatHandoverService {
         : {}),
     });
     if (!launch.ok) {
+      if(dispatchReservation)this.deps.dispatchReservations!.recordFailedPrecommit(dispatchReservation.reservation_id,input.rotationActor??"",input.rotationActorGeneration??"",{preparedGeneration:occupantGeneration??"",discoveredId:null,nativeId:null,replacementStarted:launch.replacementStarted},"successor_create_failed","completed");
       return {
         ok: false,
         code: "successor_create_failed",
@@ -468,6 +508,13 @@ export class SeatHandoverService {
         guidance: "The seat's registry binding is unchanged. If the failure was after the in-place respawn, the seat is re-wakeable from its provider session file. Inspect tmux/daemon logs and retry.",
       };
     }
+
+    if(dispatchReservation)this.deps.dispatchReservations!.recordLaunched(dispatchReservation.reservation_id,input.rotationActor??"",input.rotationActorGeneration??"",{preparedGeneration:occupantGeneration??"",discoveredId:launch.discoveredId,nativeId:launch.resumeToken??null,replacementStarted:true});
+    const cleanupFailedAttempt = async (code:string) => {
+      let cleanup:"completed"|"uncertain"="uncertain";
+      try {await this.successorLauncher.cleanup(launch.tmuxSession,launch.discoveredId);cleanup="completed";}
+      finally {if(dispatchReservation)this.deps.dispatchReservations!.recordFailedPrecommit(dispatchReservation.reservation_id,input.rotationActor??"",input.rotationActorGeneration??"",{preparedGeneration:occupantGeneration??"",discoveredId:launch.discoveredId,nativeId:launch.resumeToken??null,replacementStarted:true},code,cleanup);}
+    };
 
     // 3. fresh: deliver the captured restore packet to the live successor BEFORE
     //    continuity verify (a blank occupant is a relaunch, not a handover).
@@ -501,7 +548,7 @@ export class SeatHandoverService {
         // Partial: the successor is live in the preserved pane but the context packet never landed —
         // unwind the discovery candidate (cleanup marks it vanished; it NEVER kills the preserved seat)
         // and leave the binding unchanged (no false-green). The seat is re-wakeable from its session file.
-        await this.successorLauncher.cleanup(launch.tmuxSession, launch.discoveredId);
+        await cleanupFailedAttempt("context_delivery_failed");
         return {
           ok: false,
           code: "context_delivery_failed",
@@ -555,7 +602,7 @@ export class SeatHandoverService {
       if (!delivered.ok) {
         // Same partial-state contract as the fresh packet: unwind the candidate,
         // binding unchanged, seat re-wakeable — never a false complete.
-        await this.successorLauncher.cleanup(launch.tmuxSession, launch.discoveredId);
+        await cleanupFailedAttempt("context_delivery_failed");
         return {
           ok: false,
           code: "context_delivery_failed",
@@ -584,7 +631,10 @@ export class SeatHandoverService {
       occupantGeneration,
       appliedLaunch: launch.appliedLaunch ?? null,
       sourceOutcome,
-      cleanup: () => this.successorLauncher.cleanup(launch.tmuxSession, launch.discoveredId),
+      cleanup: cleanupFailedAttempt,
+      dispatchReservation,
+      rotationActor: input.rotationActor,
+      rotationActorGeneration: input.rotationActorGeneration,
     });
   }
 
@@ -613,10 +663,13 @@ export class SeatHandoverService {
     appliedLaunch: AppliedLaunchObservation | null;
     /** OPR.0.5.5.5 — per-source execution outcome, threaded onto the result. */
     sourceOutcome?: SeatHandoverMutationResult["sourceOutcome"];
-    cleanup: (() => Promise<void>) | null;
+    cleanup: ((code:string) => Promise<void>) | null;
+    dispatchReservation?: DispatchReservation;
+    rotationActor?: string;
+    rotationActorGeneration?: string;
   }): Promise<SeatHandoverResult> {
     const fail = async (result: SeatHandoverResult): Promise<SeatHandoverResult> => {
-      if (input.cleanup) await input.cleanup();
+      if (input.cleanup) await input.cleanup(result.ok?"unknown_failure":result.code);
       return result;
     };
 
@@ -699,6 +752,9 @@ export class SeatHandoverService {
       occupantGeneration: input.occupantGeneration,
       appliedLaunch: input.appliedLaunch,
       sourceOutcome: input.sourceOutcome,
+      dispatchReservation: input.dispatchReservation,
+      rotationActor: input.rotationActor,
+      rotationActorGeneration: input.rotationActorGeneration,
     });
     if (!committed.ok) return fail(committed);
     this.tmuxAdapter.deliveryGuard?.rebindLifecycle(input.node.id);
@@ -709,13 +765,14 @@ export class SeatHandoverService {
     // right after handover can still resume (the window FR-3 closes elsewhere).
     // Post-commit + non-blocking (mirrors FR-3): the async derivation cannot run
     // inside better-sqlite3's synchronous transaction. Never logs the token.
-    if (input.reportedSource.mode === "discovered" && "result" in committed) {
+    if (!input.launchToken && "result" in committed) {
       await this.captureDiscoveredResumeToken({
         rigId: input.status.rig_id,
         nodeId: input.node.id,
         sessionId: committed.result.newSessionId,
         sessionName: discovered.tmuxSession,
         runtime: input.node.runtime,
+        generationUuid: this.sessionRegistry.currentOccupantTenure(input.node.id)?.generationUuid ?? null,
       });
     }
     return committed;
@@ -729,7 +786,7 @@ export class SeatHandoverService {
    * nothing + a redacted skip event. NEVER throws, never logs the token.
    */
   private async captureDiscoveredResumeToken(input: {
-    rigId: string; nodeId: string; sessionId: string; sessionName: string; runtime: string | null;
+    rigId: string; nodeId: string; sessionId: string; sessionName: string; runtime: string | null; generationUuid: string | null;
   }): Promise<void> {
     try {
       const derived = await deriveResumeToken(
@@ -742,6 +799,7 @@ export class SeatHandoverService {
         this.emitCaptureSkip(input, runtime, derived.reason);
         return;
       }
+      if (!input.generationUuid || this.sessionRegistry.currentOccupantTenure(input.nodeId)?.generationUuid !== input.generationUuid) return;
       const wrote = this.sessionRegistry.updateResumeToken(input.sessionId, derived.resumeType, derived.token, "adoption");
       try {
         this.eventBus.emit(wrote
@@ -909,6 +967,9 @@ export class SeatHandoverService {
     occupantGeneration: string | null;
     appliedLaunch: AppliedLaunchObservation | null;
       sourceOutcome?: SeatHandoverMutationResult["sourceOutcome"];
+    dispatchReservation?: DispatchReservation;
+    rotationActor?: string;
+    rotationActorGeneration?: string;
   }): SeatHandoverResult {
     const handoverAt = this.now().toISOString();
     const tx = this.db.transaction(() => {
@@ -984,6 +1045,15 @@ export class SeatHandoverService {
         WHERE id = ?
       `).run(continuityOutcome, input.latestSession.session_name, handoverAt, input.node.id);
 
+      // The claim-release permission and the release itself share THIS SQLite
+      // transaction with the seat swap. Other connections never observe the permission.
+      if (input.dispatchReservation) {
+        // The lease stays held; rebind it to the transaction's newly minted generation
+        // before checking exact custody. On rollback the catch below rebinds the old one.
+        this.tmuxAdapter.deliveryGuard!.rebindLifecycle(input.node.id);
+        this.deps.dispatchReservations!.prepareClaimRelease(input.dispatchReservation.reservation_id, retiringGeneration);
+      }
+
       // Ghost-stage (e) re-key seam — the rebind is done; now invalidate the RETIRING occupant's
       // seat-name-keyed stores so the successor never inherits a ghost (drained compaction stage, frozen
       // telemetry sample, delayed lifecycle message to the retired generation). The ghost-stage slice
@@ -996,6 +1066,12 @@ export class SeatHandoverService {
         successorSessionName: input.discovered.tmuxSession,
         retiringGeneration,
       });
+
+      // Persist the reservation's committed successor in the same transaction as the
+      // binding/generation swap; a crash can no longer leave a swapped seat at `started`.
+      if (input.dispatchReservation) this.deps.dispatchReservations!.committed(
+        input.dispatchReservation.reservation_id, input.rotationActor ?? "", input.rotationActorGeneration ?? "",
+      );
 
       const event = this.eventBus.persistWithinTransaction({
         type: "seat.handover_completed",
@@ -1020,6 +1096,7 @@ export class SeatHandoverService {
       // by the successor tenure (never the retiree's). In-memory, post-commit, optional.
       this.activityOracle?.declareOccupantSwap(input.node.id, committed.newSessionId);
     } catch (err) {
+      if (input.dispatchReservation) this.tmuxAdapter.deliveryGuard?.rebindLifecycle(input.node.id);
       return {
         ok: false,
         code: "handover_commit_failed",

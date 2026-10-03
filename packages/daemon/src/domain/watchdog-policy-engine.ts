@@ -39,6 +39,7 @@ import type { WatchdogHistoryEntry, WatchdogHistoryLog } from "./watchdog-histor
  */
 
 export interface DeliveryRequest {
+  coordinatorRecovery?: {rigId:string;expectedEpoch:number;evidenceId:string};
   targetSession: string;
   message: string;
   continuityAction?: {
@@ -512,6 +513,7 @@ export class WatchdogPolicyEngine {
         targetSession: outcome.target.session,
         message: outcome.message,
         ...(continuityAction ? { continuityAction } : {}),
+        ...(outcome.coordinatorRecovery ? {coordinatorRecovery:outcome.coordinatorRecovery} : {}),
       },
       { jobId: job.jobId, policy: job.policy, occurrenceId: createHash("sha256").update(JSON.stringify([job.jobId, occupantGeneration, outcome.conditionReceipt ?? (job.policy === "periodic-reminder" ? job.lastFireAt : outcome.message)])).digest("hex") },
     );

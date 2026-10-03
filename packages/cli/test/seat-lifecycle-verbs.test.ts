@@ -116,6 +116,29 @@ describe("rig seat set-model", () => {
   });
 });
 
+describe("rig seat set-codex-profile", () => {
+  it("posts profile/reason to the audited route", async () => {
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const deps = makeDeps({ status: 200, data: { ok: true, seat: { logicalId: "dev.qa", rigName: "xv" },
+      from: "old", to: "xv-sol61-low-continuity", changed: true, effect: "Future managed launches only." } }, calls);
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCommand(deps).parseAsync(["node", "rig", "seat", "set-codex-profile", "dev-qa@xv", "--profile", "xv-sol61-low-continuity", "--reason", "native tuple"]);
+    });
+    expect(calls[0]).toEqual({ path: "/api/seat/set-codex-profile/dev-qa%40xv",
+      body: { profile: "xv-sol61-low-continuity", reason: "native tuple" } });
+    expect(exitCode).toBeUndefined();
+    expect(logs.join("\n")).toContain("pinned (audited)");
+  });
+
+  it("requires profile and reason before posting", async () => {
+    const calls: Array<{ path: string; body: unknown }> = [];
+    const deps = makeDeps({ status: 200, data: {} }, calls);
+    await expect(makeCommand(deps).parseAsync(["node", "rig", "seat", "set-codex-profile", "dev-qa@xv", "--reason", "x"])).rejects.toThrow(/--profile/);
+    await expect(makeCommand(deps).parseAsync(["node", "rig", "seat", "set-codex-profile", "dev-qa@xv", "--profile", "p"])).rejects.toThrow(/--reason/);
+    expect(calls).toHaveLength(0);
+  });
+});
+
 describe("rig seat stop", () => {
   it("posts reason to /api/seat/stop/<seat> and prints the stopped summary", async () => {
     const calls: Array<{ path: string; body: unknown }> = [];
@@ -159,4 +182,9 @@ describe("rig seat clean", () => {
     expect(logs.join("\n")).toContain("binding cleared: yes");
     expect(logs.join("\n")).toContain("launchable again");
   });
+});
+
+describe("rig seat set-cwd",()=>{
+ it("posts saved cwd and reason without any launch request",async()=>{const calls:Array<{path:string;body:unknown}>=[];const deps=makeDeps({status:200,data:{ok:true,from:"/old",to:"/new",changed:true,effect:"future launches only"}},calls);await captureLogs(async()=>{await makeCommand(deps).parseAsync(["node","rig","seat","set-cwd","worker@tagmaster","--cwd","/new","--reason","project move"]);});expect(calls).toEqual([{path:"/api/seat/set-cwd/worker%40tagmaster",body:{cwd:"/new",reason:"project move"}}]);});
+ it("requires cwd and reason",async()=>{const deps=makeDeps({status:200,data:{}},[]);await expect(makeCommand(deps).parseAsync(["node","rig","seat","set-cwd","worker@rig","--reason","x"])).rejects.toThrow(/--cwd/);await expect(makeCommand(deps).parseAsync(["node","rig","seat","set-cwd","worker@rig","--cwd","/new"])).rejects.toThrow(/--reason/);});
 });

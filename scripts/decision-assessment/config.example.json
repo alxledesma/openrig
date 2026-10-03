@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "mode": "observe",
+  "enabled": false,
+  "primary": "laya-local",
+  "providers": {
+    "laya-local": {
+      "adapter": "laya",
+      "endpoint": "http://127.0.0.1:18091/v1/systemone",
+      "model": "typed-decisions",
+      "acceptedModels": ["laya-rl-agent"],
+      "secretRef": "env:OPENRIG_LAYA_API_KEY",
+      "timeoutMs": 1200,
+      "maxResponseBytes": 65536,
+      "allowedData": ["public", "private"],
+      "capabilities": {"schema": "systemone.v1", "primitives": ["choice", "score", "noul"], "maxStateChars": 1000, "maxQuestions": 8, "maxOptions": 10, "inputCoverage": "reported"}
+    },
+    "typesafe-hosted": {
+      "adapter": "typesafe",
+      "endpoint": "https://api.typesafe.ai/v1/systemone",
+      "model": "jev-1.13.0",
+      "acceptedModels": ["jev-1.13.0"],
+      "secretRef": "keychain:openrig.typesafe-jev/example-user",
+      "timeoutMs": 2000,
+      "maxResponseBytes": 65536,
+      "allowedData": ["public"],
+      "capabilities": {"schema": "systemone.v1", "primitives": ["choice", "score", "noul"], "maxStateChars": 10000, "maxQuestions": 8, "maxOptions": 10, "inputCoverage": "unverified"}
+    },
+    "openrouter-hosted": {
+      "adapter": "openrouter",
+      "endpoint": "https://openrouter.ai/api/alpha/decisions",
+      "model": "typesafe/jev-1.13",
+      "acceptedModels": ["typesafe/jev-1.13", "typesafe/jev-1.13-20260917"],
+      "secretRef": "env:OPENROUTER_API_KEY",
+      "timeoutMs": 2000,
+      "maxResponseBytes": 65536,
+      "allowedData": ["public"],
+      "capabilities": {"schema": "systemone.v1", "primitives": ["choice", "score", "noul"], "maxStateChars": 10000, "maxQuestions": 8, "maxOptions": 10, "inputCoverage": "unverified"}
+    }
+  }
+}

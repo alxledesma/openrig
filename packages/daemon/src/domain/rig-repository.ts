@@ -446,6 +446,19 @@ export class RigRepository {
     return result.changes > 0;
   }
 
+  /** Persist only the named Codex launch profile; the lifecycle service validates
+   *  the installed file and records an audit event in the same transaction. */
+  setNodeCwd(nodeId: string, cwd: string): boolean {
+    return this.db.prepare("UPDATE nodes SET cwd=? WHERE id=?").run(cwd, nodeId).changes > 0;
+  }
+
+  setNodeCodexConfigProfile(nodeId: string, profile: string): boolean {
+    const result = this.db
+      .prepare("UPDATE nodes SET codex_config_profile = ? WHERE id = ? AND runtime = 'codex'")
+      .run(profile, nodeId);
+    return result.changes > 0;
+  }
+
   addEdge(rigId: string, sourceId: string, targetId: string, kind: string): Edge {
     const id = ulid();
     this.db

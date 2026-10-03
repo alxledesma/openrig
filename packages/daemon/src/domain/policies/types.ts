@@ -54,6 +54,7 @@ export type PolicyEvaluation =
        * that do not set this are unaffected.
        */
       conditionReceipt?: string;
+      coordinatorRecovery?: {rigId:string;expectedEpoch:number;evidenceId:string};
     }
   | { action: "skip"; reason: string; notes?: Record<string, unknown> }
   | { action: "terminal"; reason: string; notes?: Record<string, unknown> };

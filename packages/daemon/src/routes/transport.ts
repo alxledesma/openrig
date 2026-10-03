@@ -1,3 +1,5 @@
+import type { QueueRepository } from "../domain/queue-repository.js";
+import { CoordinatorFenceError } from "../domain/coordinator-authority-service.js";
 import { Hono } from "hono";
 import type { SessionTransport, TargetSpec } from "../domain/session-transport.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
@@ -97,6 +99,8 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       return c.json({ ok: false, error: resolved.error }, status);
     }
 
+    try { (c.get("queueRepo" as never) as QueueRepository | undefined)?.coordinatorAuthority.assertRawSend(derivedActor ?? undefined,body.session); }
+    catch(err) { if(err instanceof CoordinatorFenceError) return c.json({ok:false,reason:err.code,error:err.message},409); throw err; }
     const result = await transport.send(body.session, body.text ?? "", {
       deliveryId: body.deliveryId,
       verify: body.verify,
@@ -113,6 +117,18 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
     });
 
     if (result.outcome === "retained") return c.json(result);
+
+    // Record and settle this exact attributed direct attempt. Confirmed render is
+    // delivery evidence; an unconfirmed successful turn remains indeterminate.
+    if (derivedActor && !body.submitOnly) {
+      const outbox = c.get("outboxHandler" as never) as OutboxHandler | undefined;
+      if (outbox) try {
+        const outcome = result.ok && (result.verified === true || result.outcome === "delivered") ? "delivered" : !result.ok ? "failed" : "indeterminate";
+        const entry = outbox.recordDirectAttempt({ senderSession: derivedActor, destinationSession: body.session,
+          body: body.text, identityProvenance: "transport:v1" }, outcome);
+        result.outboxIds = [...(result.outboxIds ?? []), entry.outboxId];
+      } catch { console.warn("[transport/send] direct-attempt outbox audit failed; original transport result preserved."); }
+    }
 
     if (!result.ok) {
       const statusMap: Record<string, number> = {
@@ -139,31 +155,6 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
       };
       const status = (statusMap[result.reason ?? ""] ?? 500) as 400 | 404 | 409 | 500 | 502 | 503;
       return c.json(result, status);
-    }
-
-    // A3 (P22): auto-record the DISPATCHED send into the sender-side outbox, so a derived send cannot
-    // accept-and-drop at the audit layer (the specimen-5 window: no outbox row, attribution survived only
-    // via provider JSONL). STRICTLY DOWNSTREAM of the certified header-derivation (line 65): it consumes
-    // the already-derived `derivedActor`, never re-derives or alters it. Records only a DERIVED send —
-    // `derivedActor` present — with the era-stamp `transport:v1` (the sole mode this header-derived route
-    // produces; a cross-host relay's header IS the origin triple, so the recorded sender is the ORIGIN,
-    // never the relay). A null-actor send has no derived sender to attribute (no fabricated row). The
-    // send is already committed, so a rare audit-write failure is LOGGED, never a false-negative on a
-    // delivered send.
-    if (derivedActor && !body.submitOnly) { // submitOnly types no text — nothing to outbox-record
-      const outbox = c.get("outboxHandler" as never) as OutboxHandler | undefined;
-      if (outbox) {
-        try {
-          outbox.record({
-            senderSession: derivedActor,
-            destinationSession: body.session,
-            body: body.text,
-            identityProvenance: "transport:v1",
-          });
-        } catch (err) {
-          console.warn(`[transport/send] outbox auto-record failed (send already delivered): ${(err as Error).message}`);
-        }
-      }
     }
 
     // S2 (OPR.0.5.4.3) sender-side honesty: an unattributed delivery tells the sender, on the
@@ -277,6 +268,9 @@ export function transportRoutes(opts?: { bearerToken?: string | null }): Hono {
             ? { rig: body.rig }
             : { global: true };
 
+    const fencedTargets = await transport.resolveSessions(target);
+    try { for(const session of (fencedTargets.ok ? fencedTargets.sessions : [])) (c.get("queueRepo" as never) as QueueRepository | undefined)?.coordinatorAuthority.assertRawSend(derivedActor ?? undefined,session.sessionName); }
+    catch(err) { if(err instanceof CoordinatorFenceError) return c.json({ok:false,reason:err.code,error:err.message},409); throw err; }
     const result = await transport.broadcast(target, body.text, {
       verify: body.verify,
       force: body.force,

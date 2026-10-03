@@ -170,6 +170,10 @@ export const migrationsForFullTestDbExclusions: Record<string, string> = {
   "076_owner_notification_levels.sql": "owner-notification columns extend queue transitions plus the archive table (054 is excluded); focused S14 suites use the canonical full migration list.",
   "078_idle_gate_fired_condition.sql": "idle-gate watchdog extension migrated inline by the idle-gate policy suite.",
   "079_workflow_lifecycle_parallel.sql": "workflow lifecycle identity, frontier, and failure tables — workflow suites migrate the canonical workflow schema inline; the shared core fixture does not read them.",
+  "090_coordinator_authority.sql": "Coordinator authority and resource tables are exercised by canonical full-migration fixtures; the shared core fixture does not enter coordinator control routes.",
+  "091_seat_dispatch_reservations.sql": "Rotation reservation and queue-admission triggers are exercised by canonical full-migration fixtures; the shared core fixture does not reserve or rotate seats.",
+  "092_reserved_claim_release.sql": "Extends 091 with exact retiring-generation release records and queue trigger exception; canonical full-migration rotation fixtures exercise it, while this shared core fixture has no reservation tables.",
+  "093_reservation_attempt_locks.sql": "Cross-process cutover/recovery exclusion references 091 reservations, absent from this shared core fixture; reservation suites use full migrations.",
 };
 
 export function createFullTestDb(): Database.Database {

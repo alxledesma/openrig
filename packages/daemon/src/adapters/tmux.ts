@@ -1,3 +1,4 @@
+import {managedCmuxCommand} from "../domain/managed-cmux-window.js";
 import { DeliveryGuardError, type SeatDeliveryGuard } from "../domain/seat-delivery-guard.js";
 import { writeFile as fsWriteFile, unlink as fsUnlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -587,6 +588,19 @@ export class TmuxAdapter {
     }
   }
 
+  async configureManagedCmuxWindow(target:string):Promise<TmuxResult> {
+    try{await this.exec(managedCmuxCommand(target,"true"));return {ok:true};}catch(err){return classifyWriteError(err);}
+  }
+
+  /** Preserve managed cmux sizing and explicit user exceptions across web broker opens. */
+  async shouldPreserveWindowSizing(target:string):Promise<boolean> {
+    for(const key of ["@openrig-cmux-auto-size","@openrig-preserve-window-size"]){
+      const value=await this.exec(`tmux show-options -wqv -t ${shellQuote(target)} ${shellQuote(key)}`);
+      if(value.trim()==="1")return true;
+    }
+    return false;
+  }
+
   async resizeWindow(target: string, cols: number, rows: number): Promise<TmuxResult> {
     if (!Number.isFinite(cols) || !Number.isInteger(cols) || cols < 1) {
       return { ok: false, code: "validation_error", message: `resizeWindow: cols must be a positive integer, got ${cols}` };
@@ -597,6 +611,13 @@ export class TmuxAdapter {
     const cmd = `tmux resize-window -t ${shellQuote(target)} -x ${cols} -y ${rows}`;
     try {
       await this.exec(cmd);
+      // resize-window switches tmux to manual. A cmux attachment may have
+      // marked the window while the broker's earlier sizing read was in flight.
+      const preserve=await this.exec(`tmux show-options -wqv -t ${shellQuote(target)} @openrig-preserve-window-size`);
+      if(preserve.trim()!=="1"){
+        const managed=await this.exec(`tmux show-options -wqv -t ${shellQuote(target)} @openrig-cmux-auto-size`);
+        if(managed.trim()==="1")await this.exec(`tmux set-option -w -t ${shellQuote(target)} window-size latest`);
+      }
       return { ok: true };
     } catch (err) {
       return classifyWriteError(err);

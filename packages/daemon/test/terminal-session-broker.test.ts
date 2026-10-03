@@ -225,6 +225,16 @@ describe("TerminalSessionBroker", () => {
     expect(setWindowOption).not.toHaveBeenCalledWith("dev@rig", "aggressive-resize", expect.anything());
   });
 
+  it("managed cmux marker or explicit sizing exception prevents later manual resize",async()=>{
+    const resizeWindow=vi.fn(async()=>({ok:true as const}));const setWindowOption=vi.fn(async()=>({ok:true as const}));
+    const broker=track(new TerminalSessionBroker("dev@rig",makeTmux({resizeWindow,setWindowOption,shouldPreserveWindowSizing:async()=>true}),{pollMs:10}));
+    await broker.attach(makeSub());expect(resizeWindow).not.toHaveBeenCalled();expect(setWindowOption).not.toHaveBeenCalled();
+  });
+  it("failed sizing proof does not silently undo managed geometry",async()=>{
+    const resizeWindow=vi.fn(async()=>({ok:true as const}));const setWindowOption=vi.fn(async()=>({ok:true as const}));
+    const broker=track(new TerminalSessionBroker("dev@rig",makeTmux({resizeWindow,setWindowOption,shouldPreserveWindowSizing:async()=>{throw new Error("read failed");}}),{pollMs:10}));
+    await broker.attach(makeSub());expect(resizeWindow).not.toHaveBeenCalled();expect(setWindowOption).not.toHaveBeenCalled();
+  });
   it("test 8: seeds on FIRST attach with NO resize message, as the first bytes the subscriber sees", async () => {
     const tmux = makeTmux({
       capturePaneScreen: async () => "line one\nline two",

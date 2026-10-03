@@ -1,3 +1,4 @@
+import {managedCmuxCommand,managedSeatTitle} from "../managed-cmux-window.js";
 // OPR.0.4.6.02 C2 — the cmux TerminalProvider facade.
 //
 // Renders a composed view the way the rig-scope "Launch in CMUX" endpoint
@@ -106,8 +107,9 @@ export class CmuxProviderAdapter implements TerminalProvider {
       const build = await this.deps.layoutService.buildWorkspacePanes(
         workspaceName,
         undefined,
-        page.map((pane) => pane.paneCommand),
+        page.map((pane) => pane.localTmuxSession ? managedCmuxCommand(pane.localTmuxSession,pane.paneCommand) : pane.paneCommand),
         autoGridCols(page.length),
+        page.map(pane=>managedSeatTitle(pane.seat)),
       );
       if (build.ok) {
         pagesPainted += 1;

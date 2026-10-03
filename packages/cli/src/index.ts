@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { coordinatorCommand } from "./commands/coordinator.js";
 import { Command } from "commander";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -204,6 +205,7 @@ export function createProgram(depsOverride?: ProgramDeps): Command {
   program.addCommand(sendCommand(depsOverride?.sendDeps));
   program.addCommand(streamCommand(depsOverride?.streamDeps));
   program.addCommand(queueCommand(depsOverride?.queueDeps));
+  program.addCommand(coordinatorCommand());
   program.addCommand(slackCommand(depsOverride?.slackDeps));
   program.addCommand(projectCommand(depsOverride?.projectDeps));
   program.addCommand(viewCommand(depsOverride?.viewDeps));

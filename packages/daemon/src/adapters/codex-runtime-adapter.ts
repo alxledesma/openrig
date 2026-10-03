@@ -1,3 +1,4 @@
+import { readOpenCodexRollout } from "../domain/codex-open-rollout.js";
 import nodePath from "node:path";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
@@ -63,7 +64,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private tmux: TmuxAdapter;
   private fs: CodexAdapterFsOps;
   private listProcesses: () => CodexProcess[] | Promise<CodexProcess[]>;
-  private readThreadIdByPid: (pid: number) => Promise<string | undefined> | string | undefined;
+  private readThreadIdByPid: (pid: number, startedAt?: string) => Promise<string | undefined> | string | undefined;
   private sleep: (ms: number) => Promise<void>;
   private resolveHomeDirByPid: ResolveHomeDirByPid;
   private codexHome?: string;
@@ -110,7 +111,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     this.resolveGitAddDirs = deps.resolveGitAddDirs ?? resolveCodexGitAddDirs;
     this.activityRelayPath = deps.activityRelayPath;
     this.listProcesses = deps.listProcesses ?? defaultListProcesses;
-    this.readThreadIdByPid = deps.readThreadIdByPid ?? ((pid) => this.readThreadIdFromLogs(pid));
+    this.readThreadIdByPid = deps.readThreadIdByPid ?? (async (pid, startedAt) => await this.readThreadIdFromLogs(pid) ?? await readOpenCodexRollout(pid, undefined, startedAt));
     this.resolveHomeDirByPid = deps.resolveHomeDirByPid ?? defaultResolveHomeDirByPid;
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.verifyProfilePreflight = deps.verifyProfilePreflight ?? defaultProfilePreflight;
@@ -729,20 +730,34 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return Array.from(keys);
   }
 
-  private async captureFreshThreadId(binding: NodeBinding, updatePrompt: UpdatePromptAttempt): Promise<string | undefined> {
+  async captureNativeResumeToken(binding: NodeBinding): Promise<{ token: string; resumeType: string } | undefined> {
+    const token = await this.captureFreshThreadId(binding, { handled: false }, false);
+    return token ? { token, resumeType: "codex_id" } : undefined;
+  }
+
+  private async captureFreshThreadId(binding: NodeBinding, updatePrompt: UpdatePromptAttempt, handleUpdatePrompt = true): Promise<string | undefined> {
     const target = binding.tmuxPane ?? binding.tmuxSession;
     if (!target || !this.tmux.getPanePid) return undefined;
 
     for (let attempt = 0; attempt < 20; attempt++) {
       const shellPid = await this.tmux.getPanePid(target);
       if (shellPid) {
-        const codexPids = await this.findCodexDescendantPids(shellPid);
-        for (const codexPid of codexPids) {
-          const threadId = await this.readThreadIdByPid(codexPid);
-          if (threadId) return threadId;
+        const census = await this.listProcesses();
+        const codexPids = findCodexDescendantPids(census, shellPid).filter(pid => nodePath.basename(census.find(row => row.pid === pid)?.command.trim().split(/\s+/)[0] ?? "") === "codex");
+        if (codexPids.length === 1) {
+          const codexPid = codexPids[0]!;
+          const startedAt = census.find(row => row.pid === codexPid)?.startedAt;
+          const threadId = await this.readThreadIdByPid(codexPid, startedAt);
+          if (threadId) {
+            // The bounded native probe may outlive its pane/process ancestry.
+            const currentShell = await this.tmux.getPanePid(target);
+            const rows = currentShell === shellPid ? await this.listProcesses() : [];
+            const current = findCodexDescendantPids(rows, shellPid).filter(pid => nodePath.basename(rows.find(row => row.pid === pid)?.command.trim().split(/\s+/)[0] ?? "") === "codex");
+            if (current.length === 1 && current[0] === codexPid && rows.find(row => row.pid === codexPid)?.startedAt === startedAt) return threadId;
+          }
         }
       }
-      if (binding.tmuxSession) {
+      if (handleUpdatePrompt && binding.tmuxSession) {
         await this.dismissSkippableCodexUpdatePrompt(binding.tmuxSession, updatePrompt, 1);
         if (updatePrompt.failure) return undefined;
       }
@@ -861,7 +876,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
 
   private async findCodexDescendantPids(parentPid: number): Promise<number[]> {
     const processes = await this.listProcesses();
-    return findCodexDescendantPids(processes, parentPid);
+    return findCodexDescendantPids(processes, parentPid).filter(pid => nodePath.basename(processes.find(row => row.pid === pid)?.command.trim().split(/\s+/)[0] ?? "") === "codex");
   }
 
   private async readThreadIdFromLogs(pid: number): Promise<string | undefined> {

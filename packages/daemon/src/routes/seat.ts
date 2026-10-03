@@ -1,3 +1,8 @@
+import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
+import { SeatDispatchReservationService } from "../domain/seat-dispatch-reservation.js";
+import { getConnInfo } from "@hono/node-server/conninfo";
+import { isRotationLoopback } from "../domain/rotation-precondition.js";
+import { rotationFactsResolver } from "../domain/rotation-facts-resolver.js";
 import { OutboxHandler } from "../domain/outbox-handler.js";
 import { Hono } from "hono";
 import type { RigRepository } from "../domain/rig-repository.js";
@@ -92,8 +97,24 @@ seatRoutes.get("/status/:seatRef", (c) => {
 
 seatRoutes.post("/handover/:seatRef", async (c) => {
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  if(body["rotationExpected"]){
+    const token = c.get("terminalBearerToken" as never) as string | null;
+    if (!token) return c.json({ok:false,code:"rotation_authenticated_control_required"},503);
+    const authResponse = await authBearerTokenMiddleware({expectedToken:token})(c, async()=>{});
+    if (authResponse) return authResponse;
+    let address:string|undefined;
+    try{address=getConnInfo(c).remote.address;}catch{}
+    if(c.req.header("Origin") || !isRotationLoopback(address))return c.json({ok:false,code:"rotation_local_only",message:"Automatic rotation requires local non-browser transport"},403);
+  }
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
+  const rotationRoot=process.env["OPENRIG_ROTATION_ROOT"];
+  const rotationPrecondition=rotationRoot ? rotationFactsResolver({db:rigRepo.db,root:rotationRoot,
+    whoami:c.get("whoamiService" as never) as import("../domain/whoami-service.js").WhoamiService,
+    activity:c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService,
+    tmux:c.get("tmuxAdapter" as never) as TmuxAdapter}) : undefined;
   const service = new SeatHandoverService({
+    rotationPrecondition,
+    dispatchReservations: rotationPrecondition && (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard ? new SeatDispatchReservationService({db:rigRepo.db,guard:(c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard!,verifyPredecessor:rotationPrecondition,observeSuccessor:async()=>{throw new Error("Successor observation uses authenticated reservation route");}}) : undefined,
     db: rigRepo.db,
     rigRepo,
     sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
@@ -176,6 +197,9 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     source: typeof body["source"] === "string" ? body["source"] : null,
     operator: typeof body["operator"] === "string" ? body["operator"] : null,
     dryRun: body["dryRun"] === true,
+    rotationActor: transportSenderSession(c) ?? undefined,
+    rotationActorGeneration: c.req.header("X-OpenRig-Occupant-Generation"),
+    rotationExpected: body["rotationExpected"] && typeof body["rotationExpected"] === "object" ? body["rotationExpected"] as Record<string, unknown> : undefined,
   });
 
   if (result.ok) {
@@ -233,10 +257,10 @@ export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifec
 }
 
 function seatLifecycleStatus(code: SeatRefusal["code"]): 400 | 404 | 409 | 500 | 502 {
-  if (code === "seat_ref_required" || code === "missing_model" || code === "missing_reason" || code === "fresh_required") return 400;
+  if (code === "seat_ref_required" || code === "missing_model" || code === "missing_reason" || code === "missing_actor" || code === "fresh_required" || code === "invalid_cwd" || code === "invalid_codex_profile" || code === "profile_not_installed") return 400;
   if (code === "seat_not_found") return 404;
   if (code === "tmux_probe_failed") return 502;
-  if (code === "launch_unavailable" || code === "runtime_adapter_missing" || code === "launch_failed" || code === "startup_failed") return 500;
+  if (code === "launch_unavailable" || code === "runtime_adapter_missing" || code === "launch_failed" || code === "startup_failed" || code === "profile_guard_unavailable") return 500;
   // seat_ambiguous / session_live / session_not_live / no_session / claimed_session /
   // nothing_to_clean — state conflicts, not client syntax errors.
   return 409;
@@ -261,6 +285,31 @@ seatRoutes.post("/set-model/:seatRef", async (c) => {
     model: typeof body["model"] === "string" ? body["model"] : "",
     reason: typeof body["reason"] === "string" ? body["reason"] : "",
     operator: typeof body["operator"] === "string" ? body["operator"] : null,
+  });
+  if (result.ok) return c.json(result);
+  return c.json(result, seatLifecycleStatus(result.code));
+});
+
+seatRoutes.post("/set-cwd/:seatRef", async (c) => {
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  const actor = transportSenderSession(c);
+  if (!actor) return c.json({ ok: false, code: "missing_actor", message: "Transport sender identity is required for directory audit." }, 400);
+  const result = await seatLifecycleService(c).setCwd({ seatRef: decodeURIComponent(c.req.param("seatRef")),
+    cwd: typeof body["cwd"] === "string" ? body["cwd"] : "", reason: typeof body["reason"] === "string" ? body["reason"] : "", actor });
+  return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
+});
+
+seatRoutes.post("/set-codex-profile/:seatRef", async (c) => {
+  const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
+  // This is an attributed local transport audit, not an occupant-generation
+  // proof or a new Operator-authorization grant. Existing caller policy applies.
+  const actor = transportSenderSession(c);
+  if (!actor) return c.json({ ok: false, code: "missing_actor", message: "A transport-derived seat identity is required for profile pin audit." }, 400);
+  const result = await seatLifecycleService(c).setCodexProfile({
+    seatRef: decodeURIComponent(c.req.param("seatRef")!),
+    profile: typeof body["profile"] === "string" ? body["profile"] : "",
+    reason: typeof body["reason"] === "string" ? body["reason"] : "",
+    actor,
   });
   if (result.ok) return c.json(result);
   return c.json(result, seatLifecycleStatus(result.code));

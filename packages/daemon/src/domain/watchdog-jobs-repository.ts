@@ -23,6 +23,7 @@ import { ulid } from "ulid";
 
 export const PHASE_D_POLICIES = [
   "periodic-reminder",
+  "coordinator-continuity",
   "artifact-pool-ready",
   "edge-artifact-required",
   "workflow-keepalive",

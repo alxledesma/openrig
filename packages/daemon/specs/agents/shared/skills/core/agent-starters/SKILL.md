@@ -132,3 +132,30 @@ included, and is that starter still recommended?"
 
 - `session-source-fork` skill — low-level fork primitive that makes native session-based starters possible
 - `composable-priming-packs` skill — manifest-driven layer for producing primed sessions starters reference
+
+
+## Inherited project process
+
+For an OpenRig-managed project, use its selected OpenRig workflow and durable
+queue. Owner policy retires inherited Software Factory issue-authorization and
+Factory-specific execution ceremonies; do not import those gates during context
+ingestion. Preserve substantive product, security and database constraints,
+useful tests/validation, independent candidate review, actual-risk admission and
+owner external/destructive boundaries. Native OpenRig mode names and publication
+metadata such as factory-approved are not external Factory execution gates.
+
+At ingestion, retain original guidance, classify inherited rules and record the
+scoped replacements. Align project guidance and startup projections; reconcile
+workers, exclusive resources and queue custody before dispatch. Verify actual
+adoption and return evidence. Ambiguous substantive constraints go to the
+Architect while unrelated ready packages continue. Consult the project’s own operating policy before ingestion or migration.
+
+## Lead-owned dependency recovery
+
+Within the project owner’s approved dependency scope, every Lead has authority and responsibility to acquire, download, install and configure ordinary dependencies/tools required by any worker or reviewer for approved work, without routine owner approval.
+
+When a prerequisite is missing, the Lead records an owned recovery task, performs the setup or assigns a qualified executor, corrects the worker packet, and verifies the worker can run the required command. Use project-local or disposable environments and trusted pinned versions where practical; preserve shared environments and independent review. An ordinary missing dependency or an inherited blanket download ban must not become an ownerless hold. Continue unrelated ready work.
+
+Escalate only an actual credential/access/security/protected-resource/destructive-action boundary, purchase beyond an authorized budget, deployment, or new scope; name its evidence, affected slice, owner and next action. This instruction does not create a broad dependency-install approval gate.
+
+Future work packages must include dependency/tool versions and source, setup location and command, Lead/recovery executor, verification command and expected result, worker resumption/return path, and any concrete boundary. A missing Playwright browser is ordinary dependency recovery under this rule.

@@ -43,10 +43,10 @@ describe("POST /api/seat/{set-model,stop,clean}/:seatRef", () => {
     return t;
   }
 
-  function post(path: string, seatRef: string, body: Record<string, unknown> = {}) {
+  function post(path: string, seatRef: string, body: Record<string, unknown> = {}, sender?: string) {
     return setup.app.request(`/api/seat/${path}/${encodeURIComponent(seatRef)}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...(sender ? { "X-OpenRig-Session": sender } : {}) },
       body: JSON.stringify(body),
     });
   }
@@ -66,6 +66,25 @@ describe("POST /api/seat/{set-model,stop,clean}/:seatRef", () => {
     const noReason = await post("set-model", sessionName, { model: "claude-fable-5" });
     expect(noReason.status).toBe(400);
     expect((await noReason.json() as { code: string }).code).toBe("missing_reason");
+  });
+
+  it("set-codex-profile forwards the audited request and maps refusals", async () => {
+    const setCodexProfile = vi.spyOn(SeatLifecycleService.prototype, "setCodexProfile")
+      .mockResolvedValueOnce({ ok: true, seat: { rigId: "r", rigName: "seat-rig", logicalId: "dev.qa", nodeId: "n" },
+        from: "old", to: "new", changed: true, profileSha256: "a".repeat(64),
+        effective: { model: "gpt-6.1-sol", provider: "openai", effort: "low", approval: "never", sandbox: "danger-full-access" },
+        effect: "Future managed launches only." })
+      .mockResolvedValueOnce({ ok: false, code: "profile_not_installed", message: "missing" });
+    const noActor = await post("set-codex-profile", "dev-qa@seat-rig", { profile: "new", reason: "align native tuple", operator: "forged@rig" });
+    expect(noActor.status).toBe(400);
+    expect(await noActor.json()).toMatchObject({ code: "missing_actor" });
+    const ok = await post("set-codex-profile", "dev-qa@seat-rig", { profile: "new", reason: "align native tuple", operator: "forged@rig" }, "op@rig");
+    expect(ok.status).toBe(200);
+    expect(setCodexProfile).toHaveBeenCalledWith({ seatRef: "dev-qa@seat-rig", profile: "new", reason: "align native tuple", actor: "op@rig" });
+    expect(await ok.json()).toMatchObject({ ok: true, to: "new" });
+    const missing = await post("set-codex-profile", "dev-qa@seat-rig", { profile: "missing", reason: "check" }, "op@rig");
+    expect(missing.status).toBe(400);
+    expect(await missing.json()).toMatchObject({ code: "profile_not_installed" });
   });
 
   it("404 seat_not_found; 409 seat_ambiguous with matches", async () => {
@@ -156,5 +175,10 @@ describe("POST /api/seat/{set-model,stop,clean}/:seatRef", () => {
       operator: "orch-lead@seat-rig",
     });
     expect(await res.json()).toMatchObject({ status: "ready", generation: "gen-fresh" });
+  });
+  it("set-cwd requires transport identity and ignores body impersonation",async()=>{
+    const setter=vi.spyOn(SeatLifecycleService.prototype,"setCwd").mockResolvedValue({ok:false,code:"invalid_cwd",message:"missing"});
+    const missing=await post("set-cwd","dev-qa@seat-rig",{cwd:"/project",reason:"move",actor:"forged"});expect(missing.status).toBe(400);expect(setter).not.toHaveBeenCalled();
+    const result=await post("set-cwd","dev-qa@seat-rig",{cwd:"/project",reason:"move",actor:"forged"},"op@rig");expect(result.status).toBe(400);expect(setter).toHaveBeenCalledWith({seatRef:"dev-qa@seat-rig",cwd:"/project",reason:"move",actor:"op@rig"});
   });
 });

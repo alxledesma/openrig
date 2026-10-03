@@ -66,6 +66,7 @@ function makeMockAdapter(overrides: Partial<{
         ? overrides.splitSurfaceFn(surfaceId, direction, workspaceId)
         : { ok: true, data: nextSurface() };
     }),
+    renameSurface: vi.fn(async(surfaceId:string,title:string,workspaceId?:string)=>{calls.push({method:"renameSurface",args:[surfaceId,title,workspaceId]});return {ok:true,data:undefined};}),
     sendText: vi.fn(async (surfaceId: string, text: string, workspaceId?: string) => {
       calls.push({ method: "sendText", args: [surfaceId, text, workspaceId] });
       return overrides.sendTextFn
@@ -335,7 +336,8 @@ describe("CmuxLayoutService.buildWorkspace", () => {
     expect(splits).toHaveLength(0);
     const sends = calls.filter((c) => c.method === "sendText");
     expect(sends).toHaveLength(1);
-    expect((sends[0]!.args[1] as string)).toMatch(/tmux attach -t session-a/);
+    expect((sends[0]!.args[1] as string)).toMatch(/tmux attach -t 'session-a'/);
+    expect(calls.filter(c=>c.method==="renameSurface")[0]!.args[1]).toBe("A");
   });
 
   it("for N=2: creates workspace, 1 split right, 2 sends", async () => {

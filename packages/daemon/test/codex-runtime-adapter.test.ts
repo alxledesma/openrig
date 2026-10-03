@@ -733,6 +733,29 @@ describe("Codex runtime adapter", () => {
     });
   });
 
+  it("post-prompt capture refuses lost pane ancestry after native probe", async () => {
+    const pane = vi.fn().mockResolvedValueOnce(900).mockResolvedValue(999);
+    const tmux = mockTmux({ getPanePid: pane });
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), listProcesses: () => [
+      { pid: 900, ppid: 1, command: "-zsh" }, { pid: 901, ppid: 900, command: "/bin/codex" },
+    ], readThreadIdByPid: async () => "00000000-0000-7000-8000-000000000001", sleep: async () => {} });
+    expect(await adapter.captureNativeResumeToken(makeBinding())).toBeUndefined();
+  });
+
+  it("post-prompt capture refuses two native processes and never sends input", async () => {
+    const tmux = mockTmux({ getPanePid: vi.fn(async () => 900) });
+    const read = vi.fn(async () => "00000000-0000-7000-8000-000000000001");
+    const adapter = new CodexRuntimeAdapter({ tmux, fsOps: mockFs(), listProcesses: () => [
+      { pid: 900, ppid: 1, command: "-zsh" },
+      { pid: 901, ppid: 900, command: "/bin/codex" },
+      { pid: 902, ppid: 900, command: "/other/codex" },
+    ], readThreadIdByPid: read, sleep: async () => {} });
+    expect(await adapter.captureNativeResumeToken(makeBinding())).toBeUndefined();
+    expect(read).not.toHaveBeenCalled();
+    expect(tmux.sendKeys).not.toHaveBeenCalled();
+    expect(tmux.sendText).not.toHaveBeenCalled();
+  });
+
   it("launchHarness captures a fresh Codex thread id from a nested wrapper -> vendor codex process tree", async () => {
     const tmux = mockTmux({
       getPanePid: vi.fn(async () => 900),

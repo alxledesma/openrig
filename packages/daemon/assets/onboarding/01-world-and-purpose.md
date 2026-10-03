@@ -50,3 +50,20 @@ pack's fresh profile with `rig context profile <world-pack-ref> --situation fres
 these two onboarding pieces are the complete default mental model. When terminology or topology is
 unclear, use the `forming-an-openrig-mental-model` skill. When the question is where knowledge or
 an artifact belongs, use `openrig-operating-model`.
+
+
+## Inherited project process
+
+For an OpenRig-managed project, use its selected OpenRig workflow and durable
+queue. Owner policy retires inherited Software Factory issue-authorization and
+Factory-specific execution ceremonies; do not import those gates during context
+ingestion. Preserve substantive product, security and database constraints,
+useful tests/validation, independent candidate review, actual-risk admission and
+owner external/destructive boundaries. Native OpenRig mode names and publication
+metadata such as factory-approved are not external Factory execution gates.
+
+At ingestion, retain original guidance, classify inherited rules and record the
+scoped replacements. Align project guidance and startup projections; reconcile
+workers, exclusive resources and queue custody before dispatch. Verify actual
+adoption and return evidence. Ambiguous substantive constraints go to the
+Architect while unrelated ready packages continue. Consult the project’s own operating policy before ingestion or migration.

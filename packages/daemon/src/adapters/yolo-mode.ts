@@ -61,8 +61,8 @@ export function codexPostureArg(
   env: NodeJS.ProcessEnv = process.env,
   resolvedPosture?: ResolvedLaunchPosture,
 ): string {
-  if (resolvedPosture === "full_bypass") return " -s danger-full-access -a never";
-  if (yoloEnabled(env, resolvedPosture)) return " -s danger-full-access";
+  if (resolvedPosture === "full_bypass") return `${profileArg} -s danger-full-access -a never`;
+  if (yoloEnabled(env, resolvedPosture)) return `${profileArg} -s danger-full-access`;
   return profileArg ? profileArg : " -s workspace-write";
 }
 

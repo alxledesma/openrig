@@ -226,3 +226,11 @@ describe("cmux CLI transport — layout RPC method pass-through (slice 24.A repa
     });
   });
 });
+
+describe("cmux persistent custom surface title transport",()=>{
+ it("uses supported rename-tab with exact surface/workspace and quoted role title",async()=>{
+  const captured:string[]=[];const transport=await createCmuxCliTransport(mockExec(captured,{}))();
+  await transport.request("surface.rename",{surfaceId:"surface:7",workspaceId:"workspace:3",title:"Reviewer Space Bunny"});
+  expect(captured.at(-1)).toBe("cmux rename-tab --surface 'surface:7' --workspace 'workspace:3' 'Reviewer Space Bunny'");
+ });
+});

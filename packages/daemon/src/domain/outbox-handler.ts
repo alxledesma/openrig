@@ -1,3 +1,6 @@
+import type { SeatDeliveryGuard } from "./seat-delivery-guard.js";
+import { EventBus } from "./event-bus.js";
+import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 
 /**
@@ -234,6 +237,134 @@ export class OutboxHandler {
       WHERE delivery_state='retained' AND json_extract(guard_binding,'$.nodeId')=? ORDER BY ts_dispatched,outbox_id LIMIT ? OFFSET ?`)
       .all(nodeId, limit, offset) as OutboxEntryRow[];
     return { items: rows.map(r => this.rowToEntry(r)), total, limit, offset, truncated: offset + rows.length < total };
+  }
+
+  /** Explicitly abandon an unresolved historical direct effect, without asserting delivery/failure. */
+  async abandonUncertain(input: {outboxId:string;bodySha256:string;expectedState:"pending"|"indeterminate";operationId:string;
+    authorizationId:string;reason:string;evidenceRef:string;actor:string;generation:string}, guard: SeatDeliveryGuard | undefined): Promise<OutboxEntry> {
+    const refuse = (code:string,message:string):never => {throw new OutboxHandlerError(code,message);};
+    if (!guard || guard.db !== this.db) refuse("outbox_lifecycle_required","Same-database lifecycle guard required.");
+    if (!["pending","indeterminate"].includes(input.expectedState) || !input.operationId?.trim() || !input.reason?.trim()
+      || !input.evidenceRef?.trim() || !input.authorizationId || !/^[a-f0-9]{64}$/.test(input.bodySha256)) refuse("outbox_abandon_contract_required","Exact effect, operation, reason and evidence required.");
+    const entry = this.getById(input.outboxId);
+    if (!entry || entry.senderSession !== input.actor || entry.outboxId.startsWith(WAKE_INTENT_PREFIX) || entry.guardBinding) {
+      refuse("outbox_abandon_refused","Only actual sender's unguarded non-executable direct effect can be abandoned.");
+    }
+    const local = (session:string) => {
+      const parts = session.split("@");
+      if (parts.length !== 2) return undefined;
+      const row = this.db.prepare(`SELECT s.node_id FROM sessions s JOIN nodes n ON n.id=s.node_id JOIN rigs r ON r.id=n.rig_id
+        WHERE s.session_name=? AND r.name=? ORDER BY s.id DESC LIMIT 1`).get(session,parts[1]) as {node_id:string}|undefined;
+      if (!row) return undefined;
+      const t = this.db.prepare("SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1").get(row.node_id) as {generation_uuid:string}|undefined;
+      return t?.generation_uuid ? {nodeId:row.node_id,generation:t.generation_uuid} : undefined;
+    };
+    const operator = "operator-agent@kernel";
+    const sessions = [input.actor,entry!.destinationSession,operator];
+    const nodes = sessions.map(local);
+    if (nodes.some(n=>!n) || nodes[0]!.generation !== input.generation) refuse("outbox_generation_unknown","Current local sender, recipient and Kernel Operator identities required.");
+    const snapshot = JSON.stringify(entry);
+    const requestDigest = createHash("sha256").update(JSON.stringify([input.outboxId,input.bodySha256,input.expectedState,input.operationId,
+      input.authorizationId,input.reason,input.evidenceRef,input.actor,input.generation,nodes])).digest("hex");
+    return guard!.lifecycle(nodes.map(n=>n!.nodeId), async()=>this.db.transaction(()=>{
+      if (JSON.stringify(sessions.map(local)) !== JSON.stringify(nodes) || nodes.some(n=>!guard!.ownsLifecycle(n!.nodeId))) {
+        refuse("outbox_generation_changed","Seat identity changed while waiting for lifecycle boundary.");
+      }
+      const prior = this.db.prepare("SELECT payload FROM events WHERE type='outbox.uncertain_abandoned' AND json_extract(payload,'$.outboxId')=? AND json_extract(payload,'$.operationId')=? ORDER BY seq LIMIT 1")
+        .get(input.outboxId,input.operationId) as {payload:string}|undefined;
+      if (prior) {
+        const event = JSON.parse(prior.payload) as {requestDigest:string};
+        if (event.requestDigest !== requestDigest) refuse("outbox_operation_conflict","Abandonment operation reused with changed contract or identities.");
+        const result = this.getById(input.outboxId);
+        if (result?.deliveryState !== "retired") refuse("outbox_abandon_drift","Retirement receipt and current effect disagree.");
+        return result!;
+      }
+      const current = this.getById(input.outboxId);
+      if (JSON.stringify(current) !== snapshot || current?.deliveryState !== input.expectedState
+        || createHash("sha256").update(current.body).digest("hex") !== input.bodySha256) {
+        refuse("outbox_abandon_drift","Frozen effect body/state changed; no abandonment.");
+      }
+      const auth = this.db.prepare("SELECT source_session,destination_session,minting_generation_uuid,claimed_by_generation_uuid,state,body FROM queue_items WHERE qitem_id=?")
+        .get(input.authorizationId) as {source_session:string;destination_session:string;minting_generation_uuid:string|null;claimed_by_generation_uuid:string|null;state:string;body:string}|undefined;
+      const creation = this.db.prepare("SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? AND transition_note='created' ORDER BY transition_id LIMIT 1")
+        .get(input.authorizationId) as {actor_session:string;identity_provenance:string|null}|undefined;
+      const contract = {kind:"outbox-abandon-authorization",outboxId:input.outboxId,bodySha256:input.bodySha256,expectedState:input.expectedState,
+        operationId:input.operationId,senderGeneration:input.generation,reason:input.reason,evidenceRef:input.evidenceRef};
+      let proof:Record<string,unknown>|undefined;try{proof=auth?JSON.parse(auth.body):undefined;}catch{}
+      if (!auth || auth.source_session !== operator || auth.destination_session !== input.actor || auth.minting_generation_uuid !== nodes[2]!.generation
+        || auth.claimed_by_generation_uuid !== input.generation || auth.state !== "in-progress" || creation?.actor_session !== operator
+        || creation.identity_provenance !== "transport:v1" || !proof || Object.keys(proof).length !== Object.keys(contract).length
+        || Object.entries(contract).some(([k,v])=>proof![k]!==v)) {
+        refuse("outbox_operator_authorization_required","Current Kernel Operator's exact transport-authored authorization must be claimed by the current sender.");
+      }
+      const changed = this.db.prepare("UPDATE outbox_entries SET delivery_state='retired',retired_at=?,retired_by=?,retirement_reason=? WHERE outbox_id=? AND delivery_state=?")
+        .run(new Date().toISOString(),input.actor,`Uncertain effect explicitly abandoned: ${input.reason}`,input.outboxId,input.expectedState);
+      if (changed.changes !== 1) refuse("outbox_abandon_drift","Concurrent effect disposition won; no abandonment.");
+      new EventBus(this.db).persistWithinTransaction({type:"outbox.uncertain_abandoned",schemaVersion:1,outboxId:input.outboxId,operationId:input.operationId,
+        requestDigest,originalState:input.expectedState,deliveryConclusion:"unknown",sender:input.actor,senderGeneration:input.generation,
+        operatorGeneration:nodes[2]!.generation,recipientGeneration:nodes[1]!.generation,authorizationId:input.authorizationId,
+        bodySha256:input.bodySha256,reason:input.reason,evidenceRef:input.evidenceRef,originalAuditPointer:current!.auditPointer});
+      return this.getByIdOrThrow(input.outboxId);
+    }).immediate());
+  }
+
+  /** Internal transport seam: atomic audit origin and observed outcome, never exposed by /outbox/record. */
+  recordDirectAttempt(input: OutboxRecordInput, outcome: "delivered" | "failed" | "indeterminate"): OutboxEntry {
+    return this.db.transaction(() => {
+      // Caller-supplied IDs cannot turn ordinary records into transport evidence.
+      const entry = this.record({...input, outboxId: undefined, identityProvenance: "transport:v1"});
+      new EventBus(this.db).persistWithinTransaction({type:"outbox.direct_attempt",schemaVersion:1,outboxId:entry.outboxId,
+        sender:entry.senderSession,destination:entry.destinationSession,bodySha256:createHash("sha256").update(entry.body).digest("hex"),
+        outcome,dispatchedAt:entry.tsDispatched});
+      return outcome === "delivered" ? this.markDelivered(entry.outboxId) : outcome === "failed" ? this.markFailed(entry.outboxId) : this.markIndeterminate(entry.outboxId);
+    }).immediate();
+  }
+
+  /** Reconcile an old direct effect only from a current recipient's durable exact acknowledgment.
+   * No queue mutations, sends, native input or executable wake-intent retirement. */
+  reconcileRecipientDelivery(input: { outboxId: string; receiptId: string; actor: string; generation: string; reason: string }): OutboxEntry {
+    return this.db.transaction(() => {
+      const entry = this.getById(input.outboxId);
+      if (!entry) throw new OutboxHandlerError("outbox_not_found", "Exact outbox entry not found.");
+      if (!input.reason?.trim() || !input.actor || !input.generation || entry.outboxId.startsWith(WAKE_INTENT_PREFIX)
+        || entry.destinationSession !== input.actor || entry.guardBinding) {
+        throw new OutboxHandlerError("outbox_reconciliation_refused", "Attributed recipient, reason and non-executable direct effect required.");
+      }
+      const node = this.db.prepare("SELECT node_id FROM sessions WHERE session_name=? ORDER BY id DESC LIMIT 1").get(input.actor) as {node_id:string}|undefined;
+      const current = node ? this.db.prepare("SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1").get(node.node_id) as {generation_uuid:string}|undefined : undefined;
+      const attempt = this.db.prepare("SELECT payload FROM events WHERE type='outbox.direct_attempt' AND json_extract(payload,'$.outboxId')=? ORDER BY seq LIMIT 1").get(entry.outboxId) as {payload:string}|undefined;
+      let origin: {schemaVersion?:number;sender?:string;destination?:string;bodySha256?:string;outcome?:string;dispatchedAt?:string}|undefined;
+      try { origin = attempt ? JSON.parse(attempt.payload) : undefined; } catch {}
+      const hash = createHash("sha256").update(entry.body).digest("hex");
+      if (origin?.schemaVersion !== 1 || origin.sender !== entry.senderSession || origin.destination !== entry.destinationSession
+        || origin.bodySha256 !== hash || origin.dispatchedAt !== entry.tsDispatched || origin.outcome !== "indeterminate") {
+        throw new OutboxHandlerError("outbox_direct_attempt_required", "Actual unresolved direct transport attempt evidence required; ordinary records cannot prove delivery.");
+      }
+      const receipt = this.db.prepare("SELECT source_session,destination_session,minting_generation_uuid,body,ts_created FROM queue_items WHERE qitem_id=?").get(input.receiptId) as {source_session:string;destination_session:string;minting_generation_uuid:string|null;body:string;ts_created:string}|undefined;
+      let proof: {kind?:string;outboxId?:string;bodySha256?:string}|undefined;
+      try { proof = receipt ? JSON.parse(receipt.body) : undefined; } catch {}
+      const creation = this.db.prepare("SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? AND transition_note='created' ORDER BY transition_id LIMIT 1").get(input.receiptId) as {actor_session:string;identity_provenance:string|null}|undefined;
+      if (creation?.actor_session !== input.actor || creation.identity_provenance !== "transport:v1") {
+        throw new OutboxHandlerError("outbox_recipient_receipt_required", "Receipt creation must be attributed to the recipient's managed transport.");
+      }
+      if (current?.generation_uuid !== input.generation || !receipt || receipt.source_session !== input.actor
+        || receipt.destination_session !== entry.senderSession || receipt.minting_generation_uuid !== input.generation
+        || !Number.isFinite(Date.parse(entry.tsDispatched)) || !Number.isFinite(Date.parse(receipt.ts_created)) || Date.parse(receipt.ts_created) < Date.parse(entry.tsDispatched)
+        || proof?.kind !== "outbox-delivery-ack" || proof.outboxId !== entry.outboxId || proof.bodySha256 !== hash) {
+        throw new OutboxHandlerError("outbox_recipient_receipt_required", "Current recipient's durable exact delivery acknowledgment required.");
+      }
+      if (entry.deliveryState === "delivered") {
+        let audit: {receiptId?:string}|undefined;try { audit = JSON.parse(entry.auditPointer ?? ""); } catch {}
+        if (audit?.receiptId !== input.receiptId) throw new OutboxHandlerError("outbox_reconciliation_conflict", "Existing delivery has another evidence receipt.");
+        return entry;
+      }
+      if (!["pending", "indeterminate"].includes(entry.deliveryState)) throw new OutboxHandlerError("outbox_reconciliation_conflict", "Only unresolved direct effects can be reconciled.");
+      const audit = JSON.stringify({kind:"recipient-delivery-reconciliation",receiptId:input.receiptId,actor:input.actor,
+        generation:input.generation,reason:input.reason.trim(),priorAuditPointer:entry.auditPointer});
+      this.db.prepare("UPDATE outbox_entries SET delivery_state='delivered',delivered_at=?,audit_pointer=? WHERE outbox_id=? AND delivery_state=?")
+        .run(new Date().toISOString(),audit,input.outboxId,entry.deliveryState);
+      return this.getByIdOrThrow(input.outboxId);
+    }).immediate();
   }
 
   markDelivered(outboxId: string): OutboxEntry {

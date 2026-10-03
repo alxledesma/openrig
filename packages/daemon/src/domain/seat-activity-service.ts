@@ -321,6 +321,17 @@ export class SeatActivityService {
     return seat.arbitrated;
   }
 
+  /** Rotation needs the deciding activity observation, not a rung's latest
+   * needs-input/chrome timestamp. Held debounce decisions have no new witness. */
+  getRotationActivityWitness(seatNodeId: string): ActivityEvidence | null {
+    const seat=this.ladder.get(seatNodeId);
+    if(!seat)return null;
+    this.arbitrate(seat);
+    const candidate=this.rawCandidate(seat);
+    if(!candidate || candidate.activity!==seat.arbitrated.activity || candidate.rung!==seat.arbitrated.decidedBy || this.rungTrust(seat,candidate.rung)!=="authoritative")return null;
+    return {...candidate};
+  }
+
   /** Wait-after-seq read primitive (T1 seam, exposed not consumed here): resolves when
    *  the arbitrated seq passes `afterSeq` (a fast pass-through transition still
    *  satisfies the wait — the lost-wakeup guard). Timeout resolves null, never throws. */

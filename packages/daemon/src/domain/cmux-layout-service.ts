@@ -1,3 +1,5 @@
+import {managedCmuxCommand,managedSeatTitle} from "./managed-cmux-window.js";
+import {shellQuote} from "../adapters/shell-quote.js";
 // Slice 24 — CmuxLayoutService.
 //
 // Algorithmic core of the "Launch in CMUX" feature. Three pure helpers
@@ -156,7 +158,9 @@ export class CmuxLayoutService {
     const built = await this.buildWorkspacePanes(
       workspaceName,
       cwd,
-      agentSessions.map((session) => `tmux attach -t ${session}`),
+      agentSessions.map((session) => managedCmuxCommand(session, `tmux attach -t ${shellQuote(session)}`)),
+      undefined,
+      agentSessions.map(managedSeatTitle),
     );
     if (!built.ok) return built;
     return {
@@ -185,6 +189,7 @@ export class CmuxLayoutService {
     cwd: string | undefined,
     paneCommands: string[],
     cols?: number,
+    paneTitles?: string[],
   ): Promise<CmuxResult<BuildWorkspacePanesResult>> {
     if (paneCommands.length === 0) {
       const ws = await this.cmuxAdapter.createWorkspace(workspaceName, cwd);
@@ -273,6 +278,10 @@ export class CmuxLayoutService {
           workspaceId,
         );
         if (!sendResult.ok) return sendResult;
+        if(paneTitles?.[paneIndex] && this.cmuxAdapter.renameSurface){
+          const title=await this.cmuxAdapter.renameSurface(surface,paneTitles[paneIndex]!,workspaceId);
+          if(!title.ok)return title;
+        }
         paneIndex += 1;
       }
     }

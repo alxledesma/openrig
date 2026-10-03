@@ -29,6 +29,8 @@ export interface ComposedPane {
   label: string;
   /** Provider-neutral shell command; a provider may wrap it using runtime metadata. */
   paneCommand: string;
+  /** Local managed tmux attachment; absent for SSH/external panes. */
+  localTmuxSession?: string;
   /** True when the attach is view-only (`tmux attach -r`) — cross-rig / saved read-only. */
   readOnly: boolean;
 }

@@ -1,3 +1,6 @@
+import { CoordinationRecoveryService } from "./domain/coordination-recovery-service.js";
+import {makeCoordinatorRuntimeObserver} from "./domain/coordinator-runtime-availability.js";
+import {makeCoordinatorContinuityPolicy} from "./domain/policies/coordinator-continuity.js";
 import { configureShadowCapture } from "./domain/shadow-capture.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "./domain/seat-delivery-guard.js";
 import { queueRecoveryOwnsWake } from "./domain/queue-wake-ladder.js";
@@ -397,6 +400,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const watchdogHistoryLogInstance = new WatchdogHistoryLog(db);
 
   const tmuxAdapter = new TmuxAdapter(opts?.tmuxExec ?? execCommand);
+  queueRepoInstance.coordinatorAuthority.setRuntimeObserver(makeCoordinatorRuntimeObserver(db, opts?.tmuxExec ?? execCommand));
   const deliveryGuard = new SeatDeliveryGuard(db, target => resolveGuardTarget(db, target));
   deliveryGuard.recoverActivation();
   tmuxAdapter.deliveryGuard = deliveryGuard;
@@ -422,6 +426,15 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // per running seat per tick + classifies motion STRUCTURALLY, so the `rig ps` ACTIVITY column reflects
   // real liveness for hook-less / stale-hook / turn-boundary seats WITHOUT a per-request capture storm.
   const seatStructuralActivityService = new SeatStructuralActivityService(tmuxAdapter);
+  queueRepoInstance.coordinatorAuthority.coordinationRecovery = new CoordinationRecoveryService(queueRepoInstance, session => {
+    const state=seatActivityService.getSeatStateBySession(session);
+    const generation=sessionRegistry.currentOccupantGenerationForSession(session);
+    if(!state||!generation)return null;
+    const identity=db.prepare('SELECT verdict,session_name,observed_at FROM seat_identity_verdicts WHERE node_id=?').get(state.seatNodeId) as {verdict:string;session_name:string;observed_at:string}|undefined;
+    const observed=Date.parse(identity?.observed_at??'');
+    const identityVerified=identity?.verdict==='verified'&&identity.session_name===session&&observed<=Date.now()&&Date.now()-observed<=3000;
+    return {generation,identityVerified,state,witness:seatActivityService.getRotationActivityWitness(state.seatNodeId)};
+  });
   // OPR.0.4.3.19 — SeatIdentityReconciler owns the liveness identity verdict
   // (the THIRD axis). Reconciles each running seat's pane PID/command against
   // the registered binding and persists the verdict so node-inventory can gate
@@ -1839,9 +1852,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       jobsRepo: watchdogJobsRepoInstance,
       historyLog: watchdogHistoryLogInstance,
       eventBus,
-      deliver: async ({ targetSession, message, continuityAction }, source) => {
+      deliver: async ({ targetSession, message, continuityAction, coordinatorRecovery }, source) => {
         let continuityActionCompleted = false;
         try {
+          if(coordinatorRecovery){await queueRepoInstance.coordinatorAuthority.refreshRuntimeAvailability(coordinatorRecovery.rigId);queueRepoInstance.coordinatorAuthority.recordObservedOutage(coordinatorRecovery.rigId,coordinatorRecovery.expectedEpoch,source.jobId,coordinatorRecovery.evidenceId);}
           if (continuityAction) {
             await createContinuityCutoverBaton(continuityAction, queueRepoInstance);
             continuityActionCompleted = true;
@@ -1883,6 +1897,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       // rendered by public surfaces
       // into one bounded wake. Wakes/flags only; cooldown via engine throttle.
       additionalPolicies: [
+        makeCoordinatorContinuityPolicy(queueRepoInstance.coordinatorAuthority),
         makeWorkflowKeepalivePolicy({
           db,
           // OPR.0.4.6.WF5 FR-2 class (b): detection-time exception items,

@@ -418,8 +418,10 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default destination nudge (cold-queue)")
     .option("--verify", "Boundedly wait for the existing gateway delivery receipt after persistence; never retries the create and never claims human readership")
+    .option("--dispatch-file <path>", "Frozen admitted package envelope with saved coordinator epoch/generation")
     .option("--json", "JSON output for agents")
     .action(async (opts: {
+      dispatchFile?: string;
       source?: string;
       destination: string;
       body?: string;
@@ -518,6 +520,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           }
         }
         const res = await client.post<Record<string, unknown>>("/api/queue/create", {
+          ...(opts.dispatchFile ? {dispatch: JSON.parse(fs.readFileSync(opts.dispatchFile,"utf8"))} : {}),
           qitemId: opts.id,
           destinationSession: hostResolved.destination,
           body: resolvedBody,
@@ -756,8 +759,10 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default nudge to the new destination")
+    .option("--dispatch-file <path>", "Frozen admitted package envelope with saved coordinator epoch/generation")
     .option("--json", "JSON output for agents")
     .action(async (qitemId: string, opts: {
+      dispatchFile?: string;
       from?: string;
       to: string;
       body?: string;
@@ -816,6 +821,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       const tags = dedupedTags.length > 0 ? dedupedTags : undefined;
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/handoff`, {
+          ...(opts.dispatchFile ? {dispatch: JSON.parse(fs.readFileSync(opts.dispatchFile,"utf8"))} : {}),
           toSession: hostResolved.destination,
           body: resolvedBody,
           summary: opts.summary,
@@ -851,8 +857,10 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: durable-artifact pointer for the new qitem. Required by the daemon when the new qitem is human-routed; optional otherwise.")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default nudge to the new destination")
+    .option("--dispatch-file <path>", "Frozen admitted package envelope with saved coordinator epoch/generation")
     .option("--json", "JSON output for agents")
     .action(async (qitemId: string, opts: {
+      dispatchFile?: string;
       from?: string;
       to: string;
       body?: string;
@@ -909,6 +917,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       const tags = dedupedTags.length > 0 ? dedupedTags : undefined;
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/handoff-and-complete`, {
+          ...(opts.dispatchFile ? {dispatch: JSON.parse(fs.readFileSync(opts.dispatchFile,"utf8"))} : {}),
           toSession: hostResolved.destination,
           body: resolvedBody,
           summary: opts.summary,

@@ -1,3 +1,4 @@
+import { CoordinatorAuthorityService, CoordinatorFenceError } from "./coordinator-authority-service.js";
 import { randomUUID } from "node:crypto";
 import { OutboxHandler } from "./outbox-handler.js";
 import type Database from "better-sqlite3";
@@ -435,6 +436,8 @@ export type ResolveResult =
   | { ok: false; code: "not_found" | "ambiguous"; error: string };
 
 export interface SendOpts {
+  /** Internal-only committed assignment wake; never read from HTTP body. */
+  queueAssignmentId?: string;
   /** Stable caller request ID, reused for readback after transport uncertainty. */
   deliveryId?: string;
   auditPointer?: string;
@@ -554,6 +557,7 @@ interface ResolvedTarget { sessionName: string; rigName: string; nodeLogicalId: 
 
 export class SessionTransport {
   readonly db: Database.Database;
+  private coordinatorAuthority: CoordinatorAuthorityService;
   private rigRepo: RigRepository;
   private sessionRegistry: SessionRegistry;
   private tmuxAdapter: TmuxAdapter;
@@ -570,6 +574,7 @@ export class SessionTransport {
 
   constructor(deps: SessionTransportDeps) {
     this.db = deps.db;
+    this.coordinatorAuthority = new CoordinatorAuthorityService(deps.db);
     this.rigRepo = deps.rigRepo;
     this.sessionRegistry = deps.sessionRegistry;
     this.tmuxAdapter = deps.tmuxAdapter;
@@ -890,6 +895,8 @@ export class SessionTransport {
   }
 
   async send(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
+    try { this.coordinatorAuthority.assertManagedSend(opts?.actorSession ?? undefined,sessionName,opts?.queueAssignmentId); }
+    catch(err) { if(err instanceof CoordinatorFenceError)return {ok:false,sessionName,sent:false,reason:err.code,error:err.message};throw err; }
     const guard = this.tmuxAdapter.deliveryGuard;
     if (!guard) return this.sendUnguarded(sessionName, text, opts);
     const outbox = new OutboxHandler(this.db);
@@ -1164,7 +1171,7 @@ export class SessionTransport {
       }
       const submitResult = await this.runStage(
         "session_transport.submit",
-        () => this.tmuxAdapter.sendKeys(sessionName, ["C-m"]),
+        () => { this.coordinatorAuthority.assertManagedSend(opts?.actorSession ?? undefined,sessionName,opts?.queueAssignmentId); return this.tmuxAdapter.sendKeys(sessionName, ["C-m"]); },
         (result) => result.ok ? "ok" : "failed",
       );
       if (!submitResult.ok) {
@@ -1308,7 +1315,7 @@ export class SessionTransport {
     if (observed) observed.sentHash = hashSentText(text);
     const textResult = await this.runStage(
       "session_transport.send_text",
-      () => this.tmuxAdapter.sendText(sessionName, text),
+      () => { this.coordinatorAuthority.assertManagedSend(opts?.actorSession ?? undefined,sessionName,opts?.queueAssignmentId); return this.tmuxAdapter.sendText(sessionName, text); },
       (result) => result.ok ? "ok" : "failed",
     );
     if (!textResult.ok) {
@@ -1328,7 +1335,7 @@ export class SessionTransport {
     // 5. Submit (C-m)
     const submitResult = await this.runStage(
       "session_transport.submit",
-      () => this.tmuxAdapter.sendKeys(sessionName, ["C-m"]),
+      () => { this.coordinatorAuthority.assertManagedSend(opts?.actorSession ?? undefined,sessionName,opts?.queueAssignmentId); return this.tmuxAdapter.sendKeys(sessionName, ["C-m"]); },
       (result) => result.ok ? "ok" : "failed",
     );
     if (!submitResult.ok) {

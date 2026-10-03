@@ -1,3 +1,4 @@
+import { CoordinatorAuthorityService, AssignmentReplay, type DispatchEnvelope } from "./coordinator-authority-service.js";
 import { readWakeLadderBackstop } from "./queue-wake-ladder.js";
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -215,11 +216,12 @@ export interface QueueNudgeTransport {
     // (h): stampISO threads the nudge's compose time so the transport's delivered-latency calc can
     // measure the wait for a handoff nudge too (the real impl is SessionTransport, which accepts it).
     text: string,
-    opts?: { verify?: boolean; stampISO?: string; actorSession?: string; committedOutboxIds?: string[]; deliveryId?: string; auditPointer?: string }
+    opts?: { queueAssignmentId?: string; verify?: boolean; stampISO?: string; actorSession?: string; committedOutboxIds?: string[]; deliveryId?: string; auditPointer?: string }
   ): Promise<{ ok: boolean; verified?: boolean; error?: string; reason?: string; outcome?: string }>;
 }
 
 export interface QueueCreateInput {
+  dispatch?: DispatchEnvelope;
   qitemId?: string;
   sourceSession: string;
   destinationSession: string;
@@ -319,6 +321,7 @@ export interface QueueUpdateInput {
 }
 
 export interface QueueHandoffInput {
+  dispatch?: DispatchEnvelope;
   qitemId: string;
   fromSession: string;
   toSession: string;
@@ -647,6 +650,8 @@ export class QueueRepository {
     | ((qitemId: string) => { instanceId: string; workflowName: string } | null)
     | undefined;
 
+  readonly coordinatorAuthority: CoordinatorAuthorityService;
+
   constructor(
     db: Database.Database,
     eventBus: EventBus,
@@ -684,6 +689,7 @@ export class QueueRepository {
     this.db = db;
     this.eventBus = eventBus;
     this.transitionLog = new QueueTransitionLog(db);
+    this.coordinatorAuthority = new CoordinatorAuthorityService(db, eventBus, this.transitionLog);
     this.wakeRepo = new QueueWakeRepository(db);
     this.validateRig = opts?.validateRig ?? (() => true);
     this.transport = opts?.transport;
@@ -1293,7 +1299,7 @@ export class QueueRepository {
       text = held.body;
     }
     try {
-      const res = await this.transport!.send(destinationSession, text, { verify: true, stampISO, actorSession: sourceSession, committedOutboxIds, deliveryId: committedOutboxIds ? undefined : deliveryId, auditPointer: qitemId });
+      const res = await this.transport!.send(destinationSession, text, { queueAssignmentId: qitemId, verify: true, stampISO, actorSession: sourceSession, committedOutboxIds, deliveryId: committedOutboxIds ? undefined : deliveryId, auditPointer: qitemId });
       // OPR.0.3.2.21.FR-4(c) — wording rename: the prior literal
       // "sent-unverified" read as a failure even in the common case
       // (delivery confirmed but the synchronous ack window expired,
@@ -1340,8 +1346,9 @@ export class QueueRepository {
     let id: string;
     let persistedEvent: PersistedEvent;
     try {
-      ({ qitemId: id, persistedEvent } = txn());
+      ({ qitemId: id, persistedEvent } = txn.immediate());
     } catch (err) {
+      if (err instanceof AssignmentReplay) return this.getByIdOrThrow(err.queueId);
       // OPR.0.4.6.MH3 Q-a (FR-5): at-least-once cross-host forwards retry with
       // the SAME minted qitemId, so a PK conflict on an EXISTING row is an
       // idempotent RE-DELIVERY when the identity fields match — return the
@@ -1373,7 +1380,8 @@ export class QueueRepository {
       throw err;
     }
     this.eventBus.notifySubscribers(persistedEvent);
-    await this.maybeNudge(id, input.destinationSession, input.nudge, input.sourceSession);
+    if (input.dispatch) await this.deliverWakeForSuccessor(id, input.destinationSession, input.nudge, input.sourceSession);
+    else await this.maybeNudge(id, input.destinationSession, input.nudge, input.sourceSession);
     return this.getByIdOrThrow(id);
   }
 
@@ -1455,6 +1463,7 @@ export class QueueRepository {
       if (!this.hasHumanIntentColumn) throw new QueueRepositoryError("invalid_human_notification", "Human notification fields require the current queue schema; they were not saved.");
     }
     const id = input.qitemId ?? newQitemId();
+    this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
     const ts = new Date().toISOString();
     const priority = input.priority ?? "routine";
     const tier = input.tier ?? null;
@@ -1515,6 +1524,7 @@ export class QueueRepository {
       tier,
       summary: input.summary ?? null,
     });
+    if (input.dispatch) this.stageWakeIntent(id, input.sourceSession, input.destinationSession, input.identityProvenance ?? null, input.nudge);
     return { qitemId: id, persistedEvent };
   }
 
@@ -1530,6 +1540,16 @@ export class QueueRepository {
         "qitem_not_found",
         `qitem ${input.qitemId} not found`
       );
+    }
+    if (input.dispatch) {
+      try {
+        this.db.transaction(() => {
+          this.coordinatorAuthority.reserve(input.fromSession, input.toSession, input.body ?? source.body, "preflight-only", input.dispatch, true, input.qitemId);
+        }).immediate();
+      } catch (err) {
+        if (err instanceof AssignmentReplay) return { closed: source, created: this.getByIdOrThrow(err.queueId) };
+        throw err;
+      }
     }
     if (isTerminalState(source.state)) {
       throw new QueueRepositoryError(
@@ -1568,6 +1588,7 @@ export class QueueRepository {
     const events: Array<{ name: string; payload: import("./types.js").RigEvent }> = [];
 
     const txn = this.db.transaction(() => {
+      this.coordinatorAuthority.reserve(input.fromSession, input.toSession, body, newId, input.dispatch, false, input.qitemId);
       this.db
         .prepare(
           `UPDATE queue_items
@@ -1678,7 +1699,10 @@ export class QueueRepository {
       this.assertTerminalClosureHasIntent(source.qitemId, newId, input.nudge);
     });
 
-    txn();
+    try { txn.immediate(); } catch (err) {
+      if (err instanceof AssignmentReplay) return { closed: this.getByIdOrThrow(source.qitemId), created: this.getByIdOrThrow(err.queueId) };
+      throw err;
+    }
     for (const e of events) {
       this.eventBus.notifySubscribers(e.payload as import("./types.js").PersistedEvent);
     }
@@ -1707,6 +1731,16 @@ export class QueueRepository {
         "qitem_not_found",
         `qitem ${input.qitemId} not found`
       );
+    }
+    if (input.dispatch) {
+      try {
+        this.db.transaction(() => {
+          this.coordinatorAuthority.reserve(input.fromSession, input.toSession, input.body ?? source.body, "preflight-only", input.dispatch, true, input.qitemId);
+        }).immediate();
+      } catch (err) {
+        if (err instanceof AssignmentReplay) return { closed: source, created: this.getByIdOrThrow(err.queueId) };
+        throw err;
+      }
     }
     if (isTerminalState(source.state)) {
       throw new QueueRepositoryError(
@@ -1743,6 +1777,7 @@ export class QueueRepository {
     const events: Array<{ name: string; payload: import("./types.js").RigEvent }> = [];
 
     const txn = this.db.transaction(() => {
+      this.coordinatorAuthority.reserve(input.fromSession, input.toSession, body, newId, input.dispatch, false, input.qitemId);
       this.db
         .prepare(
           `UPDATE queue_items
@@ -1850,7 +1885,10 @@ export class QueueRepository {
       this.assertTerminalClosureHasIntent(source.qitemId, newId, input.nudge);
     });
 
-    txn();
+    try { txn.immediate(); } catch (err) {
+      if (err instanceof AssignmentReplay) return { closed: this.getByIdOrThrow(source.qitemId), created: this.getByIdOrThrow(err.queueId) };
+      throw err;
+    }
     for (const e of events) {
       this.eventBus.notifySubscribers(e.payload as import("./types.js").PersistedEvent);
     }
@@ -3370,6 +3408,8 @@ export class QueueRepository {
       throw new QueueRepositoryError("qitem_not_found", `qitem ${qitemId} not found`);
     }
     const ts = new Date().toISOString();
+    if (this.coordinatorAuthority.available() && (this.db.prepare("SELECT 1 FROM coordinator_authority WHERE baton_id=?").get(qitemId) || this.db.prepare("SELECT 1 FROM coordinator_assignments WHERE queue_id=?").get(qitemId))) throw new QueueRepositoryError("coordinator_redesign_required", "Canonical baton and admitted assignments require their attributed authority/disposition path");
+    if (this.coordinatorAuthority.scope(qitem.sourceSession,qitem.destinationSession)) throw new QueueRepositoryError("coordinator_redesign_required", "Enabled rig assignments cannot silently reroute their frozen destination; admit a new attributed package after disposition");
     const originalDestination = qitem.destinationSession;
     const newChain = JSON.stringify([...(qitem.chainOfRecord ?? []), `fallback-from:${originalDestination}`]);
 
