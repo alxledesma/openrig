@@ -116,6 +116,16 @@ describe("Restore check routes", () => {
     fs.rmSync(openRigHome, { recursive: true, force: true });
   });
 
+  // These fixtures isolate other diagnostics from snapshot-availability/occupant failures.
+  function seedCurrentSnapshot(rigId: string) {
+    const rig = rigRepo.getRig(rigId)!;
+    const sessions = sessionRegistry.getSessionsForRig(rigId);
+    return snapshotRepo.createSnapshot(rigId, "auto-pre-down", {
+      rig: rig.rig, nodes: rig.nodes, edges: rig.edges, sessions, checkpoints: {},
+      activeSessionIdByNode: Object.fromEntries(sessions.map((s) => [s.nodeId, s.id])),
+    });
+  }
+
   it("uses restore's ranked snapshot and reports missing service inputs in compact output", async () => {
     const rig = rigRepo.createRig("service-rig");
     const selected = snapshotRepo.createSnapshot(rig.id, "auto-pre-down", minimalSnapshotData(rig.id, rig.name) as never);
@@ -133,6 +143,7 @@ describe("Restore check routes", () => {
     expect(check.evidence).toContain(`Snapshot ${selected.id}`);
     expect(check.evidence).toContain("service_rig_root_missing");
     expect(check.evidence).toContain("service_compose_file_missing");
+    expect(body.recovery.status).toBe("blocked");
     expect(db.prepare("SELECT COUNT(*) AS n FROM snapshots").get()).toEqual(before);
   });
 
@@ -164,6 +175,24 @@ describe("Restore check routes", () => {
       expect(result.rigs.find((r) => r.rigId === broken.id)?.status).toBe("unknown");
       expect(result.checks.find((c) => c.check === "rig.good-read.restore-preconditions")?.status).toBe("green");
       expect(result.recovery.unknown[0]?.reason).toContain("fixture snapshot read failure");
+    } finally {
+      selection.mockRestore();
+    }
+  });
+
+  it("does not add snapshot selection to a running-ready composed status poll", async () => {
+    const rig = rigRepo.createRig("ready-poll");
+    const node = rigRepo.addNode(rig.id, "seat", { runtime: "terminal" });
+    const session = sessionRegistry.registerSession(node.id, "seat@ready-poll");
+    sessionRegistry.updateStartupStatus(session.id, "ready");
+    insertStartupContextRow(db, node.id, { runtime: "terminal" });
+    seedCurrentSnapshot(rig.id);
+    const selection = vi.spyOn(snapshotRepo, "selectRestoreUsable");
+    try {
+      expect((await app.request(`/api/rigs/${rig.id}/status`)).status).toBe(200);
+      expect(selection).not.toHaveBeenCalled();
+      await app.request("/api/restore-check?rig=ready-poll&noQueue=true&noHooks=true");
+      expect(selection).toHaveBeenCalledTimes(1);
     } finally {
       selection.mockRestore();
     }
@@ -204,7 +233,8 @@ describe("Restore check routes", () => {
     fs.mkdirSync(sharedDocs, { recursive: true });
     vi.stubEnv("OPENRIG_SHARED_DOCS_ROOT", sharedDocs);
     try {
-      rigRepo.createRig("outside-rig");
+      const rig = rigRepo.createRig("outside-rig");
+      seedCurrentSnapshot(rig.id);
 
       const res = await app.request("/api/restore-check?rig=outside-rig&noQueue=true&noHooks=true");
       expect(res.status).toBe(200);
@@ -347,7 +377,7 @@ describe("Restore check routes", () => {
     sessionRegistry.updateStatus(session.id, "stopped");
     sessionRegistry.updateStartupStatus(session.id, "failed");
     insertStartupContextRow(db, node.id);
-    snapshotRepo.createSnapshot(rig.id, "auto-pre-down", minimalSnapshotData(rig.id, rig.name) as never);
+    seedCurrentSnapshot(rig.id);
 
     const res = await app.request("/api/restore-check?rig=recoverable-rig&noQueue=true&noHooks=true");
     expect(res.status).toBe(200);
@@ -377,7 +407,7 @@ describe("Restore check routes", () => {
     const session = sessionRegistry.registerSession(node.id, "dev-impl@recoverable-rig");
     sessionRegistry.updateStatus(session.id, "stopped");
     sessionRegistry.updateStartupStatus(session.id, "failed");
-    snapshotRepo.createSnapshot(rig.id, "auto-pre-down", minimalSnapshotData(rig.id, rig.name) as never);
+    seedCurrentSnapshot(rig.id);
 
     const res = await app.request("/api/restore-check?rig=recoverable-rig&noQueue=true&noHooks=true");
     expect(res.status).toBe(200);
@@ -414,6 +444,7 @@ describe("Restore check routes", () => {
     insertStartupContextRow(db, node.id, {
       resolvedFilesJson: "{",
     });
+    seedCurrentSnapshot(rig.id);
 
     const res = await app.request("/api/restore-check?rig=malformed-startup-rig&noQueue=true&noHooks=true");
     expect(res.status).toBe(200);
@@ -459,6 +490,7 @@ describe("Restore check routes", () => {
     insertStartupContextRow(db, node.id, {
       startupActionsJson: "{",
     });
+    seedCurrentSnapshot(rig.id);
 
     const res = await app.request("/api/restore-check?rig=malformed-startup-actions-rig&noQueue=true&noHooks=true");
     expect(res.status).toBe(200);

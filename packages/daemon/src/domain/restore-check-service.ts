@@ -1279,12 +1279,12 @@ export class RestoreCheckService {
         attention_required: acc.attention_required + r.classCounts.attention_required,
         unknown: acc.unknown + r.classCounts.unknown,
       }), { ready: 0, ready_with_caveats: 0, not_ready: 0, attention_required: 0, unknown: 0 }),
-      hostInfra: result.verdict === "unknown"
+      hostInfra: hostInfra ?? (result.verdict === "unknown"
         ? {
             status: "unknown",
             evidence: "Host bootstrap/autostart source could not be inspected because restore-check state is unknown",
           }
-        : (hostInfra ?? {
+        : {
             status: "not_inspected",
             evidence: "No host bootstrap/autostart source inspected by v0; readiness only covers observable daemon, rig, and seat checks",
           }),
@@ -1340,7 +1340,9 @@ export class RestoreCheckService {
       };
     }
 
-    const allReady = recoveryInputs.every((input) => !input.snapshotLookupError && input.runningReadyNodes === input.expectedNodes);
+    const allReady = recoveryInputs.every((input) => !input.snapshotLookupError
+      && input.runningReadyNodes === input.expectedNodes
+      && !input.blockingChecks.some((check) => this.classifyRecoveryBlockingCheck(check) === "restore_input"));
     if (allReady) {
       return {
         status: "not_needed",
@@ -1365,8 +1367,6 @@ export class RestoreCheckService {
         });
         continue;
       }
-      if (input.runningReadyNodes === input.expectedNodes) continue;
-
       const restoreInputBlockers = input.blockingChecks.filter((check) =>
         this.classifyRecoveryBlockingCheck(check) === "restore_input"
       );
@@ -1379,6 +1379,7 @@ export class RestoreCheckService {
         });
         continue;
       }
+      if (input.runningReadyNodes === input.expectedNodes) continue;
 
       if (input.latestSnapshot) {
         actions.push({
