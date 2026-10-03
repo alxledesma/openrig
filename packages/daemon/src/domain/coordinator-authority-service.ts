@@ -77,6 +77,27 @@ export class CoordinatorAuthorityService {
      WHERE s.session_name=? AND s.node_id=? ORDER BY t.generation_ordinal DESC LIMIT 1`).get(session,node.id) as {generation_uuid:string}|undefined;
    return row?.generation_uuid ?? null;
  }
+ /** Current Operator enrollment assigns coordination roles; names cannot create another occupant. */
+ coordinatorMembersValid(rigId:string,owner:string,members:unknown):boolean {
+   if(!Array.isArray(members)||members.length!==2||members.some(s=>typeof s!=='string')||new Set(members).size!==2||!members.includes(owner))return false;
+   const identities=members.map(session=>{
+     const node=this.local(session);if(!node||node.rig_id!==rigId||!this.generation(session))return null;
+     return this.db.prepare(`SELECT n.id,n.runtime,s.resume_type,s.resume_token,t.generation_uuid,t.native_session_id_at_boot
+       FROM sessions s JOIN nodes n ON n.id=s.node_id JOIN occupant_tenures t ON t.node_id=n.id
+       WHERE s.session_name=? AND n.id=? ORDER BY t.generation_ordinal DESC,s.id DESC LIMIT 1`).get(session,node.id) as {id:string;runtime:string|null;resume_type:string|null;resume_token:string|null;generation_uuid:string;native_session_id_at_boot:string|null}|undefined;
+   });
+   const [a,b]=identities;if(!a||!b||a.id===b.id||a.generation_uuid===b.generation_uuid)return false;
+   if(a.runtime===b.runtime){
+     if(a.native_session_id_at_boot&&b.native_session_id_at_boot&&a.native_session_id_at_boot===b.native_session_id_at_boot)return false;
+     if(a.resume_type&&a.resume_type===b.resume_type&&a.resume_token&&b.resume_token&&a.resume_token===b.resume_token)return false;
+   }
+   return true;
+ }
+ private coordinatorMembers(authority:Authority):string[]{
+   let members:unknown;try{members=JSON.parse(authority.coordinators);}catch{reject('coordinator_invalid_members','Malformed current coordinator roster requires exact Operator recovery');}
+   if(!Array.isArray(members)||members.some(s=>typeof s!=='string'))reject('coordinator_invalid_members','Malformed current coordinator roster requires exact Operator recovery');
+   return members as string[];
+ }
  private caller(session: string, generation: string): void {
    if (!generation || this.generation(session) !== generation) reject("coordinator_generation_mismatch", "Caller generation is missing, retired, or unknown");
  }
@@ -97,8 +118,7 @@ export class CoordinatorAuthorityService {
      this.operator(actor,generation);
      const replay = this.replay(input.rigId,input.operationId,"enable",input); if (replay) return replay as Authority;
      if (this.get(input.rigId)) reject("coordinator_already_enabled","Enabled rig cannot silently reset epochs");
-     if (!input.coordinators.includes(input.owner) || input.coordinators.length!==2 || new Set(input.coordinators).size!==2) reject("coordinator_invalid_members","Exactly two distinct registered coordinators required");
-     for (const s of input.coordinators) if (this.local(s)?.rig_id !== input.rigId) reject("coordinator_wrong_rig","Coordinator must be local to immutable rig");
+     if(!this.coordinatorMembersValid(input.rigId,input.owner,input.coordinators))reject("coordinator_invalid_members","Exactly two current same-rig distinct actual coordinator occupants required");
      this.caller(input.owner,input.ownerGeneration); this.validLease(input.leaseMs);
      const baton = this.db.prepare("SELECT destination_session,state FROM queue_items WHERE qitem_id=?").get(input.batonId) as {destination_session:string;state:string}|undefined;
      if (!baton || baton.destination_session!==input.owner || !["pending","in-progress"].includes(baton.state)) reject("coordinator_baton_mismatch","Canonical live baton must already belong to initial holder");
@@ -133,7 +153,7 @@ export class CoordinatorAuthorityService {
      const operationRequest={actor,generation,input};
      const replay=this.replay(input.rigId,input.operationId,"legacy-enrollment",operationRequest);if(replay)return replay as Authority;
      if(this.get(input.rigId))reject("coordinator_already_enabled","Migration cannot reset an enabled epoch");
-     if(input.coordinators.length!==2||new Set(input.coordinators).size!==2||!input.coordinators.includes(input.owner)||input.coordinators.some(s=>this.local(s)?.rig_id!==input.rigId))reject("coordinator_invalid_members","Exactly two local registered coordinators required");
+     if(!this.coordinatorMembersValid(input.rigId,input.owner,input.coordinators))reject("coordinator_invalid_members","Exactly two current same-rig distinct actual coordinator occupants required");
      this.validLease(input.leaseMs);
      const auth=this.db.prepare("SELECT * FROM queue_items WHERE qitem_id=?").get(input.authorizationId) as Record<string,unknown>|undefined;
      let receipt:{kind?:string;proposalDigest?:string}|undefined;try{receipt=auth?JSON.parse(String(auth.body)):undefined;}catch{}
@@ -338,13 +358,13 @@ export class CoordinatorAuthorityService {
  scope(source:string|undefined,destination:string): Authority | undefined {
    if(!this.available())return undefined;
    const from=source && this.local(source), to=this.local(destination);
-   const origin=(from && this.get(from.rig_id)) || (source ? this.db.prepare("SELECT * FROM coordinator_authority WHERE EXISTS(SELECT 1 FROM json_each(CASE WHEN json_valid(coordinators) THEN CASE WHEN json_type(coordinators)='array' THEN coordinators ELSE '[]' END ELSE '[]' END) WHERE value=?)").get(source) as Authority|undefined : undefined), target=to && this.get(to.rig_id);
-   if(origin && (JSON.parse(origin.coordinators) as string[]).includes(source!)) {
+   const origin=from ? this.get(from.rig_id) : (source ? this.db.prepare("SELECT * FROM coordinator_authority WHERE EXISTS(SELECT 1 FROM json_each(CASE WHEN json_valid(coordinators) THEN CASE WHEN json_type(coordinators)='array' THEN coordinators ELSE '[]' END ELSE '[]' END) WHERE value=?)").get(source) as Authority|undefined : undefined), target=to && this.get(to.rig_id);
+   if(origin && this.coordinatorMembers(origin).includes(source!)) {
      // Informational messages to registered coordinators/Kernel remain available, no text classification.
-     if((JSON.parse(origin.coordinators) as string[]).includes(destination)||destination.endsWith("@kernel"))return undefined;
+     if(this.coordinatorMembers(origin).includes(destination)||destination.endsWith("@kernel"))return undefined;
      return origin;
    }
-   if(target && !(JSON.parse(target.coordinators) as string[]).includes(destination))return target;
+   if(target && !this.coordinatorMembers(target).includes(destination))return target;
    return undefined;
  }
  assertRawSend(source:string|undefined,destination:string): void {

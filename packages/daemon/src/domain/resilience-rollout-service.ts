@@ -18,7 +18,7 @@ export class ResilienceRolloutService {
   const a=this.authority.get(rigId);if(!a)return ['explicit-enrollment-and-legacy-custody-contract-required'];
   const coordinators=JSON.parse(a.coordinators) as string[];
   const reasons:string[]=[];
-  if(!Array.isArray(coordinators)||new Set(coordinators).size<2||!coordinators.includes(a.owner_session)||coordinators.some(s=>typeof s!=='string'||!this.authority.generation(s)))reasons.push('actual-current-Lead-and-distinct-Peer-required');
+  if(!this.authority.coordinatorMembersValid(rigId,a.owner_session,coordinators))reasons.push('actual-current-Lead-and-distinct-Peer-required');
   if(a.state!=='active'||this.authority.generation(a.owner_session)!==a.owner_generation||a.lease_until<=this.now())reasons.push('current-holder-reconciliation-required');
   const p=this.authority.coordinationRecovery?.plan(rigId),op=this.authority.generation('operator-agent@kernel');
   if(!p||p.operatorGeneration!==op)reasons.push('current-Operator-admitted-recovery-plan-required');
