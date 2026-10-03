@@ -12,6 +12,7 @@ import { CodexResumeAdapter } from "../src/adapters/codex-resume.js";
 import { CodexThreadIdResolver } from "../src/domain/codex-thread-id.js";
 import { ContextUsageStore } from "../src/domain/context-usage-store.js";
 import { codexDaemonSupportProbe } from "../src/domain/codex-daemon-support.js";
+import { shellQuote } from "../src/adapters/shell-quote.js";
 
 const exec = promisify(execFile), roots: string[] = [];
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const r of roots.splice(0)) fs.rmSync(r, { recursive: true, force: true }); });
@@ -20,6 +21,8 @@ function fixture() {
   const home = path.join(root, "home"), selected = path.join(root, "selected home's"), cwd = path.join(root, "project-two"), bin = path.join(root, "bin");
   for (const dir of [home, selected, cwd, bin, path.join(home, ".codex"), path.join(root, "project-one")]) fs.mkdirSync(dir, { recursive: true });
   const firstConfig = path.join(home, ".codex/config.toml"); fs.writeFileSync(firstConfig, '# first-home sentinel\nmodel = "fixture"\n');
+  fs.writeFileSync(path.join(home, '.codex/history.jsonl'), '{"fixture":"first-home"}\n');
+  fs.writeFileSync(path.join(root, 'project-one/AGENTS.md'), 'first-project sentinel\n');
   fs.writeFileSync(path.join(bin, "codex"), `#!${process.execPath}\nconst fs=require('node:fs');const r={home:process.env.CODEX_HOME,cwd:process.cwd(),argv:process.argv.slice(2)};if(process.env.PROBE_RECORD)fs.appendFileSync(process.env.PROBE_RECORD,JSON.stringify(r)+'\\n');if(process.argv.includes('--help'))console.log('Usage: codex [OPTIONS]\\n  --no-daemon');else if(process.argv.includes('--version'))console.log('codex-cli 0.155.1');else console.log(JSON.stringify(r));\n`, { mode: 0o700 });
   const cli = path.join(bin, "rig"); fs.writeFileSync(cli, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
   const env = { PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`, HOME: home, CODEX_HOME: selected, OPENRIG_HOME: path.join(root, "instance") };
@@ -27,7 +30,8 @@ function fixture() {
   const tmux = { getPaneCommand: vi.fn(async () => "bash"), getSessionEnv: vi.fn(async (_s: string, k: string) => ids[k]), sendShellCommand: vi.fn(async (_s: string, _cmd: string) => ({ ok: true })) };
   const fsOps = { homedir: home, readFile: (p: string) => fs.readFileSync(p, "utf8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c), exists: fs.existsSync, mkdirp: (p: string) => { fs.mkdirSync(p, { recursive: true }); } };
   const launch = (explicit: boolean) => new (SeatLaunchEnvironment as any)(tmux, env, root, cli, explicit ? selected : undefined) as SeatLaunchEnvironment;
-  const run = (cmd: string) => exec('/bin/bash', ['--noprofile', '--norc', '-c', cmd], { cwd, env: { ...env, CODEX_HOME: path.join(home, '.codex') }, timeout: 5000 });
+  const rc = path.join(root, 'pane.rc'); fs.writeFileSync(rc, `export CODEX_HOME=${shellQuote(path.join(home, '.codex'))}\n`);
+  const run = (cmd: string) => exec('/bin/bash', ['--noprofile', '--norc', '-c', `. ${shellQuote(rc)}; ${cmd}`], { cwd, env, timeout: 5000 });
   return { root, home, selected, cwd, bin, env, tmux, fsOps, launch, run, firstConfig };
 }
 
@@ -73,6 +77,7 @@ it.each(['managed', 'legacy', 'capability'])("%s probe uses the explicit home an
   }
   const rows = fs.readFileSync(record, 'utf8').trim().split('\n').map(l => JSON.parse(l));
   expect(rows.length).toBeGreaterThan(0); for (const r of rows) { expect(r.home).toBe(f.selected); expect(r.cwd).toBe(f.cwd); }
+  if (kind !== 'capability') expect(JSON.parse((await f.run(f.tmux.sendShellCommand.mock.calls.at(-1)![1])).stdout).home).toBe(f.selected);
 });
 function seed(root: string, id: string) {
   const logs = new Database(path.join(root, 'logs_2.sqlite')); logs.exec('CREATE TABLE logs (process_uuid TEXT,thread_id TEXT,ts INTEGER)');
@@ -85,6 +90,7 @@ it("selected state root wins without querying PID HOME or falling through to ano
   const pidHome = vi.fn(() => f.home);
   const resolver = new CodexThreadIdResolver({ defaultHome: f.home, codexHome: f.selected, resolveHomeDirByPid: pidHome } as any);
   expect(await resolver.resolve(42, 'Sat Oct  3 00:00:00 2026')).toBe('second'); expect(pidHome).not.toHaveBeenCalled();
+  expect(await resolver.resolve(42, 'Sat Oct  3 00:00:00 2037')).toBeUndefined();
   fs.unlinkSync(path.join(f.selected, 'logs_2.sqlite'));
   expect(await resolver.resolve(42, 'Sat Oct  3 00:00:00 2026')).toBeUndefined(); expect(pidHome).not.toHaveBeenCalled();
 });
@@ -110,6 +116,8 @@ it("seatless startup, disable and projection preserve the other home's bytes; st
     const config = path.join(f.selected, 'config.toml'); const text = fs.readFileSync(config, 'utf8');
     expect(text).toContain('trusted_hash'); expect(text).toContain('hooks');
     const a = first.deps.runtimeAdapters!.codex as CodexRuntimeAdapter;
+    a.ensureCodexFeatureFlag(true, { codexVersion: '0.120.0' });
+    expect(fs.readFileSync(config, 'utf8')).toContain('codex_hooks = true');
     a.ensureManagedBootstrap({ cwd: f.cwd });
     const fragment = path.join(f.cwd, 'fragment.toml'); fs.writeFileSync(fragment, '[sandbox_workspace_write]\nnetwork_access = false\n');
     const result = await a.project({ entries: [{ category: 'runtime_resource', effectiveId: 'fixture', classification: 'safe_projection', resourceType: 'codex_config_fragment', absolutePath: fragment }] } as any, { cwd: f.cwd } as any);
@@ -123,6 +131,12 @@ it("seatless startup, disable and projection preserve the other home's bytes; st
   } finally { first.db.close(); }
   vi.stubEnv('OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED', 'false');
   const second = await start();
-  try { expect(fs.readFileSync(path.join(f.selected, 'config.toml'), 'utf8')).not.toContain('# BEGIN OPENRIG MANAGED ACTIVITY HOOKS'); expect(fs.readFileSync(f.firstConfig)).toEqual(before); }
+  try {
+    expect(fs.readFileSync(path.join(f.selected, 'config.toml'), 'utf8')).not.toContain('# BEGIN OPENRIG MANAGED ACTIVITY HOOKS');
+    expect(fs.readFileSync(f.firstConfig)).toEqual(before);
+    expect(fs.readdirSync(path.join(f.home, '.codex')).sort()).toEqual(['config.toml', 'history.jsonl']);
+    expect(fs.readFileSync(path.join(f.home, '.codex/history.jsonl'), 'utf8')).toBe('{"fixture":"first-home"}\n');
+    expect(fs.readFileSync(path.join(f.root, 'project-one/AGENTS.md'), 'utf8')).toBe('first-project sentinel\n');
+  }
   finally { second.db.close(); }
 }, 60000);
