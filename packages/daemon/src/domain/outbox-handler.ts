@@ -1,3 +1,4 @@
+import { historicalQuarantineExists, isHistoricalQuarantined } from "./historical-effect-disposition.js";
 import type { SeatDeliveryGuard } from "./seat-delivery-guard.js";
 import { EventBus } from "./event-bus.js";
 import { createHash } from "node:crypto";
@@ -430,11 +431,14 @@ export class OutboxHandler {
    * overlapping drainer's claim finds the row no longer `pending` and returns
    * false, so exactly one caller performs the external send.
    */
+  isHistoricalQuarantined(outboxId: string): boolean { return isHistoricalQuarantined(this.db,outboxId); }
+
   claimForDelivery(outboxId: string): boolean {
+    const exclude = historicalQuarantineExists(this.db) ? " AND NOT EXISTS (SELECT 1 FROM outbox_historical_quarantines h WHERE h.outbox_id=outbox_entries.outbox_id AND h.state='held')" : "";
     const result = this.db
       .prepare(
         `UPDATE outbox_entries SET delivery_state = 'sending'
-          WHERE outbox_id = ? AND delivery_state = 'pending'`
+          WHERE outbox_id = ? AND delivery_state = 'pending'${exclude}`
       )
       .run(outboxId);
     return result.changes === 1;
@@ -484,6 +488,7 @@ export class OutboxHandler {
    * so a caller can page and terminate on a served short batch (never a silent cap).
    */
   listPending(idPrefix: string, limit = 200): OutboxEntry[] {
+    const exclude = historicalQuarantineExists(this.db) ? " AND NOT EXISTS (SELECT 1 FROM outbox_historical_quarantines h WHERE h.outbox_id=outbox_entries.outbox_id AND h.state='held')" : "";
     // EXACT-CASE prefix match. SQLite `LIKE` is case-insensitive by default, so a
     // `LIKE 'wake-intent-%'` selector would also execute `WAKE-INTENT-…` variants.
     // `substr(...) = ?` uses the binary collation (case-sensitive), so exactly one
@@ -493,7 +498,7 @@ export class OutboxHandler {
     const rows = this.db
       .prepare(
         `SELECT * FROM outbox_entries
-          WHERE delivery_state = 'pending' AND substr(outbox_id, 1, ?) = ?
+          WHERE delivery_state = 'pending' AND substr(outbox_id, 1, ?) = ?${exclude}
           ORDER BY ts_dispatched ASC, rowid ASC LIMIT ?`
       )
       .all(idPrefix.length, idPrefix, limit) as OutboxEntryRow[];

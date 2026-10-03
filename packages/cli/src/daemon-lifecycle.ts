@@ -167,6 +167,8 @@ export interface StartOptions {
   // Exposed at the CLI as `rig daemon start --no-kernel`; projected
   // into the daemon process env as OPENRIG_NO_KERNEL.
   skipKernelBoot?: boolean;
+  wakeRecoveryMode?: "deliver"|"observe";
+  wakeRecoveryManifest?: string;
 }
 
 export interface LifecycleDeps {
@@ -424,6 +426,12 @@ const ENV_SCRUB_EXACT = new Set([
   "TERMINFO",
 ]);
 
+export function validateWakeRecoveryOptions(opts: Pick<StartOptions, "wakeRecoveryMode"|"wakeRecoveryManifest">): "deliver"|"observe" {
+  const mode=opts.wakeRecoveryMode??"deliver";
+  if (!["deliver","observe"].includes(mode) || (mode==="observe"&&(!opts.wakeRecoveryManifest||!path.isAbsolute(opts.wakeRecoveryManifest))) || (mode==="deliver"&&opts.wakeRecoveryManifest)) throw new Error("Observe wake recovery requires an absolute exact cohort manifest; deliver has none");
+  return mode;
+}
+
 export function buildDaemonEnv(
   baseEnv: Record<string, string>,
   opts: {
@@ -452,9 +460,12 @@ export function buildDaemonEnv(
     // V0.3.1 slice 05 — projected via OPENRIG_NO_KERNEL env var so
     // the daemon's startup.ts kernel-boot path honors the flag.
     skipKernelBoot?: boolean;
+  wakeRecoveryMode?: "deliver"|"observe";
+  wakeRecoveryManifest?: string;
   },
 ): Record<string, string> {
   const env: Record<string, string> = {};
+  const recoveryMode=validateWakeRecoveryOptions(opts);
 
   for (const [key, value] of Object.entries(baseEnv)) {
     if (ENV_SCRUB_EXACT.has(key)) continue;
@@ -490,6 +501,9 @@ export function buildDaemonEnv(
     env["OPENRIG_NO_KERNEL"] = "1";
   }
 
+  env["OPENRIG_WAKE_RECOVERY_MODE"]=recoveryMode;
+  delete env["OPENRIG_WAKE_RECOVERY_MANIFEST"];
+  if(opts.wakeRecoveryManifest)env["OPENRIG_WAKE_RECOVERY_MANIFEST"]=opts.wakeRecoveryManifest;
   return env;
 }
 
@@ -579,6 +593,7 @@ class StartupIdentityError extends Error {}
 class StartupChildPendingError extends Error {}
 
 export async function startDaemon(opts: StartOptions, deps: LifecycleDeps): Promise<DaemonState> {
+  validateWakeRecoveryOptions(opts);
   if (!deps.acquireStartLock) throw new Error("Daemon startup requires a local launch reservation");
   const lock = deps.acquireStartLock();
   let preserve = false;
@@ -658,6 +673,8 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
       transcriptsLines: opts.transcriptsLines,
       transcriptsPollIntervalSeconds: opts.transcriptsPollIntervalSeconds,
       skipKernelBoot: opts.skipKernelBoot,
+      wakeRecoveryMode:opts.wakeRecoveryMode,
+      wakeRecoveryManifest:opts.wakeRecoveryManifest,
     }),
     stdio: ["ignore", logFd, logFd],
     detached: true,

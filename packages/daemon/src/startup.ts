@@ -1,4 +1,5 @@
 import {RuntimeOutcomeAssessment} from "./domain/runtime-outcome-assessment.js";
+import { applyHistoricalStartupRecovery } from "./domain/historical-effect-disposition.js";
 import { CoordinationRecoveryService } from "./domain/coordination-recovery-service.js";
 import {makeCoordinatorRuntimeObserver} from "./domain/coordinator-runtime-availability.js";
 import {makeCoordinatorContinuityPolicy} from "./domain/policies/coordinator-continuity.js";
@@ -260,6 +261,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const dbPath = opts?.dbPath ?? ":memory:";
   const db = createDb(dbPath);
   migrate(db, ALL_MIGRATIONS);
+  // Freeze only the genuine authorized exact cohort before any startup policy or send.
+  applyHistoricalStartupRecovery(db,process.env.OPENRIG_WAKE_RECOVERY_MODE,process.env.OPENRIG_WAKE_RECOVERY_MANIFEST);
 
   // 51-09 increment 1 — establish the daemon's durable self-host identity at
   // boot (mint on first boot, reconcile thereafter). host.name is a display-only

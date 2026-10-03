@@ -1,0 +1,109 @@
+import { beforeEach, afterEach, it, expect, vi } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createFullTestDb } from './helpers/test-app.js';
+import { seed } from './helpers/coordinator-fixture.js';
+import { HistoricalEffectDispositionService, historicalDigest, applyHistoricalStartupRecovery, type HistoricalPlan, type HistoricalDisposition } from '../src/domain/historical-effect-disposition.js';
+import { OutboxHandler } from '../src/domain/outbox-handler.js';
+import { SeatDeliveryGuard, resolveGuardTarget } from '../src/domain/seat-delivery-guard.js';
+import { QueueRepository } from '../src/domain/queue-repository.js';
+import { SessionRegistry } from '../src/domain/session-registry.js';
+import { EventBus } from '../src/domain/event-bus.js';
+import { Hono } from 'hono';
+import { queueRoutes } from '../src/routes/queue.js';
+
+let db: ReturnType<typeof createFullTestDb>, service: HistoricalEffectDispositionService, outbox: OutboxHandler, repo: QueueRepository, guard: SeatDeliveryGuard;
+const actor='operator-agent@kernel', generation='operator-agent-g1';
+beforeEach(async()=>{
+ db=createFullTestDb();seed(db);for(const n of ['builder@xv','worker@other'])db.prepare("INSERT INTO bindings(id,node_id,tmux_session) VALUES (?,?,?)").run(n,n,n);service=new HistoricalEffectDispositionService(db);outbox=new OutboxHandler(db);guard=new SeatDeliveryGuard(db,n=>resolveGuardTarget(db,n));
+ const sessions=new SessionRegistry(db);repo=new QueueRepository(db,new EventBus(db),{resolveOccupantGeneration:s=>sessions.currentOccupantGenerationForSession(s)});
+ await repo.create({qitemId:'baton',sourceSession:actor,destinationSession:'lead@xv',body:'canonical valuable baton',nudge:false,identityProvenance:'transport:v1'});repo.claim({qitemId:'baton',destinationSession:'lead@xv'});
+});
+afterEach(()=>{vi.restoreAllMocks();db.close();});
+async function wake(id='old',destination='builder@xv') {
+ await repo.create({qitemId:id,sourceSession:'lead@xv',destinationSession:destination,body:'valuable obligation',nudge:false});
+ outbox.record({outboxId:`wake-intent-${id}`,senderSession:'lead@xv',destinationSession:destination,body:'frozen old intent',auditPointer:id});return `wake-intent-${id}`;
+}
+function plan(ids:string[],operationId='quarantine'):HistoricalPlan {return {rigId:'xv',leadBatonId:'baton',leadGeneration:'lead-g1',operatorGeneration:generation,operationId,authorizationId:`auth-${operationId}`,expiresAt:Date.now()+600000,effects:service.inspect('xv',ids)};}
+function disposition(id:string,operationId='withdraw',action:HistoricalDisposition['action']='withdraw-obsolete-wake'):HistoricalDisposition {const {effects,...p}=plan([id],operationId);return {...p,quarantineOperationId:'hold-'+id,effect:effects[0]!,action,reason:'Current custodian withdraws obsolete input while preserving unknown delivery',evidenceRef:'public-synthetic-current-native-review'};}
+async function authorize(input:HistoricalPlan|HistoricalDisposition,kind='effects' in input?'outbox-historical-quarantine-authorization':'outbox-historical-disposition-authorization',provenance='transport:v1') {
+ if(!('effects' in input)&&!outbox.isHistoricalQuarantined(input.effect.outboxId)){const p=plan([input.effect.outboxId],input.quarantineOperationId);await authorize(p);service.quarantine(actor,generation,p);}
+ await repo.create({qitemId:input.authorizationId,sourceSession:'lead@xv',destinationSession:actor,body:JSON.stringify({kind,requestDigest:historicalDigest({actor,generation,input})}),identityProvenance:provenance,nudge:false});repo.claim({qitemId:input.authorizationId,destinationSession:actor});
+}
+const original=()=>db.prepare('SELECT * FROM outbox_entries ORDER BY outbox_id').all();
+it('refuses fresh or unlisted effects and a different quarantine operation',async()=>{
+ const old=await wake(),p=plan([old],'admitted');await authorize(p);service.quarantine(actor,generation,p);const fresh=await wake('fresh');const before=original();await expect(service.dispose(actor,generation,disposition(fresh),guard)).rejects.toThrow('prior historical quarantine');await expect(service.dispose(actor,generation,{...disposition(old),quarantineOperationId:'wrong'},guard)).rejects.toThrow('prior historical quarantine');expect(original()).toEqual(before);expect(outbox.claimForDelivery(fresh)).toBe(true);expect(outbox.claimForDelivery(old)).toBe(false);
+});
+it('quarantines exact historical rows without changing outbox, obligations, or valuable claims',async()=>{
+ const id=await wake();const p=plan([id]);await authorize(p);const rows=original(),q=db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all();
+ expect(service.quarantine(actor,generation,p)).toMatchObject({deliveryConclusion:'unknown',outboxMutations:0});expect(original()).toEqual(rows);expect(db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all()).toEqual(q);expect(outbox.listPending('wake-intent-')).toEqual([]);expect(outbox.claimForDelivery(id)).toBe(false);
+});
+it('delivers new unambiguous work to the same rig and another project while old intents remain held',async()=>{
+ const old=await wake(),p=plan([old]);await authorize(p);service.quarantine(actor,generation,p);await wake('fresh');await wake('other','worker@other');
+ const sent:string[]=[];repo.attachOutbox(outbox);repo.attachTransport({send:async(_s,_b,o)=>{sent.push(...o!.committedOutboxIds!);return {ok:true,verified:true};}});
+ expect(await repo.drainPendingWakeIntents()).toMatchObject({delivered:2});expect(sent.sort()).toEqual(['wake-intent-fresh','wake-intent-other']);expect(outbox.getById(old)?.deliveryState).toBe('pending');
+});
+it('excludes held peers from coalesced returns, even when a fresh intent drains first',async()=>{
+ const old=await wake(),p=plan([old]);await authorize(p);service.quarantine(actor,generation,p);const fresh=await wake('fresh');
+ db.prepare("UPDATE outbox_entries SET tags=? WHERE outbox_id IN (?,?)").run(JSON.stringify(['queue:return:one-result']),old,fresh);
+ const sent:string[]=[];repo.attachOutbox(outbox);repo.attachTransport({send:async(_s,_b,o)=>{sent.push(...o!.committedOutboxIds!);return {ok:true,verified:true};}});await repo.drainPendingWakeIntents();expect(sent).toEqual([fresh]);expect(outbox.getById(old)?.deliveryState).toBe('pending');
+});
+it('withdraws guarded executable intentions with unknown delivery and unchanged original custody/payload',async()=>{
+ const id=await wake();db.prepare('UPDATE outbox_entries SET guard_binding=? WHERE outbox_id=?').run(JSON.stringify({nodeId:'builder@xv',occupant:'retired-g0',pane:'%retired',session:'builder@xv'}),id);const p=disposition(id);await authorize(p);
+ const q=db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all(),before=outbox.getById(id)!;const result=await service.dispose(actor,generation,p,guard);
+ expect(result).toMatchObject({deliveryConclusion:'unknown',queueMutations:0,originalState:'pending'});expect(outbox.getById(id)).toMatchObject({deliveryState:'retired',body:before.body,auditPointer:before.auditPointer,guardBinding:before.guardBinding,deliveredAt:null});expect(db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all()).toEqual(q);
+});
+it('does not supersede or mutate a quarantined terminal-target wake during drain',async()=>{
+ const id=await wake();repo.claim({qitemId:'old',destinationSession:'builder@xv'});repo.update({qitemId:'old',actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});const p=plan([id]);await authorize(p);service.quarantine(actor,generation,p);const before=original();repo.attachOutbox(outbox);const send=vi.fn(async()=>({ok:true,verified:true}));repo.attachTransport({send});await repo.drainPendingWakeIntents();expect(send).not.toHaveBeenCalled();expect(original()).toEqual(before);
+});
+it('missing sender is recorded as custodian disposition without inventing original delivery or provenance',async()=>{
+ const id=outbox.record({senderSession:'departed@xv',destinationSession:'lead@xv',body:'valuable preserved historical payload'}).outboxId;outbox.markIndeterminate(id);const p=disposition(id,'missing','custodian-withdraw-unregistered-direct');await authorize(p);const before=outbox.getById(id)!;expect(await service.dispose(actor,generation,p,guard)).toMatchObject({originalState:'indeterminate',deliveryConclusion:'unknown'});expect(outbox.getById(id)).toMatchObject({body:before.body,senderSession:'departed@xv',deliveryState:'retired',deliveredAt:null});expect(db.prepare("SELECT 1 FROM sessions WHERE session_name='departed@xv'").get()).toBeUndefined();
+});
+it('registered direct traffic retains the original sender abandonment gate',async()=>{
+ const id=outbox.record({senderSession:'builder@xv',destinationSession:'lead@xv',body:'current sender obligation'}).outboxId;const p=disposition(id,'registered','custodian-withdraw-unregistered-direct');await authorize(p);await expect(service.dispose(actor,generation,p,guard)).rejects.toThrow('registered direct');expect(outbox.getById(id)?.deliveryState).toBe('pending');
+});
+it('withdraws an obsolete wake whose historical guard node is gone without recreating a custodian',async()=>{
+ const id=await wake();const binding=JSON.stringify({nodeId:'gone-predecessor',session:'departed@xv',occupant:'retired',pane:'%gone'});db.prepare('UPDATE outbox_entries SET guard_binding=? WHERE outbox_id=?').run(binding,id);const p=disposition(id);await authorize(p);expect(await service.dispose(actor,generation,p,guard)).toMatchObject({deliveryConclusion:'unknown',originalGuardHash:historicalDigest(binding)});expect(db.prepare("SELECT 1 FROM nodes WHERE id='gone-predecessor'").get()).toBeUndefined();expect(db.prepare('SELECT guard_binding FROM outbox_entries WHERE outbox_id=?').get(id)).toEqual({guard_binding:binding});
+});
+it('after enrollment requires the actual current Peer baton and Peer transport authorization',async()=>{
+ const id=await wake();db.prepare("UPDATE queue_items SET source_session='lead@xv',destination_session='peer@xv',claimed_by_generation_uuid='peer-g1' WHERE qitem_id='baton'").run();db.prepare("INSERT INTO coordinator_authority VALUES ('xv','baton','peer@xv','peer-g1',2,?,'reconciling','new-holder','[\"lead@xv\",\"peer@xv\"]',NULL)").run(Date.now()+600000);const p={...plan([id]),leadGeneration:'peer-g1'};await repo.create({qitemId:p.authorizationId,sourceSession:'peer@xv',destinationSession:actor,body:JSON.stringify({kind:'outbox-historical-quarantine-authorization',requestDigest:historicalDigest({actor,generation,input:p})}),nudge:false,identityProvenance:'transport:v1'});repo.claim({qitemId:p.authorizationId,destinationSession:actor});expect(service.quarantine(actor,generation,p)).toMatchObject({lead:'peer@xv',leadGeneration:'peer-g1'});
+});
+it('read-only snapshot returns exact hashes and refuses retired or foreign custody',async()=>{
+ const id=await wake(),input={rigId:'xv',leadBatonId:'baton',leadGeneration:'lead-g1',operatorGeneration:generation,outboxIds:[id]},before=original();expect(service.snapshot(actor,generation,input)).toEqual(service.inspect('xv',[id]));expect(()=>service.snapshot(actor,'retired',input)).toThrow('current Kernel');expect(original()).toEqual(before);expect(db.prepare('SELECT count(*) n FROM outbox_historical_operations').get()).toEqual({n:0});
+});
+it.each(['claimed:v1','legacy:v1'])('refuses nontransport Lead authorization %s',async provenance=>{const id=await wake(),p=plan([id]);await authorize(p,undefined,provenance);expect(()=>service.quarantine(actor,generation,p)).toThrow('transport authorization');expect(outbox.isHistoricalQuarantined(id)).toBe(false);});
+it('requires actual authorization claim, exact digest, current Lead and Operator generations',async()=>{
+ const id=await wake(),p=plan([id]);await authorize(p);expect(()=>service.quarantine(actor,'retired',p)).toThrow('current Kernel');expect(()=>service.quarantine(actor,generation,{...p,leadGeneration:'retired'})).toThrow('Lead baton');expect(()=>service.quarantine(actor,generation,{...p,expiresAt:p.expiresAt+1})).toThrow('transport authorization');db.prepare("UPDATE queue_items SET claimed_by_generation_uuid=NULL WHERE qitem_id=?").run(p.authorizationId);expect(()=>service.quarantine(actor,generation,p)).toThrow('transport authorization');
+});
+it('refuses a nonLead baton before enrollment and the former Lead after current authority changes',async()=>{
+ const id=await wake(),p=plan([id]);await authorize(p);db.prepare("UPDATE queue_items SET destination_session='builder@xv',claimed_by_generation_uuid='builder-g1' WHERE qitem_id='baton'").run();expect(()=>service.quarantine(actor,generation,{...p,leadGeneration:'builder-g1'})).toThrow('actual Operator-issued');
+ db.prepare("UPDATE queue_items SET destination_session='lead@xv',claimed_by_generation_uuid='lead-g1' WHERE qitem_id='baton'").run();db.prepare("INSERT INTO coordinator_authority VALUES ('xv','baton','peer@xv','peer-g1',1,?,'reconciling','new-holder','[\"lead@xv\",\"peer@xv\"]',NULL)").run(Date.now()+600000);expect(()=>service.quarantine(actor,generation,p)).toThrow('Retired dispatcher');
+});
+it('rollback covers partial cohort insertion, row/custody drift, and durable receipt failure',async()=>{
+ const a=await wake('a'),b=await wake('b'),p=plan([a,b]);await authorize(p);outbox.markFailed(b);expect(()=>service.quarantine(actor,generation,p)).toThrow('row/custody changed');expect(outbox.isHistoricalQuarantined(a)).toBe(false);
+ const d=disposition(a);await authorize(d);const before=original();db.exec("CREATE TRIGGER fail_historical_receipt BEFORE INSERT ON outbox_historical_operations BEGIN SELECT RAISE(ABORT,'receipt unavailable');END");await expect(service.dispose(actor,generation,d,guard)).rejects.toThrow('receipt unavailable');expect(original()).toEqual(before);
+});
+it('refuses changed obligation custody and in-flight effects rather than converting them to retained',async()=>{
+ const id=await wake(),p=disposition(id);await authorize(p);repo.claim({qitemId:'old',destinationSession:'builder@xv'});await expect(service.dispose(actor,generation,p,guard)).rejects.toThrow('row/custody changed');const q=disposition(id,'inflight');await authorize(q);expect(outbox.claimForDelivery(id)).toBe(false);db.prepare("UPDATE outbox_entries SET delivery_state='sending' WHERE outbox_id=?").run(id);await expect(service.dispose(actor,generation,q,guard)).rejects.toThrow('row/custody changed');expect(outbox.getById(id)?.deliveryState).toBe('sending');
+});
+it('waits for lifecycle and rejects recipient replacement before any effect mutation',async()=>{
+ const id=await wake(),p=disposition(id);await authorize(p);let release!:()=>void,ready!:()=>void;const entered=new Promise<void>(r=>ready=r);const hold=guard.lifecycle(['builder@xv'],async()=>{ready();await new Promise<void>(r=>release=r);});await entered;const before=original(),pending=service.dispose(actor,generation,p,guard);db.prepare("UPDATE occupant_tenures SET generation_uuid='builder-g2' WHERE node_id='builder@xv'").run();release();await hold;await expect(pending).rejects.toThrow('changed while waiting');expect(original()).toEqual(before);
+});
+it('exact retry works after authorization closes; changed request or retired caller cannot replay',async()=>{
+ const id=await wake(),p=disposition(id);await authorize(p);const receipt=await service.dispose(actor,generation,p,guard);repo.update({qitemId:p.authorizationId,actorSession:actor,state:'done',closureReason:'no-follow-on'});expect(await service.dispose(actor,generation,p,guard)).toEqual(receipt);await expect(service.dispose(actor,generation,{...p,reason:'changed'},guard)).rejects.toThrow('replay changed');await expect(service.dispose(actor,'old-g0',p,guard)).rejects.toThrow('current Kernel');expect(db.prepare("SELECT count(*) n FROM outbox_historical_operations").get()).toEqual({n:2});
+});
+it('overlapping disposition callers commit exactly one receipt and preserve uncertain outcome',async()=>{
+ const id=await wake(),a=disposition(id,'a'),b=disposition(id,'b');await authorize(a);await authorize(b);const outcomes=await Promise.allSettled([service.dispose(actor,generation,a,guard),service.dispose(actor,generation,b,guard)]);expect(outcomes.filter(r=>r.status==='fulfilled')).toHaveLength(1);expect(db.prepare("SELECT count(*) n FROM outbox_historical_operations").get()).toEqual({n:2});expect(outbox.getById(id)).toMatchObject({deliveryState:'retired',deliveredAt:null});
+});
+it('startup requires exact absolute nonlink manifest; expires without releasing held history or stopping fresh work',async()=>{
+ const id=await wake(),p=plan([id]);await authorize(p);const dir=mkdtempSync(join(tmpdir(),'openrig-historical-startup-'));
+ try {const path=join(dir,'manifest.json');writeFileSync(path,JSON.stringify(p));const link=join(dir,'link');symlinkSync(path,link);expect(()=>applyHistoricalStartupRecovery(db,'observe',link)).toThrow('Regular manifest');expect(()=>applyHistoricalStartupRecovery(db,'observe','relative.json')).toThrow('absolute');expect(()=>applyHistoricalStartupRecovery(db,'deliver',path)).toThrow('requires observe');expect(()=>applyHistoricalStartupRecovery(db,'invalid',undefined)).toThrow('deliver or observe');expect(applyHistoricalStartupRecovery(db,'observe',path)).toMatchObject({outboxMutations:0});expect(applyHistoricalStartupRecovery(db,'observe',path)).toEqual(applyHistoricalStartupRecovery(db,'observe',path));db.prepare('UPDATE outbox_historical_quarantines SET admitted_until=0').run();await wake('fresh');expect(outbox.listPending('wake-intent-').map(e=>e.outboxId)).toEqual(['wake-intent-fresh']);const expired={...plan([id],'expired'),expiresAt:0};expect(()=>service.quarantine(actor,generation,expired)).toThrow('future admission');}finally{rmSync(dir,{recursive:true,force:true});}
+});
+it('typed malformed/foreign/missing-audit requests fail without modifying outbox',async()=>{
+ expect(()=>service.quarantine(actor,generation,null as never)).toThrow('typed historical');const id=outbox.record({outboxId:'wake-intent-no-audit',senderSession:'lead@xv',destinationSession:'builder@xv',body:'preserved'}).outboxId;const p=disposition(id);await authorize(p);await expect(service.dispose(actor,generation,p,guard)).rejects.toThrow('preserved queue custody');const foreign=outbox.record({senderSession:'worker@other',destinationSession:'missing@other',body:'other rig'}).outboxId;expect(()=>service.inspect('xv',[foreign])).toThrow('active local rig');expect(outbox.getById(id)?.deliveryState).toBe('pending');
+});
+it('API requires configured bearer control and derives actual Operator identity',async()=>{
+ const id=await wake(),p=plan([id]);await authorize(p);const app=new Hono();app.use('*',async(c,next)=>{c.set('terminalBearerToken' as never,'synthetic-control' as never);c.set('queueRepo' as never,repo as never);c.set('tmuxAdapter' as never,{deliveryGuard:guard} as never);await next();});app.route('/queue',queueRoutes());
+ const request=(headers:Record<string,string>)=>app.request('/queue/outbox/historical/quarantine',{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify({...p,actor:'forged-body'})});expect((await request({})).status).toBe(401);const headers={Authorization:'Bearer synthetic-control','X-OpenRig-Session':actor,'X-OpenRig-Occupant-Generation':generation};expect((await request(headers)).status).toBe(409);const valid=await app.request('/queue/outbox/historical/quarantine',{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(p)});expect(valid.status).toBe(200);
+});

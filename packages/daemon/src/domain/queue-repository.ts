@@ -1017,6 +1017,8 @@ export class QueueRepository {
     // original frozen intent and audit pointer survives; only transport coalesces.
     let superseded = false;
     const actionable = (entry: import("./outbox-handler.js").OutboxEntry): boolean => {
+      // Exact historical quarantine applies to individual and coalesced drains.
+      if (this.outbox!.isHistoricalQuarantined(entry.outboxId)) return false;
       const row = entry.auditPointer ? this.db.prepare("SELECT state FROM queue_items WHERE qitem_id = ?").get(entry.auditPointer) as { state: string } | undefined : undefined;
       let current = row?.state === "pending";
       if(current&&entry.tags?.includes('queue:coordinator-resume')){

@@ -1,3 +1,5 @@
+import { HistoricalEffectDispositionService, HistoricalEffectError } from "../domain/historical-effect-disposition.js";
+import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import { CoordinatorFenceError, AssignmentReplay, type DispatchEnvelope } from "../domain/coordinator-authority-service.js";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
@@ -1115,6 +1117,22 @@ export function queueRoutes(): Hono {
       identityProvenance: resolveRecordedProvenance(c, identity), // P21 §4 era-stamp: transport:v1 if the header proved it here, else claimed:v1 (resolveRecordedProvenance degrades)
     });
     return c.json(entry, 201);
+  });
+
+  app.post("/outbox/historical/:operation", async c => {
+    const token=c.get("terminalBearerToken" as never) as string|null;
+    if(!token)return c.json({error:"historical_authenticated_control_required"},503);
+    const auth=await authBearerTokenMiddleware({expectedToken:token})(c,async()=>{});if(auth)return auth;
+    const actor=transportSenderSession(c),generation=c.req.header("X-OpenRig-Occupant-Generation");
+    if(!actor||!generation)return c.json({error:"historical_operator_required"},403);
+    const service=new HistoricalEffectDispositionService(getRepo(c).coordinatorAuthority.db);
+    try {
+      const input=await c.req.json(),operation=c.req.param("operation");
+      if(operation==="snapshot")return c.json(service.snapshot(actor,generation,input));
+      if(operation==="quarantine")return c.json(service.quarantine(actor,generation,input));
+      if(operation==="dispose")return c.json(await service.dispose(actor,generation,input,(c.get("tmuxAdapter" as never) as import("../adapters/tmux.js").TmuxAdapter|undefined)?.deliveryGuard));
+      return c.json({error:"unknown_historical_operation"},404);
+    }catch(error){if(error instanceof HistoricalEffectError)return c.json({error:error.code,message:error.message},409);if(error instanceof SyntaxError)return c.json({error:"invalid_json"},400);throw error;}
   });
 
   app.post("/outbox/abandon-uncertain", async(c)=>{

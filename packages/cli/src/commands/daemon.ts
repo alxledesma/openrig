@@ -14,6 +14,7 @@ import {
   OPENRIG_DIR,
   STATE_FILE,
   resolveBindIntent,
+  validateWakeRecoveryOptions,
 } from "../daemon-lifecycle.js";
 
 interface ProcessAliveDeps {
@@ -104,6 +105,8 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
     .command("start")
     .description("Start the daemon")
     .addHelpText("after", "\nStartup reserves this local instance before initialization and verifies the spawned child PID on every required listener.\nMissing/mismatched identity or child exit fails startup; failed publication withdraws only this launch's matching state. Use a matching CLI/daemon installation.\nA concurrent start fails without spawning another child. Inspect daemon-start.lock for launcher/child PIDs after an interrupted start;\nonly archive an abandoned reservation after proving both processes absent. A failed cleanup retains it and reports the child PID.\n")
+    .option("--wake-recovery-mode <mode>", "deliver (default) or observe exact historical cohort")
+    .option("--wake-recovery-manifest <path>", "Absolute current Lead/Operator-authorized cohort manifest for observe")
     .option("--port <port>", "Port to listen on")
     .option("--host <host>", "Host to bind on")
     .option("--db <path>", "Database path")
@@ -121,8 +124,9 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
     // weaker "daemon-ready". Default 60s; override with --wait-for-kernel-ms.
     .option("--wait-for-kernel", "After daemon binds, also wait for kernel-agent readiness (default timeout 60s)")
     .option("--wait-for-kernel-ms <ms>", "Override --wait-for-kernel timeout in milliseconds")
-    .action(async (opts: { port?: string; host?: string; db?: string; kernel?: boolean; waitForKernel?: boolean; waitForKernelMs?: string }) => {
+    .action(async (opts: { port?: string; host?: string; db?: string; kernel?: boolean; wakeRecoveryMode?: "deliver"|"observe"; wakeRecoveryManifest?: string; waitForKernel?: boolean; waitForKernelMs?: string }) => {
       try {
+        validateWakeRecoveryOptions(opts);
         const { ConfigStore } = await import("../config-store.js");
         const { SystemPreflight } = await import("../system-preflight.js");
         const { execSync } = await import("node:child_process");
@@ -190,6 +194,8 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
             // OPENRIG_NO_KERNEL env var so the daemon's kernel-boot
             // check in startup.ts honors the flag.
             skipKernelBoot: skipKernel,
+            wakeRecoveryMode:opts.wakeRecoveryMode,
+            wakeRecoveryManifest:opts.wakeRecoveryManifest,
           },
           getDeps(),
         );
