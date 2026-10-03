@@ -8,6 +8,24 @@ export interface OutcomePolicy {
  qualification:{ref:string;providerConfigDigest:string;validUntil:number};
 }
 type Job={rigId:string;packageKey:string;queueId:string;dispositionId:string;worker:string;generation:string;policyRevision:string;inputDigest:string;configurationDigest:string|null;state:string;createdAt:number;startedAt?:number};
+/** Fixed-size allowlist of normalized adapter evidence; never raw provider payloads. */
+export function sanitizedAssessmentEvidence(receipt:Record<string,unknown>,configDigest:string):Record<string,unknown> {
+ const obj=(v:unknown):Record<string,unknown>|null=>v!==null&&typeof v==='object'&&!Array.isArray(v)?v as Record<string,unknown>:null;
+ const text=(v:unknown)=>typeof v==='string'&&v.length<=256?v:null;
+ const hash=(v:unknown)=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v)?v:null;
+ const probability=(v:unknown)=>typeof v==='number'&&Number.isFinite(v)&&v>=0&&v<=1;
+ const count=(v:unknown)=>typeof v==='number'&&Number.isSafeInteger(v)&&v>=0;
+ const answer=obj(obj(receipt.answers)?.outcome), probabilities=obj(answer?.probabilities);
+ let outcome:Record<string,unknown>|null=null;
+ if(answer?.type==='choice'&&['yes','no','unknown'].includes(String(answer.choice))&&probabilities&&Object.keys(probabilities).sort().join(',')==='no,unknown,yes'&&Object.values(probabilities).every(probability)&&Math.abs(Number(probabilities.yes)+Number(probabilities.no)+Number(probabilities.unknown)-1)<0.0001&&probability(answer.topProbability)&&probability(answer.margin)){
+  outcome={type:'choice',choice:answer.choice,probabilities:{yes:probabilities.yes,no:probabilities.no,unknown:probabilities.unknown},topProbability:answer.topProbability,margin:answer.margin};
+  for(const key of ['providerConfidence','providerAnswerConfidence'])if(probability(answer[key]))outcome[key]=answer[key];
+ }
+ const rawUsage=obj(receipt.usage),usage:Record<string,number>={};
+ for(const key of ['input_tokens','output_tokens'])if(count(rawUsage?.[key]))usage[key]=rawUsage![key] as number;
+ if(typeof rawUsage?.cost==='number'&&Number.isFinite(rawUsage.cost)&&rawUsage.cost>=0&&rawUsage.cost<=Number.MAX_SAFE_INTEGER)usage.cost=rawUsage.cost;
+ return {schema:'runtime-assessment-evidence.v1',providerConfigDigest:hash(configDigest),assessmentInputDigest:hash(receipt.inputDigest),rubricId:receipt.rubricId==='runtime-explicit-unfinished-v1'?receipt.rubricId:null,rubricDigest:hash(receipt.rubricDigest),providerId:text(receipt.providerId),requestedModel:text(receipt.requestedModel),model:text(receipt.model),calibrationId:text(receipt.calibrationId),inputCoverage:['unverified','truncated','reported_complete'].includes(String(receipt.inputCoverage))?receipt.inputCoverage:null,outcome,usage,latencyMs:count(receipt.latencyMs)?receipt.latencyMs:null,grantsAuthority:false};
+}
 const reject=(code:string,message:string):never=>{throw new CoordinatorFenceError(code,message);};
 /** One harness-neutral durable terminal-return consumer. Models classify only;
  * queue/identity/admission/current-holder checks remain deterministic authority. */
@@ -59,7 +77,7 @@ export class RuntimeOutcomeAssessment {
    const job=JSON.parse(row.receipt) as Job,p=this.policy(rigId);if(!p)continue;
    if(row.kind==='runtime-outcome-running'&&this.now()-(job.startedAt??job.createdAt)<15000)continue;
    if(row.kind==='runtime-outcome-pending'){job.startedAt=this.now();if(!this.db.prepare("UPDATE coordinator_operations SET kind='runtime-outcome-running',receipt=? WHERE rig_id=? AND operation_id=? AND kind='runtime-outcome-pending'").run(JSON.stringify(job),rigId,row.operation_id).changes)continue;}
-   let classification='unknown',reason='deterministic-fallback',status='unavailable',negativeAdvice=false;let provenance:Record<string,unknown>={};
+   let classification='unknown',reason='deterministic-fallback',status='unavailable',negativeAdvice=false;let provenance:Record<string,unknown>={};let assessmentEvidence:Record<string,unknown>|null=null;
    const a=this.db.prepare('SELECT a.disposition_id,q.body,q.state,q.claimed_by_generation_uuid FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=?').get(rigId,job.packageKey) as {disposition_id:string;body:string;state:string;claimed_by_generation_uuid:string}|undefined;
    const returned=this.db.prepare('SELECT body FROM queue_items WHERE qitem_id=?').get(job.dispositionId) as {body:string}|undefined;
    const ownerBefore=this.authority.get(rigId);const before=digest(JSON.stringify({a,returned,policy:p.revision,generation:this.authority.generation(job.worker),epoch:ownerBefore?.epoch,ownerGeneration:ownerBefore?.owner_generation}));
@@ -69,7 +87,8 @@ export class RuntimeOutcomeAssessment {
     const receipt=await assess({schema:'assessment.v1',rubricId:'runtime-explicit-unfinished-v1',dataClass:p.dataClass,state:job.state,context:{qitemId:job.queueId,operationId:row.operation_id,generation:job.generation,currentGeneration:job.generation,stateRevision:before,currentStateRevision:before,authorized:true,deterministicEvidenceSufficient:false},questions:{outcome:{type:'choice',instructions:'Does the attributed return explicitly say required assigned work remains unfinished? Answer yes only for explicit remaining required work, no if absent, unknown if ambiguous. Never infer completion or override a protected boundary.',criteria:{yes:'Explicit required work remains unfinished',no:'No explicit remaining required work statement',unknown:'Ambiguous or insufficient evidence'}}}},p.adapterConfig,{...this.dependencies,allowPaid:p.allowPaid});
     status=String(receipt.status);reason=String(receipt.reason);
     const choice=(receipt.answers as Record<string,{choice:string}>|undefined)?.outcome?.choice;
-    provenance={providerId:receipt.providerId,model:receipt.model,rubricId:receipt.rubricId,rubricDigest:receipt.rubricDigest,inputCoverage:receipt.inputCoverage,calibrationId:receipt.calibrationId};
+    assessmentEvidence=sanitizedAssessmentEvidence(receipt,p.qualification.providerConfigDigest);
+    provenance={providerId:assessmentEvidence.providerId,model:assessmentEvidence.model,rubricId:assessmentEvidence.rubricId,rubricDigest:assessmentEvidence.rubricDigest,inputCoverage:assessmentEvidence.inputCoverage,calibrationId:assessmentEvidence.calibrationId};
     if(receipt.status==='assessed')classification=choice==='yes'?'incomplete':choice==='no'?'no-explicit-unfinished':'unknown';
     negativeAdvice=p.allowUnqualifiedNegativeAdvice===true&&receipt.status==='abstained'&&['uncalibrated','coverage_unverified','low_probability'].includes(String(receipt.reason))&&receipt.inputCoverage!=='truncated'&&choice==='yes';
     if(negativeAdvice)classification='incomplete';
@@ -83,7 +102,7 @@ export class RuntimeOutcomeAssessment {
     const hasAuthorizedRecovery=!!target&&!!plan?.tasks.some(t=>t.recoveryFor===target.key);
     const required=unchanged&&p.mode==='enforce'&&(classification==='incomplete'||!a||!['done','handed-off'].includes(a.state));
     const recoveryGap=required&&!hasAuthorizedRecovery?{owner:'operator-agent@kernel',action:'Admit and configure a distinct concrete recovery task for this exact incomplete return',deadline:this.now()+60000}:null;
-    const result={rigId,packageKey:job.packageKey,queueId:job.queueId,dispositionId:job.dispositionId,policyRevision:p.revision,inputDigest:job.inputDigest,status,reason,classification,required,recoveryGap,negativeAdvice,provenance,grantsAuthority:false,observedAt:this.now()};
+    const result={rigId,packageKey:job.packageKey,queueId:job.queueId,dispositionId:job.dispositionId,policyRevision:p.revision,inputDigest:job.inputDigest,status,reason,classification,required,recoveryGap,negativeAdvice,provenance,assessmentEvidence:assessmentEvidence?{...assessmentEvidence,applied:unchanged&&classification==='incomplete',suppressed:!unchanged}:null,jobBinding:{operationId:row.operation_id,worker:job.worker,generation:job.generation,configurationDigest:job.configurationDigest,policyRevision:job.policyRevision,createdAt:job.createdAt,startedAt:job.startedAt??null,inputDigest:job.inputDigest,stateRevision:before,holderEpoch:ownerBefore?.epoch??null,holderGeneration:ownerBefore?.owner_generation??null,providerConfigDigest:p.qualification.providerConfigDigest},grantsAuthority:false,observedAt:this.now()};
     if(!this.db.prepare("UPDATE coordinator_operations SET kind='runtime-outcome-finished',receipt=? WHERE rig_id=? AND operation_id=? AND kind='runtime-outcome-running'").run(JSON.stringify(result),rigId,row.operation_id).changes)return;
     if(required)this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'runtime-outcome-recovery:'+job.dispositionId,'runtime-outcome-recovery',JSON.stringify(result),digest(JSON.stringify(result)));
     if(recoveryGap){const queueId='qitem-outcome-recovery-'+digest(rigId+':'+job.dispositionId+':'+p.revision+':'+p.operatorGeneration).slice(0,24);if(!this.repo.getById(queueId))this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',body:JSON.stringify({action:recoveryGap.action,deadline:recoveryGap.deadline,rigId,packageKey:job.packageKey,dispositionId:job.dispositionId,policyRevision:p.revision,recipientGeneration:p.operatorGeneration,returnPath:'current coordinator holder '+ownerNow?.owner_session,required:'Inspect exact return; admit a bounded recovery package or return a concrete protected boundary. No product dispatch/qualification/acceptance authority granted by model.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});this.repo.stageWakeIntent(queueId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,p.operatorGeneration);}
