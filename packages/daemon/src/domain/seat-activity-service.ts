@@ -262,6 +262,9 @@ export class SeatActivityService {
   reportEvidence(evidence: ActivityEvidence): void {
     const seat = this.seatLadder(evidence.seatNodeId, evidence.sessionName);
     this.sessionToSeat.set(evidence.sessionName, evidence.seatNodeId);
+    // A late pre-swap sample cannot become successor activity, even after
+    // the adapter re-declares its inventory. Restart has no swap watermark.
+    if (seat.arbitrated.lastSwap && Date.parse(evidence.observedAt) < Date.parse(seat.arbitrated.lastSwap.at)) return;
     const prior = seat.sources.get(evidence.sourceId);
     if (prior && evidence.seq <= prior.latest.seq) return; // stale/reordered — dropped
     seat.sources.set(evidence.sourceId, {

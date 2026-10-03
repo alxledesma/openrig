@@ -1085,16 +1085,16 @@ export class SeatHandoverService {
         operator: input.operator,
         ...(input.sourceOutcome ? { sourceOutcome: input.sourceOutcome } : {}),
       });
-      return { newSessionId: newSession.id, previousSessionIdsSuperseded, event };
+      return { newSessionId: newSession.id, occupantGeneration: this.sessionRegistry.currentOccupantTenure(input.node.id)!.generationUuid, previousSessionIdsSuperseded, event };
     });
 
-    let committed: { newSessionId: string; previousSessionIdsSuperseded: string[]; event: PersistedEvent };
+    let committed: { newSessionId: string; occupantGeneration: string; previousSessionIdsSuperseded: string[]; event: PersistedEvent };
     try {
       committed = tx();
       // S19 ruling 01530 — the SOLE narrow call: after the commit lands, the activity
       // oracle sees the swap as its own event, keyed by the durable node id, identified
       // by the successor tenure (never the retiree's). In-memory, post-commit, optional.
-      this.activityOracle?.declareOccupantSwap(input.node.id, committed.newSessionId);
+      this.activityOracle?.declareOccupantSwap(input.node.id, committed.occupantGeneration);
     } catch (err) {
       if (input.dispatchReservation) this.tmuxAdapter.deliveryGuard?.rebindLifecycle(input.node.id);
       return {

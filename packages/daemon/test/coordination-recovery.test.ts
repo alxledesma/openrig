@@ -26,6 +26,22 @@ describe('durable coordination recovery',()=>{
   const s=sample('builder@xv');expect(coordinationIdle(s,s.generation,clock)).toBe(true);
   for(const bad of [{...s,identityVerified:false},{...s,generation:'old'},{...s,witness:null},{...s,witness:{...s.witness!,observedAt:new Date(clock-3001).toISOString()}},{...s,witness:{...s.witness!,observedAt:new Date(clock+1).toISOString()}},{...s,state:{...s.state,decidedBy:'lifecycle-hooks' as const}},{...s,state:{...s.state,needsInput:{count:1,reason:'input'}}}])expect(coordinationIdle(bad,s.generation,clock)).toBe(false);
  });
+ it('restart has no swap yet real fresh idle remains eligible; actual pickup follows',()=>{
+  configure(normal());const session='builder@xv',generation=repo.coordinatorAuthority.generation(session)!;
+  const ladder=new SeatActivityService({tmux:{readPaneLastActivity:async()=>null},defaultWindowSeconds:3,now:()=>new Date(clock)});
+  ladder.reportEvidence({seatNodeId:session,sessionName:session,rung:'window-sampling',sourceId:'tmux',seq:1,observedAt:new Date(clock).toISOString(),activity:'idle-at-prompt'});
+  const state=ladder.getSeatState(session)!;expect(state.lastSwap).toBeNull();
+  const a={generation,identityVerified:true,state,witness:ladder.getRotationActivityWitness(session)};
+  expect(coordinationIdle(a,generation,clock)).toBe(true);expect(coordinationIdle({...a,generation:'retired'},generation,clock)).toBe(false);
+  samples.set(session,a);const q=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;repo.claim({qitemId:q,destinationSession:session,identityProvenance:'transport:v1'});expect(svc.reconcile('lead@xv','lead-g1','xv')[0].state).toBe('picked-up');
+ });
+ it('swap rejects pre-swap samples and ULID mismatch; fresh managed-generation idle passes',()=>{
+  const session='builder@xv',generation='managed-uuid';const ladder=new SeatActivityService({tmux:{readPaneLastActivity:async()=>null},defaultWindowSeconds:3,now:()=>new Date(clock)});
+  const e={seatNodeId:session,sessionName:session,rung:'window-sampling' as const,sourceId:'tmux',seq:1,observedAt:new Date(clock-1).toISOString(),activity:'idle-at-prompt' as const};
+  ladder.reportEvidence(e);ladder.declareOccupantSwap(session,generation);ladder.declareRungInventory({seatNodeId:session,sessionName:session},{adapterId:'codex',runtime:'codex',rungs:[{rung:'window-sampling',lifecycleCoverage:'full',initialTrust:'authoritative'}]});
+  ladder.reportEvidence({...e,seq:2});expect(ladder.getRotationActivityWitness(session)).toBeNull();ladder.reportEvidence({...e,seq:3,observedAt:new Date(clock).toISOString()});
+  const a={generation,identityVerified:true,state:ladder.getSeatState(session)!,witness:ladder.getRotationActivityWitness(session)};expect(coordinationIdle(a,generation,clock)).toBe(true);expect(coordinationIdle({...a,state:{...a.state,lastSwap:{generation:'session-ulid',at:new Date(clock).toISOString()}}},generation,clock)).toBe(false);
+ });
  it('unavailable reviewer creates admitted concrete recovery while independent builder gets actual work',()=>{
   configure([task('review','reviewer@xv'),task('review-repair','architect@xv',{recoveryFor:'review'}),...normal()]);samples.delete('reviewer@xv');const r=svc.reconcile('lead@xv','lead-g1','xv');expect(r.find(x=>x.key==='review')?.reason).toBe('fresh-activity-required');expect(r.find(x=>x.key==='review-repair')?.state).toBe('pending-pickup');expect(r.find(x=>x.key==='product')?.state).toBe('pending-pickup');
   const repair=r.find(x=>x.key==='review-repair')!;repo.claim({qitemId:repair.queueId!,destinationSession:'architect@xv',identityProvenance:'transport:v1'});expect(svc.reconcile('lead@xv','lead-g1','xv').find(x=>x.key==='review-repair')?.state).toBe('picked-up');

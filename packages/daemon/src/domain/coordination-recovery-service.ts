@@ -21,11 +21,15 @@ function heldDispatchCode(error:unknown):string|undefined {
  return ['coordinator_resource_conflict','seat_dispatch_reserved'].includes(e.code??'')?e.code:undefined;
 }
 const fail=(code:string,message:string):never=>{throw new CoordinatorFenceError(code,message);};
-/** Same-observation proof; public display/old hook timestamps cannot manufacture idle. */
+/** Same-observation proof; public display/old hook timestamps cannot manufacture idle.
+ * lastSwap records an observed handover, not an initial-generation admission.
+ * After restart it is null: independently verified current identity/generation plus
+ * fresh deciding evidence remain required. A present swap must match the managed
+ * generation UUID and the witness cannot predate its invalidation watermark. */
 export function coordinationIdle(sample:CoordinationActivity|null,generation:string,now:number):boolean {
- if(!sample||!sample.identityVerified||sample.generation!==generation||sample.state.lastSwap?.generation!==generation||sample.state.needsInput.count!==0)return false;
+ if(!sample||!sample.identityVerified||sample.generation!==generation||(sample.state.lastSwap!==null&&sample.state.lastSwap.generation!==generation)||sample.state.needsInput.count!==0)return false;
  const w=sample.witness,at=Date.parse(w?.observedAt??"");
- return !!w&&w.sessionName.length>0&&w.seatNodeId===sample.state.seatNodeId&&w.activity==="idle-at-prompt"&&sample.state.activity===w.activity&&sample.state.decidedBy===w.rung&&Number.isFinite(at)&&at<=now&&now-at<=3000;
+ return !!w&&w.sessionName.length>0&&w.seatNodeId===sample.state.seatNodeId&&w.activity==="idle-at-prompt"&&sample.state.activity===w.activity&&sample.state.decidedBy===w.rung&&Number.isFinite(at)&&at<=now&&now-at<=3000&&(!sample.state.lastSwap||at>=Date.parse(sample.state.lastSwap.at));
 }
 /** Durable plans use the existing append-only operation store, with queue/resource
  * mutations in one SQLite transaction. Reconciliation never manufactures worker claims. */

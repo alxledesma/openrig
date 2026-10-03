@@ -1,3 +1,5 @@
+import { SeatActivityService } from '../src/domain/seat-activity-service.js';
+import { coordinationIdle } from '../src/domain/coordination-recovery-service.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type Database from "better-sqlite3";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
@@ -737,6 +739,9 @@ describe("SeatHandoverService", () => {
   it("S19 (territory ruling 01530): the commit declares the occupant swap to the activity oracle — seat-keyed rungs re-declare, no bleed", async () => {
     const { node } = seedSeat({ runtime: "codex" });
     const retiringGen = sessionRegistry.currentOccupantGenerationForSession("dev-impl@seat-rig");
+    const activity = new SeatActivityService({ tmux: { readPaneLastActivity: async () => null }, defaultWindowSeconds: 3 });
+    activity.reportEvidence({seatNodeId:node.id,sessionName:"dev-impl@seat-rig",rung:"window-sampling",sourceId:"tmux",seq:1,observedAt:new Date().toISOString(),activity:"idle-at-prompt"});
+    declareOccupantSwap.mockImplementation((id: string, generation: string) => activity.declareOccupantSwap(id, generation));
 
     const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fresh" });
 
@@ -746,7 +751,16 @@ describe("SeatHandoverService", () => {
     expect(seatNodeId).toBe(node.id); // seat-keyed: the durable node id, never the session name
     expect(typeof generation).toBe("string");
     expect(generation.length).toBeGreaterThan(0);
+    expect(generation).toBe(sessionRegistry.currentOccupantGenerationForSession("dev-impl@seat-rig"));
+    if (result.ok) expect(generation).not.toBe(result.result.newSessionId);
     expect(generation).not.toBe(retiringGen); // the SWAP identity is the successor tenure, not the retiree
+    expect(activity.getRotationActivityWitness(node.id)).toBeNull();
+    activity.declareRungInventory({seatNodeId:node.id,sessionName:"dev-impl@seat-rig"},{adapterId:"codex",runtime:"codex",rungs:[{rung:"window-sampling",lifecycleCoverage:"full",initialTrust:"authoritative"}]});
+    const now = Date.now();
+    activity.reportEvidence({seatNodeId:node.id,sessionName:"dev-impl@seat-rig",rung:"window-sampling",sourceId:"tmux",seq:2,observedAt:new Date(now).toISOString(),activity:"idle-at-prompt"});
+    const sample={generation,identityVerified:true,state:activity.getSeatState(node.id)!,witness:activity.getRotationActivityWitness(node.id)};
+    expect(coordinationIdle(sample,generation,now)).toBe(true);
+    expect(coordinationIdle(sample,retiringGen!,now)).toBe(false);
   });
 
   it("S19: a handover that fails before commit never declares a swap (no phantom swap events)", async () => {
