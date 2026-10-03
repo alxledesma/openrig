@@ -179,12 +179,34 @@ export class CoordinatorAuthorityService {
    if (r!.state!=="active" && !(allowReconcile && r!.state==="reconciling")) reject("coordinator_not_acknowledged","Transferred authority has not reconciled and acknowledged custody");
    return r!;
  }
+ assertCurrentOwner(actor:string,token:CoordinatorToken):void {this.assertOwner(actor,token);}
  obligations(rigId:string): unknown[] {
    const assignments=this.db.prepare(`SELECT a.package_key,a.queue_id,a.disposition_id,q.state,q.destination_session,q.claimed_at,q.claimed_by_generation_uuid,q.last_nudge_attempt,q.last_nudge_result,a.body_hash FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? ORDER BY a.package_key`).all(rigId);
    const stages=this.db.prepare("SELECT a.*,q.state,q.claimed_by_generation_uuid,q.last_nudge_attempt,q.last_nudge_result FROM coordinator_stage_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? ORDER BY a.queue_id").all(rigId);
    const resources=this.db.prepare("SELECT * FROM coordinator_resources WHERE rig_id=? ORDER BY resource_key").all(rigId);
    const queue=this.db.prepare("SELECT qitem_id,source_session,destination_session,state,claimed_by_generation_uuid,minting_generation_uuid,last_nudge_attempt,last_nudge_result FROM queue_items WHERE state NOT IN ('done','failed','denied','canceled','cancelled','handed-off') ORDER BY qitem_id").all() as Array<Record<string,unknown>>;
    return [{assignments,stages,resources,openQueue:queue.filter(q=>this.local(String(q.source_session))?.rig_id===rigId||this.local(String(q.destination_session))?.rig_id===rigId)}];
+ }
+ /** One explicit, bounded extension for an expired unacknowledged transfer.
+  * Never elects a new owner, acknowledges work, or grants retired rights. */
+ recoverReconciliation(actor:string,generation:string,input:{token:CoordinatorToken;operationId:string;obligationsDigest:string;windowMs:number}):Authority {
+  return this.db.transaction(()=>{
+   this.caller(actor,generation);
+   if(typeof input.operationId!=="string"||!input.operationId.trim()||input.operationId.length>160)reject("coordinator_invalid_operation","Bounded attributed recovery operation ID required");
+   const r=this.get(input.token.rigId);
+   if(!r||r.state!=="reconciling"||r.epoch!==input.token.epoch||r.owner_generation!==input.token.generation||this.generation(r.owner_session)!==r.owner_generation)reject("coordinator_reconciliation_mismatch","Exact current unacknowledged owner/epoch required");
+   if(actor!==r!.owner_session)this.operator(actor,generation);
+   else if(generation!==r!.owner_generation)reject("coordinator_retired","Current recipient generation required");
+   const request={actor,generation,input};const replay=this.replay(input.token.rigId,input.operationId,"reconciliation-recover",request);if(replay)return replay as Authority;
+   if(r!.lease_until>this.now())reject("coordinator_reconciliation_not_expired","Recovery is only for expired unacknowledged transfer");
+   if(!Number.isSafeInteger(input.windowMs)||input.windowMs<10000||input.windowMs>900000)reject("coordinator_invalid_ack_window","Recovery window must be 10 seconds to 15 minutes");
+   if(this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind='reconciliation-recover' AND json_extract(receipt,'$.epoch')=?").get(r!.rig_id,r!.epoch))reject("coordinator_reconciliation_recovery_exhausted","One bounded reconciliation recovery per epoch; no unlimited lease renewal");
+   if(input.obligationsDigest!==this.reconciliationDigest(r!.rig_id))reject("coordinator_reconciliation_changed","Read exact current custody before extending acknowledgment window");
+   const baton=this.db.prepare("SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?").get(r!.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string|null}|undefined;
+   if(!baton||baton.destination_session!==r!.owner_session||!['pending','in-progress'].includes(baton.state)||(baton.claimed_by_generation_uuid!==null&&baton.claimed_by_generation_uuid!==r!.owner_generation))reject("coordinator_baton_mismatch","Exact current recipient baton custody required");
+   this.db.prepare("UPDATE coordinator_authority SET lease_until=?,operation_id=? WHERE rig_id=? AND epoch=? AND state='reconciling'").run(this.now()+input.windowMs,input.operationId,r!.rig_id,r!.epoch);
+   const out=this.get(r!.rig_id)!;this.log(r!.rig_id,input.operationId,"reconciliation-recover",out,request);return out;
+  }).immediate();
  }
  acknowledge(actor:string, token:CoordinatorToken, evidence:{obligationsDigest:string;operationId:string}): Authority {
    return this.db.transaction(() => {

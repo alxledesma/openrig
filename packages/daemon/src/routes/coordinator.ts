@@ -24,6 +24,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
      const operation=c.req.param("operation");
      if(operation==="coordination-plan"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');return c.json(svc.coordinationRecovery.configure(actor,generation,b));}
      if(operation==="coordination-reconcile"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');const result=svc.coordinationRecovery.reconcile(actor,generation,b.rigId);await svc.coordinationRecovery.deliverCommitted();return c.json(result);}
+     if(operation==="coordination-continue-custody"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");const result=svc.coordinationRecovery.continueCustody(actor,generation,await c.req.json());await svc.coordinationRecovery.deliverCommitted();return c.json(result);}
      if(operation==="coordination-accept"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');svc.coordinationRecovery.accept(actor,generation,b.rigId,b.packageKey,b.dispositionId,b.evidenceRef);return c.json({ok:true});}
      if(operation==="legacy-inventory"){const b=await c.req.json();return c.json(svc.legacyInventory(b.rigId,b.authorizationId));}
      if(operation==="migrate-legacy")return c.json(svc.migrateLegacy(actor,generation,await c.req.json()),201);
@@ -33,6 +34,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
        const b=await c.req.json();if(b.token?.generation!==generation)throw new CoordinatorFenceError("coordinator_generation_mismatch","Token and immutable caller generation differ");
        return c.json(svc.acknowledge(actor,b.token,b));
      }
+     if(operation==="reconciliation-recover")return c.json(svc.recoverReconciliation(actor,generation,await c.req.json()));
      if(operation==="renew"){
        const b=await c.req.json();if(b.token?.generation!==generation)throw new CoordinatorFenceError("coordinator_generation_mismatch","Token and caller generation differ");return c.json(svc.renew(actor,b.token,b.leaseMs,b.operationId));
      }

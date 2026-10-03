@@ -1,3 +1,6 @@
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
+import {resolve} from 'node:path';
 import { describe,it,expect,beforeEach,afterEach,vi } from 'vitest';
 import {mkdtempSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import {join} from 'node:path';
 import type Database from 'better-sqlite3';
@@ -148,6 +151,56 @@ describe('durable coordination recovery',()=>{
 
  it('cyclic recovery activation chain cannot masquerade as a ready independent plan',()=>{
   expect(()=>configure([task('a','builder@xv',{recoveryFor:'b'}),task('b','architect@xv',{recoveryFor:'a'})])).toThrow('cannot cycle');expect(svc.plan('xv')).toBeNull();
+ });
+
+ it('undispatched dependent with busy owner never activates recovery before prerequisite acceptance',()=>{
+  const dependent=task('dependent','builder@xv',{predecessors:[{queueId:'qitem-coordination-'+digest('xv:product').slice(0,24),dispositionId:'not-returned'}],deadline:clock+1});
+  configure([...normal(),dependent,task('repair-dependent','reviewer@xv',{recoveryFor:'dependent'})]);
+  const product=svc.reconcile('lead@xv','lead-g1','xv').find(x=>x.key==='product')!;
+  repo.claim({qitemId:product.queueId!,destinationSession:'builder@xv',identityProvenance:'transport:v1'});samples.get('builder@xv')!.state.activity='working';clock+=2;
+  const results=svc.reconcile('lead@xv','lead-g1','xv');expect(results.find(x=>x.key==='dependent')?.reason).toBe('predecessor-disposition');expect(results.find(x=>x.key==='repair-dependent')?.reason).toBe('recovery-not-needed');
+  expect(db.prepare("SELECT COUNT(*) n FROM coordinator_assignments WHERE package_key='repair-dependent'").get()).toEqual({n:0});
+ });
+ it('current recipient or Operator recovers expired reconciling lease once with exact custody, never acknowledges implicitly',()=>{
+  configure(normal());job();clock+=11000;vi.setSystemTime(clock);refresh();svc.supervise('xv','j');
+  const authority=repo.coordinatorAuthority,a=authority.get('xv')!;expect(a.state).toBe('reconciling');expect(a.lease_until-clock).toBe(300000);
+  clock=a.lease_until+1;vi.setSystemTime(clock);const notice=svc.supervise('xv','j')![0];expect(notice.state).toBe('pending-reconciliation-recovery');repo.claim({qitemId:notice.queueId!,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});expect(svc.supervise('xv','j')![0].queueId).toBe(notice.queueId);const input={token:{rigId:'xv',epoch:a.epoch,generation:'peer-g1'},operationId:'bounded-recovery',obligationsDigest:authority.reconciliationDigest('xv'),windowMs:60000};
+  expect(()=>authority.recoverReconciliation('lead@xv','lead-g1',input)).toThrow();expect(()=>authority.recoverReconciliation('operator-agent@kernel','retired',input)).toThrow();expect(()=>authority.recoverReconciliation('peer@xv','peer-g1',{...input,obligationsDigest:'stale'})).toThrow('exact current custody');
+  const recovered=authority.recoverReconciliation('peer@xv','peer-g1',input);expect(recovered.state).toBe('reconciling');expect(repo.getById('baton')?.state).toBe('pending');expect(authority.recoverReconciliation('peer@xv','peer-g1',input)).toEqual(recovered);
+  clock=recovered.lease_until+1;vi.setSystemTime(clock);expect(()=>authority.recoverReconciliation('operator-agent@kernel','operator-agent-g1',{...input,operationId:'again'})).toThrow('One bounded');
+ });
+ it('separately admitted feedback is picked up without modifying blocked parent custody or bypassing raw fence',()=>{
+  configure(normal());const q=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;repo.claim({qitemId:q,destinationSession:'builder@xv',identityProvenance:'transport:v1'});repo.update({qitemId:q,actorSession:'builder@xv',state:'blocked'});
+  const before=repo.getById(q),body=JSON.stringify({action:'reconcile-existing-custody',parentQueueId:q,parentPackageKey:'product',instruction:'Return denied with exact premature-dispatch evidence; do not perform dependent work'});
+  repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv','feedback',{inputDigest:digest(body),destination:'builder@xv',bodyHash:digest(body),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+  const input={rigId:'xv',epoch:1,parentPackageKey:'product',parentQueueId:q,workerGeneration:'builder-g1',feedbackPackageKey:'feedback',body};
+  expect(()=>svc.continueCustody('lead@xv','retired',input)).toThrow();expect(()=>svc.continueCustody('lead@xv','lead-g1',{...input,parentQueueId:'wrong'})).toThrow('Exact current claimed');
+  const feedback=svc.continueCustody('lead@xv','lead-g1',input);expect(svc.continueCustody('lead@xv','lead-g1',input)).toEqual(feedback);expect(repo.getById(q)).toEqual(before);
+  repo.claim({qitemId:feedback.queueId,destinationSession:'builder@xv',identityProvenance:'transport:v1'});expect(db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(feedback.queueId)).toEqual({claimed_by_generation_uuid:'builder-g1'});expect(repo.getById(q)?.state).toBe('blocked');
+  expect(()=>repo.coordinatorAuthority.assertRawSend('lead@xv','builder@xv')).toThrow('Raw managed sends');
+ });
+
+ it('two real processes cannot extend one expired reconciliation twice',async()=>{
+  configure(normal());job();clock+=11000;vi.setSystemTime(clock);refresh();svc.supervise('xv','j');const a=repo.coordinatorAuthority.get('xv')!;clock=a.lease_until+1;vi.setSystemTime(clock);
+  const base={token:{rigId:'xv',epoch:a.epoch,generation:'peer-g1'},obligationsDigest:repo.coordinatorAuthority.reconciliationDigest('xv'),windowMs:60000};
+  const code=`import D from 'better-sqlite3';import {CoordinatorAuthorityService} from './dist/domain/coordinator-authority-service.js';const db=new D(process.argv[1]);const s=new CoordinatorAuthorityService(db,undefined,undefined,()=>Number(process.argv[2]));try{s.recoverReconciliation('operator-agent@kernel','operator-agent-g1',JSON.parse(process.argv[3]));console.log('extended');}catch(e){console.log(e.code);process.exitCode=7;}finally{db.close();}`;
+  const run=async(op:string)=>{const child=spawn(process.execPath,['--input-type=module','-e',code,join(dir,'db'),String(clock),JSON.stringify({...base,operationId:op})],{cwd:resolve('.'),stdio:['ignore','pipe','pipe']});let out='';child.stdout.on('data',b=>out+=b);const [exit]=await once(child,'exit');return {exit,out};};
+  const results=await Promise.all([run('race-a'),run('race-b')]);expect(results.filter(r=>r.exit===0)).toHaveLength(1);expect(results.filter(r=>r.exit===7)).toHaveLength(1);expect(db.prepare("SELECT COUNT(*) n FROM coordinator_operations WHERE kind='reconciliation-recover'").get()).toEqual({n:1});
+ });
+
+ it('Operator recovered window still requires genuine Peer custody acknowledgment and fences retired Lead',()=>{
+  configure(normal());job();clock+=11000;vi.setSystemTime(clock);refresh();svc.supervise('xv','j');const authority=repo.coordinatorAuthority,a=authority.get('xv')!;clock=a.lease_until+1;vi.setSystemTime(clock);
+  const token={rigId:'xv',epoch:a.epoch,generation:'peer-g1'};authority.recoverReconciliation('operator-agent@kernel','operator-agent-g1',{token,operationId:'operator-recovery',obligationsDigest:authority.reconciliationDigest('xv'),windowMs:60000});
+  expect(()=>svc.reconcile('peer@xv','peer-g1','xv')).toThrow('Only reconciled');const digestNow=authority.reconciliationDigest('xv');
+  expect(()=>authority.acknowledge('lead@xv',{...token,generation:'lead-g1'},{operationId:'retired-ack',obligationsDigest:digestNow})).toThrow();
+  expect(authority.acknowledge('peer@xv',token,{operationId:'real-peer-ack',obligationsDigest:digestNow}).state).toBe('active');expect(repo.getById('baton')?.state).toBe('in-progress');
+ });
+
+ it('fresh working owner is scheduling, but stale busy evidence cannot indefinitely suppress ready recovery',()=>{
+  configure(normal());const busy=samples.get('builder@xv')!;busy.state.activity='working';busy.witness!.activity='working';
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(x=>x.key==='repair')?.reason).toBe('recovery-not-needed');
+  clock+=3001;vi.setSystemTime(clock);samples.set('architect@xv',sample('architect@xv'));
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(x=>x.key==='repair')?.state).toBe('pending-pickup');
  });
 
 });
