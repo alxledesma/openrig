@@ -615,6 +615,7 @@ function isWakeTimeoutSignal(s: string | undefined): boolean {
 }
 
 export class QueueRepository {
+  private readonly nativeTerminalReturnControls=new WeakSet<QueueCreateInput>();
   readonly db: Database.Database;
   readonly transitionLog: QueueTransitionLog;
   private readonly eventBus: EventBus;
@@ -1453,6 +1454,17 @@ export class QueueRepository {
    * may roll back). For independent create()s that don't need to
    * compose with an outer transaction, use create() instead.
    */
+  /** Internal-only validated completion control; JSON queue requests cannot forge
+   * the object-identity capability or bypass ordinary dispatch admission. */
+  createNativeTerminalReturnDuty(actor:string,generation:string,rigId:string,input:QueueCreateInput) {
+    if(!input.qitemId||input.sourceSession!=='watchdog@system'||input.identityProvenance!=='system:operator-authorized-coordination'||input.expiresAt!==new Date(JSON.parse(input.body).deadline).toISOString())throw new QueueRepositoryError('invalid_terminal_return_control','Exact internal finite completion control required');
+    this.coordinatorAuthority.registerNativeTerminalReturnControl(actor,generation,rigId,input.qitemId,input.body);
+    const body=JSON.parse(input.body);
+    const assigned=this.db.prepare('SELECT destination FROM coordinator_assignments WHERE rig_id=? AND queue_id=?').get(rigId,body.originalQueueId) as {destination:string};
+    if(input.destinationSession!==assigned.destination)throw new QueueRepositoryError('invalid_terminal_return_control','Original worker destination required');
+    this.nativeTerminalReturnControls.add(input);
+    try{return this.createWithinTransaction(input);}finally{this.nativeTerminalReturnControls.delete(input);}
+  }
   createWithinTransaction(input: QueueCreateInput): {
     qitemId: string;
     persistedEvent: PersistedEvent;
@@ -1508,7 +1520,7 @@ export class QueueRepository {
       if (!this.hasHumanIntentColumn) throw new QueueRepositoryError("invalid_human_notification", "Human notification fields require the current queue schema; they were not saved.");
     }
     const id = input.qitemId ?? newQitemId();
-    this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
+    if(!this.nativeTerminalReturnControls.has(input))this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
     const ts = new Date().toISOString();
     const priority = input.priority ?? "routine";
     const tier = input.tier ?? null;

@@ -129,6 +129,52 @@ describe('durable coordination recovery',()=>{
  it('native pickup is progress; message/reconciliation repetition is not',()=>{
   configure(normal());job();let r=svc.reconcile('lead@xv','lead-g1','xv');clock+=9000;vi.setSystemTime(clock);refresh();repo.claim({qitemId:r[0].queueId!,destinationSession:'builder@xv',identityProvenance:'transport:v1'});svc.reconcile('lead@xv','lead-g1','xv');clock+=2000;vi.setSystemTime(clock);refresh();expect(svc.supervise('xv','j')?.[0].state).toBe('picked-up');expect(repo.coordinatorAuthority.get('xv')?.epoch).toBe(1);
  });
+ it('automatically assigns the original worker a terminal-return duty without releasing locks or accepting work',async()=>{
+  configure(normal(),{product:['source.ts']});
+  const original=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='product')!.queueId!;
+  repo.claim({qitemId:original,destinationSession:'builder@xv',identityProvenance:'transport:v1'});
+  repo.update({qitemId:original,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
+  // Fixture transport has completed the original wake before terminal return.
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE audit_pointer=?").run(original);
+  const first=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='terminal-return:product')!;
+  expect(first.state).toBe('pending-native-terminal-return');
+  expect(JSON.parse(repo.getById(first.queueId!)!.body)).toMatchObject({action:'record-exact-native-terminal-return',originalQueueId:original,recipientGeneration:'builder-g1',grantsAuthority:false,returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+  expect(db.prepare('SELECT count(*) n FROM coordinator_resources WHERE package_key=?').get('product')).toEqual({n:1});
+  expect(db.prepare("SELECT disposition_id FROM coordinator_assignments WHERE package_key='product'").get()).toEqual({disposition_id:null});
+  const realGeneration=repo.coordinatorAuthority.generation.bind(repo.coordinatorAuthority);
+  const changedHolder=vi.spyOn(repo.coordinatorAuthority,'generation').mockImplementation(session=>session==='lead@xv'?'new-lead':realGeneration(session));
+  expect(()=>repo.coordinatorAuthority.assertManagedSend('watchdog@system','builder@xv',first.queueId!)).toThrow();changedHolder.mockRestore();
+  db.prepare('UPDATE queue_items SET claimed_by_generation_uuid=NULL WHERE qitem_id=?').run(original);
+  const missingWorker=vi.spyOn(repo.coordinatorAuthority,'generation').mockImplementation(session=>session==='builder@xv'?null:realGeneration(session));
+  expect(()=>db.transaction(()=>repo.coordinatorAuthority.registerNativeTerminalReturnControl('lead@xv','lead-g1','xv',first.queueId!,repo.getById(first.queueId!)!.body))()).toThrow('Exact original live claimant');missingWorker.mockRestore();
+  db.prepare("UPDATE queue_items SET claimed_by_generation_uuid='builder-g1' WHERE qitem_id=?").run(original);
+  expect(()=>repo.coordinatorAuthority.assertManagedSend('watchdog@system','builder@xv',first.queueId!)).not.toThrow();
+  repo.claim({qitemId:first.queueId!,destinationSession:'builder@xv',identityProvenance:'transport:v1'});
+  svc.reconcile('lead@xv','lead-g1','xv');expect(db.prepare("SELECT count(*) n FROM queue_items WHERE qitem_id LIKE 'qitem-coordination-terminal-return-%'").get()).toEqual({n:1});
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE audit_pointer=?").run(first.queueId!);
+  repo.update({qitemId:first.queueId!,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='terminal-return:product')?.reason).toBe('terminal-return-duty-exhausted');
+  expect(db.prepare("SELECT count(*) n FROM queue_items WHERE qitem_id LIKE 'qitem-coordination-terminal-return-%'").get()).toEqual({n:1});
+  expect(db.prepare("SELECT count(*) n FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_extract(body,'$.reason')='terminal-return-duty-exhausted'").get()).toEqual({n:1});
+  expect(()=>repo.coordinatorAuthority.assertManagedSend('watchdog@system','builder@xv',first.queueId!)).toThrow();
+  await repo.create({qitemId:'native-terminal-receipt',sourceSession:'builder@xv',destinationSession:'lead@xv',body:JSON.stringify({packageKey:'product',inputDigest:digest('product'),evidence:[{kind:'report',ref:'retained/report.md'}]}),nudge:false});
+  repo.coordinatorAuthority.dispose('builder@xv','builder-g1','xv','product','native-terminal-receipt');
+  expect(db.prepare('SELECT count(*) n FROM coordinator_resources WHERE package_key=?').get('product')).toEqual({n:0});
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='product')!.state).toBe('returned-awaiting-acceptance');
+ });
+ it('missing terminal returns respect checkpoint quiescence and never assign a changed incarnation',()=>{
+  const initial=configure([...normal(),task('other','builder@xv',{boundary:'owner-material'})],{product:['source.ts']});
+  const original=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='product')!.queueId!;
+  repo.claim({qitemId:original,destinationSession:'builder@xv',identityProvenance:'transport:v1'});
+  repo.update({qitemId:original,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
+  svc.configure('operator-agent@kernel','operator-agent-g1',{...initial,revision:'terminal-quiescence',dispatchRestrictions:[{session:'builder@xv',generation:'builder-g1',packageKeys:['other'],validUntil:clock+30000,evidenceRef:'checkpoint.json'}]});
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='terminal-return:product')?.reason).toBe('checkpoint-quiescence');
+  expect(db.prepare("SELECT count(*) n FROM queue_items WHERE qitem_id LIKE 'qitem-coordination-terminal-return-%'").get()).toEqual({n:0});
+  db.prepare("UPDATE queue_items SET claimed_by_generation_uuid='retired-builder' WHERE qitem_id=?").run(original);
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='terminal-return:product')?.reason).toBe('terminal-return-incarnation-changed');
+  expect(db.prepare("SELECT count(*) n FROM queue_items WHERE qitem_id LIKE 'qitem-coordination-terminal-return-%'").get()).toEqual({n:0});
+  expect(db.prepare('SELECT count(*) n FROM coordinator_resources WHERE package_key=?').get('product')).toEqual({n:1});
+ });
  it('actual Architect return is followed through only after exact holder acceptance',async()=>{
   const q='qitem-coordination-'+digest('xv:decision').slice(0,24);
   configure([task('decision','architect@xv'),task('decision-repair','reviewer@xv',{recoveryFor:'decision'}),task('next','builder@xv',{predecessors:[{queueId:q,dispositionId:'returned'}]}),task('next-repair','reviewer@xv',{recoveryFor:'next'})]);

@@ -517,7 +517,27 @@ export class CoordinatorAuthorityService {
    if(scope)reject("coordinator_raw_dispatch_refused","Raw managed sends cannot bypass admitted durable assignments in enabled rigs");
  }
  /** Only the INTERNAL committed-queue wake seam can bypass the raw-send prohibition. */
+ registerNativeTerminalReturnControl(actor:string,generation:string,rigId:string,queueId:string,body:string):void {
+   if(!this.db.inTransaction)reject('coordinator_transaction_required','Native return duty requires atomic control registration');
+   const a=this.get(rigId);if(!a||a.owner_session!==actor||a.owner_generation!==generation||this.generation(actor)!==generation||a.state!=='active'||a.lease_until<=this.now())reject('coordinator_retired','Current genuine holder required');
+   const b=JSON.parse(body),plan=this.coordinationRecovery?.plan(rigId);
+   const original=this.db.prepare("SELECT a.destination,a.body_hash,a.disposition_id,q.body,q.state,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.package_key=? AND a.queue_id=?").get(rigId,b.packageKey,b.originalQueueId) as any;
+   const contract=original?JSON.parse(original.contract):null;
+   if(!plan||plan.operatorGeneration!==this.generation('operator-agent@kernel')||!original||original.disposition_id||!original.claimed_by_generation_uuid||!['done','failed','denied','canceled','handed-off'].includes(original.state)||original.claimed_by_generation_uuid!==this.generation(original.destination)||digest(original.body)!==original.body_hash||contract.destination!==original.destination||contract.bodyHash!==original.body_hash||b.action!=='record-exact-native-terminal-return'||b.rigId!==rigId||b.recipientGeneration!==original.claimed_by_generation_uuid||b.inputDigest!==contract.inputDigest||JSON.stringify(b.returnContract)!==JSON.stringify(contract.returnContract)||b.grantsAuthority!==false||!Number.isSafeInteger(b.deadline)||b.deadline<=this.now()||b.deadline>this.now()+1200000||queueId!=='qitem-coordination-terminal-return-'+digest(rigId+':'+b.originalQueueId+':'+b.recipientGeneration).slice(0,24)||!this.db.prepare('SELECT 1 FROM coordinator_resources WHERE rig_id=? AND package_key=?').get(rigId,b.packageKey))reject('coordinator_terminal_return_control_required','Exact original live claimant, immutable admitted contract and retained scope required');
+   this.assertRecipientDispatchScope(rigId,original.destination,b.packageKey);
+   this.log(rigId,queueId,'native-terminal-return-control',{queueId,bodyHash:digest(body),originalQueueId:b.originalQueueId,packageKey:b.packageKey,worker:original.destination,workerGeneration:b.recipientGeneration,holder:actor,holderGeneration:generation,operatorGeneration:plan!.operatorGeneration,expiresAt:b.deadline},{actor,generation,body});
+ }
+ private validNativeTerminalReturnWake(source:string|undefined,destination:string,queueId:string):boolean {
+   if(source!=='watchdog@system')return false;
+   const record=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE operation_id=? AND kind='native-terminal-return-control'").get(queueId) as {rig_id:string;receipt:string}|undefined;
+   if(!record)return false;
+   const r=JSON.parse(record.receipt),a=this.get(record.rig_id),q=this.db.prepare('SELECT source_session,destination_session,body,state,expires_at FROM queue_items WHERE qitem_id=?').get(queueId) as any;
+   const original=this.db.prepare('SELECT disposition_id,q.claimed_by_generation_uuid FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.queue_id=?').get(record.rig_id,r.originalQueueId) as any;
+   if(!q||q.source_session!==source||q.destination_session!==destination||r.worker!==destination||digest(q.body)!==r.bodyHash||!['pending','in-progress','blocked'].includes(q.state)||Date.parse(q.expires_at)!==r.expiresAt||r.expiresAt<=this.now()||r.workerGeneration!==this.generation(destination)||!original||original.disposition_id||original.claimed_by_generation_uuid!==r.workerGeneration||!a||a.state!=='active'||a.lease_until<=this.now()||a.owner_session!==r.holder||a.owner_generation!==r.holderGeneration||this.generation(r.holder)!==r.holderGeneration||r.operatorGeneration!==this.generation('operator-agent@kernel'))return false;
+   this.assertRecipientDispatchScope(record.rig_id,destination,r.packageKey);return true;
+ }
  assertManagedSend(source:string|undefined,destination:string,queueAssignmentId?:string):void {
+   if(queueAssignmentId&&this.validNativeTerminalReturnWake(source,destination,queueAssignmentId))return;
    if(!this.scope(source,destination))return;
    if(queueAssignmentId){
      const a=this.db.prepare(`SELECT a.rig_id,a.destination,a.owner_session,a.body_hash,q.body,q.state FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.queue_id=? UNION ALL SELECT a.rig_id,a.destination,a.source AS owner_session,a.body_hash,q.body,q.state FROM coordinator_stage_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.queue_id=?`).get(queueAssignmentId,queueAssignmentId) as {rig_id:string;destination:string;owner_session:string;body_hash:string;body:string;state:string}|undefined;

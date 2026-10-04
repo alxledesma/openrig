@@ -162,11 +162,28 @@ export class CoordinationRecoveryService {
     }
     result.push({key:t.key,state:'pending-pickup',queueId,deadline:t.deadline});
    }
+   // A terminal UI state is not an attributed return. Detect retained scope even
+   // when that completed assignment is absent from the latest dispatch plan.
+   const missingReturns=this.db.prepare("SELECT a.package_key,a.queue_id,a.destination,a.body_hash,q.body,q.ts_updated,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.disposition_id IS NULL AND q.state IN ('done','failed','denied','canceled','handed-off') AND EXISTS (SELECT 1 FROM coordinator_resources r WHERE r.rig_id=a.rig_id AND r.package_key=a.package_key)").all(rigId) as Array<{package_key:string;queue_id:string;destination:string;body_hash:string;body:string;ts_updated:string;claimed_by_generation_uuid:string|null;contract:string}>;
+   for(const missing of missingReturns){
+    const current=this.authority.generation(missing.destination),contract=JSON.parse(missing.contract);
+    const restriction=plan!.dispatchRestrictions?.find(r=>r.session===missing.destination);
+    const scopeHeld=restriction&&(restriction.generation!==current||restriction.validUntil<=this.now()||!restriction.packageKeys.includes(missing.package_key));
+    const reason=!current||current!==missing.claimed_by_generation_uuid?'terminal-return-incarnation-changed':digest(missing.body)!==missing.body_hash||contract.destination!==missing.destination||contract.bodyHash!==missing.body_hash?'terminal-return-contract-drift':scopeHeld?'checkpoint-quiescence':this.workerEffectDebt(missing.destination)?'uncertain-worker-effect':null;
+    if(reason){result.push({key:'terminal-return:'+missing.package_key,state:'held',queueId:missing.queue_id,reason,deadline:Date.parse(missing.ts_updated)+1200000});continue;}
+    const queueId='qitem-coordination-terminal-return-'+digest(rigId+':'+missing.queue_id+':'+current).slice(0,24),deadline=this.now()+1200000;
+    const existing=this.repo.getById(queueId);if(existing&&(!['pending','in-progress','blocked'].includes(existing.state)||!existing.expiresAt||Date.parse(existing.expiresAt)<=this.now())){result.push({key:'terminal-return:'+missing.package_key,state:'held',queueId,reason:'terminal-return-duty-exhausted',deadline:existing.expiresAt?Date.parse(existing.expiresAt):Date.parse(missing.ts_updated)+1200000});continue;}
+    try{
+     this.db.transaction(()=>{if(!this.repo.getById(queueId)){this.repo.createNativeTerminalReturnDuty(actor,generation,rigId,{qitemId:queueId,sourceSession:'watchdog@system',destinationSession:missing.destination,expiresAt:new Date(deadline).toISOString(),body:JSON.stringify({action:'record-exact-native-terminal-return',rigId,packageKey:missing.package_key,originalQueueId:missing.queue_id,recipientGeneration:current,inputDigest:contract.inputDigest,returnContract:contract.returnContract,deadline,grantsAuthority:false,required:'Claim this bounded return duty under your genuine current native identity. Reuse retained evidence from your own original assignment; author its exact typed durable return and use supported coordinator disposition. Close this duty with the actual receipt. Do not reopen or redo work, fabricate evidence, release locks directly, accept work, merge, deploy, or claim another incarnation’s results. Preserve uncertainty and explicit scope limits; report a concrete supported API refusal to the current Lead.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});this.repo.stageWakeIntent(queueId,'watchdog@system',missing.destination,'system:operator-authorized-coordination',true,current!);}})();
+     result.push({key:'terminal-return:'+missing.package_key,state:'pending-native-terminal-return',queueId,deadline:Date.parse(this.repo.getById(queueId)!.expiresAt!)});
+    }catch(error){const code=heldDispatchCode(error);if(!code)throw error;result.push({key:'terminal-return:'+missing.package_key,state:'held',queueId:missing.queue_id,reason:'terminal-return-'+code,deadline:Date.parse(missing.ts_updated)+1200000});}
+   }
    // Configuration/effect holds need real recovery custody, not only a diagnostic
    // string. Control intake grants no dispatch, acceptance or history authority.
    for(const held of result){
-    if(held.state!=='held'||!['current-admission-required','uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict'].includes(held.reason??''))continue;
-    const task=plan!.tasks.find(t=>t.key===held.key)!;
+    if(held.state!=='held'||!['current-admission-required','uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict','terminal-return-incarnation-changed','terminal-return-contract-drift','terminal-return-duty-exhausted','terminal-return-seat_dispatch_reserved','terminal-return-coordinator_resource_conflict'].includes(held.reason??''))continue;
+    const missing=missingReturns.find(m=>'terminal-return:'+m.package_key===held.key);
+    const task=plan!.tasks.find(t=>t.key===held.key)??(missing?{packageKey:missing.package_key,owner:missing.destination}:undefined);if(!task)continue;
     const queueId='qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:plan!.revision,operatorGeneration:plan!.operatorGeneration,packageKey:task.packageKey,reason:held.reason,queueId:held.queueId??null})).slice(0,24);
     try {this.db.transaction(()=>{if(!this.repo.getById(queueId)){
      const deadline=this.now()+1200000;
