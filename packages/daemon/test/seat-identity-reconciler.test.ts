@@ -366,13 +366,20 @@ describe("SeatIdentityReconciler — bounded polling", () => {
       // Twenty ticks, but the first availability read is still outstanding.
       expect(tmux.listSessions).toHaveBeenCalledTimes(1);
       expect(store.getForNode("n1")).toBeNull();
+      let refreshed=false;
+      const refresh=rec.reconcileFresh().then(()=>{refreshed=true;});
+      await Promise.resolve();
+      expect(refreshed).toBe(false);
       releaseList();
       await vi.advanceTimersByTimeAsync(1000);
       // The guard covers the whole sweep, not only its availability probe.
       expect(tmux.listSessions).toHaveBeenCalledTimes(1);
       expect(tmux.getPaneCommand).toHaveBeenCalledTimes(1);
       expect(store.getForNode("n1")).toBeNull();
+      expect(refreshed).toBe(false);
       releaseCommand();
+      await refresh;
+      expect(refreshed).toBe(true);
       await new Promise((resolve) => setImmediate(resolve));
       expect(store.getForNode("n1")?.verdict).toBe("verified");
       await vi.advanceTimersByTimeAsync(100);

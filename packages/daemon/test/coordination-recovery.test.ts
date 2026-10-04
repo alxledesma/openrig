@@ -45,6 +45,32 @@ describe('durable coordination recovery',()=>{
   svc.reconcile('lead@xv','lead-g1','xv');
   expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordination-reconcile'").get()).toEqual(before);
  });
+ it('native identity refresh enables only the checkpoint-authorized recovery, with genuine pickup and no Peer takeover',async()=>{
+  const tasks=[task('product'),task('unrelated','peer@xv',{recoveryFor:'product'}),task('repair','peer@xv',{recoveryFor:'product'})];
+  const initial=configure(tasks);job();samples.delete('builder@xv');samples.get('peer@xv')!.identityVerified=false;
+  svc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,async()=>{samples.set('peer@xv',sample('peer@xv'));});repo.coordinatorAuthority.coordinationRecovery=svc;
+  svc.configure('operator-agent@kernel','operator-agent-g1',{...initial,revision:'scoped-r2',refreshDispatchIdentity:true,dispatchRestrictions:[{session:'peer@xv',generation:'peer-g1',packageKeys:['repair'],validUntil:clock+30000,evidenceRef:'native/checkpoint-qa-only.json'}]});
+  const e=await makeCoordinatorContinuityPolicy(repo.coordinatorAuthority).evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);
+  const results=e.notes!.coordination as any[];
+  expect(results.find(r=>r.key==='unrelated')).toMatchObject({state:'held',reason:'checkpoint-quiescence'});
+  const repair=results.find(r=>r.key==='repair');expect(repair.state).toBe('pending-pickup');
+  expect(()=>db.transaction(()=>repo.createWithinTransaction({qitemId:'scope-bypass',sourceSession:'lead@xv',destinationSession:'peer@xv',body:'unrelated',dispatch:{token,packageKey:'unrelated'}}))()).toThrow('checkpoint dispatch scope');
+  expect(()=>repo.coordinatorAuthority.transfer('lead@xv','lead-g1',{expected:token,oldOwner:'lead@xv',recipient:'peer@xv',recipientGeneration:'peer-g1',operationId:'scope-transfer-bypass',leaseMs:60000})).toThrow('checkpoint dispatch scope');
+  repo.claim({qitemId:repair.queueId,destinationSession:'peer@xv',identityProvenance:'transport:v1'});
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='repair')?.state).toBe('picked-up');
+  expect(svc.canTransferUnavailable('xv','peer@xv','peer-g1')).toBe(false);
+  expect(svc.canTransferIdle('xv','peer@xv','peer-g1','any')).toBe(false);
+  expect(repo.coordinatorAuthority.get('xv')?.owner_session).toBe('lead@xv');
+ });
+ it('an expired dispatch scope keeps quiescence closed rather than reopening older work',()=>{
+  const tasks=[task('product'),task('unrelated','peer@xv',{recoveryFor:'product'}),task('repair','peer@xv',{recoveryFor:'product'})];
+  const initial=configure(tasks);samples.delete('builder@xv');
+  svc.configure('operator-agent@kernel','operator-agent-g1',{...initial,revision:'scope-expiry-r2',dispatchRestrictions:[{session:'peer@xv',generation:'peer-g1',packageKeys:['repair'],validUntil:clock+10000,evidenceRef:'native/checkpoint-qa-only.json'}]});
+  clock+=10001;vi.setSystemTime(clock);refresh();samples.delete('builder@xv');
+  const results=svc.reconcile('lead@xv','lead-g1','xv');
+  for(const key of ['unrelated','repair'])expect(results.find(r=>r.key===key)).toMatchObject({state:'held',reason:'dispatch-scope-expired'});
+  expect(db.prepare('select count(*) n from coordinator_assignments').get()).toEqual({n:0});
+ });
  it('restart has no swap yet real fresh idle remains eligible; actual pickup follows',()=>{
   configure(normal());const session='builder@xv',generation=repo.coordinatorAuthority.generation(session)!;
   const ladder=new SeatActivityService({tmux:{readPaneLastActivity:async()=>null},defaultWindowSeconds:3,now:()=>new Date(clock)});

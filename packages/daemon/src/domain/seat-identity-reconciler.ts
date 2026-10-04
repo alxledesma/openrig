@@ -98,6 +98,7 @@ export class SeatIdentityReconciler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private reconciling = false;
   private generation = 0;
+  private pendingSweep:Promise<void>|null=null;
 
   constructor(deps: SeatIdentityReconcilerDeps) {
     this.db = deps.db;
@@ -126,10 +127,19 @@ export class SeatIdentityReconciler {
     // Skip ticks while actual reads are pending; never release on a deadline
     // that could leave subprocesses alive. Normal polling cost is unchanged.
     if (this.reconciling) return;
+    await this.reconcileFresh();
+  }
+
+  /** Decision consumers await the actual native sweep, including an in-flight
+   * sweep. Observation timestamps and all strict freshness gates stay intact. */
+  async reconcileFresh():Promise<void> {
+    if(this.pendingSweep)return this.pendingSweep;
     this.reconciling = true;
+    this.pendingSweep=this.reconcileSweep(this.generation);
     try {
-      await this.reconcileSweep(this.generation);
+      await this.pendingSweep;
     } finally {
+      this.pendingSweep=null;
       this.reconciling = false;
     }
   }

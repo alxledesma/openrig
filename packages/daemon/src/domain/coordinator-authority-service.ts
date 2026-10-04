@@ -367,6 +367,7 @@ export class CoordinatorAuthorityService {
        const e=input.recoveryEvidenceId && this.db.prepare("SELECT destination_session,state,closure_reason FROM queue_items WHERE qitem_id=?").get(input.recoveryEvidenceId) as {destination_session:string;state:string;closure_reason:string}|undefined;
        if (!this.excluded(old!.owner_session,old!.owner_generation)||!e||input.recoveryEvidenceId!==old!.recovery_queue_id||e.destination_session!==actor||e.state!=="done"||e.closure_reason!=="no-follow-on"||old!.lease_until>this.now()) reject("coordinator_recovery_evidence_required","Unplanned transfer needs expired lease and completed Operator recovery evidence; stale telemetry alone is insufficient");
      }
+     this.assertRecipientDispatchScope(old!.rig_id,input.recipient);
      if (!(JSON.parse(old!.coordinators) as string[]).includes(input.recipient) || this.local(input.recipient)?.rig_id!==old!.rig_id) reject("coordinator_ineligible_recipient","Recipient is not a registered local coordinator");
      this.caller(input.recipient,input.recipientGeneration); this.validLease(input.leaseMs);
      const epoch=old!.epoch+1;
@@ -452,7 +453,9 @@ export class CoordinatorAuthorityService {
  }
  /** Runs INSIDE the queue write transaction, before rows/events/wake intents. */
  reserve(source:string,destination:string,body:string,queueId:string,envelope?:DispatchEnvelope,dryRun=false,sourceQueueId:string|null=null): void {
-   const scope=this.scope(source,destination);
+   // Explicit admitted recovery to a coordinator is work, even though ordinary
+   // informational coordinator messages intentionally have no dispatch scope.
+   const scope=this.scope(source,destination)??(envelope?this.get(envelope.token.rigId)??reject('coordinator_not_enabled','Explicit dispatch requires enrolled authority'):undefined);
    if(!scope) return;
    if(!this.db.inTransaction)reject("coordinator_transaction_required","Assignment fence requires its queue write transaction");
    const coords=JSON.parse(scope.coordinators) as string[];
@@ -480,6 +483,7 @@ export class CoordinatorAuthorityService {
    if(!pkg)reject("coordinator_package_not_admitted","Caller cannot mint a package revision");
    const contract=JSON.parse(pkg!.contract) as PackageContract;
    if(contract.destination!==destination||contract.bodyHash!==digest(body))reject("coordinator_package_conflict","Assignment differs from frozen admitted contract");
+   this.assertRecipientDispatchScope(scope.rig_id,destination,envelope!.packageKey);
    const prior=this.db.prepare("SELECT queue_id,source_queue_id FROM coordinator_assignments WHERE rig_id=? AND package_key=?").get(scope.rig_id,envelope!.packageKey) as {queue_id:string;source_queue_id:string|null}|undefined;
    if(prior&&prior.source_queue_id!==sourceQueueId)reject("coordinator_replay_source_conflict","Replay source differs from original committed operation");
    if(prior)throw new AssignmentReplay(prior.queue_id);
@@ -501,6 +505,11 @@ export class CoordinatorAuthorityService {
    }
    if(target && !this.coordinatorMembers(target).includes(destination))return target;
    return undefined;
+ }
+ private assertRecipientDispatchScope(rigId:string,recipient:string,packageKey?:string):void {
+   const row=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordination-plan' ORDER BY rowid DESC LIMIT 1").get(rigId) as {receipt:string}|undefined;
+   const restriction=row?(JSON.parse(row.receipt) as import('./coordination-recovery-service.js').CoordinationPlan).dispatchRestrictions?.find(r=>r.session===recipient):undefined;
+   if(restriction&&(!packageKey||restriction.generation!==this.generation(recipient)||restriction.validUntil<=this.now()||!restriction.packageKeys.includes(packageKey)))reject('coordinator_checkpoint_quiescence','Current checkpoint dispatch scope excludes this assignment or takeover');
  }
  assertRawSend(source:string|undefined,destination:string): void {
    const scope=this.scope(source,destination);
