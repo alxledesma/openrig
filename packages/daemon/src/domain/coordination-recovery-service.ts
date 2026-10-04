@@ -292,7 +292,7 @@ export class CoordinationRecoveryService {
        return [{key:'coordinator',state:'pending-peer-acknowledgment',queueId,deadline:transferred.lease_until}];
       })();
      } catch(error) {
-      const code=(error as {code?:string}).code,hold=heldDispatchCode(error)??(['coordination_stall_unproven','coordinator_uncertain_effects'].includes(code??'')?code:undefined);
+      const code=(error as {code?:string}).code,hold=heldDispatchCode(error)??(['coordination_stall_unproven','coordinator_uncertain_effects','coordinator_held_history_recovery_required'].includes(code??'')?code:undefined);
       if(!hold)throw error;
       // A safe takeover refusal is not a global work gate. Re-read authority before
       // fallback; never use a stale cached holder/epoch or imply successor pickup.

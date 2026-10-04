@@ -152,3 +152,20 @@ it('automatic frontier ignores only exact adopted contained Peer return while pr
  repo.update({qitemId:r.queueId!,actorSession:'reviewer@xv',state:'done',closureReason:'no-follow-on'});await repo.create({qitemId:'peer-ready-return',sourceSession:'reviewer@xv',destinationSession:'lead@xv',body:JSON.stringify({packageKey:'peer-ready',inputDigest:digest('peer-ready'),evidence:[{kind:'report',ref:'bounded/peer-ready.md'}]}),nudge:false,identityProvenance:'transport:v1'});svc().dispose('reviewer@xv','reviewer-g1','xv','peer-ready','peer-ready-return');recovery.accept('lead@xv','lead-g1','xv','peer-ready','peer-ready-return','bounded/accepted-peer-ready.md');
  expect(repo.getById('old-peer-return')).toEqual(priorReturn);expect(outbox.getById('peer-held-return')?.deliveryState).toBe('pending');expect(original().work).toEqual(preserved.work);expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id IN ('wake-intent-old','peer-held-return') ORDER BY outbox_id").all()).toEqual((preserved.effects as any[]).filter(e=>['wake-intent-old','peer-held-return'].includes(e.outbox_id)));expect(outbox.isHistoricalQuarantined('peer-held-return')).toBe(true);
 });
+
+it('expired held-history binding holds idle takeover without aborting independent ready work',async()=>{
+ const p=await packet();await authorize(p);migrate(p);svc().acknowledge('lead@xv',token,{obligationsDigest:svc().reconciliationDigest('xv'),operationId:'ack'});
+ let clock=Date.now();
+ const sample=(session:string):CoordinationActivity=>({generation:svc().generation(session)!,identityVerified:true,state:{seatNodeId:session,activity:'idle-at-prompt',needsInput:{count:0,reason:null},decidedBy:'window-sampling',seq:1,changedAt:new Date(clock).toISOString(),rungs:[],lastSwap:null},witness:{seatNodeId:session,sessionName:session,rung:'window-sampling',sourceId:'tmux',seq:1,observedAt:new Date(clock).toISOString(),activity:'idle-at-prompt'}});
+ const recovery=new CoordinationRecoveryService(repo,s=>sample(s),()=>clock);svc().coordinationRecovery=recovery;
+ const tasks=['reviewer@xv','architect@xv'].map((owner,i)=>({key:'task'+i,packageKey:'task'+i,owner,action:'Bounded review/recovery',body:'task'+i,deadline:clock+60000,predecessors:[],...(i?{recoveryFor:'task0'}:{}),admission:{generation:svc().generation(owner)!,configurationDigest:recovery.configurationDigest(owner)!,qualificationRef:'independent-current',capacityRef:'current',effortRef:'current',validUntil:clock+60000}}));
+ for(const t of tasks)svc().admit(actor,gen,'xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+ recovery.configure(actor,gen,{rigId:'xv',revision:'current',operatorGeneration:gen,stallMs:10000,allowIdlePeerTransfer:true,allowUnavailablePeerTransfer:false,tasks});
+ db.prepare("INSERT INTO watchdog_jobs(job_id,target_session,policy,interval_seconds,spec_yaml,state,registered_by_session,registered_at,registered_by_generation_uuid) VALUES ('j',?,'coordinator-continuity',1,'context: {}','active',?,?,?)").run(actor,actor,new Date(clock).toISOString(),gen);
+
+ clock+=11000;vi.setSystemTime(clock);db.prepare("UPDATE queue_items SET expires_at='2000-01-01T00:00:00Z' WHERE qitem_id='recovery'").run();
+ const before=original();const results=recovery.supervise('xv','j')!;
+ expect(results.find(r=>r.key==='coordinator')).toMatchObject({state:'held',reason:'coordinator_held_history_recovery_required'});
+ expect(results.find(r=>r.key==='task0')?.state).toBe('pending-pickup');expect(svc().get('xv')?.epoch).toBe(1);expect(repo.getById('baton')?.destinationSession).toBe('lead@xv');
+ const after=original();expect(after.work).toEqual(before.work);expect(after.holds).toEqual(before.holds);expect(after.effects.filter((e:any)=>e.outbox_id==='wake-intent-old')).toEqual(before.effects);const second=recovery.supervise('xv','j')!;expect(second.find(r=>r.key==='task0')?.state).toBe('pending-pickup');expect(db.prepare("SELECT count(*) n FROM coordinator_assignments WHERE package_key='task0'").get()).toEqual({n:1});
+});
