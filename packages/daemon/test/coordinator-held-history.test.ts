@@ -83,3 +83,41 @@ it('other rig continues while only exactly adopted held debt permits genuine una
  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='held-history-recovery-binding'").get()).toEqual({n:1});
  const before=original();expect(svc().transferObservedUnavailable('j',input)).toMatchObject({epoch:2,state:'reconciling',owner_session:'peer@xv'});expect(repo.getById('work')).toEqual(before.work);expect(outbox.getById('wake-intent-old')?.deliveryState).toBe('pending');expect(repo.getById('baton')?.state).toBe('pending');repo.claim({qitemId:'baton',destinationSession:'peer@xv',identityProvenance:'transport:v1'});svc().acknowledge('peer@xv',{...token,epoch:2,generation:'peer-g1'},{obligationsDigest:svc().reconciliationDigest('xv'),operationId:'peer-ack'});expect(svc().get('xv')?.state).toBe('active');
 });
+
+it('expired history recovery is renewed only from genuine unavailable-owner supervise provenance and actual Operator pickup',async()=>{
+ const p=await packet();await authorize(p);migrate(p);const q=await repo.create({qitemId:'other-ready',sourceSession:'worker@other',destinationSession:actor,body:'independent result',nudge:false});expect(q.qitemId).toBe('other-ready');expect(svc().legacyInventory('other','none',true).heldHistory).toEqual([]);
+ svc().acknowledge('lead@xv',token,{obligationsDigest:svc().reconciliationDigest('xv'),operationId:'ack'});
+ let clock=Date.now();
+ const sample=(session:string):CoordinationActivity=>({generation:svc().generation(session)!,identityVerified:true,state:{seatNodeId:session,activity:'idle-at-prompt',needsInput:{count:0,reason:null},decidedBy:'window-sampling',seq:1,changedAt:new Date(clock).toISOString(),rungs:[],lastSwap:null},witness:{seatNodeId:session,sessionName:session,rung:'window-sampling',sourceId:'tmux',seq:1,observedAt:new Date(clock).toISOString(),activity:'idle-at-prompt'}});
+ const recovery=new CoordinationRecoveryService(repo,s=>sample(s),()=>clock);svc().coordinationRecovery=recovery;
+ const tasks=['reviewer@xv','architect@xv'].map((owner,i)=>({key:'task'+i,packageKey:'task'+i,owner,action:'Bounded review/recovery',body:'task'+i,deadline:clock+60000,predecessors:[],...(i?{recoveryFor:'task0'}:{}),admission:{generation:svc().generation(owner)!,configurationDigest:recovery.configurationDigest(owner)!,qualificationRef:'independent-current',capacityRef:'current',effortRef:'current',validUntil:clock+60000}}));
+ for(const t of tasks)svc().admit(actor,gen,'xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+ recovery.configure(actor,gen,{rigId:'xv',revision:'current',operatorGeneration:gen,stallMs:10000,allowIdlePeerTransfer:false,allowUnavailablePeerTransfer:true,tasks});
+ db.prepare("INSERT INTO watchdog_jobs(job_id,target_session,policy,interval_seconds,spec_yaml,state,registered_by_session,registered_at,registered_by_generation_uuid) VALUES ('j',?,'coordinator-continuity',1,'context: {}','active',?,?,?)").run(actor,actor,new Date(clock).toISOString(),gen);
+ svc().renew('lead@xv',token,1000,'short');clock+=1001;vi.setSystemTime(clock);svc().setRuntimeObserver(async session=>({session,generation:svc().generation(session)!,state:session==='lead@xv'?'absent':'present',observedAt:clock,fingerprint:'actual-fixture-native-census'}));await svc().refreshRuntimeAvailability('xv');
+ const input={rigId:'xv',expectedEpoch:1,expectedOwner:'lead@xv',expectedOwnerGeneration:'lead-g1',planRevision:'current',recipient:'peer@xv',recipientGeneration:'peer-g1',leaseMs:60000};
+ db.prepare("UPDATE queue_items SET expires_at='2000-01-01T00:00:00Z' WHERE qitem_id='recovery'").run();
+ const originalBefore=original();const held=recovery.supervise('xv','j')!;expect(held[0]).toMatchObject({state:'held',reason:'coordinator_held_history_recovery_required'});
+ const id=held[0]!.queueId!;const task=repo.getById(id)!;expect(task.state).toBe('pending');expect(JSON.parse(task.body).heldHistoryAdmission).toMatchObject({jobId:'j',epoch:1,owner:'lead@xv',ownerGeneration:'lead-g1',planRevision:'current'});
+ const bind=()=>({rigId:'xv',operationId:'observer-renewal',effects:svc().legacyInventory('xv','none',true).heldHistory!,recovery:{queueId:id,rowHash:historicalDigest(db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(id))}});
+ expect(()=>svc().bindHeldHistoryRecovery(actor,gen,bind())).toThrow('Actual current Operator claim');
+ // Supported committed transport delivery precedes the actual recipient claim.
+ repo.attachTransport({send:async()=>({ok:true,verified:true})});await recovery.deliverCommitted();repo.claim({qitemId:id,destinationSession:actor,identityProvenance:'transport:v1'});
+ const bound=bind();
+ for(const kind of ['owner-present','plan','job','operator','expiry','claimed','receipt','held-ref']){db.exec('SAVEPOINT refused');
+   if(kind==='owner-present'){svc().setRuntimeObserver(async session=>({session,generation:svc().generation(session)!,state:'present',observedAt:clock,fingerprint:'live-returning-owner'}));await svc().refreshRuntimeAvailability('xv');}
+   if(kind==='plan')db.prepare("UPDATE coordinator_operations SET receipt=json_set(receipt,'$.revision','changed') WHERE rig_id='xv' AND kind='coordination-plan'").run();
+   if(kind==='job')db.prepare("UPDATE watchdog_jobs SET state='stopped' WHERE job_id='j'").run();
+   if(kind==='operator')db.prepare("UPDATE occupant_tenures SET generation_uuid='retired' WHERE node_id=?").run(actor);
+   if(kind==='expiry')db.prepare("UPDATE queue_items SET expires_at='2000-01-01T00:00:00Z' WHERE qitem_id=?").run(id);
+   if(kind==='claimed')db.prepare("UPDATE queue_items SET claimed_by_generation_uuid='retired' WHERE qitem_id=?").run(id);
+   if(kind==='receipt')db.prepare("UPDATE coordinator_operations SET receipt='{}' WHERE kind='held-history-recovery-notice'").run();
+   const request=kind==='held-ref'?{...bound,effects:[]}:['expiry','claimed'].includes(kind)?{...bound,recovery:bind().recovery}:bound;expect(()=>svc().bindHeldHistoryRecovery(actor,gen,request)).toThrow();expect(svc().get('xv')?.epoch).toBe(1);db.exec('ROLLBACK TO refused');db.exec('RELEASE refused');
+   svc().setRuntimeObserver(async session=>({session,generation:svc().generation(session)!,state:session==='lead@xv'?'absent':'present',observedAt:clock,fingerprint:'actual-fixture-native-census'}));await svc().refreshRuntimeAvailability('xv');
+ }
+ expect(svc().bindHeldHistoryRecovery(actor,gen,bound)).toMatchObject({originalMutations:0});expect(svc().bindHeldHistoryRecovery(actor,gen,bound)).toMatchObject({originalMutations:0});
+ db.exec('SAVEPOINT staleReplay');db.prepare("UPDATE queue_items SET state='done' WHERE qitem_id=?").run(id);expect(()=>svc().bindHeldHistoryRecovery(actor,gen,bound)).toThrow();db.exec('ROLLBACK TO staleReplay');db.exec('RELEASE staleReplay');
+ const after=recovery.supervise('xv','j')!;expect(after[0]).toMatchObject({state:'pending-peer-acknowledgment',reason:'fresh-native-unavailable-owner'});expect(svc().get('xv')?.epoch).toBe(2);expect(repo.getById('work')).toEqual(originalBefore.work);expect(outbox.getById('wake-intent-old')).toMatchObject({deliveryState:'pending'});
+ expect(svc().bindHeldHistoryRecovery.bind(svc(),actor,gen,bound)).toThrow();
+ expect(repo.getById('baton')?.state).toBe('pending');repo.claim({qitemId:'baton',destinationSession:'peer@xv',identityProvenance:'transport:v1'});svc().acknowledge('peer@xv',{...token,epoch:2,generation:'peer-g1'},{obligationsDigest:svc().reconciliationDigest('xv'),operationId:'peer-ack'});expect(svc().get('xv')?.state).toBe('active');
+});
