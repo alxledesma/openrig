@@ -46,7 +46,7 @@ export class HistoricalEffectDispositionService {
   const resources=assignment.flatMap(a=>this.db.prepare('SELECT * FROM coordinator_resources WHERE rig_id=? AND package_key=? ORDER BY resource_key').all((a as {rig_id:string}).rig_id,(a as {package_key:string}).package_key));
   return {queue:q??null,assignment,resources};
  }
- inspect(rigId:string,ids:string[],archivedScope?:HistoricalArchivedScope):HistoricalEffectRef[] {return ids.map(id=>{const r=this.row(id);this.scope(rigId,r,archivedScope);return {outboxId:id,rowHash:historicalDigest(r),custodyHash:historicalDigest(this.custody(r))};});}
+ inspect(rigId:string,ids:string[],archivedScope?:HistoricalArchivedScope):HistoricalEffectRef[] {return ids.map(id=>{const r=this.row(id);this.scope(rigId,r,archivedScope,true);return {outboxId:id,rowHash:historicalDigest(r),custodyHash:historicalDigest(this.custody(r))};});}
  snapshot(actor:string,generation:string,input:HistoricalSnapshotInput):HistoricalEffectRef[] {
   if(!input||['rigId','leadBatonId','leadGeneration','operatorGeneration'].some(k=>typeof (input as unknown as Record<string,unknown>)[k]!=='string')||!Array.isArray(input.outboxIds)||input.outboxIds.length<1||input.outboxIds.length>2000||input.outboxIds.some(id=>typeof id!=='string'))refuse('historical_exact_cohort','Explicit bounded snapshot required');
   this.actors(actor,generation,input);return this.inspect(input.rigId,input.outboxIds,input.archivedScope);
@@ -65,9 +65,18 @@ export class HistoricalEffectDispositionService {
   }
   return subjects;
  }
- private scope(rigId:string,r:Row,archivedScope?:HistoricalArchivedScope):void {
+ private scope(rigId:string,r:Row,archivedScope?:HistoricalArchivedScope,preservation=false):void {
   const rig=this.db.prepare('SELECT name FROM rigs WHERE id=? AND archived_at IS NULL').get(rigId) as {name:string}|undefined;
-  if(!rig||[r.sender_session,r.destination_session].some(s=>s.split('@').length!==2))refuse('historical_effect_scope','Exact active local rig; no host-qualified forwarding');
+  // Historic incoming self-qualified sender bytes stay intact. This local
+  // preservation exception grants no remote authentication or disposition.
+  const sender=r.sender_session.split('@'),recipient=r.destination_session.split('@');
+  if(preservation&&!archivedScope&&rig&&sender.length===3){
+   const self=this.db.prepare('SELECT host_id FROM self_host_identity WHERE singleton=1').get() as {host_id:string}|undefined;
+   const destination=this.local(r.destination_session);
+   if(sender.some(p=>!p||! /^[A-Za-z0-9_.-]+$/.test(p))||!self?.host_id||sender[2]!==self.host_id||recipient.length!==2||!destination||destination.rigId!==rigId)refuse('historical_effect_scope','Incoming preservation requires persisted self host and current registered local recipient in exact custodial rig');
+   return;
+  }
+  if(!rig||[sender,recipient].some(p=>p.length!==2))refuse('historical_effect_scope','Exact active local rig; no host-qualified forwarding');
   if(archivedScope){const subjects=this.archived(archivedScope);if([r.sender_session,r.destination_session].some(s=>!subjects.some(a=>a.name===s.split('@')[1])))refuse('historical_effect_scope','Both archived endpoints must be explicitly delegated');}
   else if(![r.sender_session,r.destination_session].some(s=>s.split('@')[1]===rig!.name))refuse('historical_effect_scope','Exact active local rig; no host-qualified forwarding');
  }
@@ -136,7 +145,7 @@ export class HistoricalEffectDispositionService {
    const {lead}=this.actors(actor,generation,input),hash=historicalDigest({actor,generation,input});const replay=this.replay(input.rigId,input.operationId,'quarantine',hash);if(replay)return replay;
    this.validateContract(input);if(!Array.isArray(input.effects)||input.effects.length<1||input.effects.length>2000||input.effects.some(e=>!e||['outboxId','rowHash','custodyHash'].some(k=>typeof (e as unknown as Record<string,unknown>)[k]!=='string'))||new Set(input.effects.map(e=>e.outboxId)).size!==input.effects.length)refuse('historical_exact_cohort','One bounded enumerated effect cohort required');
    this.authorization(actor,generation,input,'outbox-historical-quarantine-authorization',hash,lead);
-   for(const e of input.effects){const r=this.row(e.outboxId);this.scope(input.rigId,r,input.archivedScope);if(!['pending','indeterminate'].includes(r.delivery_state)||historicalDigest(r)!==e.rowHash||historicalDigest(this.custody(r))!==e.custodyHash)refuse('historical_effect_drift','Exact unresolved row/custody changed; no quarantine');if(isHistoricalQuarantined(this.db,e.outboxId))refuse('historical_quarantine_conflict','Effect already has an attributed quarantine');
+   for(const e of input.effects){const r=this.row(e.outboxId);this.scope(input.rigId,r,input.archivedScope,true);if(!['pending','indeterminate'].includes(r.delivery_state)||historicalDigest(r)!==e.rowHash||historicalDigest(this.custody(r))!==e.custodyHash)refuse('historical_effect_drift','Exact unresolved row/custody changed; no quarantine');if(isHistoricalQuarantined(this.db,e.outboxId))refuse('historical_quarantine_conflict','Effect already has an attributed quarantine');
     this.db.prepare("INSERT INTO outbox_historical_quarantines VALUES (?,?,?,?,?,?,'held',?)").run(e.outboxId,input.rigId,e.rowHash,input.operationId,input.authorizationId,input.expiresAt,new Date(this.now()).toISOString());}
    const receipt={kind:'historical-quarantine',rigId:input.rigId,operationId:input.operationId,actor,generation,lead,leadGeneration:input.leadGeneration,effects:input.effects.map(e=>e.outboxId),...(input.archivedScope?{archivedScope:input.archivedScope,quarantineOnly:true}:{}),admittedUntil:input.expiresAt,deliveryConclusion:'unknown',outboxMutations:0};this.record(input.rigId,input.operationId,'quarantine',hash,receipt);return receipt;
   }).immediate();

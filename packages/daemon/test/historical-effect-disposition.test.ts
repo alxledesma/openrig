@@ -226,3 +226,65 @@ it.each(['resume-token','resume-type','resume-provenance','probe-status','status
  release();await hold;await expect(pending).rejects.toThrow();
  expect(original()).toEqual(rows);expect(db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all()).toEqual(queues);expect(db.prepare('SELECT * FROM outbox_historical_quarantines ORDER BY outbox_id').all()).toEqual(quarantines);expect(db.prepare('SELECT * FROM outbox_historical_operations ORDER BY operation_id').all()).toEqual(operations);
 });
+
+async function incomingQualified(id='incoming',sender='visitor@historical-rig@host-self',destination='builder@xv'){
+ db.prepare("INSERT OR IGNORE INTO self_host_identity(singleton,host_id,minted_at,reconciled_at) VALUES (1,'host-self','2026-10-04','2026-10-04')").run();
+ await repo.create({qitemId:id,sourceSession:sender,destinationSession:destination,body:'valuable incoming obligation',nudge:false});
+ outbox.record({outboxId:`wake-intent-${id}`,senderSession:sender,destinationSession:destination,body:'original qualified incoming intent',auditPointer:id,identityProvenance:'transport:v1'});
+ return `wake-intent-${id}`;
+}
+it('incoming persisted self-host-bound sender snapshot and atomic startup preserve UNKNOWN and exclude only old wake',async()=>{
+ const id=await incomingQualified(),p=plan([id]);await authorize(p);
+ const rows=original(),queues=db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all();
+ expect(service.snapshot(actor,generation,{...p,outboxIds:[id]})).toEqual(p.effects);
+ const dir=mkdtempSync(join(tmpdir(),'incoming-historical-'));
+ try{const path=join(dir,'manifest.json');writeFileSync(path,JSON.stringify({schema:'historical-startup-bundle.v1',cohorts:[p]}));expect(applyHistoricalStartupRecovery(db,'observe',path)).toMatchObject({effectCount:1,deliveryConclusion:'unknown',outboxMutations:0});}finally{rmSync(dir,{recursive:true,force:true});}
+ expect(original()).toEqual(rows);expect(db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all()).toEqual(queues);
+ expect(outbox.getById(id)).toMatchObject({senderSession:'visitor@historical-rig@host-self',deliveryState:'pending',deliveredAt:null});
+ await wake('fresh-local');const sent:string[]=[];repo.attachOutbox(outbox);repo.attachTransport({send:async(_s,_b,o)=>{sent.push(...o!.committedOutboxIds!);return {ok:true,verified:true};}});
+ expect(await repo.drainPendingWakeIntents()).toMatchObject({delivered:1});expect(sent).toEqual(['wake-intent-fresh-local']);expect(outbox.getById(id)?.deliveryState).toBe('pending');
+});
+it('incoming own-host qualified historical sender is preserved without rewriting its recorded provenance',async()=>{
+ const id=await incomingQualified('self-incoming','visitor@historical-rig@host-self');
+ const p=plan([id]);await authorize(p);const rows=original();expect(service.quarantine(actor,generation,p)).toMatchObject({deliveryConclusion:'unknown'});expect(original()).toEqual(rows);
+});
+it.each(['withdraw-obsolete-wake','custodian-withdraw-unregistered-direct','withdraw-archived-sender-active-direct'] as const)('incoming preservation does not expand %s disposition authority',async action=>{
+ const id=await incomingQualified(),p=plan([id],'hold-'+id);await authorize(p);service.quarantine(actor,generation,p);
+ const {effects,...rest}=plan([id],'forbidden-dispose');const d:HistoricalDisposition={...rest,quarantineOperationId:p.operationId,effect:effects[0]!,action,reason:'must never grant remote retirement',evidenceRef:'synthetic'};
+ await authorize(d);const rows=original(),queues=db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all(),ledger=db.prepare('SELECT * FROM outbox_historical_operations ORDER BY operation_id').all();
+ await expect(service.dispose(actor,generation,d,guard)).rejects.toThrow();expect(original()).toEqual(rows);expect(db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all()).toEqual(queues);expect(db.prepare('SELECT * FROM outbox_historical_operations ORDER BY operation_id').all()).toEqual(ledger);
+});
+it.each(['foreign-host','missing-self-id','malformed','missing-recipient','foreign-recipient','archived-recipient','qualified-destination'])('incoming scope refuses %s without ledger/outbox writes',async kind=>{
+ const id=await incomingQualified();
+ if(kind==='foreign-host')db.prepare("UPDATE outbox_entries SET sender_session='visitor@remote@host-unknown' WHERE outbox_id=?").run(id);
+ if(kind==='missing-self-id')db.prepare('DELETE FROM self_host_identity').run();
+ if(kind==='qualified-destination')db.prepare("UPDATE outbox_entries SET destination_session='builder@xv@host-self' WHERE outbox_id=?").run(id);
+ if(kind==='malformed')db.prepare("UPDATE outbox_entries SET sender_session='visitor@@host-self' WHERE outbox_id=?").run(id);
+ if(kind==='missing-recipient')db.prepare("UPDATE outbox_entries SET destination_session='gone@xv' WHERE outbox_id=?").run(id);
+ if(kind==='foreign-recipient')db.prepare("UPDATE outbox_entries SET destination_session='worker@other' WHERE outbox_id=?").run(id);
+ if(kind==='archived-recipient')db.prepare("UPDATE rigs SET archived_at='archived' WHERE id='xv'").run();
+ const rows=original();expect(()=>service.inspect('xv',[id])).toThrow();expect(original()).toEqual(rows);expect(db.prepare('SELECT count(*) n FROM outbox_historical_operations').get()).toEqual({n:0});expect(db.prepare('SELECT count(*) n FROM outbox_historical_quarantines').get()).toEqual({n:0});
+});
+it('incoming finite exact custody refuses drift and later-cohort refusal rolls back earlier admission',async()=>{
+ const id=await incomingQualified(),p=plan([id]);await authorize(p);const rows=original();
+ expect(()=>service.quarantine(actor,'old',p)).toThrow();expect(()=>service.quarantine(actor,generation,{...p,leadGeneration:'old'})).toThrow();
+ const expired={...p,operationId:'expired',authorizationId:'auth-expired',expiresAt:Date.now()-1};expect(()=>service.quarantine(actor,generation,expired)).toThrow('future admission');
+ const fresh=await wake('later'),later=plan([fresh],'later');await authorize(later);repo.claim({qitemId:'later',destinationSession:'builder@xv'});
+ const dir=mkdtempSync(join(tmpdir(),'incoming-historical-rollback-'));
+ try{const path=join(dir,'manifest.json');writeFileSync(path,JSON.stringify({schema:'historical-startup-bundle.v1',cohorts:[p,later]}));expect(()=>applyHistoricalStartupRecovery(db,'observe',path)).toThrow('row/custody changed');}finally{rmSync(dir,{recursive:true,force:true});}
+ expect(outbox.getById(id)?.deliveryState).toBe('pending');expect(original().filter(r=>(r as {outbox_id:string}).outbox_id===id)).toEqual(rows);expect(db.prepare('SELECT count(*) n FROM outbox_historical_operations').get()).toEqual({n:0});expect(db.prepare('SELECT count(*) n FROM outbox_historical_quarantines').get()).toEqual({n:0});
+});
+
+it('incoming pending direct and indeterminate wake preserve original bytes with exact idempotent admission',async()=>{
+ const wakeId=await incomingQualified();outbox.markIndeterminate(wakeId);
+ const direct=outbox.record({outboxId:'incoming-direct',senderSession:'visitor@historical-rig@host-self',destinationSession:'builder@xv',body:'valuable pending direct',identityProvenance:'transport:v1'}).outboxId;
+ const p=plan([wakeId,direct]);await authorize(p);const rows=original(),queues=db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all();
+ const receipt=service.quarantine(actor,generation,p),ledger=db.prepare('SELECT * FROM outbox_historical_operations').all();expect(service.quarantine(actor,generation,p)).toEqual(receipt);expect(db.prepare('SELECT * FROM outbox_historical_operations').all()).toEqual(ledger);
+ expect(original()).toEqual(rows);expect(db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all()).toEqual(queues);expect(outbox.listPending('')).toEqual([]);expect(outbox.claimForDelivery(direct)).toBe(false);expect(outbox.reconcileAbandonedSending('')).toBe(0);expect(original()).toEqual(rows);
+});
+it('incoming self host or recipient registration drift after authorization refuses atomic admission',async()=>{
+ const id=await incomingQualified(),p=plan([id]);await authorize(p);const rows=original();
+ db.prepare("UPDATE self_host_identity SET host_id='host-changed'").run();expect(()=>service.quarantine(actor,generation,p)).toThrow('persisted self host');
+ db.prepare("UPDATE self_host_identity SET host_id='host-self'").run();db.prepare("DELETE FROM occupant_tenures WHERE node_id='builder@xv'").run();expect(()=>service.quarantine(actor,generation,p)).toThrow('current registered local recipient');
+ expect(original()).toEqual(rows);expect(db.prepare('SELECT count(*) n FROM outbox_historical_operations').get()).toEqual({n:0});expect(db.prepare('SELECT count(*) n FROM outbox_historical_quarantines').get()).toEqual({n:0});
+});
