@@ -8,11 +8,12 @@ export function makeCoordinatorContinuityPolicy(service:CoordinatorAuthorityServ
   await service.coordinationRecovery?.refreshActivity(job.context.rigId);
   // Persisted opt-in recovery reconciles real queue transitions, not reminder replies.
   const coordination=service.coordinationRecovery?.supervise(job.context.rigId,job.jobId);
+  const outcomePolicyRecovery=service.runtimeOutcomeAssessment?.stagePolicyBoundary(job.context.rigId);
   await service.runtimeOutcomeAssessment?.drain(job.context.rigId);
   await service.coordinationRecovery?.deliverCommitted();
-  if(coordination?.some(result=>result.key==='coordinator'&&result.queueId))return {action:'skip',reason:'committed-coordinator-recovery-custody',notes:{coordination}};
+  if(coordination?.some(result=>result.key==='coordinator'&&result.queueId))return {action:'skip',reason:'committed-coordinator-recovery-custody',notes:{coordination,...(outcomePolicyRecovery?{outcomePolicyRecovery}: {})}};
   const recovery=service.observeContinuity(job.context.rigId);
-  if(!recovery)return {action:"skip",reason:coordination?'coordination-reconciled':"no-authoritative-exclusion",...(coordination?{notes:{coordination}}:{})};
-  return {action:"send",target:job.target,message:`Coordinator recovery intake for ${recovery.rigId}, epoch ${recovery.expectedEpoch}. Preserve workers; no product dispatch or automatic transfer.`,conditionReceipt:recovery.evidenceId,coordinatorRecovery:recovery,...(coordination?{notes:{coordination}}:{})};
+  if(!recovery)return {action:"skip",reason:coordination?'coordination-reconciled':"no-authoritative-exclusion",...(coordination?{notes:{coordination,...(outcomePolicyRecovery?{outcomePolicyRecovery}: {})}}:{})};
+  return {action:"send",target:job.target,message:`Coordinator recovery intake for ${recovery.rigId}, epoch ${recovery.expectedEpoch}. Preserve workers; no product dispatch or automatic transfer.`,conditionReceipt:recovery.evidenceId,coordinatorRecovery:recovery,...(coordination?{notes:{coordination,...(outcomePolicyRecovery?{outcomePolicyRecovery}: {})}}:{})};
  }};
 }

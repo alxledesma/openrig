@@ -51,6 +51,16 @@ export class RuntimeOutcomeAssessment {
   }).immediate();
  }
  private current(p:OutcomePolicy):boolean {return p.operatorGeneration===this.authority.generation('operator-agent@kernel')&&p.qualification.validUntil>this.now()&&p.qualification.providerConfigDigest===digest(JSON.stringify(p.adapterConfig));}
+ /** Expiry is a native recovery obligation, never permission to extend a grant. */
+ stagePolicyBoundary(rigId:string):string|null {
+  return this.db.transaction(()=>{
+   const p=this.policy(rigId),generation=this.authority.generation('operator-agent@kernel');
+   if(!p||this.current(p)||!generation||generation!==p.operatorGeneration||!this.authority.get(rigId))return null;
+   const queueId='qitem-outcome-policy-recovery-'+digest(rigId+':'+p.revision+':'+generation).slice(0,24);
+   if(!this.repo.getById(queueId)){const deadline=this.now()+1200000;this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:new Date(deadline).toISOString(),body:JSON.stringify({action:'requalify-expired-outcome-policy',rigId,policyRevision:p.revision,recipientGeneration:generation,providerConfigDigest:p.qualification.providerConfigDigest,qualificationRef:p.qualification.ref,qualificationValidUntil:p.qualification.validUntil,deadline,grantsAuthority:false,required:'Claim this finite recovery. Revalidate exact provider configuration, existing private-input owner permission and credential availability without logging credentials. Record a dated qualification preserving all calibration/negative-advice limits and apply a new finite policy revision through supported native Operator API only when proven. Preserve prior decisions, acceptance gates and unknown provider effects; no automatic grant extension, paid retry, positive authority or acceptance waiver. If prior acceptance/Owner credential gates refuse, return the exact concrete boundary to current Lead/Root.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});this.repo.stageWakeIntent(queueId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,generation);}
+   return queueId;
+  }).immediate();
+ }
  enqueueDisposed(actor:string,generation:string,rigId:string,packageKey:string,dispositionId:string):void {
   const p=this.policy(rigId);if(!p)return;
   const a=this.db.prepare('SELECT a.queue_id,a.disposition_id,q.body,q.state,q.claimed_by_generation_uuid FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=?').get(rigId,packageKey) as {queue_id:string;disposition_id:string;body:string;state:string;claimed_by_generation_uuid:string}|undefined;
