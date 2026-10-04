@@ -1,3 +1,4 @@
+import { CoordinatorFenceError, digest } from "./coordinator-authority-service.js";
 import { findQueueRecovery, recoveryId, recoveryTag } from "./queue-recovery.js";
 import { queueWaitNotice } from "./queue-wait-backoff.js";
 import { lastMeaningfulTransition, pendingSince } from "./queue-waiting.js";
@@ -153,6 +154,17 @@ export interface StuckSweepResult {
   outcome: "clean" | "findings" | "failed";
   findings: StuckSweepFindingAction[];
   error?: string;
+  /** A failed scope is visible even when independent findings committed. */
+  refusals?: StuckSweepRefusal[];
+}
+
+export interface StuckSweepRefusal {
+  qitemId: string;
+  kind: StuckFindingKind;
+  code: string;
+  message: string;
+  recoveryQueueId?: string;
+  recoveryError?: string;
 }
 
 export { resolveSessionNodeId, defaultResolveOrchestrator } from "./queue-owner.js";
@@ -307,6 +319,63 @@ function evidenceBody(db: Database.Database, c: Candidate): string {
   );
 }
 
+const ACCOUNTABILITY_TAG = "stuck-sweep-accountability";
+const OPERATOR = "operator-agent@kernel";
+
+function refusalCode(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : "stuck_sweep_route_failed";
+}
+
+function sourceFacts(row: QueueItem): string {
+  return JSON.stringify([row.qitemId, row.sourceSession, row.destinationSession, digest(row.body),
+    row.state, row.tsUpdated, row.claimedAt, row.closureTarget]);
+}
+
+/** A detector notice is distinct from the refused assignment. Current Operator
+ * control only; no borrowed creator, dispatch envelope, package, or resource. */
+function stageRefusalRecovery(deps: StuckSweepDeps, c: Candidate, code: string, now: Date):
+  { qitemId: string; action: "created" | "refreshed" } {
+  return deps.db.transaction(() => {
+    const authority = deps.queueRepo.coordinatorAuthority;
+    const generation = authority.generation(OPERATOR);
+    if (!generation) throw new CoordinatorFenceError("stuck_sweep_operator_unavailable", "Actual current Operator required for accountable sweep recovery");
+    authority.assertCurrentOperator(OPERATOR, generation);
+    const current = deps.queueRepo.getById(c.row.qitemId);
+    if (!current || sourceFacts(current) !== sourceFacts(c.row)) {
+      throw new CoordinatorFenceError("stuck_sweep_source_changed", "Source facts changed; next sweep must reconcile current evidence");
+    }
+    const recoveryKey = digest(JSON.stringify([sourceFacts(current), c.kind, c.evidenceAt, code, generation]));
+    const previous = deps.db.prepare(`SELECT qitem_id,state FROM queue_items
+      WHERE source_session='watchdog@system' AND destination_session=? AND json_valid(body)
+        AND json_extract(body,'$.stuckSweepRecoveryKey')=? ORDER BY rowid DESC LIMIT 1`)
+      .get(OPERATOR, recoveryKey) as { qitem_id: string; state: string } | undefined;
+    if (previous && ["pending", "in-progress", "blocked"].includes(previous.state)) {
+      return { qitemId: previous.qitem_id, action: "refreshed" as const };
+    }
+    const queueId = "qitem-stuck-sweep-control-" + digest(recoveryKey + ":" + (previous?.qitem_id ?? "initial")).slice(0, 24);
+    deps.queueRepo.createWithinTransaction({
+      qitemId: queueId, sourceSession: "watchdog@system", destinationSession: OPERATOR,
+      body: JSON.stringify({ action: "reconcile-refused-stuck-finding", stuckSweepRecoveryKey: recoveryKey,
+        previousQueueId: previous?.qitem_id ?? null, reason: code, kind: c.kind,
+        original: { qitemId: current.qitemId, sourceSession: current.sourceSession,
+          destinationSession: current.destinationSession, bodyHash: digest(current.body),
+          state: current.state, evidenceAt: c.evidenceAt, factsHash: digest(sourceFacts(current)) },
+        intendedRoute: c.route, recipientGeneration: generation, deadline: now.getTime() + 60000,
+        required: "Preserve exact original source/body/claims/resources and unknown effects. Read current facts and admission; use supported current-owner/Operator control to repair or record a concrete protected boundary. Do not fabricate dispatch envelopes, admit a diagnostic as product work, or replay uncertain delivery. Continue independent ready work.",
+        returnPath: { queueId, actor: OPERATOR, generation,
+          completion: "Claim this exact recovery notice and return supported reconciliation evidence through queue update. Recheck original custody; notice closure is not original-work completion.",
+          failure: "Block this same claimed notice with exact remaining guard, accountable next action and finite deadline." } }),
+      summary: `Stuck finding refused: ${code} on ${current.qitemId}`,
+      evidenceRef: `rig queue show ${current.qitemId}`, tags: [STUCK_SWEEP_FINDING_TAG, ACCOUNTABILITY_TAG],
+      identityProvenance: "system:operator-authorized-coordination", nudge: true,
+    });
+    deps.queueRepo.stageWakeIntent(queueId, "watchdog@system", OPERATOR,
+      "system:operator-authorized-coordination", true, generation);
+    return { qitemId: queueId, action: "created" as const };
+  }).immediate();
+}
+
 /**
  * One sweep pass. Instance-wide (no rig scope — the loop is the net for every rig the
  * daemon carries). Never throws: a sweep that cannot run reports outcome=failed loudly
@@ -316,6 +385,26 @@ function evidenceBody(db: Database.Database, c: Candidate): string {
 export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepResult> {
   const log = deps.log ?? ((line: string) => console.error(line));
   const status = deps.status;
+  const findings: StuckSweepFindingAction[] = [];
+  const refusals: StuckSweepRefusal[] = [];
+  const recordRefusal = async (c: Candidate, error: unknown, now: Date): Promise<void> => {
+    const refusal: StuckSweepRefusal = { qitemId: c.row.qitemId, kind: c.kind,
+      code: refusalCode(error), message: error instanceof Error ? error.message : String(error) };
+    refusals.push(refusal);
+    log(`[stuck-sweep] scope refused ${c.row.qitemId}: ${refusal.code}`);
+    try {
+      const recovery = stageRefusalRecovery(deps, c, refusal.code, now);
+      refusal.recoveryQueueId = recovery.qitemId;
+      findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: recovery.qitemId, action: recovery.action });
+      if (recovery.action === "created") {
+        // Commit is already counted even if the subsequent exact wake fails.
+        await deps.queueRepo.deliverWakeForSuccessor(recovery.qitemId, OPERATOR, true, "watchdog@system");
+      }
+    } catch (recoveryError) {
+      refusal.recoveryError = refusalCode(recoveryError);
+      log(`[stuck-sweep] recovery refused ${c.row.qitemId}: ${refusal.recoveryError}`);
+    }
+  };
   try {
     const now = deps.now ?? new Date();
     const ageMinutes = deps.unclaimedAgeMinutes ?? resolveStuckSweepUnclaimedAgeMinutes();
@@ -480,46 +569,50 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
 
     // Route: idempotent per (row, kind). An existing open finding refreshes its age; a
     // new one is created durable + waking (the create path's default nudge).
-    const findings: StuckSweepFindingAction[] = [];
     const liveDedupTags = new Set<string>();
     for (const c of [...new Map(candidates.map(c => [c.row.qitemId, c])).values()]) {
+      // A detected condition stays live even if its route or recovery is refused.
       const dedupTag = findingDedupTag(c.kind, c.row.qitemId);
-      const shared = findQueueRecovery(deps.db, c.row.qitemId);
-      if (shared) {
-        const existingTags = deps.queueRepo.getById(shared.qitemId)?.tags ?? [];
-        for (const tag of existingTags) if (tag.startsWith("stuck-sweep:")) liveDedupTags.add(tag);
-        if (["pending", "in-progress", "blocked"].includes(shared.state)) findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: shared.qitemId, action: "refreshed" });
-        continue;
-      }
       liveDedupTags.add(dedupTag);
-      const existing = deps.db
-        .prepare(
-          `SELECT qitem_id, source_session, state, ts_updated FROM queue_items
-            WHERE tags LIKE ?
-            ORDER BY CASE WHEN state IN ('pending', 'in-progress', 'blocked') THEN 0 ELSE 1 END,
-                     ts_updated DESC, ts_created DESC, qitem_id DESC
-            LIMIT 1`,
-        )
-        .get(`%"${dedupTag}"%`) as
-        | { qitem_id: string; source_session: string; state: string; ts_updated: string }
-        | undefined;
-      const existingIsOpen = existing && ["pending", "in-progress", "blocked"].includes(existing.state);
-      if (existing && existingIsOpen) {
-        // Age is derived at read time; an unchanged scan is not a transition.
-        findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: existing.qitem_id, action: "refreshed" });
-      } else if (!existing || evidenceIsNewer(c.evidenceAt, existing.ts_updated)) {
-        const created = await deps.queueRepo.create({
-          qitemId: recoveryId(deps.db, c.row.qitemId),
-          // The detector is machinery, not a seat: the obligation's own creator is the
-          // finding's source (the workflow-exception precedent).
-          sourceSession: c.row.sourceSession,
-          destinationSession: c.route,
-          body: evidenceBody(deps.db, c),
-          summary: `Stuck sweep: ${c.verificationTargets ? "successor-verification-required" : c.kind} on ${c.row.qitemId} (${c.ageMinutes} min)`,
-          evidenceRef: `rig queue show ${c.row.qitemId}`,
-          tags: [STUCK_SWEEP_FINDING_TAG, dedupTag, recoveryTag(c.row.qitemId)],
-        });
-        findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: created.qitemId, action: "created" });
+      try {
+        const shared = findQueueRecovery(deps.db, c.row.qitemId);
+        if (shared) {
+          const existingTags = deps.queueRepo.getById(shared.qitemId)?.tags ?? [];
+          for (const tag of existingTags) if (tag.startsWith("stuck-sweep:")) liveDedupTags.add(tag);
+          if (["pending", "in-progress", "blocked"].includes(shared.state)) findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: shared.qitemId, action: "refreshed" });
+          continue;
+        }
+        const existing = deps.db
+          .prepare(
+            `SELECT qitem_id, source_session, state, ts_updated FROM queue_items
+              WHERE tags LIKE ?
+              ORDER BY CASE WHEN state IN ('pending', 'in-progress', 'blocked') THEN 0 ELSE 1 END,
+                       ts_updated DESC, ts_created DESC, qitem_id DESC
+              LIMIT 1`,
+          )
+          .get(`%"${dedupTag}"%`) as
+          | { qitem_id: string; source_session: string; state: string; ts_updated: string }
+          | undefined;
+        const existingIsOpen = existing && ["pending", "in-progress", "blocked"].includes(existing.state);
+        if (existing && existingIsOpen) {
+          // Age is derived at read time; an unchanged scan is not a transition.
+          findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: existing.qitem_id, action: "refreshed" });
+        } else if (!existing || evidenceIsNewer(c.evidenceAt, existing.ts_updated)) {
+          const created = await deps.queueRepo.create({
+            qitemId: recoveryId(deps.db, c.row.qitemId),
+            // The detector is machinery, not a seat: the obligation's own creator is the
+            // finding's source (the workflow-exception precedent).
+            sourceSession: c.row.sourceSession,
+            destinationSession: c.route,
+            body: evidenceBody(deps.db, c),
+            summary: `Stuck sweep: ${c.verificationTargets ? "successor-verification-required" : c.kind} on ${c.row.qitemId} (${c.ageMinutes} min)`,
+            evidenceRef: `rig queue show ${c.row.qitemId}`,
+            tags: [STUCK_SWEEP_FINDING_TAG, dedupTag, recoveryTag(c.row.qitemId)],
+          });
+          findings.push({ kind: c.kind, qitemId: c.row.qitemId, findingQitemId: created.qitemId, action: "created" });
+        }
+      } catch (error) {
+        await recordRefusal(c, error, now);
       }
     }
 
@@ -539,34 +632,48 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       } catch {
         continue;
       }
+      // Accountable control notices require the actual Operator's return. Source
+      // disappearance or changed facts must never manufacture their completion.
+      if (tags.includes(ACCOUNTABILITY_TAG)) continue;
       const dedupTag = tags.find((t) => t.startsWith("stuck-sweep:"));
       if (!dedupTag || liveDedupTags.has(dedupTag)) continue;
       const [, kind, stuckId] = dedupTag.match(/^stuck-sweep:([a-z-]+):(.+)$/) ?? [];
-      await deps.queueRepo.update({
-        qitemId: f.qitem_id,
-        actorSession: f.source_session,
-        state: "done",
-        closureReason: "no-follow-on",
-        transitionNote: `stuck-sweep resolved: ${kind ?? "finding"} on ${stuckId ?? "row"} no longer detected`,
-      });
-      if (kind && stuckId) {
-        findings.push({
-          kind: kind as StuckFindingKind,
-          qitemId: stuckId,
-          findingQitemId: f.qitem_id,
-          action: "closed",
+      try {
+        await deps.queueRepo.update({
+          qitemId: f.qitem_id,
+          actorSession: f.source_session,
+          state: "done",
+          closureReason: "no-follow-on",
+          transitionNote: `stuck-sweep resolved: ${kind ?? "finding"} on ${stuckId ?? "row"} no longer detected`,
         });
+        if (kind && stuckId) {
+          findings.push({
+            kind: kind as StuckFindingKind,
+            qitemId: stuckId,
+            findingQitemId: f.qitem_id,
+            action: "closed",
+          });
+        }
+      } catch (error) {
+        const row = deps.queueRepo.getById(f.qitem_id);
+        if (row) await recordRefusal({ kind: (kind as StuckFindingKind) ?? "unclaimed-obligation",
+          row, route: f.source_session, ageMinutes: 0, evidenceAt: row.tsUpdated,
+          why: "Existing finding resolution refused" }, error, now);
+        else refusals.push({ qitemId: f.qitem_id, kind: "unclaimed-obligation",
+          code: refusalCode(error), message: "Finding changed during resolution; reconcile next tick" });
       }
     }
 
-    const outcome = findings.length > 0 ? "findings" : "clean";
-    status?.record(outcome, { findings: findings.filter((f) => f.action !== "closed").length });
-    return { outcome, findings };
+    const error = refusals.length ? `${refusals.length} stuck scope(s) refused; first ${refusals[0]!.qitemId}: ${refusals[0]!.code}` : undefined;
+    const outcome = error ? "failed" : findings.length > 0 ? "findings" : "clean";
+    // Count committed new rows only; refresh/closure is not a new routed write.
+    status?.record(outcome, { error, findings: findings.filter((f) => f.action === "created").length });
+    return { outcome, findings, ...(error ? { error, refusals } : {}) };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // Loud, never silent: the failure lands on the log AND the status surface (healthz).
     log(`[stuck-sweep] SWEEP FAILED (skipping this tick loudly): ${message}`);
-    status?.record("failed", { error: message });
-    return { outcome: "failed", findings: [], error: message };
+    status?.record("failed", { error: message, findings: findings.filter((f) => f.action === "created").length });
+    return { outcome: "failed", findings, error: message, ...(refusals.length ? { refusals } : {}) };
   }
 }
