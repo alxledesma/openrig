@@ -8,6 +8,13 @@ export class HistoricalEffectError extends Error {constructor(readonly code:stri
 const refuse=(code:string,message:string):never=>{throw new HistoricalEffectError(code,message);};
 const canonical=(value:unknown):string=>Array.isArray(value)?`[${value.map(canonical).join(',')}]`:value!==null&&typeof value==='object'?`{${Object.entries(value).sort(([a],[b])=>a<b?-1:a>b?1:0).map(([k,v])=>JSON.stringify(k)+':'+canonical(v)).join(',')}}`:JSON.stringify(value)??'null';
 export const historicalDigest=(value:unknown):string=>createHash('sha256').update(canonical(value)).digest('hex');
+/** Shared capability issuer/verifier digest. A successful equal-token resume
+ * probe refreshes this observation timestamp without changing the endpoint.
+ * Keep every other identity, lifecycle and resume field bound to the capability. */
+export function historicalEndpointDigest(node:Record<string,unknown>,session:Record<string,unknown>):string {
+ const {resume_last_verified:_verifiedAt,...identity}=session;
+ return historicalDigest({node,session:identity});
+}
 export interface HistoricalEffectRef {outboxId:string;rowHash:string;custodyHash:string}
 export interface HistoricalArchivedSubject {rigId:string;name:string;archivedAt:string;fingerprint:string}
 export interface HistoricalArchivedScope {subjects:HistoricalArchivedSubject[]}
@@ -95,8 +102,8 @@ export class HistoricalEffectDispositionService {
   return {lead:String(baton!.destination_session),nodes:[op!.nodeId,lead!.nodeId],...(typed?{capabilityDigest:historicalDigest(baton!.body)}:{})};
  }
  private endpointFingerprint(session:string,nodeId:string):string {
-  const n=this.db.prepare('SELECT * FROM nodes WHERE id=?').get(nodeId),s=this.db.prepare('SELECT * FROM sessions WHERE session_name=? AND node_id=? ORDER BY id DESC LIMIT 1').get(session,nodeId);
-  if(!n||!s)refuse('historical_archived_direct_identity','Exact registered endpoint required');return historicalDigest({node:n,session:s});
+  const n=this.db.prepare('SELECT * FROM nodes WHERE id=?').get(nodeId) as Record<string,unknown>|undefined,s=this.db.prepare('SELECT * FROM sessions WHERE session_name=? AND node_id=? ORDER BY id DESC LIMIT 1').get(session,nodeId) as Record<string,unknown>|undefined;
+  if(!n||!s)refuse('historical_archived_direct_identity','Exact registered endpoint required');return historicalEndpointDigest(n!,s!);
  }
  private archivedDirect(entry:Row,input:HistoricalDisposition):void {
   const scope=input.archivedActiveDirect;

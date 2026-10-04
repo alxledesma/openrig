@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createFullTestDb } from './helpers/test-app.js';
 import { seed } from './helpers/coordinator-fixture.js';
-import { HistoricalEffectDispositionService, historicalDigest, applyHistoricalStartupRecovery, type HistoricalPlan, type HistoricalDisposition } from '../src/domain/historical-effect-disposition.js';
+import { HistoricalEffectDispositionService, historicalDigest, historicalEndpointDigest, applyHistoricalStartupRecovery, type HistoricalPlan, type HistoricalDisposition } from '../src/domain/historical-effect-disposition.js';
 import { OutboxHandler } from '../src/domain/outbox-handler.js';
 import { SeatDeliveryGuard, resolveGuardTarget } from '../src/domain/seat-delivery-guard.js';
 import { QueueRepository } from '../src/domain/queue-repository.js';
@@ -173,9 +173,10 @@ it('disposition capability cannot be used to quarantine or bypass enrolled curre
 it('active disposition rechecks exact capability body while waiting on interprocess lifecycle ownership',async()=>{const id=await wake();await preservationBaton();const p=preservationPlan([id]);await authorize(p);service.quarantine(actor,generation,p);const b=await dispositionBaton();const {effects,...base}=p;const d:HistoricalDisposition={...base,leadBatonId:'disposition-baton',operationId:'race-dispose',authorizationId:'auth-race-dispose',quarantineOperationId:p.operationId,effect:effects[0]!,action:'withdraw-obsolete-wake',reason:'preserve',evidenceRef:'race'};await authorize(d);let release!:()=>void,ready!:()=>void;const entered=new Promise<void>(r=>ready=r),hold=guard.lifecycle(['builder@xv'],async()=>{ready();await new Promise<void>(r=>release=r);});await entered;const pending=service.dispose(actor,generation,d,guard);b.ownerDelegationRef='different-owner-contract';db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(JSON.stringify(b),'disposition-baton');release();await hold;await expect(pending).rejects.toThrow('identity/lifecycle changed');expect(outbox.getById(id)?.deliveryState).toBe('pending');expect(outbox.isHistoricalQuarantined(id)).toBe(true);});
 
 async function archivedDirectFixture(){
+ db.prepare("UPDATE sessions SET resume_type='codex_id',resume_token='current-native-id',resume_provenance='scrape',resume_last_verified='2026-10-04 06:32:04',resume_last_probe_status='resumable' WHERE node_id='builder@xv'").run();
  const scope=archivedSubjects();db.prepare("INSERT INTO nodes(id,rig_id,logical_id) VALUES('old-sender','old-a','old-sender')").run();db.prepare("INSERT INTO sessions(id,node_id,session_name) VALUES('old-session','old-sender','old-sender@merlin-dev')").run();db.prepare("INSERT INTO occupant_tenures(id,node_id,generation_ordinal,generation_uuid,kind) VALUES('old-tenure','old-sender',1,'old-g1','fresh')").run();
  outbox.record({outboxId:'cross-direct',senderSession:'old-sender@merlin-dev',destinationSession:'builder@xv',body:'valuable original direct payload'});await preservationBaton();const p=preservationPlan(['cross-direct'],undefined,'cross-hold');await authorize(p);service.quarantine(actor,generation,p);
- const fp=(session:string,nodeId:string)=>historicalDigest({node:db.prepare('SELECT * FROM nodes WHERE id=?').get(nodeId),session:db.prepare('SELECT * FROM sessions WHERE session_name=? AND node_id=? ORDER BY id DESC LIMIT 1').get(session,nodeId)});
+ const fp=(session:string,nodeId:string)=>historicalEndpointDigest(db.prepare('SELECT * FROM nodes WHERE id=?').get(nodeId) as Record<string,unknown>,db.prepare('SELECT * FROM sessions WHERE session_name=? AND node_id=? ORDER BY id DESC LIMIT 1').get(session,nodeId) as Record<string,unknown>);
  const {effects,...base}=p;const d:HistoricalDisposition={...base,leadBatonId:'cross-capability',operationId:'cross-dispose',authorizationId:'cross-auth',quarantineOperationId:p.operationId,effect:effects[0]!,action:'withdraw-archived-sender-active-direct',reason:'Explicit Owner withdraws obsolete transport intention; work remains preserved',evidenceRef:'owner-exact-effect-decision',archivedActiveDirect:{subjects:scope.subjects,sender:{rigId:'old-a',nodeId:'old-sender',session:'old-sender@merlin-dev',fingerprint:fp('old-sender@merlin-dev','old-sender')},recipient:{rigId:'xv',nodeId:'builder@xv',session:'builder@xv',generation:'builder-g1',fingerprint:fp('builder@xv','builder@xv')}}};
  const body={kind:'historical-archived-active-direct-custodian.v1',rigId:'xv',nodeId:'lead@xv',session:'lead@xv',generation:'lead-g1',operatorGeneration:generation,purpose:'historical-archived-active-direct',configurationRef:'exact-reviewed-config',ownerDelegationRef:'owner-explicit-single-cross-intention',expiresAt:Date.now()+600000,returnPath:{session:actor,queueId:d.leadBatonId},archivedActiveDirect:d.archivedActiveDirect,effect:d.effect,ownerIntent:{kind:'owner-explicit-archived-active-intention-withdrawal.v1',reference:'owner-explicit-single-cross-intention',deliveryConclusion:'unknown',requestDigest:historicalDigest({action:d.action,effect:d.effect,scope:d.archivedActiveDirect,reason:d.reason,evidenceRef:d.evidenceRef})}};
  await repo.create({qitemId:d.leadBatonId,sourceSession:actor,destinationSession:'lead@xv',body:JSON.stringify(body),identityProvenance:'transport:v1',nudge:false});repo.claim({qitemId:d.leadBatonId,destinationSession:'lead@xv'});await authorize(d);return {d,body};
@@ -183,3 +184,45 @@ async function archivedDirectFixture(){
 it('explicit per-effect archived sender/active recipient capability withdraws UNKNOWN with exact custody and replay',async()=>{const {d}=await archivedDirectFixture();const before=outbox.getById('cross-direct')!,queues=db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all(),rigs=db.prepare('SELECT * FROM rigs ORDER BY id').all();const r=await service.dispose(actor,generation,d,guard);expect(r).toMatchObject({deliveryConclusion:'unknown',queueMutations:0,originalSender:'old-sender@merlin-dev',action:'withdraw-archived-sender-active-direct'});expect(outbox.getById('cross-direct')).toMatchObject({body:before.body,deliveryState:'retired',deliveredAt:null});expect(db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all()).toEqual(queues);expect(db.prepare('SELECT * FROM rigs ORDER BY id').all()).toEqual(rigs);expect(await service.dispose(actor,generation,d,guard)).toEqual(r);});
 it.each(['owner-intent','generic-capability','archive-drift','ambiguous-name','recipient-generation','sender-fingerprint','expired','body-drift','guarded','both-archived'])('archived-active withdrawal refuses %s without mutating original',async kind=>{const {d,body}=await archivedDirectFixture();if(kind==='owner-intent')(body.ownerIntent as any).kind='generic-owner-approval';if(kind==='generic-capability'){body.kind='historical-disposition-custodian.v1';body.purpose='historical-disposition';}if(kind==='expired')body.expiresAt=Date.now()-1;if(['owner-intent','generic-capability','expired'].includes(kind))db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(JSON.stringify(body),d.leadBatonId);if(kind==='archive-drift')db.prepare("UPDATE rigs SET archived_at='new-marker' WHERE id='old-a'").run();if(kind==='ambiguous-name')db.prepare("INSERT INTO rigs(id,name,archived_at) VALUES('duplicate','merlin-dev','old')").run();if(kind==='recipient-generation')db.prepare("UPDATE occupant_tenures SET generation_uuid='builder-g2' WHERE node_id='builder@xv'").run();if(kind==='sender-fingerprint')db.prepare("UPDATE nodes SET logical_id='changed' WHERE id='old-sender'").run();if(kind==='body-drift')db.prepare("UPDATE outbox_entries SET body='changed' WHERE outbox_id='cross-direct'").run();if(kind==='guarded')db.prepare("UPDATE outbox_entries SET guard_binding='{}' WHERE outbox_id='cross-direct'").run();if(kind==='both-archived')db.prepare("UPDATE rigs SET archived_at='archived' WHERE id='xv'").run();const before=outbox.getById('cross-direct');await expect(service.dispose(actor,generation,d,guard)).rejects.toThrow();expect(outbox.getById('cross-direct')).toEqual(before);expect(outbox.isHistoricalQuarantined('cross-direct')).toBe(true);});
 it('archive marker drift during lifecycle wait refuses without mutation',async()=>{const {d}=await archivedDirectFixture();let release!:()=>void,ready!:()=>void;const entered=new Promise<void>(r=>ready=r),hold=guard.lifecycle(['builder@xv'],async()=>{ready();await new Promise<void>(r=>release=r);});await entered;const pending=service.dispose(actor,generation,d,guard);db.prepare("UPDATE rigs SET archived_at='concurrent-change' WHERE id='old-a'").run();release();await hold;await expect(pending).rejects.toThrow();expect(outbox.getById('cross-direct')?.deliveryState).toBe('pending');});
+
+function refreshSameResumeIdentity(){
+ const before=db.prepare("SELECT * FROM sessions WHERE node_id='builder@xv'").get() as Record<string,unknown>;
+ new SessionRegistry(db).markResumeProbeResult(String(before.id),'resumable');
+ const after=db.prepare("SELECT * FROM sessions WHERE id=?").get(before.id) as Record<string,unknown>;
+ expect(after.resume_last_verified).not.toBe(before.resume_last_verified);
+ const {resume_last_verified:_before,...identityBefore}=before,{resume_last_verified:_after,...identityAfter}=after;
+ expect(identityAfter).toEqual(identityBefore);
+}
+it('equal-token successful verification before disposition preserves exact endpoint authority',async()=>{
+ const {d}=await archivedDirectFixture();refreshSameResumeIdentity();
+ const queues=db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all(),before=outbox.getById('cross-direct')!;
+ expect(await service.dispose(actor,generation,d,guard)).toMatchObject({deliveryConclusion:'unknown',queueMutations:0});
+ expect(outbox.getById('cross-direct')).toMatchObject({body:before.body,deliveryState:'retired',deliveredAt:null});
+ expect(db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all()).toEqual(queues);
+});
+it('equal-token successful verification while waiting for lifecycle does not invalidate endpoint authority',async()=>{
+ const {d}=await archivedDirectFixture();let release!:()=>void,ready!:()=>void;
+ const entered=new Promise<void>(r=>ready=r),hold=guard.lifecycle(['builder@xv'],async()=>{ready();await new Promise<void>(r=>release=r);});
+ await entered;const pending=service.dispose(actor,generation,d,guard);refreshSameResumeIdentity();release();await hold;
+ expect(await pending).toMatchObject({deliveryConclusion:'unknown',queueMutations:0});
+});
+it('timestamp-only verification after commit preserves exact replay without another write',async()=>{
+ const {d}=await archivedDirectFixture();const receipt=await service.dispose(actor,generation,d,guard);refreshSameResumeIdentity();
+ const rows=original(),operations=db.prepare('SELECT * FROM outbox_historical_operations ORDER BY operation_id').all();
+ expect(await service.dispose(actor,generation,d,guard)).toEqual(receipt);
+ expect(original()).toEqual(rows);expect(db.prepare('SELECT * FROM outbox_historical_operations ORDER BY operation_id').all()).toEqual(operations);
+});
+it.each(['resume-token','resume-type','resume-provenance','probe-status','status','session-id','session-name','node-runtime','node-model','generation','archive'])('material endpoint %s drift during lifecycle refuses with no disposition writes',async kind=>{
+ const {d}=await archivedDirectFixture();let release!:()=>void,ready!:()=>void;
+ const entered=new Promise<void>(r=>ready=r),hold=guard.lifecycle(['builder@xv'],async()=>{ready();await new Promise<void>(r=>release=r);});
+ await entered;const pending=service.dispose(actor,generation,d,guard);
+ const columns:Record<string,string>={'resume-token':'resume_token','resume-type':'resume_type','resume-provenance':'resume_provenance','probe-status':'resume_last_probe_status','status':'status','session-id':'id','session-name':'session_name'};
+ if(columns[kind])db.prepare(`UPDATE sessions SET ${columns[kind]}='changed' WHERE node_id='builder@xv'`).run();
+ if(kind==='node-runtime')db.prepare("UPDATE nodes SET runtime='changed' WHERE id='builder@xv'").run();
+ if(kind==='node-model')db.prepare("UPDATE nodes SET model='changed' WHERE id='builder@xv'").run();
+ if(kind==='generation')db.prepare("UPDATE occupant_tenures SET generation_uuid='builder-g2' WHERE node_id='builder@xv'").run();
+ if(kind==='archive')db.prepare("UPDATE rigs SET archived_at='changed' WHERE id='old-a'").run();
+ const rows=original(),queues=db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all(),quarantines=db.prepare('SELECT * FROM outbox_historical_quarantines ORDER BY outbox_id').all(),operations=db.prepare('SELECT * FROM outbox_historical_operations ORDER BY operation_id').all();
+ release();await hold;await expect(pending).rejects.toThrow();
+ expect(original()).toEqual(rows);expect(db.prepare('SELECT * FROM queue_items ORDER BY qitem_id').all()).toEqual(queues);expect(db.prepare('SELECT * FROM outbox_historical_quarantines ORDER BY outbox_id').all()).toEqual(quarantines);expect(db.prepare('SELECT * FROM outbox_historical_operations ORDER BY operation_id').all()).toEqual(operations);
+});
