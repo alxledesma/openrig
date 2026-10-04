@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { Command } from "commander";
-import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, DaemonResponseError } from "../client.js";
+import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, DaemonResponseError, terminalAuthHeaders } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { readOpenRigEnv } from "../openrig-compat.js";
 import { sessionRigOf, isHumanSeatSessionRef } from "../session-name.js";
@@ -980,7 +980,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     .option("--json", "JSON output")
     .action(async(qitemId:string,opts:{sourceFactsHash:string;operationId:string;authorizationId:string;json?:boolean})=>{
       await withClient(getDeps(),async client=>{
-        const res=await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/inspect-recovery`,{sourceFactsHash:opts.sourceFactsHash,operationId:opts.operationId,authorizationId:opts.authorizationId});
+        const res=await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/inspect-recovery`,{sourceFactsHash:opts.sourceFactsHash,operationId:opts.operationId,authorizationId:opts.authorizationId},{headers:terminalAuthHeaders()});
         printResult(opts.json??false,res.data,res.status);
       });
     });
