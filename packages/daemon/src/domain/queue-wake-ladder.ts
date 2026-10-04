@@ -201,6 +201,7 @@ export interface WakeLadderAction {
 }
 
 export interface WakeLadderTickResult {
+  aggregates?: Array<{qitemId:string;destination:string;action:"created"|"refreshed"}>;
   refusals?: Array<{ qitemId: string; phase: string; code: string; recoveryQueueId?: string; recoveryError?: string }>;
   outcome: "clean" | "actions" | "failed";
   actions: WakeLadderAction[];
@@ -587,6 +588,7 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
   const log = deps.log ?? ((line: string) => console.error(line));
   const status = deps.status;
   const actions: WakeLadderAction[] = [];
+  const aggregates: NonNullable<WakeLadderTickResult["aggregates"]> = [];
   const refusals: Array<{ qitemId: string; phase: string; code: string; recoveryQueueId?: string; recoveryError?: string }> = [];
   const refuse = async (row: QueueItem, phase: string, error: unknown) => {
     const code = typeof (error as {code?:unknown})?.code === "string" ? (error as {code:string}).code : error instanceof Error ? error.message : "wake_ladder_refused";
@@ -824,7 +826,8 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
           // the obligation's own creator) so the escalations view and the health count
           // expose it — it stays open past the batons' exhaustion.
           const floorDest = resolveOperatorSeat() ?? needsOrchRung[0]!.row.sourceSession;
-          await ensureEscalationRow(deps, dest, floorDest, needsOrchRung, reason);
+          const floorRow = await ensureEscalationRow(deps, dest, floorDest, needsOrchRung, reason);
+          aggregates.push({...floorRow,destination:floorDest});
           for (const m of needsOrchRung) {
             appendMarker(
               deps.queueRepo,
@@ -838,6 +841,7 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
           }
         } else {
           const escRow = await ensureEscalationRow(deps, dest, orch, members, reason);
+          aggregates.push({...escRow,destination:orch});
           const outcome = await attemptWake(escRow.qitemId, orch);
           for (const m of needsOrchRung) {
             appendMarker(
@@ -893,12 +897,12 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
     ).n;
     const outcome = refusals.length ? "failed" : actions.length > 0 ? "actions" : "clean";
     status?.record(outcome, { active: activeLadders, escalations: escalationsOpen, exhausted: exhaustedThisTick, ...(refusals.length ? {error: refusals.map(r=>`${r.phase}:${r.qitemId}:${r.code}`).join("; ")} : {}) });
-    return { outcome, actions, ...(refusals.length ? {refusals} : {}) };
+    return { outcome, actions, aggregates, ...(refusals.length ? {refusals} : {}) };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`[wake-ladder] TICK FAILED (skipping loudly): ${message}`);
     status?.record("failed", { error: message });
-    return { outcome: "failed", actions, error: message, ...(refusals.length ? {refusals} : {}) };
+    return { outcome: "failed", actions, aggregates, error: message, ...(refusals.length ? {refusals} : {}) };
   }
 }
 
@@ -978,7 +982,7 @@ async function ensureEscalationRow(
   orch: string,
   members: Array<{ row: QueueItem; reason: string }>,
   reason: string,
-): Promise<{ qitemId: string }> {
+): Promise<{ qitemId: string; action: "created" | "refreshed" }> {
   const dedupTag = escalationDedupTag(dest);
   const existing = deps.db
     .prepare(
@@ -988,7 +992,7 @@ async function ensureEscalationRow(
     .get(`%"${dedupTag}"%`) as { qitem_id: string } | undefined;
   if (existing) {
     await refreshEscalationRowIfExists(deps, dest, members);
-    return { qitemId: existing.qitem_id };
+    return { qitemId: existing.qitem_id, action: "refreshed" };
   }
   const body =
     `WAKE ESCALATION (aggregated per destination)\n` +
@@ -1005,7 +1009,7 @@ async function ensureEscalationRow(
     tags: [WAKE_ESCALATION_TAG, dedupTag, ...members.map(m => recoveryTag(m.row.qitemId))],
     nudge: false, // delivery is the ladder's own rung attempt, recorded with its outcome
   });
-  return { qitemId: created.qitemId };
+  return { qitemId: created.qitemId, action: "created" };
 }
 
 export interface WakeLadderSchedulerDeps {
