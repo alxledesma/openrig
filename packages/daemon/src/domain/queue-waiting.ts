@@ -61,9 +61,9 @@ export interface WaitingView {
 }
 
 export function readWaitingView(db: Database.Database, id: string, readActivity?: WaitingActivityReader): WaitingView | null {
-  const row = db.prepare(`SELECT qitem_id, source_session, destination_session, state, blocked_on, closure_required_at
+  const row = db.prepare(`SELECT *
     FROM queue_items WHERE qitem_id = ?`).get(id) as {
-    qitem_id: string; source_session: string; destination_session: string; state: string; blocked_on: string | null; closure_required_at: string | null;
+    qitem_id: string; source_session: string; destination_session: string; state: string; blocked_on: string | null; closure_required_at: string | null; expires_at?: string | null; tags?: string | null; body?: string;
   } | undefined;
   if (!row) return null;
   const blocker = row.blocked_on?.startsWith("qitem-") ? db.prepare(
@@ -90,6 +90,21 @@ export function readWaitingView(db: Database.Database, id: string, readActivity?
     view.nextBackstop.owner = recoveryOwner ?? row.destination_session;
     view.nextBackstop.dueAt = base ? new Date(Date.parse(base) + delay * 1000).toISOString() : null;
     view.nextBackstop.mechanism = row.state === "pending" ? "queue-stuck-sweep:unclaimed" : "queue-stuck-sweep:pickup (activity checked at detection)";
+  }
+  // Typed detector controls use the existing persisted deadline field. This is
+  // an accountability backstop, never a queue expiry/implicit closure operation.
+  if (row.state === "pending" && row.source_session === "watchdog@system" && row.destination_session === "operator-agent@kernel") {
+    try {
+      const tags = JSON.parse(row.tags ?? "null"), body = JSON.parse(row.body ?? "null");
+      if (Array.isArray(tags) && tags.includes("wake-ladder-accountability")
+        && body?.action === "reconcile-refused-wake-ladder") {
+        const due = row.expires_at ? Date.parse(row.expires_at) : body.deadline;
+        if (Number.isSafeInteger(due)) {
+          view.deadlineAt = new Date(due).toISOString();
+          view.nextBackstop = {owner: row.destination_session, mechanism: "wake-ladder:control-deadline", dueAt: view.deadlineAt, intervalSeconds: 60};
+        }
+      }
+    } catch { /* malformed control remains unknown, never gains authority */ }
   }
   if (row.state === "blocked") {
     const hasTimers = db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'queue_transition_wakes'").get();

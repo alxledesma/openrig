@@ -196,11 +196,18 @@ export interface WakeLadderDeps {
 
 export interface WakeLadderAction {
   qitemId: string;
-  action: "retry" | "escalate-orchestrator" | "escalate-operator" | "suspend" | "resume" | "exhaust" | "park-usage-limit";
+  action: "escalate-control-deadline" | "retry" | "escalate-orchestrator" | "escalate-operator" | "suspend" | "resume" | "exhaust" | "park-usage-limit";
   target?: string;
 }
 
+export interface WakeControlReceipt {
+  qitemId: string;
+  disposition: "created-escalation" | "existing-escalation" | "source-terminal" | "source-changed";
+  recoveryQueueId?: string;
+}
+
 export interface WakeLadderTickResult {
+  controls?: WakeControlReceipt[];
   aggregates?: Array<{qitemId:string;destination:string;action:"created"|"refreshed"}>;
   refusals?: Array<{ qitemId: string; phase: string; code: string; recoveryQueueId?: string; recoveryError?: string }>;
   outcome: "clean" | "actions" | "failed";
@@ -577,6 +584,7 @@ function stageRefusalRecovery(deps: WakeLadderDeps, c: { row: QueueItem; kind: s
       summary: `Wake recovery refused: ${code} on ${current.qitemId}`,
       evidenceRef: `rig queue show ${current.qitemId}`, tags: ["wake-ladder-accountability"],
       identityProvenance: "system:operator-authorized-coordination", nudge: true,
+      expiresAt: new Date(now.getTime() + 60000).toISOString(),
     });
     deps.queueRepo.stageWakeIntent(queueId, "watchdog@system", OPERATOR,
       "system:operator-authorized-coordination", true, generation);
@@ -584,11 +592,99 @@ function stageRefusalRecovery(deps: WakeLadderDeps, c: { row: QueueItem; kind: s
   }).immediate();
 }
 
+/** The existing ladder loop also owns its detector notices' finite backstop.
+ * One distinct overdue notice per original/current Operator generation; never
+ * replay an indeterminate wake or turn this into a recursive notice ladder. */
+async function reconcileControlDeadlines(
+  deps: WakeLadderDeps, now: Date, controls: WakeControlReceipt[],
+  refusals: NonNullable<WakeLadderTickResult["refusals"]>, actions: WakeLadderAction[],
+): Promise<void> {
+  const rows = deps.db.prepare(`SELECT qitem_id FROM queue_items
+    WHERE source_session='watchdog@system' AND destination_session=?
+      AND state='pending' AND claimed_at IS NULL AND json_valid(body)
+      AND json_extract(body,'$.action')='reconcile-refused-wake-ladder'`).all(OPERATOR) as Array<{qitem_id:string}>;
+  for (const {qitem_id} of rows) {
+    const qitemId = qitem_id;
+    const parent = deps.queueRepo.getById(qitem_id);
+    if (!parent || !Array.isArray(parent.tags) || !parent.tags.includes("wake-ladder-accountability")) continue;
+    try {
+      const body = JSON.parse(parent.body);
+      // Legacy ada notices have only body.deadline. New notices persist expiresAt
+      // through the public queue creation contract and expose it in waiting.
+      const due = parent.expiresAt ? Date.parse(parent.expiresAt) : body.deadline;
+      if (!Number.isSafeInteger(due) || typeof body.original?.qitemId !== "string" || typeof body.original?.factsHash !== "string") {
+        throw new CoordinatorFenceError("wake_control_contract_invalid", "Exact control deadline/source facts required");
+      }
+      if (now.getTime() < due) continue;
+      const original = deps.queueRepo.getById(body.original.qitemId);
+      if (original && !["pending", "in-progress", "blocked"].includes(original.state)) {
+        controls.push({qitemId, disposition: "source-terminal"});
+        continue; // Receipt only: never auto-close a control or accept its work.
+      }
+      if (!original || digest(sourceFacts(original)) !== body.original.factsHash) {
+        controls.push({qitemId, disposition: "source-changed"});
+        throw new CoordinatorFenceError("wake_control_source_changed", "Reconcile current source facts; old control cannot manufacture authority");
+      }
+      const result = deps.db.transaction(() => {
+        const authority = deps.queueRepo.coordinatorAuthority;
+        const generation = authority.generation(OPERATOR);
+        if (!generation) throw new CoordinatorFenceError("wake_control_operator_unavailable", "Actual current Operator required for overdue control recovery");
+        authority.assertCurrentOperator(OPERATOR, generation);
+        const current = deps.queueRepo.getById(qitem_id);
+        const source = deps.queueRepo.getById(body.original.qitemId);
+        if (!current || current.state !== "pending" || current.claimedAt || sourceFacts(current) !== sourceFacts(parent)
+          || !source || digest(sourceFacts(source)) !== body.original.factsHash) {
+          throw new CoordinatorFenceError("wake_control_custody_changed", "Control/source changed before overdue commitment");
+        }
+        const recoveryQueueId = "qitem-wake-control-overdue-" + digest(JSON.stringify([qitem_id, generation])).slice(0, 24);
+        const existing = deps.queueRepo.getById(recoveryQueueId);
+        if (existing) {
+          let receipt: Record<string, unknown> | null = null;
+          try { receipt = JSON.parse(existing.body); } catch { /* conflict refuses below */ }
+          if (existing.sourceSession !== "watchdog@system" || existing.destinationSession !== OPERATOR
+            || receipt?.action !== "reconcile-overdue-wake-control" || receipt.parentQueueId !== qitem_id
+            || receipt.recipientGeneration !== generation || receipt.parentFactsHash !== digest(sourceFacts(current))) {
+            throw new CoordinatorFenceError("wake_control_recovery_conflict", "Correlated recovery ID belongs to different custody/facts");
+          }
+          return {recoveryQueueId, created: false};
+        }
+        const deadline = now.getTime() + 60000;
+        deps.queueRepo.createWithinTransaction({
+          qitemId: recoveryQueueId, sourceSession: "watchdog@system", destinationSession: OPERATOR,
+          body: JSON.stringify({action: "reconcile-overdue-wake-control", parentQueueId: qitem_id,
+            parentFactsHash: digest(sourceFacts(current)), original: body.original, recipientGeneration: generation,
+            deadline, required: "The exact original control missed its finite deadline. Claim this correlated recovery and reconcile the original control's actual current custody. Preserve protected source work, claims, resources and indeterminate delivery. Use supported current authority; return a concrete boundary/deadline when busy or blocked. Do not replay the old ambiguous wake or infer completion from this reminder.",
+            returnPath: {queueId: recoveryQueueId, actor: OPERATOR, generation,
+              completion: "Return actual original-control pickup/reconciliation evidence on this exact claimed recovery. This does not complete the protected original work.",
+              failure: "Block this same claimed recovery with actual remaining boundary, accountable action and supported finite wake timer."}}),
+          tags: ["wake-ladder-accountability", "wake-control-deadline-escalation", `wake-control-parent:${qitem_id}`],
+          summary: `Overdue wake control: ${qitem_id}`, expiresAt: new Date(deadline).toISOString(),
+          identityProvenance: "system:operator-authorized-coordination", nudge: true,
+        });
+        deps.queueRepo.stageWakeIntent(recoveryQueueId, "watchdog@system", OPERATOR,
+          "system:operator-authorized-coordination", true, generation);
+        return {recoveryQueueId, created: true};
+      }).immediate();
+      // Record commitment before external delivery, including partial failures.
+      controls.push({qitemId, disposition: result.created ? "created-escalation" : "existing-escalation", recoveryQueueId: result.recoveryQueueId});
+      refusals.push({qitemId, phase: "control-deadline", code: "wake_control_deadline_missed", recoveryQueueId: result.recoveryQueueId});
+      if (result.created) {
+        actions.push({qitemId, action: "escalate-control-deadline", target: OPERATOR});
+        await deps.queueRepo.deliverWakeForSuccessor(result.recoveryQueueId, OPERATOR, true, "watchdog@system");
+      }
+    } catch (error) {
+      const code = typeof (error as {code?:unknown})?.code === "string" ? String((error as {code:string}).code) : "wake_control_backstop_failed";
+      refusals.push({qitemId, phase: "control-deadline", code, recoveryError: error instanceof Error ? error.message : String(error)});
+    }
+  }
+}
+
 export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadderTickResult> {
   const log = deps.log ?? ((line: string) => console.error(line));
   const status = deps.status;
   const actions: WakeLadderAction[] = [];
   const aggregateReceipts: NonNullable<WakeLadderTickResult["aggregates"]> = [];
+  const controls: WakeControlReceipt[] = [];
   const refusals: Array<{ qitemId: string; phase: string; code: string; recoveryQueueId?: string; recoveryError?: string }> = [];
   const refuse = async (row: QueueItem, phase: string, error: unknown) => {
     const code = typeof (error as {code?:unknown})?.code === "string" ? (error as {code:string}).code : error instanceof Error ? error.message : "wake_ladder_refused";
@@ -601,6 +697,7 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
   };
   try {
     const now = deps.now ?? new Date();
+    await reconcileControlDeadlines(deps, now, controls, refusals, actions);
     // Retire only aggregates whose explicitly tagged underlying members all
     // resolved. Legacy untagged history is not interpreted from its body.
     const aggregates = deps.db.prepare("SELECT qitem_id, source_session, tags, ts_created FROM queue_items WHERE state IN ('pending','in-progress','blocked') AND tags LIKE ?").all(`%"${WAKE_ESCALATION_TAG}"%`) as Array<{ qitem_id: string; source_session: string; tags: string; ts_created: string }>;
@@ -897,12 +994,12 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
     ).n;
     const outcome = refusals.length ? "failed" : actions.length > 0 ? "actions" : "clean";
     status?.record(outcome, { active: activeLadders, escalations: escalationsOpen, exhausted: exhaustedThisTick, ...(refusals.length ? {error: refusals.map(r=>`${r.phase}:${r.qitemId}:${r.code}`).join("; ")} : {}) });
-    return { outcome, actions, aggregates: aggregateReceipts, ...(refusals.length ? {refusals} : {}) };
+    return { outcome, actions, aggregates: aggregateReceipts, controls, ...(refusals.length ? {refusals} : {}) };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`[wake-ladder] TICK FAILED (skipping loudly): ${message}`);
     status?.record("failed", { error: message });
-    return { outcome: "failed", actions, aggregates: aggregateReceipts, error: message, ...(refusals.length ? {refusals} : {}) };
+    return { outcome: "failed", actions, aggregates: aggregateReceipts, controls, error: message, ...(refusals.length ? {refusals} : {}) };
   }
 }
 
@@ -1063,7 +1160,9 @@ export class WakeLadderScheduler {
 
   private scheduleNext(): void {
     if (this.shuttingDown) return;
-    const ms = this.deps.tickIntervalMs ?? DEFAULT_WAKE_RETRY_INTERVAL_SECONDS * 1000;
+    // A notice deadline is60s; scan by the next bounded60s pass. Ordinary
+    // ladder attempts retain their configured due gates. No additional timer engine.
+    const ms = Math.min(this.deps.tickIntervalMs ?? DEFAULT_WAKE_RETRY_INTERVAL_SECONDS * 1000, 60000);
     this.timer = (this.deps.setTimer ?? setTimeout)(() => {
       void this.runTickNow()
         .catch((err) => (this.deps.onTickError ?? console.error)(err))
