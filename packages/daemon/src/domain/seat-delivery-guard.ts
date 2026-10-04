@@ -141,6 +141,25 @@ export class SeatDeliveryGuard {
     });
   }
 
+  /** Read-only protection inspection under the exact delivery serialization domain.
+   * Callback cannot grant delivery/lifecycle permission. No preference or input write. */
+  async inspectProtection<T>(name: string, fn: (target: GuardTarget, protection: {code: "seat_dispatch_reserved" | "typing_guard_enabled"; fingerprint: string} | null) => T): Promise<T> {
+    const bound = this.target(name);
+    return this.serial(bound.nodeId, async () => {
+      const current = this.target(name);
+      if (!this.same(bound, current)) throw new DeliveryGuardError("guard_target_changed", "Inspection target changed while waiting");
+      const protection = this.protectionFacts(current.nodeId);
+      return fn(current, protection);
+    });
+  }
+
+  /** Pure current protection facts; reads grant no input/lifecycle authority. */
+  protectionFacts(nodeId: string): {code: "seat_dispatch_reserved" | "typing_guard_enabled"; fingerprint: string} | null {
+    const reservation=this.activeReservation(nodeId),preference=this.preference(nodeId);
+    return reservation ? {code:"seat_dispatch_reserved",fingerprint:JSON.stringify(this.db.prepare("SELECT * FROM seat_dispatch_reservations WHERE reservation_id=?").get(reservation.reservation_id))}
+      : preference.desired||preference.effective ? {code:"typing_guard_enabled",fingerprint:JSON.stringify(preference)} : null;
+  }
+
   ownsLifecycle(nodeId: string): boolean {
     const lease = this.scope.getStore()?.get(nodeId);
     if (!lease?.active || !lease.lifecycle) return false;

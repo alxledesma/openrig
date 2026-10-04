@@ -542,14 +542,14 @@ async function ensureUsageLimitBlocker(
  */
 const OPERATOR = "operator-agent@kernel";
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
-function sourceFacts(row: QueueItem): string {
+export function sourceFacts(row: QueueItem): string {
   return JSON.stringify([row.qitemId, row.sourceSession, row.destinationSession, digest(row.body),
     row.state, row.tsUpdated, row.claimedAt, row.closureTarget]);
 }
 
 /** A detector notice is distinct from the refused assignment. Current Operator
  * control only; no borrowed creator, dispatch envelope, package, or resource. */
-function stageRefusalRecovery(deps: WakeLadderDeps, c: { row: QueueItem; kind: string; evidenceAt: string; route: string }, code: string, now: Date):
+export function stageRefusalRecovery(deps: WakeLadderDeps, c: { row: QueueItem; kind: string; evidenceAt: string; route: string }, code: string, now: Date, inspection?: Record<string, string>):
   { qitemId: string; action: "created" | "refreshed" } {
   return deps.db.transaction(() => {
     const authority = deps.queueRepo.coordinatorAuthority;
@@ -560,7 +560,7 @@ function stageRefusalRecovery(deps: WakeLadderDeps, c: { row: QueueItem; kind: s
     if (!current || sourceFacts(current) !== sourceFacts(c.row)) {
       throw new CoordinatorFenceError("wake_ladder_source_changed", "Source facts changed; next tick must reconcile current evidence");
     }
-    const recoveryKey = digest(JSON.stringify([sourceFacts(current), c.kind, c.evidenceAt, code, generation]));
+    const recoveryKey = digest(JSON.stringify([sourceFacts(current), c.kind, c.evidenceAt, code, generation, ...(inspection ? [inspection] : [])]));
     const previous = deps.db.prepare(`SELECT qitem_id,state FROM queue_items
       WHERE source_session='watchdog@system' AND destination_session=? AND json_valid(body)
         AND json_extract(body,'$.wakeLadderRecoveryKey')=? ORDER BY rowid DESC LIMIT 1`)
@@ -576,7 +576,7 @@ function stageRefusalRecovery(deps: WakeLadderDeps, c: { row: QueueItem; kind: s
         original: { qitemId: current.qitemId, sourceSession: current.sourceSession,
           destinationSession: current.destinationSession, bodyHash: digest(current.body),
           state: current.state, evidenceAt: c.evidenceAt, factsHash: digest(sourceFacts(current)) },
-        intendedRoute: c.route, recipientGeneration: generation, deadline: now.getTime() + 60000,
+        ...(inspection ? {inspection} : {}), intendedRoute: c.route, recipientGeneration: generation, deadline: now.getTime() + 60000,
         required: "Preserve exact original source/body/claims/resources and unknown effects. Read current facts and admission; use supported current-owner/Operator control to repair or record a concrete protected boundary. Do not fabricate dispatch envelopes, admit a diagnostic as product work, or replay uncertain delivery. Continue independent ready work.",
         returnPath: { queueId, actor: OPERATOR, generation,
           completion: "Claim this exact recovery notice and return supported reconciliation evidence through queue update. Recheck original custody; notice closure is not original-work completion.",

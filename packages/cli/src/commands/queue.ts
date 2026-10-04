@@ -972,6 +972,20 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
     });
 
   cmd
+    .command("inspect-recovery <qitemId>")
+    .description("Current Operator: inspect real protection without modifying original work")
+    .requiredOption("--source-facts-hash <sha256>", "Canonical current source facts SHA256")
+    .requiredOption("--operation-id <id>", "Distinct inspection operation")
+    .requiredOption("--authorization-id <qitemId>", "Current Operator-owned claimed finite authorization")
+    .option("--json", "JSON output")
+    .action(async(qitemId:string,opts:{sourceFactsHash:string;operationId:string;authorizationId:string;json?:boolean})=>{
+      await withClient(getDeps(),async client=>{
+        const res=await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/inspect-recovery`,{sourceFactsHash:opts.sourceFactsHash,operationId:opts.operationId,authorizationId:opts.authorizationId});
+        printResult(opts.json??false,res.data,res.status);
+      });
+    });
+
+  cmd
     .command("show <qitemId>")
     .description("Show one qitem and its derived waiting state (bounded preview; --full for complete body)")
     .option("--full", "Complete original record; may be large (use --full --json for lossless JSON)")

@@ -1,3 +1,4 @@
+import {inspectQueueRecovery} from "../domain/queue-recovery-inspection.js";
 import { HistoricalEffectDispositionService, HistoricalEffectError } from "../domain/historical-effect-disposition.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import { CoordinatorFenceError, AssignmentReplay, type DispatchEnvelope } from "../domain/coordinator-authority-service.js";
@@ -1117,6 +1118,20 @@ export function queueRoutes(): Hono {
       identityProvenance: resolveRecordedProvenance(c, identity), // P21 §4 era-stamp: transport:v1 if the header proved it here, else claimed:v1 (resolveRecordedProvenance degrades)
     });
     return c.json(entry, 201);
+  });
+
+  app.post("/:id/inspect-recovery", async c => {
+    const token=c.get("terminalBearerToken" as never) as string|null;
+    if(!token)return c.json({error:"inspection_authenticated_control_required"},503);
+    const auth=await authBearerTokenMiddleware({expectedToken:token})(c,async()=>{});if(auth)return auth;
+    const actor=transportSenderSession(c),generation=c.req.header("X-OpenRig-Occupant-Generation");
+    if(!actor||!generation)return c.json({error:"inspection_operator_required"},403);
+    try {
+      const body=await c.req.json();
+      if(!body||Array.isArray(body)||typeof body!=="object"||Object.keys(body).sort().join(",")!=="authorizationId,operationId,sourceFactsHash")return c.json({error:"inspection_contract_invalid"},400);
+      const adapter=c.get("tmuxAdapter" as never) as import("../adapters/tmux.js").TmuxAdapter|undefined;
+      return c.json(await inspectQueueRecovery(getRepo(c),adapter?.deliveryGuard,actor,generation,{...body,qitemId:c.req.param("id")}));
+    }catch(error){if(error instanceof CoordinatorFenceError)return c.json({error:error.code,message:error.message},409);if(error instanceof SyntaxError)return c.json({error:"invalid_json"},400);throw error;}
   });
 
   app.post("/outbox/historical/:operation", async c => {
