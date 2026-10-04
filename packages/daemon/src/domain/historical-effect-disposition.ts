@@ -11,10 +11,11 @@ export const historicalDigest=(value:unknown):string=>createHash('sha256').updat
 export interface HistoricalEffectRef {outboxId:string;rowHash:string;custodyHash:string}
 export interface HistoricalArchivedSubject {rigId:string;name:string;archivedAt:string;fingerprint:string}
 export interface HistoricalArchivedScope {subjects:HistoricalArchivedSubject[]}
-export interface HistoricalCustody {rigId:string;leadBatonId:string;leadGeneration:string;operatorGeneration:string;archivedScope?:HistoricalArchivedScope}
+export interface ArchivedActiveDirectScope { subjects:HistoricalArchivedSubject[]; sender:{rigId:string;nodeId:string;session:string;fingerprint:string}; recipient:{rigId:string;nodeId:string;session:string;generation:string;fingerprint:string} }
+export interface HistoricalCustody {rigId:string;leadBatonId:string;leadGeneration:string;operatorGeneration:string;archivedScope?:HistoricalArchivedScope; archivedActiveDirect?:ArchivedActiveDirectScope}
 export interface HistoricalPlan extends HistoricalCustody {rigId:string;leadBatonId:string;leadGeneration:string;operatorGeneration:string;operationId:string;authorizationId:string;expiresAt:number;effects:HistoricalEffectRef[]}
 export interface HistoricalStartupBundle {schema:"historical-startup-bundle.v1";cohorts:HistoricalPlan[]}
-export interface HistoricalDisposition extends Omit<HistoricalPlan,'effects'> {quarantineOperationId:string;effect:HistoricalEffectRef;action:'withdraw-obsolete-wake'|'custodian-withdraw-unregistered-direct';reason:string;evidenceRef:string}
+export interface HistoricalDisposition extends Omit<HistoricalPlan,'effects'> {quarantineOperationId:string;effect:HistoricalEffectRef;action:'withdraw-obsolete-wake'|'custodian-withdraw-unregistered-direct'|'withdraw-archived-sender-active-direct';reason:string;evidenceRef:string}
 export type HistoricalSnapshotInput=HistoricalCustody & {outboxIds:string[]};
 type Row=Record<string,unknown> & {outbox_id:string;sender_session:string;destination_session:string;body:string;delivery_state:string;audit_pointer:string|null;guard_binding:string|null};
 
@@ -63,21 +64,23 @@ export class HistoricalEffectDispositionService {
   if(archivedScope){const subjects=this.archived(archivedScope);if([r.sender_session,r.destination_session].some(s=>!subjects.some(a=>a.name===s.split('@')[1])))refuse('historical_effect_scope','Both archived endpoints must be explicitly delegated');}
   else if(![r.sender_session,r.destination_session].some(s=>s.split('@')[1]===rig!.name))refuse('historical_effect_scope','Exact active local rig; no host-qualified forwarding');
  }
- private typedCustodianBaton(baton:Record<string,unknown>,lead:{nodeId:string;generation:string;rigId:string},input:HistoricalCustody,generation:string):false|'preservation'|'disposition' {
+ private typedCustodianBaton(baton:Record<string,unknown>,lead:{nodeId:string;generation:string;rigId:string},input:HistoricalCustody,generation:string):false|'preservation'|'disposition'|'archived-direct' {
   let body:Record<string,unknown>|undefined;try{const parsed:unknown=JSON.parse(String(baton.body));if(parsed&&typeof parsed==='object'&&!Array.isArray(parsed))body=parsed as Record<string,unknown>;}catch{}
-  if(!body||!['historical-preservation-custodian.v1','historical-disposition-custodian.v1'].includes(String(body.kind)))return false;
-  const disposition=body.kind==='historical-disposition-custodian.v1';
-  const fields=['configurationRef','generation','kind','nodeId','operatorGeneration','ownerDelegationRef','purpose','returnPath','rigId','session',...(input.archivedScope?['archivedScope']:[]),...(disposition?['expiresAt']:[])];
+  if(!body||!['historical-preservation-custodian.v1','historical-disposition-custodian.v1','historical-archived-active-direct-custodian.v1'].includes(String(body.kind)))return false;
+  const archivedDirect=body.kind==='historical-archived-active-direct-custodian.v1';
+  const disposition=body.kind==='historical-disposition-custodian.v1'||archivedDirect;
+  const fields=['configurationRef','generation','kind','nodeId','operatorGeneration','ownerDelegationRef','purpose','returnPath','rigId','session',...(input.archivedScope?['archivedScope']:[]),...(disposition?['expiresAt']:[]),...(archivedDirect?['archivedActiveDirect','effect','ownerIntent']:[])];
   if(Object.keys(body).sort().join(',')!==fields.sort().join(','))refuse('historical_custodian_contract','Exact typed preservation-only baton required');
   const creation=this.db.prepare("SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? AND transition_note='created' ORDER BY transition_id LIMIT 1").get(input.leadBatonId) as {actor_session:string;identity_provenance:string}|undefined;
   const ret=body.returnPath as {session?:unknown;queueId?:unknown}|undefined;
-  if(baton.source_session!=='operator-agent@kernel'||baton.minting_generation_uuid!==generation||creation?.actor_session!=='operator-agent@kernel'||creation.identity_provenance!=='transport:v1'||body.rigId!==input.rigId||body.nodeId!==lead.nodeId||body.session!==baton.destination_session||body.generation!==lead.generation||body.operatorGeneration!==generation||body.purpose!==(disposition?'historical-disposition':'historical-quarantine')||typeof body.configurationRef!=='string'||!body.configurationRef.trim()||typeof body.ownerDelegationRef!=='string'||!body.ownerDelegationRef.trim()||!ret||typeof ret!=='object'||Array.isArray(ret)||Object.keys(ret).sort().join(',')!=='queueId,session'||ret.session!=='operator-agent@kernel'||ret.queueId!==input.leadBatonId||historicalDigest(body.archivedScope??null)!==historicalDigest(input.archivedScope??null))refuse('historical_custodian_contract','Current Operator-issued exact claimed preservation baton required');
+  if(baton.source_session!=='operator-agent@kernel'||baton.minting_generation_uuid!==generation||creation?.actor_session!=='operator-agent@kernel'||creation.identity_provenance!=='transport:v1'||body.rigId!==input.rigId||body.nodeId!==lead.nodeId||body.session!==baton.destination_session||body.generation!==lead.generation||body.operatorGeneration!==generation||body.purpose!==(archivedDirect?'historical-archived-active-direct':disposition?'historical-disposition':'historical-quarantine')||typeof body.configurationRef!=='string'||!body.configurationRef.trim()||typeof body.ownerDelegationRef!=='string'||!body.ownerDelegationRef.trim()||!ret||typeof ret!=='object'||Array.isArray(ret)||Object.keys(ret).sort().join(',')!=='queueId,session'||ret.session!=='operator-agent@kernel'||ret.queueId!==input.leadBatonId||historicalDigest(body.archivedScope??null)!==historicalDigest(input.archivedScope??null))refuse('historical_custodian_contract','Current Operator-issued exact claimed preservation baton required');
   if(!this.db.prepare('SELECT 1 FROM rigs WHERE id=? AND archived_at IS NULL').get(lead.rigId))refuse('historical_custodian_contract','Preservation custodian must be active');
   if(input.archivedScope)this.archived(input.archivedScope);
   if(disposition&&(input.archivedScope||!Number.isSafeInteger(body.expiresAt)||(body.expiresAt as number)<=this.now()||(body.expiresAt as number)>this.now()+1200000))refuse('historical_custodian_contract','Finite current active disposition capability required');
-  return disposition?'disposition':'preservation';
+  if(archivedDirect){const d=input as HistoricalDisposition, intent=body.ownerIntent as Record<string,unknown>|undefined; if(!d.archivedActiveDirect||historicalDigest(body.archivedActiveDirect)!==historicalDigest(d.archivedActiveDirect)||historicalDigest(body.effect)!==historicalDigest(d.effect)||!intent||Array.isArray(intent)||Object.keys(intent).sort().join(',')!=='deliveryConclusion,kind,reference,requestDigest'||intent.kind!=='owner-explicit-archived-active-intention-withdrawal.v1'||intent.reference!==body.ownerDelegationRef||intent.deliveryConclusion!=='unknown'||intent.requestDigest!==historicalDigest({action:d.action,effect:d.effect,scope:d.archivedActiveDirect,reason:d.reason,evidenceRef:d.evidenceRef}))refuse('historical_owner_intent','Exact recorded Owner intention for this effect required');}
+  return archivedDirect?'archived-direct':disposition?'disposition':'preservation';
  }
- private actors(actor:string,generation:string,input:HistoricalCustody,purpose:'quarantine'|'dispose'='quarantine'):{lead:string;nodes:string[];capabilityDigest?:string} {
+ private actors(actor:string,generation:string,input:HistoricalCustody,purpose:'quarantine'|'dispose'|'archived-direct'='quarantine'):{lead:string;nodes:string[];capabilityDigest?:string} {
   const op=this.local(actor),baton=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(input.leadBatonId) as Record<string,unknown>|undefined;
   const lead=baton?this.local(String(baton.destination_session)):undefined;
   if(actor!=='operator-agent@kernel'||!op||op.generation!==generation||input.operatorGeneration!==generation)refuse('historical_operator_required','Genuine current Kernel Operator required');
@@ -85,10 +88,23 @@ export class HistoricalEffectDispositionService {
   const authority=this.db.prepare('SELECT owner_session,owner_generation,baton_id FROM coordinator_authority WHERE rig_id=?').get(input.rigId) as {owner_session:string;owner_generation:string;baton_id:string}|undefined;
   if(authority&&(authority.owner_session!==baton!.destination_session||authority.owner_generation!==lead!.generation||authority.baton_id!==input.leadBatonId))refuse('historical_lead_custody','Retired dispatcher cannot authorize effect disposition');
   const typed=this.typedCustodianBaton(baton!,lead!,input,generation);
-  if(typed&&typed!==(purpose==='dispose'?'disposition':'preservation'))refuse('historical_quarantine_only','Typed custodian capability does not permit this operation');
+  if(typed&&typed!==(purpose==='archived-direct'?'archived-direct':purpose==='dispose'?'disposition':'preservation'))refuse('historical_quarantine_only','Typed custodian capability does not permit this operation');
+  if(purpose==='archived-direct'&&typed!=='archived-direct')refuse('historical_custodian_contract','Separate archived-active per-effect capability required');
   if(input.archivedScope&&typed!=='preservation')refuse('historical_custodian_contract','Archived preservation requires typed current custodian delegation');
   if(!authority&&!typed&&(baton!.source_session!=='operator-agent@kernel'||!(this.db.prepare("SELECT 1 FROM nodes WHERE id=? AND logical_id='lead'").get(lead!.nodeId))))refuse('historical_lead_custody','Before enrollment the actual Operator-issued Lead baton is required');
   return {lead:String(baton!.destination_session),nodes:[op!.nodeId,lead!.nodeId],...(typed?{capabilityDigest:historicalDigest(baton!.body)}:{})};
+ }
+ private endpointFingerprint(session:string,nodeId:string):string {
+  const n=this.db.prepare('SELECT * FROM nodes WHERE id=?').get(nodeId),s=this.db.prepare('SELECT * FROM sessions WHERE session_name=? AND node_id=? ORDER BY id DESC LIMIT 1').get(session,nodeId);
+  if(!n||!s)refuse('historical_archived_direct_identity','Exact registered endpoint required');return historicalDigest({node:n,session:s});
+ }
+ private archivedDirect(entry:Row,input:HistoricalDisposition):void {
+  const scope=input.archivedActiveDirect;
+  if(!scope||typeof scope!=='object'||Array.isArray(scope)||Object.keys(scope).sort().join(',')!=='recipient,sender,subjects')refuse('historical_archived_direct_scope','Exact archived-active scope required');
+  const subjects=this.archived({subjects:scope!.subjects});const sender=scope!.sender,recipient=scope!.recipient;
+  for(const [v,fields] of [[sender,'fingerprint,nodeId,rigId,session'],[recipient,'fingerprint,generation,nodeId,rigId,session']] as const){if(!v||typeof v!=='object'||Array.isArray(v)||Object.keys(v).sort().join(',')!==fields||Object.values(v).some(x=>typeof x!=='string'||!x.trim()))refuse('historical_archived_direct_scope','Typed exact endpoint hashes required');}
+  const a=this.local(entry.sender_session),b=this.local(entry.destination_session);
+  if(!a||!b||sender.session!==entry.sender_session||recipient.session!==entry.destination_session||a.nodeId!==sender.nodeId||a.rigId!==sender.rigId||b.nodeId!==recipient.nodeId||b.rigId!==recipient.rigId||b.generation!==recipient.generation||recipient.rigId!==input.rigId||!subjects.some(x=>x.rigId===sender.rigId&&x.name===entry.sender_session.split('@')[1])||!this.db.prepare('SELECT 1 FROM rigs WHERE id=? AND archived_at IS NULL').get(recipient.rigId)||this.endpointFingerprint(sender.session,sender.nodeId)!==sender.fingerprint||this.endpointFingerprint(recipient.session,recipient.nodeId)!==recipient.fingerprint)refuse('historical_archived_direct_drift','Exact archived sender and current active recipient changed');
  }
  private validateShape(input:Omit<HistoricalPlan,'effects'>):void {
   if(!input||typeof input!=='object'||['rigId','leadBatonId','leadGeneration','operatorGeneration','operationId','authorizationId'].some(k=>typeof (input as unknown as Record<string,unknown>)[k]!=='string'))refuse('historical_contract_required','Explicit typed historical contract required');
@@ -126,12 +142,15 @@ export class HistoricalEffectDispositionService {
   if(kind==='historical-preservation-custodian.v1')refuse('historical_quarantine_only','Preservation-only baton never grants withdrawal authority');
   if(typeof input.quarantineOperationId!=='string'||!input.quarantineOperationId.trim()||!input.effect||['outboxId','rowHash','custodyHash'].some(k=>typeof (input.effect as unknown as Record<string,unknown>)[k]!=='string')||typeof input.reason!=='string'||typeof input.evidenceRef!=='string')refuse('historical_contract_required','Exact typed effect/reason/evidence required');
   if(!guard||guard.db!==this.db)refuse('historical_lifecycle_required','Same-database lifecycle guard required');
-  const actors=this.actors(actor,generation,input,'dispose'),r=this.row(input.effect.outboxId),nodes=[...actors.nodes];
+  if(input.archivedActiveDirect&&input.action!=='withdraw-archived-sender-active-direct')refuse('historical_archived_direct_case','Separate direct scope cannot alter existing operations');
+  if(input.action==='withdraw-archived-sender-active-direct')this.archivedDirect(this.row(input.effect.outboxId),input);
+  const actors=this.actors(actor,generation,input,input.action==='withdraw-archived-sender-active-direct'?'archived-direct':'dispose'),r=this.row(input.effect.outboxId),nodes=[...actors.nodes];
   const endpoints=[r.sender_session,r.destination_session].map(session=>({session,identity:this.local(session)??null}));
   for(const e of endpoints){if(e.identity)nodes.push(e.identity.nodeId);}
   if(r.guard_binding){try{const g=JSON.parse(r.guard_binding);if(typeof g.nodeId==='string'&&this.db.prepare('SELECT 1 FROM nodes WHERE id=?').get(g.nodeId))nodes.push(g.nodeId);}catch{refuse('historical_guard_invalid','Historical guard binding malformed');}}
   return guard!.lifecycle([...new Set(nodes)],async()=>this.db.transaction(()=>{
-   const currentActors=this.actors(actor,generation,input,'dispose');if(currentActors.lead!==actors.lead||historicalDigest(currentActors)!==historicalDigest(actors)||endpoints.some(e=>historicalDigest(this.local(e.session)??null)!==historicalDigest(e.identity))||nodes.some(n=>!guard!.ownsLifecycle(n)))refuse('historical_identity_drift','Current identity/lifecycle changed');
+   const currentActors=this.actors(actor,generation,input,input.action==='withdraw-archived-sender-active-direct'?'archived-direct':'dispose');if(currentActors.lead!==actors.lead||historicalDigest(currentActors)!==historicalDigest(actors)||endpoints.some(e=>historicalDigest(this.local(e.session)??null)!==historicalDigest(e.identity))||nodes.some(n=>!guard!.ownsLifecycle(n)))refuse('historical_identity_drift','Current identity/lifecycle changed');
+   if(input.action==='withdraw-archived-sender-active-direct')this.archivedDirect(this.row(input.effect.outboxId),input);
    const hash=historicalDigest({actor,generation,input}),replay=this.replay(input.rigId,input.operationId,'dispose',hash);if(replay)return replay;
    const quarantine=this.db.prepare("SELECT * FROM outbox_historical_quarantines WHERE outbox_id=?").get(input.effect.outboxId) as {rig_id:string;operation_id:string;original_hash:string;state:string}|undefined;
    if(!quarantine||quarantine.state!=='held'||quarantine.rig_id!==input.rigId||quarantine.operation_id!==input.quarantineOperationId||quarantine.original_hash!==input.effect.rowHash)refuse('historical_quarantine_required','Disposition requires exact prior historical quarantine membership');
@@ -144,10 +163,13 @@ export class HistoricalEffectDispositionService {
     if(!wake||!entry.audit_pointer||!this.db.prepare('SELECT 1 FROM queue_items WHERE qitem_id=?').get(entry.audit_pointer))refuse('historical_wake_custody_required','Exact executable wake with preserved queue custody required');
    }else if(input.action==='custodian-withdraw-unregistered-direct'){
     if(wake||entry.guard_binding||(this.local(entry.sender_session)&&this.local(entry.destination_session)))refuse('historical_custodian_case_required','Only unguarded nonwake with missing local endpoint; registered direct uses existing actualsender path');
+   }else if(input.action==='withdraw-archived-sender-active-direct'){
+    if(wake||entry.guard_binding||input.archivedScope)refuse('historical_archived_direct_case','Only unguarded nonwake archived sender to active recipient');
+    this.archivedDirect(entry,input);
    }else refuse('historical_action_required','Explicit bounded historical action required');
    const changed=this.db.prepare("UPDATE outbox_entries SET delivery_state='retired',retired_at=?,retired_by=?,retirement_reason=? WHERE outbox_id=? AND delivery_state=?").run(new Date(this.now()).toISOString(),actor,`Historical intention withdrawn; delivery unknown: ${input.reason}`,entry.outbox_id,entry.delivery_state);if(changed.changes!==1)refuse('historical_effect_drift','Concurrent disposition won');
    this.db.prepare("UPDATE outbox_historical_quarantines SET state='disposed' WHERE outbox_id=?").run(entry.outbox_id);
-   const receipt={kind:'historical-disposition',rigId:input.rigId,operationId:input.operationId,action:input.action,outboxId:entry.outbox_id,actor,generation,lead:actors.lead,leadGeneration:input.leadGeneration,authorizationId:input.authorizationId,reason:input.reason,evidenceRef:input.evidenceRef,originalState:entry.delivery_state,originalRowHash:input.effect.rowHash,custodyHash:input.effect.custodyHash,originalProvenance:entry.identity_provenance??null,originalSender:entry.sender_session,originalDestination:entry.destination_session,originalAuditPointer:entry.audit_pointer,originalGuardHash:entry.guard_binding?historicalDigest(entry.guard_binding):null,deliveryConclusion:'unknown',queueMutations:0};this.record(input.rigId,input.operationId,'dispose',hash,receipt);return receipt;
+   const receipt={kind:'historical-disposition',rigId:input.rigId,operationId:input.operationId,action:input.action,outboxId:entry.outbox_id,actor,generation,lead:actors.lead,leadGeneration:input.leadGeneration,authorizationId:input.authorizationId,reason:input.reason,evidenceRef:input.evidenceRef,originalState:entry.delivery_state,originalRowHash:input.effect.rowHash,custodyHash:input.effect.custodyHash,originalProvenance:entry.identity_provenance??null,originalSender:entry.sender_session,originalDestination:entry.destination_session,originalAuditPointer:entry.audit_pointer,originalGuardHash:entry.guard_binding?historicalDigest(entry.guard_binding):null,deliveryConclusion:'unknown',queueMutations:0,...(input.action==='withdraw-archived-sender-active-direct'?{archivedActiveDirect:input.archivedActiveDirect,capabilityDigest:currentActors.capabilityDigest,ownerIntentDigest:historicalDigest({action:input.action,effect:input.effect,scope:input.archivedActiveDirect,reason:input.reason,evidenceRef:input.evidenceRef}),withdrawalAuthority:'explicit-owner-current-operator-custodian'}:{})};this.record(input.rigId,input.operationId,'dispose',hash,receipt);return receipt;
   }).immediate());
  }
 }
