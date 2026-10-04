@@ -9,7 +9,7 @@ export function coordinatorCommand():Command {
    const res=await new DaemonClient().get(`/api/coordinator/${encodeURIComponent(rigId)}`, { headers: terminalAuthHeaders() });
    console.log(JSON.stringify(res.data,null,2));if(res.status>=400)process.exitCode=1;
  });
- for(const op of ["enable","transfer","acknowledge","renew","admit","dispose","recover","legacy-inventory","migrate-legacy","coordination-worker-probe","coordination-return-successor","coordination-return-continue","coordination-return-retire","coordination-lifecycle-recovery"]){
+ for(const op of ["enable","transfer","acknowledge","renew","admit","dispose","recover","legacy-inventory","migrate-legacy","coordination-worker-probe","coordination-return-successor","coordination-return-continue","coordination-return-retire","coordination-return-intake-refresh","coordination-lifecycle-recovery"]){
    cmd.command(`${op} <contractFile>`).description(op==="dispose"?'Submit {"rigId":"...","packageKey":"original admitted package key","dispositionId":"new worker-authored JSON return queue ID"}. The original worker may dispose its own terminal return; holder role is not required.':"Submit exact frozen JSON contract; caller identity/generation derive from seat environment")
     .action(async(file:string)=>{
      const contract=JSON.parse(fs.readFileSync(file,"utf8"));
