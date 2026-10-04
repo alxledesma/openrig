@@ -3,7 +3,7 @@ import type { QueueRepository } from "./queue-repository.js";
 import { CoordinatorFenceError, digest, type CoordinatorToken } from "./coordinator-authority-service.js";
 import type { ActivityEvidence, ArbitratedSeatState } from "./activity-taxonomy.js";
 
-export interface CoordinationActivity { generation:string; identityVerified:boolean; state:ArbitratedSeatState; witness:ActivityEvidence|null }
+export interface CoordinationActivity { generation:string; identityVerified:boolean; identityObservedAt?:string|null; state:ArbitratedSeatState; witness:ActivityEvidence|null }
 export interface CoordinationTask {
  key:string; packageKey:string; owner:string; action:string; deadline:number; body:string; recoveryFor?:string;
  predecessors:Array<{queueId:string;dispositionId:string}>;
@@ -12,7 +12,7 @@ export interface CoordinationTask {
  boundary?:"owner-access"|"owner-credential"|"owner-material"|"owner-irreversible";
 }
 export interface CoordinationPlan { rigId:string; revision:string; operatorGeneration:string; stallMs:number; allowIdlePeerTransfer:boolean; allowUnavailablePeerTransfer?:boolean; acknowledgmentWindowMs?:number; tasks:CoordinationTask[] }
-export interface CoordinationResult { key:string; state:string; queueId?:string; reason?:string; deadline:number }
+export interface CoordinationResult { key:string; state:string; queueId?:string; reason?:string; deadline:number; activityEvidence?:Record<string,unknown> }
 const successfulReturn=(state:string,disposition:string|null):boolean=>!!disposition&&['done','handed-off'].includes(state);
 /** Only the exact migration091 refusal is normalized, never arbitrary SQL failures. */
 function heldDispatchCode(error:unknown):string|undefined {
@@ -122,7 +122,11 @@ export class CoordinationRecoveryService {
     if(this.workerEffectDebt(t.owner)){result.push({key:t.key,state:'held',reason:'uncertain-worker-effect',deadline:t.deadline});continue;}
     if(!this.admittedNow(t)){result.push({key:t.key,state:'held',reason:'current-admission-required',deadline:t.deadline});continue;}
     const gen=this.authority.generation(t.owner);
-    if(!gen||!coordinationIdle(this.activity(t.owner),gen,this.now())){result.push({key:t.key,state:'held',reason:'fresh-activity-required',deadline:t.deadline});continue;}
+    const sample=this.activity(t.owner),observedNow=this.now();
+    if(!gen||!coordinationIdle(sample,gen,observedNow)){
+     const age=(at:string|null|undefined)=>{const ms=Date.parse(at??'');return Number.isFinite(ms)?observedNow-ms:null;};
+     result.push({key:t.key,state:'held',reason:'fresh-activity-required',deadline:t.deadline,activityEvidence:{expectedGeneration:gen,generation:sample?.generation??null,identityVerified:sample?.identityVerified??false,identityAgeMs:age(sample?.identityObservedAt),activity:sample?.state.activity??null,decidedBy:sample?.state.decidedBy??null,needsInputCount:sample?.state.needsInput.count??null,witnessActivity:sample?.witness?.activity??null,witnessRung:sample?.witness?.rung??null,witnessAgeMs:age(sample?.witness?.observedAt),witnessSeatMatches:!!sample?.witness&&sample.witness.seatNodeId===sample.state.seatNodeId,swapGeneration:sample?.state.lastSwap?.generation??null,witnessPredatesSwap:!!sample?.witness&&!!sample.state.lastSwap&&Date.parse(sample.witness.observedAt)<Date.parse(sample.state.lastSwap.at)}});continue;
+    }
     // An unrelated queue claim is an exclusive worker obligation, even while idle.
     if(this.db.prepare("SELECT 1 FROM queue_items WHERE destination_session IN (?,?) AND state IN ('pending','in-progress','blocked')").get(...rotationLocalAddresses(this.db,t.owner))){result.push({key:t.key,state:'held',reason:'existing-worker-custody',deadline:t.deadline});continue;}
     const queueId=`qitem-coordination-${digest(rigId+':'+t.packageKey).slice(0,24)}`;
@@ -135,7 +139,9 @@ export class CoordinationRecoveryService {
     }
     result.push({key:t.key,state:'pending-pickup',queueId,deadline:t.deadline});
    }
-   const operationId=`coordination-reconcile:${digest(JSON.stringify({revision:plan!.revision,epoch:a!.epoch,result}))}`;
+   // Observation ages are diagnostics, not new work or a new reconciliation state.
+   const stableResult=result.map(({activityEvidence,...state})=>state);
+   const operationId=`coordination-reconcile:${digest(JSON.stringify({revision:plan!.revision,epoch:a!.epoch,result:stableResult}))}`;
    this.db.prepare("INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)").run(rigId,operationId,'coordination-reconcile',JSON.stringify(result),digest(JSON.stringify({actor,generation})));
    this.recordProgress(rigId);
    return result;

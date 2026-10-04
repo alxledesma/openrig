@@ -11,7 +11,7 @@ export function makeCoordinatorContinuityPolicy(service:CoordinatorAuthorityServ
   await service.coordinationRecovery?.deliverCommitted();
   if(coordination?.some(result=>result.key==='coordinator'&&result.queueId))return {action:'skip',reason:'committed-coordinator-recovery-custody',notes:{coordination}};
   const recovery=service.observeContinuity(job.context.rigId);
-  if(!recovery)return {action:"skip",reason:"no-authoritative-exclusion"};
-  return {action:"send",target:job.target,message:`Coordinator recovery intake for ${recovery.rigId}, epoch ${recovery.expectedEpoch}. Preserve workers; no product dispatch or automatic transfer.`,conditionReceipt:recovery.evidenceId,coordinatorRecovery:recovery};
+  if(!recovery)return {action:"skip",reason:coordination?'coordination-reconciled':"no-authoritative-exclusion",...(coordination?{notes:{coordination}}:{})};
+  return {action:"send",target:job.target,message:`Coordinator recovery intake for ${recovery.rigId}, epoch ${recovery.expectedEpoch}. Preserve workers; no product dispatch or automatic transfer.`,conditionReceipt:recovery.evidenceId,coordinatorRecovery:recovery,...(coordination?{notes:{coordination}}:{})};
  }};
 }

@@ -439,7 +439,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     const identity=db.prepare('SELECT verdict,session_name,observed_at FROM seat_identity_verdicts WHERE node_id=?').get(state.seatNodeId) as {verdict:string;session_name:string;observed_at:string}|undefined;
     const observed=Date.parse(identity?.observed_at??'');
     const identityVerified=identity?.verdict==='verified'&&identity.session_name===session&&observed<=Date.now()&&Date.now()-observed<=3000;
-    return {generation,identityVerified,state,witness:seatActivityService.getRotationActivityWitness(state.seatNodeId)};
+    return {generation,identityVerified,identityObservedAt:identity?.observed_at??null,state,witness:seatActivityService.getRotationActivityWitness(state.seatNodeId)};
   });
   queueRepoInstance.coordinatorAuthority.runtimeOutcomeAssessment = new RuntimeOutcomeAssessment(queueRepoInstance);
   const resilienceRollout = new ResilienceRolloutService(queueRepoInstance,watchdogJobsRepoInstance);

@@ -31,6 +31,20 @@ describe('durable coordination recovery',()=>{
   const s=sample('builder@xv');expect(coordinationIdle(s,s.generation,clock)).toBe(true);
   for(const bad of [{...s,identityVerified:false},{...s,generation:'old'},{...s,witness:null},{...s,witness:{...s.witness!,observedAt:new Date(clock-3001).toISOString()}},{...s,witness:{...s.witness!,observedAt:new Date(clock+1).toISOString()}},{...s,state:{...s.state,decidedBy:'lifecycle-hooks' as const}},{...s,state:{...s.state,needsInput:{count:1,reason:'input'}}}])expect(coordinationIdle(bad,s.generation,clock)).toBe(false);
  });
+ it('observer records the exact activity hold instead of hiding reconciliation behind outage status',async()=>{
+  configure(normal());job();const s=samples.get('builder@xv')!;
+  s.identityVerified=false;
+  s.witness!.observedAt=new Date(clock-3001).toISOString();
+  const evaluation=await makeCoordinatorContinuityPolicy(repo.coordinatorAuthority).evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);
+  expect(evaluation).toMatchObject({action:'skip',reason:'coordination-reconciled'});
+  const held=(evaluation.notes!.coordination as any[]).find(r=>r.key==='product');
+  expect(held).toMatchObject({reason:'fresh-activity-required',activityEvidence:{identityVerified:false,generation:'builder-g1',expectedGeneration:'builder-g1',activity:'idle-at-prompt',witnessAgeMs:3001,witnessRung:'window-sampling'}});
+  expect(repo.getById('qitem-coordination-'+digest('xv:product').slice(0,24))).toBeNull();
+  const before=db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordination-reconcile'").get();
+  s.witness!.observedAt=new Date(clock-4000).toISOString();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordination-reconcile'").get()).toEqual(before);
+ });
  it('restart has no swap yet real fresh idle remains eligible; actual pickup follows',()=>{
   configure(normal());const session='builder@xv',generation=repo.coordinatorAuthority.generation(session)!;
   const ladder=new SeatActivityService({tmux:{readPaneLastActivity:async()=>null},defaultWindowSeconds:3,now:()=>new Date(clock)});
