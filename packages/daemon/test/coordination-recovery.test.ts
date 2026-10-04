@@ -136,8 +136,10 @@ describe('durable coordination recovery',()=>{
   repo.update({qitemId:q,actorSession:'architect@xv',state:'done',closureReason:'no-follow-on'});
   await repo.create({qitemId:'returned',sourceSession:'architect@xv',destinationSession:'lead@xv',body:JSON.stringify({packageKey:'decision',inputDigest:digest('decision'),evidence:[{kind:'report',ref:'bounded/decision.md'}]}),nudge:false});
   repo.coordinatorAuthority.dispose('architect@xv','architect-g1','xv','decision','returned');
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(x=>x.key==='decision')?.state).toBe('returned-awaiting-acceptance');
   expect(svc.reconcile('lead@xv','lead-g1','xv').find(x=>x.key==='next')?.reason).toBe('predecessor-disposition');
   svc.accept('lead@xv','lead-g1','xv','decision','returned','bounded/technical-acceptance.md');
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(x=>x.key==='decision')?.state).toBe('accepted');
   const next=svc.reconcile('lead@xv','lead-g1','xv').find(x=>x.key==='next')!;expect(next.state).toBe('pending-pickup');
   repo.claim({qitemId:next.queueId!,destinationSession:'builder@xv',identityProvenance:'transport:v1'});expect(svc.reconcile('lead@xv','lead-g1','xv').find(x=>x.key==='next')?.state).toBe('picked-up');
  });
@@ -210,9 +212,26 @@ describe('durable coordination recovery',()=>{
   repo.claim({qitemId:id,destinationSession:'peer@xv'});repo.update({qitemId:id,state:'done',actorSession:'peer@xv',closureReason:'no-follow-on',note:'Retained historical completion'});
   const before=repo.getById(id);const result=svc.reconcile('lead@xv','lead-g1','xv');
   expect(result.find(r=>r.key==='review')).toMatchObject({state:'held',queueId:id,reason:kind==='matching'?'existing-queue-without-assignment':'deterministic-queue-conflict'});expect(result.find(r=>r.key==='product')?.state).toBe('pending-pickup');expect(repo.getById(id)).toEqual(before);expect(db.prepare("SELECT 1 FROM coordinator_assignments WHERE package_key='review'").get()).toBeUndefined();
+  const notices=()=>db.prepare("SELECT qitem_id,body FROM queue_items WHERE json_valid(body) AND json_extract(body,'$.action')='resolve-exact-coordination-task-hold'").all() as Array<{qitem_id:string;body:string}>;
+  expect(notices()).toHaveLength(1);const notice=notices()[0];
+  expect(JSON.parse(notice.body)).toMatchObject({packageKey:'review',retainedQueueId:id,recipientGeneration:'operator-agent-g1',grantsAuthority:false});
+  repo.claim({qitemId:notice.qitem_id,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});
+  expect(db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(notice.qitem_id)).toEqual({claimed_by_generation_uuid:'operator-agent-g1'});
+  svc.reconcile('lead@xv','lead-g1','xv');expect(notices()).toHaveLength(1);
+  repo.update({qitemId:notice.qitem_id,actorSession:'operator-agent@kernel',state:'done',closureReason:'no-follow-on'});
+  svc.reconcile('lead@xv','lead-g1','xv');expect(notices()).toHaveLength(1);expect(repo.getById(id)).toEqual(before);
  });
  it('unknown SQLite failure still aborts instead of being swallowed as seat reservation',()=>{
   configure(normal());db.exec("CREATE TRIGGER unknown_failure BEFORE INSERT ON queue_items WHEN NEW.destination_session='builder@xv' BEGIN SELECT RAISE(ABORT,'unrecognized_data_corruption'); END");expect(()=>svc.reconcile('lead@xv','lead-g1','xv')).toThrow('unrecognized_data_corruption');expect(db.prepare('SELECT count(*) n FROM coordinator_assignments').get()).toEqual({n:0});
+ });
+ it('reserved Operator intake cannot roll back an independent ready assignment',()=>{
+  const expired=task('expired','reviewer@xv');expired.admission.validUntil=clock+1;
+  configure([expired,task('expired-repair','architect@xv',{recoveryFor:'expired'}),...normal()]);clock+=2;vi.setSystemTime(clock);refresh();
+  db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES('op-reservation','op-rotation','operator-agent@kernel','operator-agent@kernel','operator-agent-g1','native-old','operator-agent@kernel','operator-agent-g1','hash','{}','{}','reserved',?,?)").run(new Date(clock).toISOString(),new Date(clock).toISOString());
+  const result=svc.reconcile('lead@xv','lead-g1','xv');
+  expect(result.find(r=>r.key==='expired')?.reason).toBe('current-admission-required');expect(result.find(r=>r.key==='product')?.state).toBe('pending-pickup');
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordination-intake-hold'").get()).toEqual({n:1});
+  expect(db.prepare("SELECT state FROM seat_dispatch_reservations WHERE reservation_id='op-reservation'").get()).toEqual({state:'reserved'});
  });
 
  it('cyclic recovery activation chain cannot masquerade as a ready independent plan',()=>{

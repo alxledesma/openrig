@@ -115,7 +115,8 @@ export class CoordinationRecoveryService {
      if(!dispatchHold&&!t.boundary&&this.predecessorsReady(rigId,t)&&assigned.state==='pending'&&!assigned.claimed_by_generation_uuid&&!assigned.disposition_id&&this.admittedNow(t)&&!this.workerEffectDebt(t.owner)&&coordinationIdle(this.activity(t.owner),this.authority.generation(t.owner)??'',this.now()))this.repo.stageCoordinatorAssignmentWake({rigId,epoch:a!.epoch,generation,actor,queueId:assigned.queue_id,recipient:t.owner,recipientGeneration:t.admission.generation,now:this.now()});
      const picked=assigned.state==='in-progress'&&assigned.claimed_by_generation_uuid===this.authority.generation(t.owner)&&assigned.destination_session===t.owner;
      const semanticRecovery=this.authority.runtimeOutcomeAssessment?.requiresRecovery(rigId,t.packageKey)??false;
-     const state=semanticRecovery?'recovery-required:semantic-incomplete':successfulReturn(assigned.state,assigned.disposition_id)?'returned-awaiting-acceptance':picked?'picked-up':assigned.state==='pending'?'pending-pickup':`recovery-required:${assigned.state}`;
+     const accepted=successfulReturn(assigned.state,assigned.disposition_id)&&!!this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind='coordination-accept' AND json_extract(receipt,'$.queueId')=? AND json_extract(receipt,'$.dispositionId')=?").get(rigId,assigned.queue_id,assigned.disposition_id);
+     const state=semanticRecovery?'recovery-required:semantic-incomplete':accepted?'accepted':successfulReturn(assigned.state,assigned.disposition_id)?'returned-awaiting-acceptance':picked?'picked-up':assigned.state==='pending'?'pending-pickup':`recovery-required:${assigned.state}`;
      result.push({key:t.key,state,queueId:assigned.queue_id,deadline:t.deadline,...(!assigned.disposition_id&&this.now()>t.deadline?{reason:'deadline-exceeded: concrete recovery owner/action remains '+t.owner+' / '+t.action}:{})});continue;
     }
     if(dispatchHold){result.push({key:t.key,state:'held',reason:dispatchHold,deadline:t.deadline});continue;}
@@ -160,6 +161,22 @@ export class CoordinationRecoveryService {
      result.push({key:t.key,state:'held',reason:code,deadline:t.deadline});continue;
     }
     result.push({key:t.key,state:'pending-pickup',queueId,deadline:t.deadline});
+   }
+   // Configuration/effect holds need real recovery custody, not only a diagnostic
+   // string. Control intake grants no dispatch, acceptance or history authority.
+   for(const held of result){
+    if(held.state!=='held'||!['current-admission-required','uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict'].includes(held.reason??''))continue;
+    const task=plan!.tasks.find(t=>t.key===held.key)!;
+    const queueId='qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:plan!.revision,operatorGeneration:plan!.operatorGeneration,packageKey:task.packageKey,reason:held.reason,queueId:held.queueId??null})).slice(0,24);
+    try {this.db.transaction(()=>{if(!this.repo.getById(queueId)){
+     const deadline=this.now()+1200000;
+     this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:new Date(deadline).toISOString(),body:JSON.stringify({action:'resolve-exact-coordination-task-hold',rigId,planRevision:plan!.revision,packageKey:task.packageKey,taskOwner:task.owner,reason:held.reason,retainedQueueId:held.queueId??null,recipientGeneration:plan!.operatorGeneration,deadline,grantsAuthority:false,returnPath:a!.owner_session,required:'Claim this bounded recovery and inspect the exact current task, native identity and custody. Repair an expired admission only from current qualified evidence. Reconcile uncertain effects through supported disposition without assuming delivery or retrying unknown effects. For a retained pre-ledger row, preserve it and have the current Lead define a distinct admitted follow-up contract when needed; never forge an assignment or reopen terminal history. Return supported resolution evidence or a named protected boundary. Reconcile eligible independent product frontier afterward; this control item grants no acceptance, product qualification, checkpoint release or dispatch authority.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
+     this.repo.stageWakeIntent(queueId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,plan!.operatorGeneration);
+    }})();}catch(error){
+     const code=heldDispatchCode(error);if(!code)throw error;
+     const receipt={rigId,packageKey:task.packageKey,reason:code,owner:'operator-agent@kernel',action:'Resolve native Operator reservation before exact recovery intake',grantsAuthority:false};
+     this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'coordination-intake-hold:'+digest(queueId+':'+code),'coordination-intake-hold',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+    }
    }
    // Observation ages are diagnostics, not new work or a new reconciliation state.
    const stableResult=result.map(({activityEvidence,...state})=>state);
