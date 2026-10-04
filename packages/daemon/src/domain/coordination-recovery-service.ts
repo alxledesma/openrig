@@ -60,6 +60,173 @@ export class CoordinationRecoveryService {
    return {queueId};
   })();
  }
+ /** A correction notice continues the exact claimed control; it creates no queue
+  * assignment and cannot change its custody, original return or resource locks. */
+ private terminalReturnContinuationContext(rigId:string,controlQueueId:string,bodyHash:string,workerGeneration:string,deadline:number,excludeEffect?:string,retirement=false) {
+  const op=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-control'").get(rigId,controlQueueId) as {receipt:string}|undefined;
+  const control=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(controlQueueId) as any;
+  const r=op?JSON.parse(op.receipt):null,b=control?JSON.parse(control.body):null,a=this.authority.get(rigId),plan=this.plan(rigId);
+  const original=r?this.db.prepare("SELECT a.destination,a.body_hash,a.disposition_id,q.body,q.state,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.package_key=? AND a.queue_id=?").get(rigId,r.packageKey,r.originalQueueId) as any:null;
+  const contract=original?JSON.parse(original.contract):null;
+  if(!r||!control||r.bodyHash!==bodyHash||digest(control.body)!==bodyHash||control.source_session!=='watchdog@system'||control.destination_session!==r.worker||!['in-progress','blocked'].includes(control.state)||!workerGeneration||control.claimed_by_generation_uuid!==workerGeneration||r.workerGeneration!==workerGeneration||this.authority.generation(r.worker)!==workerGeneration||Date.parse(control.expires_at)!==r.expiresAt||!Number.isSafeInteger(deadline)||deadline<=this.now()||(!retirement&&(deadline>r.expiresAt||r.expiresAt<=this.now()))||(retirement&&r.expiresAt>this.now())||b.action!=='record-exact-native-terminal-return'||b.rigId!==rigId||b.originalQueueId!==r.originalQueueId||b.packageKey!==r.packageKey||b.recipientGeneration!==workerGeneration||!original||original.disposition_id||original.destination!==r.worker||original.claimed_by_generation_uuid!==workerGeneration||!['done','failed','denied','canceled','handed-off'].includes(original.state)||digest(original.body)!==original.body_hash||contract.destination!==r.worker||contract.bodyHash!==original.body_hash||b.inputDigest!==contract.inputDigest||JSON.stringify(b.returnContract)!==JSON.stringify(contract.returnContract)||!this.authority.terminalReturnResourcesRetained(rigId,r.packageKey,contract)||!a||a.state!=='active'||a.lease_until<=this.now()||this.authority.generation(a.owner_session)!==a.owner_generation||!plan||this.authority.generation('operator-agent@kernel')!==plan.operatorGeneration)fail('coordination_return_continuation_required','Exact immutable active claimed unexpired native return duty, original claimant and current live authority required; expired duties must use supported exhaustion recovery');
+  const restriction=plan!.dispatchRestrictions?.find(scope=>scope.session===r.worker);
+  if(restriction&&(restriction.generation!==workerGeneration||restriction.validUntil<=this.now()||!restriction.packageKeys.includes(r.packageKey)))fail('coordination_return_continuation_protected','Checkpoint scope excludes this native return continuation');
+  for(const session of [r.worker,a!.owner_session,'operator-agent@kernel'])if(this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(session,session))fail('coordination_return_continuation_protected','Native seat reservation excludes this continuation');
+  if(this.workerEffectDebt(r.worker,excludeEffect))fail('coordination_return_continuation_unknown_effect','Reconcile unknown effects before continuing native return custody');
+  if(retirement){const observation=this.activity(r.worker),at=Date.parse(observation?.identityObservedAt??'');if(!Number.isFinite(at)||at>this.now()||this.now()-at>3000||!coordinationIdle(observation,workerGeneration,this.now()))fail('coordination_return_retirement_idle_required','Retirement requires fresh verified native idle; active or unknown workers remain protected');}
+  return {r,control,receiptHash:digest(op!.receipt),a:a!,plan:plan!,contract};
+ }
+ private validContinuationReturn(queueId:string,worker:string,workerGeneration:string,packageKey:string,contract:any):boolean {
+  const row=this.db.prepare('SELECT source_session,destination_session,minting_generation_uuid,body FROM queue_items WHERE qitem_id=?').get(queueId) as any;
+  let body:any;try{body=row?JSON.parse(row.body):null;}catch{return false;}
+  return !!row&&row.source_session===worker&&row.destination_session===contract.returnContract.destination&&row.minting_generation_uuid===workerGeneration&&body?.packageKey===packageKey&&body.inputDigest===contract.inputDigest&&Array.isArray(body.evidence)&&contract.returnContract.evidenceRequired.every((kind:string)=>body.evidence.some((e:any)=>e&&e.kind===kind&&typeof e.ref==='string'&&e.ref.length>0));
+ }
+ continueTerminalReturn(actor:string,generation:string,input:{rigId:string;controlQueueId:string;controlBodyHash:string;workerGeneration:string;deadline:number;dispositionId?:string}):{queueId:string;outboxId:string;deadline:number} {
+  return this.db.transaction(()=>{
+   const a=this.authority.get(input.rigId);
+   if(!generation||this.authority.generation(actor)!==generation||!(actor==='operator-agent@kernel'||(a?.owner_session===actor&&a.owner_generation===generation)))fail('coordination_return_continuation_required','Genuine current Operator or live holder required');
+   const id='native-return-continuation:'+input.controlQueueId,requestHash=digest(JSON.stringify({actor,generation,input}));
+   const prior=this.db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-continuation'").get(input.rigId,id) as {receipt:string;request_hash:string}|undefined;
+   if(prior){if(prior.request_hash!==requestHash)fail('coordination_return_continuation_conflict','This duty already has its one frozen correction notice');const r=JSON.parse(prior.receipt);return {queueId:r.controlQueueId,outboxId:r.outboxId,deadline:r.deadline};}
+   const context=this.terminalReturnContinuationContext(input.rigId,input.controlQueueId,input.controlBodyHash,input.workerGeneration,input.deadline);
+   if(input.deadline>this.now()+1200000)fail('coordination_return_continuation_required','Correction notice must expire within twenty minutes and the existing duty expiry');
+   const {r,contract}=context;
+   let dispositionId=input.dispositionId;
+   if(dispositionId&&!this.validContinuationReturn(dispositionId,r.worker,input.workerGeneration,r.packageKey,contract))fail('coordination_return_continuation_required','Referenced return must be the original worker incarnation\'s genuine typed return under its admitted contract');
+   if(!dispositionId){const returns=this.db.prepare('SELECT qitem_id FROM queue_items WHERE source_session=? AND destination_session=? AND minting_generation_uuid=? AND json_valid(body) ORDER BY rowid DESC').all(r.worker,contract.returnContract.destination,input.workerGeneration) as Array<{qitem_id:string}>;dispositionId=returns.find(row=>this.validContinuationReturn(row.qitem_id,r.worker,input.workerGeneration,r.packageKey,contract))?.qitem_id;}
+   const outboxId=this.repo.stageNativeTerminalReturnContinuation({controlQueueId:input.controlQueueId,worker:r.worker,workerGeneration:input.workerGeneration,proofId:id,body:JSON.stringify({action:'continue-exact-native-terminal-return',controlQueueId:input.controlQueueId,originalQueueId:r.originalQueueId,deadline:input.deadline,grantsAuthority:false,disposeContract:{rigId:input.rigId,packageKey:r.packageKey,dispositionId:dispositionId??'<new worker-authored typed-return queue item ID>'},returnContract:contract.returnContract,required:'Continue the same already-claimed duty; do not claim new work or repeat product work. Reuse your genuine retained typed return if identified here. Otherwise author your JSON {packageKey,inputDigest,evidence:[{kind,ref}]} return to returnContract.destination. Submit exactly {rigId,packageKey,dispositionId} to rig coordinator dispose using that actual new return queue ID. Successful duty closure requires the resulting original disposition. Preserve original evidence, unknown effects, checkpoint scope and locks; report a supported refusal. This correction grants no acceptance or automatic disposal.'})});
+   const effect=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(outboxId) as {body:string};
+   const receipt={controlQueueId:input.controlQueueId,controlBodyHash:input.controlBodyHash,controlReceiptHash:context.receiptHash,worker:r.worker,workerGeneration:input.workerGeneration,actor,actorGeneration:generation,holder:context.a.owner_session,holderGeneration:context.a.owner_generation,epoch:context.a.epoch,operatorGeneration:context.plan.operatorGeneration,deadline:input.deadline,outboxId,outboxBodyHash:digest(effect.body),...(dispositionId?{dispositionId}:{})};
+   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,id,'native-terminal-return-continuation',JSON.stringify(receipt),requestHash);
+   return {queueId:input.controlQueueId,outboxId,deadline:input.deadline};
+  }).immediate();
+ }
+ private exactAccepted(rigId:string,queueId:string,dispositionId:string):boolean {return !!this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind='coordination-accept' AND json_extract(receipt,'$.queueId')=? AND json_extract(receipt,'$.dispositionId')=?").get(rigId,queueId,dispositionId);}
+ private acceptedTaskHistory(rigId:string,t:CoordinationTask):boolean {
+  const r=this.db.prepare("SELECT a.queue_id,a.disposition_id,a.body_hash,a.destination,q.body,q.state,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.package_key=?").get(rigId,t.packageKey) as any;
+  const c=r?JSON.parse(r.contract):null;return !!r&&r.destination===t.owner&&r.body_hash===digest(t.body)&&digest(r.body)===r.body_hash&&c.destination===t.owner&&c.bodyHash===r.body_hash&&successfulReturn(r.state,r.disposition_id)&&this.exactAccepted(rigId,r.queue_id,r.disposition_id);
+ }
+ private dormantRecoveryHistory(rigId:string,t:CoordinationTask,prior:CoordinationPlan):boolean {
+  const target=prior.tasks.find(parent=>parent.key===t.recoveryFor);if(!target||!this.acceptedTaskHistory(rigId,target)||this.authority.runtimeOutcomeAssessment?.requiresRecovery(rigId,target.packageKey))return false;
+  const id='qitem-coordination-'+digest(rigId+':'+t.packageKey).slice(0,24);
+  return !this.db.prepare('SELECT 1 FROM coordinator_assignments WHERE rig_id=? AND package_key=?').get(rigId,t.packageKey)&&!this.db.prepare('SELECT 1 FROM coordinator_stage_assignments WHERE rig_id=? AND package_key=?').get(rigId,t.packageKey)&&!this.db.prepare('SELECT 1 FROM coordinator_resources WHERE rig_id=? AND package_key=?').get(rigId,t.packageKey)&&!this.db.prepare("SELECT 1 FROM queue_items WHERE qitem_id=? AND state IN ('pending','in-progress','blocked')").get(id);
+ }
+ private lifecycleRecipientReady(rigId:string,recipient:string,packageKey:string,excludeEffect?:string):boolean {
+  const plan=this.plan(rigId),scope=plan?.dispatchRestrictions?.find(r=>r.session===recipient);
+  return !!plan&&(!scope||(scope.generation===this.authority.generation(recipient)&&scope.validUntil>this.now()&&scope.packageKeys.includes(packageKey)))&&!this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(recipient,recipient)&&!this.workerEffectDebt(recipient,excludeEffect);
+ }
+ private lifecycleDuty(rigId:string,kind:'acceptance'|'recovery'|'materialization',packageKey:string,recipient:string,recipientGeneration:string,semanticKey:string,details:Record<string,unknown>):CoordinationResult {
+  const a=this.authority.get(rigId)!,plan=this.plan(rigId)!;
+  const queueId='qitem-coordination-lifecycle-'+digest(rigId+':'+kind+':'+semanticKey+':'+recipientGeneration+':'+a.epoch+':'+plan.revision).slice(0,24),existing=this.repo.getById(queueId);
+  const deadline=existing?.expiresAt?Date.parse(existing.expiresAt):this.now()+1200000;
+  if(existing&&this.lifecycleControlCompleted(queueId))return {key:kind+':'+packageKey,state:kind==='materialization'?'materialized':'owned-recovery',queueId,deadline};
+  if(existing){return {key:kind+':'+packageKey,state:['pending','in-progress','blocked'].includes(existing.state)&&deadline>this.now()?'pending-native-'+kind:'held',queueId,...(!['pending','in-progress','blocked'].includes(existing.state)||deadline<=this.now()?{reason:'lifecycle-duty-exhausted'}:{}),deadline};}
+  if(!this.lifecycleRecipientReady(rigId,recipient,packageKey))return {key:kind+':'+packageKey,state:'held',reason:'lifecycle-recipient-protected',deadline};
+  let body=JSON.stringify({action:kind==='acceptance'?'accept-exact-return-or-own-recovery':kind==='recovery'?'own-exact-failed-return-recovery':'materialize-exact-admitted-frontier',rigId,packageKey,recipientGeneration,deadline,grantsAuthority:false,...details,required:kind==='acceptance'?'Claim this finite duty under current holder identity. Inspect the exact typed disposed return and required technical evidence. Use supported coordination-accept only when all classifier, qualification and independent review gates actually pass. An incomplete or unverified outcome requires distinct admitted, configured and genuinely picked-up recovery; record its exact active custody through coordination-lifecycle-recovery. Prose is not acceptance or owned recovery. Original acceptance alone releases the existing authorized frontier; never invent work or waive a gate.':'Claim this finite Operator intake. Inspect the immutable admitted contract, retained accepted predecessor references and current plan. Materialize this exact package into the existing plan with actual current qualification, capacity, effort, native generation/configuration and recovery evidence through coordination-plan. Preserve unchanged accepted history and dormant backup bytes. If scope or a protected gate prevents this, park the concrete boundary; this notice grants no admission, qualification, dispatch or acceptance.'});
+  if(kind==='recovery'){const b=JSON.parse(body);b.required='Claim this finite recovery-only duty under the current native holder identity. Preserve the exact failed/denied/canceled original and its genuine typed disposition. Technical acceptance is forbidden for this original failure. Coordinate with the genuine current Operator to materialize a distinct admitted current recovery in the existing plan if absent; do not invent or reopen work. After actual worker pickup, record its exact active custody and evidence through coordination-lifecycle-recovery. Successful duty closure requires that verified distinct owned recovery; prose, a pending ticket and a failed-return acceptance attempt are not completion. Unknown effects, quiescence, current admission and qualifications remain protected.';body=JSON.stringify(b);}
+  this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:recipient,expiresAt:new Date(deadline).toISOString(),body,identityProvenance:'system:operator-authorized-coordination',nudge:true});
+   const receipt={kind,queueId,packageKey,recipient,recipientGeneration,bodyHash:digest(body),deadline,holder:a.owner_session,holderGeneration:a.owner_generation,epoch:a.epoch,operatorGeneration:plan.operatorGeneration,planRevision:plan.revision,...details};
+   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,queueId,'coordinator-lifecycle-control',JSON.stringify(receipt),digest(body));this.repo.stageCoordinatorLifecycleWake(queueId,recipient,recipientGeneration);
+  })();
+  return {key:kind+':'+packageKey,state:'pending-native-'+kind,queueId,deadline};
+ }
+ private centralLifecyclePass(rigId:string):CoordinationResult[] {
+  const a=this.authority.get(rigId)!,plan=this.plan(rigId)!,result:CoordinationResult[]=[];
+  const returned=this.db.prepare("SELECT a.*,q.body,q.state,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.disposition_id IS NOT NULL AND q.state IN ('done','handed-off','failed','denied','canceled')").all(rigId) as any[];
+  for(const row of returned){
+   const kind=successfulReturn(row.state,row.disposition_id)?'acceptance':'recovery';
+   if(kind==='acceptance'&&this.exactAccepted(rigId,row.queue_id,row.disposition_id))continue;
+   const contract=JSON.parse(row.contract);if(row.body_hash!==digest(row.body)||contract.destination!==row.destination||contract.bodyHash!==row.body_hash||!this.validContinuationReturn(row.disposition_id,row.destination,row.claimed_by_generation_uuid,row.package_key,contract)){result.push({key:kind+':'+row.package_key,state:'held',queueId:row.queue_id,reason:'lifecycle-return-contract-drift',deadline:this.now()+1200000});continue;}
+   const returnedBody=(this.repo.getById(row.disposition_id)!).body;
+   result.push(this.lifecycleDuty(rigId,kind,row.package_key,a.owner_session,a.owner_generation,row.queue_id+':'+row.disposition_id,{originalQueueId:row.queue_id,dispositionId:row.disposition_id,returnBodyHash:digest(returnedBody),assignmentBodyHash:row.body_hash,contractHash:digest(row.contract),...(kind==='acceptance'?{acceptContract:{rigId,packageKey:row.package_key,dispositionId:row.disposition_id,evidenceRef:'<actual technical acceptance evidence>'}}:{terminalState:row.state,recoveryContract:{rigId,dutyQueueId:'<this native recovery-only duty queue ID>',recoveryPackageKey:'<distinct admitted configured recovery package>',recoveryQueueId:'<actual currently claimed recovery assignment queue ID>',evidenceRef:'<actual recovery pickup evidence>'}})}));
+  }
+  const unplanned=this.db.prepare('SELECT package_key,contract,contract_hash FROM coordinator_packages p WHERE p.rig_id=? AND NOT EXISTS (SELECT 1 FROM coordinator_assignments a WHERE a.rig_id=p.rig_id AND a.package_key=p.package_key)').all(rigId) as any[];
+  const accepted=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordination-accept' ORDER BY operation_id").all(rigId) as Array<{receipt:string}>;
+  const acceptedPredecessors=accepted.map(row=>{const r=JSON.parse(row.receipt);return {queueId:r.queueId,dispositionId:r.dispositionId,evidenceRef:r.evidenceRef};});
+  for(const row of unplanned){if(plan.tasks.some(t=>t.packageKey===row.package_key))continue;
+   result.push(this.lifecycleDuty(rigId,'materialization',row.package_key,'operator-agent@kernel',plan.operatorGeneration,row.package_key+':'+row.contract_hash,{contractHash:row.contract_hash,contract:JSON.parse(row.contract),acceptedPredecessors}));
+  }
+  return result;
+ }
+ private lifecycleControl(queueId:string):{rigId:string;receipt:any}|null {const row=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE operation_id=? AND kind='coordinator-lifecycle-control'").get(queueId) as {rig_id:string;receipt:string}|undefined;return row?{rigId:row.rig_id,receipt:JSON.parse(row.receipt)}:null;}
+ isLifecycleControl(queueId:string):boolean {return this.lifecycleControl(queueId)!==null;}
+ lifecycleControlCompleted(queueId:string):boolean {
+  const op=this.lifecycleControl(queueId);if(!op)return false;const r=op.receipt;
+  if(r.kind==='materialization'){const plan=this.plan(op.rigId),pkg=this.db.prepare('SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(op.rigId,r.packageKey) as any;return !!plan&&plan.operatorGeneration===this.authority.generation('operator-agent@kernel')&&pkg?.contract_hash===r.contractHash&&plan.tasks.some(t=>t.packageKey===r.packageKey&&this.admittedNow(t));}
+  if(r.kind==='acceptance'&&this.exactAccepted(op.rigId,r.originalQueueId,r.dispositionId))return true;
+  const recovery=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='coordinator-lifecycle-recovery'").get(op.rigId,'lifecycle-recovery:'+queueId) as {receipt:string}|undefined;
+  return !!recovery&&this.validOwnedLifecycleRecovery(op.rigId,r,JSON.parse(recovery.receipt));
+ }
+ private validOwnedLifecycleRecovery(rigId:string,duty:any,recovery:any):boolean {
+  const plan=this.plan(rigId),target=plan?.tasks.find(t=>t.packageKey===duty.packageKey),task=plan?.tasks.find(t=>t.packageKey===recovery.recoveryPackageKey),a=this.authority.get(rigId);
+  const row=this.db.prepare('SELECT a.destination,a.body_hash,q.body,q.state,q.claimed_by_generation_uuid FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=? AND a.queue_id=?').get(rigId,recovery.recoveryPackageKey,recovery.recoveryQueueId) as any;
+  return !!a&&a.state==='active'&&a.lease_until>this.now()&&a.epoch===recovery.epoch&&a.owner_session===recovery.actor&&a.owner_generation===recovery.generation&&this.authority.generation(recovery.actor)===recovery.generation&&!!plan&&plan.operatorGeneration===this.authority.generation('operator-agent@kernel')&&!!target&&!!task&&task.recoveryFor===target.key&&task.packageKey!==duty.packageKey&&this.admittedNow(task)&&!!row&&row.destination===task.owner&&row.state==='in-progress'&&row.claimed_by_generation_uuid===recovery.workerGeneration&&this.authority.generation(task.owner)===recovery.workerGeneration&&row.body_hash===digest(row.body)&&digest(task.body)===row.body_hash;
+ }
+ recordLifecycleRecovery(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;recoveryPackageKey:string;recoveryQueueId:string;evidenceRef:string}):void {
+  this.db.transaction(()=>{
+   const op=this.lifecycleControl(input.dutyQueueId),q=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(input.dutyQueueId) as any;
+   const row=this.db.prepare('SELECT q.claimed_by_generation_uuid FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=? AND a.queue_id=?').get(input.rigId,input.recoveryPackageKey,input.recoveryQueueId) as any;
+   const receipt={actor,generation,epoch:this.authority.get(input.rigId)?.epoch,recoveryPackageKey:input.recoveryPackageKey,recoveryQueueId:input.recoveryQueueId,workerGeneration:row?.claimed_by_generation_uuid,evidenceRef:input.evidenceRef};
+   if(!op||op.rigId!==input.rigId||!['acceptance','recovery'].includes(op.receipt.kind)||!this.validLifecycleControlWake('watchdog@system',actor,input.dutyQueueId)||!q||digest(q.body)!==op.receipt.bodyHash||q.destination_session!==actor||q.claimed_by_generation_uuid!==generation||!['in-progress','blocked'].includes(q.state)||Date.parse(q.expires_at)<=this.now()||typeof input.evidenceRef!=='string'||!input.evidenceRef.trim()||!this.validOwnedLifecycleRecovery(input.rigId,op.receipt,receipt))fail('coordination_lifecycle_recovery_required','Exact current holder claim and distinct admitted genuinely active recovery required; prose cannot close acceptance duty');
+   const id='lifecycle-recovery:'+input.dutyQueueId,prior=this.db.prepare('SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(input.rigId,id) as {receipt:string}|undefined;
+   if(prior){if(prior.receipt!==JSON.stringify(receipt))fail('coordination_lifecycle_recovery_conflict','Frozen recovery disposition differs');return;}
+   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,id,'coordinator-lifecycle-recovery',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+  }).immediate();
+ }
+ validLifecycleControlWake(source:string|undefined,destination:string,queueId:string):boolean {
+  if(source!=='watchdog@system')return false;const op=this.lifecycleControl(queueId);if(!op)return false;const r=op.receipt,a=this.authority.get(op.rigId),plan=this.plan(op.rigId),q=this.repo.getById(queueId);
+  if(!q||q.sourceSession!==source||q.destinationSession!==destination||r.recipient!==destination||r.recipientGeneration!==this.authority.generation(destination)||!['pending','in-progress','blocked'].includes(q.state)||q.expiresAt===null||Date.parse(q.expiresAt)!==r.deadline||r.deadline<=this.now()||digest(q.body)!==r.bodyHash||!a||a.state!=='active'||a.lease_until<=this.now()||a.epoch!==r.epoch||a.owner_session!==r.holder||a.owner_generation!==r.holderGeneration||this.authority.generation(r.holder)!==r.holderGeneration||!plan||plan.revision!==r.planRevision||plan.operatorGeneration!==r.operatorGeneration||this.authority.generation('operator-agent@kernel')!==r.operatorGeneration||!this.lifecycleRecipientReady(op.rigId,destination,r.packageKey,'wake-intent-'+queueId)||this.lifecycleControlCompleted(queueId))return false;
+  if(r.kind==='materialization'){const pkg=this.db.prepare('SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(op.rigId,r.packageKey) as any;return pkg?.contract_hash===r.contractHash&&(!plan.tasks.some(t=>t.packageKey===r.packageKey))&&r.acceptedPredecessors.every((ref:any)=>this.exactAccepted(op.rigId,ref.queueId,ref.dispositionId));}
+  const original=this.db.prepare('SELECT a.*,q.body,q.state,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.queue_id=? AND a.package_key=?').get(op.rigId,r.originalQueueId,r.packageKey) as any;
+  const returned=this.repo.getById(r.dispositionId);return !!original&&(r.kind==='recovery'?['failed','denied','canceled'].includes(original.state)&&original.state===r.terminalState:successfulReturn(original.state,original.disposition_id))&&original.disposition_id===r.dispositionId&&original.body_hash===r.assignmentBodyHash&&digest(original.body)===r.assignmentBodyHash&&digest(original.contract)===r.contractHash&&!!returned&&digest(returned.body)===r.returnBodyHash&&this.validContinuationReturn(r.dispositionId,original.destination,original.claimed_by_generation_uuid,r.packageKey,JSON.parse(original.contract));
+ }
+ private exactRetirementIntake(rigId:string,intakeQueueId:string,controlQueueId:string,operatorGeneration:string,packageKey:string):string {
+  const q=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(intakeQueueId) as any;
+  const h=q?JSON.parse(q.body):null,creation=this.db.prepare('SELECT state,actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1').get(intakeQueueId) as any;
+  const expected=h?'qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:h.planRevision,operatorGeneration,packageKey,reason:'terminal-return-duty-exhausted',queueId:controlQueueId})).slice(0,24):null;
+  if(!q||q.source_session!=='watchdog@system'||q.destination_session!=='operator-agent@kernel'||q.claimed_by_generation_uuid!==operatorGeneration||!['in-progress','blocked'].includes(q.state)||!creation||creation.state!=='pending'||creation.actor_session!=='watchdog@system'||creation.identity_provenance!=='system:operator-authorized-coordination'||intakeQueueId!==expected||h.action!=='resolve-exact-coordination-task-hold'||h.reason!=='terminal-return-duty-exhausted'||h.rigId!==rigId||h.packageKey!==packageKey||h.retainedQueueId!==controlQueueId||h.recipientGeneration!==operatorGeneration||h.grantsAuthority!==false||!Number.isSafeInteger(h.deadline)||h.deadline!==Date.parse(q.expires_at)||h.deadline<=this.now()||!this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='coordination-plan' AND json_extract(receipt,'$.operatorGeneration')=?").get(rigId,'coordination-plan:'+h.planRevision,operatorGeneration))fail('coordination_return_retirement_required','Current Operator must genuinely claim the exact finite runtime exhaustion intake before retirement');
+  return digest(q.body);
+ }
+ retireExpiredTerminalReturn(actor:string,generation:string,input:{rigId:string;intakeQueueId:string;controlQueueId:string;controlBodyHash:string;workerGeneration:string;deadline:number}):{queueId:string;outboxId:string;deadline:number} {
+  return this.db.transaction(()=>{
+   if(actor!=='operator-agent@kernel'||!generation||this.authority.generation(actor)!==generation)fail('coordination_operator_required','Genuine current Operator authorizes expired-control retirement');
+   const id='native-return-retirement:'+input.controlQueueId,requestHash=digest(JSON.stringify({actor,generation,input}));
+   const saved=this.db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-retirement'").get(input.rigId,id) as {receipt:string;request_hash:string}|undefined;
+   if(saved){if(saved.request_hash!==requestHash)fail('coordination_return_retirement_conflict','This expired duty already has its one finite retirement notice');const r=JSON.parse(saved.receipt);return {queueId:r.controlQueueId,outboxId:r.outboxId,deadline:r.deadline};}
+   if(input.deadline>this.now()+1200000)fail('coordination_return_retirement_required','Retirement notice must expire within twenty minutes');
+   const c=this.terminalReturnContinuationContext(input.rigId,input.controlQueueId,input.controlBodyHash,input.workerGeneration,input.deadline,undefined,true);
+   const intakeBodyHash=this.exactRetirementIntake(input.rigId,input.intakeQueueId,input.controlQueueId,generation,c.r.packageKey);
+   const outboxId=this.repo.stageNativeTerminalReturnContinuation({controlQueueId:input.controlQueueId,worker:c.r.worker,workerGeneration:input.workerGeneration,proofId:id,body:JSON.stringify({action:'retire-expired-native-terminal-return',controlQueueId:input.controlQueueId,originalQueueId:c.r.originalQueueId,deadline:input.deadline,grantsAuthority:false,allowedClosureStates:['failed','canceled'],required:'This is a finite failure-only retirement notice. Your original duty has expired; do not execute expired work, dispose product scope, redo work or release locks. Under your own genuine native identity, record failed or canceled for ONLY controlQueueId through the supported queue update with an honest expiry reason. Preserve the original product claim, all typed returns, evidence and effects. Current Operator can then use the existing exact successor API. No automatic cancellation, acceptance or expiry extension is granted.'})});
+   const effect=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(outboxId) as {body:string};
+   const receipt={retirement:true,controlQueueId:input.controlQueueId,controlBodyHash:input.controlBodyHash,controlReceiptHash:c.receiptHash,intakeQueueId:input.intakeQueueId,intakeBodyHash,worker:c.r.worker,workerGeneration:input.workerGeneration,actor,actorGeneration:generation,holder:c.a.owner_session,holderGeneration:c.a.owner_generation,epoch:c.a.epoch,operatorGeneration:c.plan.operatorGeneration,deadline:input.deadline,outboxId,outboxBodyHash:digest(effect.body)};
+   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,id,'native-terminal-return-retirement',JSON.stringify(receipt),requestHash);
+   return {queueId:input.controlQueueId,outboxId,deadline:input.deadline};
+  }).immediate();
+ }
+ private retireForAuthorizedObserver(rigId:string,operatorGeneration:string,result:CoordinationResult[]):CoordinationResult[] {
+  for(const held of result){
+   if(held.reason!=='terminal-return-duty-exhausted'||!held.queueId)continue;
+   const control=this.repo.getById(held.queueId);if(!control||!['in-progress','blocked'].includes(control.state)||!control.expiresAt||Date.parse(control.expiresAt)>this.now())continue;
+   const record=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-control'").get(rigId,held.queueId) as {receipt:string}|undefined;if(!record)continue;const r=JSON.parse(record.receipt);
+   const plan=this.plan(rigId)!,intakeQueueId='qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:plan.revision,operatorGeneration,packageKey:r.packageKey,reason:'terminal-return-duty-exhausted',queueId:held.queueId})).slice(0,24);
+   const saved=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-retirement'").get(rigId,'native-return-retirement:'+held.queueId) as {receipt:string}|undefined;
+   if(saved){const receipt=JSON.parse(saved.receipt);held.reason=receipt.deadline>this.now()?'native-retirement-notice-staged':'native-retirement-notice-exhausted';continue;}
+   try{const staged=this.retireExpiredTerminalReturn('operator-agent@kernel',operatorGeneration,{rigId,intakeQueueId,controlQueueId:held.queueId,controlBodyHash:digest(control.body),workerGeneration:r.workerGeneration,deadline:this.now()+1200000});held.reason='native-retirement-notice-staged';held.deadline=staged.deadline;}catch(error){if(!(error instanceof CoordinatorFenceError))throw error;held.reason=error.code;}
+  }
+  return result;
+ }
+ /** Read-only proof shared by outbox selection and the final managed-send seam. */
+ validTerminalReturnContinuationWake(source:string|undefined,destination:string,proofId:string):boolean {
+  if(source!=='watchdog@system')return false;
+  const op=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE operation_id=? AND kind IN ('native-terminal-return-continuation','native-terminal-return-retirement')").get(proofId) as {rig_id:string;receipt:string}|undefined;
+  if(!op)return false;const r=JSON.parse(op.receipt);
+  try{
+   const c=this.terminalReturnContinuationContext(op.rig_id,r.controlQueueId,r.controlBodyHash,r.workerGeneration,r.deadline,r.outboxId,r.retirement===true);
+   const effect=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(r.outboxId) as any;
+   if(r.retirement&&this.exactRetirementIntake(op.rig_id,r.intakeQueueId,r.controlQueueId,r.operatorGeneration,c.r.packageKey)!==r.intakeBodyHash)return false;
+   return destination===r.worker&&c.receiptHash===r.controlReceiptHash&&c.a.epoch===r.epoch&&c.a.owner_session===r.holder&&c.a.owner_generation===r.holderGeneration&&c.plan.operatorGeneration===r.operatorGeneration&&this.authority.generation(r.actor)===r.actorGeneration&&(r.actor==='operator-agent@kernel'||r.actor===c.a.owner_session)&&!!effect&&effect.sender_session===source&&effect.destination_session===destination&&effect.audit_pointer===r.controlQueueId&&['pending','sending'].includes(effect.delivery_state)&&digest(effect.body)===r.outboxBodyHash&&(!r.dispositionId||this.validContinuationReturn(r.dispositionId,r.worker,r.workerGeneration,c.r.packageKey,c.contract));
+  }catch(error){if(error instanceof CoordinatorFenceError)return false;throw error;}
+ }
  async probeWorker(actor:string,generation:string,input:{rigId:string;worker:string}):Promise<{worker:string;generation:string;configurationDigest:string|null;observedAt:number;identityVerified:boolean;idle:boolean;observation:CoordinationActivity|null;grantsAuthority:false}> {
   const authorize=()=>{
    const a=this.authority.get(input.rigId),current=this.authority.generation(actor);
@@ -73,7 +240,7 @@ export class CoordinationRecoveryService {
   const identityVerified=observation?.identityVerified===true&&observation.generation===before&&Number.isFinite(identityAt)&&identityAt<=now&&now-identityAt<=3000;
   return {worker:input.worker,generation:before,configurationDigest:this.configurationDigest(input.worker),observedAt:now,identityVerified,idle:identityVerified&&coordinationIdle(observation,before,now),observation,grantsAuthority:false};
  }
- async refreshActivity(rigId:string):Promise<void> {const plan=this.plan(rigId);if(plan?.refreshDispatchIdentity===true){const coordinators=JSON.parse(this.authority.get(rigId)?.coordinators??'[]') as string[];await this.refreshIdentity?.([...new Set([...coordinators,...plan.tasks.map(t=>t.owner)])]);}}
+ async refreshActivity(rigId:string):Promise<void> {const plan=this.plan(rigId);if(plan?.refreshDispatchIdentity===true){const coordinators=JSON.parse(this.authority.get(rigId)?.coordinators??'[]') as string[];const retained=this.db.prepare("SELECT DISTINCT a.destination FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.disposition_id IS NULL AND q.state IN ('done','failed','denied','canceled','handed-off')").all(rigId) as Array<{destination:string}>;await this.refreshIdentity?.([...new Set([...coordinators,...plan.tasks.map(t=>t.owner),...retained.map(r=>r.destination)])]);}}
  private get authority(){return this.repo.coordinatorAuthority;}
  private get db(){return this.authority.db;}
  configure(actor:string,generation:string,plan:CoordinationPlan):CoordinationPlan {
@@ -95,9 +262,11 @@ export class CoordinationRecoveryService {
    const stable=(t:CoordinationTask)=>JSON.stringify({...t,admission:undefined,deadline:undefined});
    const keys=new Set(plan.tasks.map(t=>t.key));
    for(const t of plan.tasks){
+    const old=prior?.tasks.find(previous=>previous.key===t.key),historical=!!old&&(this.acceptedTaskHistory(plan.rigId,old)||this.dormantRecoveryHistory(plan.rigId,old,prior!));
+    if(historical&&JSON.stringify(old)!==JSON.stringify(t))fail('coordination_history_rewrite_refused','Accepted task and dormant backup history must retain full task, admission and deadline bytes');
     if(!t.key||!t.action.trim()||!Number.isFinite(t.deadline)||(t.deadline<=this.now()&&!prior?.tasks.some(old=>old.key===t.key&&stable(old)===stable(t)))||!t.body||!Array.isArray(t.predecessors))fail("coordination_invalid_task","Concrete action, future deadline, predecessors and exact body required");
     const ad=t.admission;
-    if(!ad||ad.generation!==this.authority.generation(t.owner)||ad.configurationDigest!==this.configurationDigest(t.owner)||!ad.qualificationRef||!ad.capacityRef||!ad.effortRef||!Number.isFinite(ad.validUntil)||ad.validUntil<=this.now())fail('coordination_current_admission_required','Exact current generation/configuration, qualification/capacity/effort evidence and expiry required');
+    if(!historical&&(!ad||ad.generation!==this.authority.generation(t.owner)||ad.configurationDigest!==this.configurationDigest(t.owner)||!ad.qualificationRef||!ad.capacityRef||!ad.effortRef||!Number.isFinite(ad.validUntil)||ad.validUntil<=this.now()))fail('coordination_current_admission_required','Exact current generation/configuration, qualification/capacity/effort evidence and expiry required');
     if(t.boundary&&!['owner-access','owner-credential','owner-material','owner-irreversible'].includes(t.boundary))fail("coordination_invalid_boundary","Unknown boundary");
     const row=this.db.prepare("SELECT contract FROM coordinator_packages WHERE rig_id=? AND package_key=?").get(plan.rigId,t.packageKey) as {contract:string}|undefined;
     if(!row)fail("coordination_package_not_admitted","Every task including recovery needs explicit admission");
@@ -144,7 +313,7 @@ export class CoordinationRecoveryService {
    if(this.authority.generation("operator-agent@kernel")!==plan!.operatorGeneration)fail("coordination_operator_retired","Reauthorize plan after Operator generation change");
    if(actor!==a!.owner_session||generation!==a!.owner_generation||this.authority.generation(actor)!==generation||a!.state!=="active"||a!.lease_until<=this.now())fail("coordinator_retired","Only reconciled current holder may dispatch");
    const token:CoordinatorToken={rigId,epoch:a!.epoch,generation};
-   const result:CoordinationResult[]=[];
+   const lifecycle=this.centralLifecyclePass(rigId),result:CoordinationResult[]=[];
    this.recordProgress(rigId);
    for(const t of plan!.tasks){
     const dispatchHold=this.dispatchScopeHold(plan!,t);
@@ -154,7 +323,7 @@ export class CoordinationRecoveryService {
      const picked=assigned.state==='in-progress'&&assigned.claimed_by_generation_uuid===this.authority.generation(t.owner)&&assigned.destination_session===t.owner;
      const semanticRecovery=this.authority.runtimeOutcomeAssessment?.requiresRecovery(rigId,t.packageKey)??false;
      const accepted=successfulReturn(assigned.state,assigned.disposition_id)&&!!this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind='coordination-accept' AND json_extract(receipt,'$.queueId')=? AND json_extract(receipt,'$.dispositionId')=?").get(rigId,assigned.queue_id,assigned.disposition_id);
-     const state=semanticRecovery?'recovery-required:semantic-incomplete':accepted?'accepted':successfulReturn(assigned.state,assigned.disposition_id)?'returned-awaiting-acceptance':picked?'picked-up':assigned.state==='pending'?'pending-pickup':`recovery-required:${assigned.state}`;
+     const state=accepted?'accepted':semanticRecovery?'recovery-required:semantic-incomplete':successfulReturn(assigned.state,assigned.disposition_id)?'returned-awaiting-acceptance':picked?'picked-up':assigned.state==='pending'?'pending-pickup':`recovery-required:${assigned.state}`;
      result.push({key:t.key,state,queueId:assigned.queue_id,deadline:t.deadline,...(!assigned.disposition_id&&this.now()>t.deadline?{reason:'deadline-exceeded: concrete recovery owner/action remains '+t.owner+' / '+t.action}:{})});continue;
     }
     if(dispatchHold){result.push({key:t.key,state:'held',reason:dispatchHold,deadline:t.deadline});continue;}
@@ -202,17 +371,20 @@ export class CoordinationRecoveryService {
    }
    // A terminal UI state is not an attributed return. Detect retained scope even
    // when that completed assignment is absent from the latest dispatch plan.
-   const missingReturns=this.db.prepare("SELECT a.package_key,a.queue_id,a.destination,a.body_hash,q.body,q.ts_updated,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.disposition_id IS NULL AND q.state IN ('done','failed','denied','canceled','handed-off') AND EXISTS (SELECT 1 FROM coordinator_resources r WHERE r.rig_id=a.rig_id AND r.package_key=a.package_key)").all(rigId) as Array<{package_key:string;queue_id:string;destination:string;body_hash:string;body:string;ts_updated:string;claimed_by_generation_uuid:string|null;contract:string}>;
+   const missingReturns=this.db.prepare("SELECT a.package_key,a.queue_id,a.destination,a.body_hash,q.body,q.ts_updated,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.disposition_id IS NULL AND q.state IN ('done','failed','denied','canceled','handed-off')").all(rigId) as Array<{package_key:string;queue_id:string;destination:string;body_hash:string;body:string;ts_updated:string;claimed_by_generation_uuid:string|null;contract:string}>;
    for(const missing of missingReturns){
     const current=this.authority.generation(missing.destination),contract=JSON.parse(missing.contract);
     const restriction=plan!.dispatchRestrictions?.find(r=>r.session===missing.destination);
     const scopeHeld=restriction&&(restriction.generation!==current||restriction.validUntil<=this.now()||!restriction.packageKeys.includes(missing.package_key));
-    const reason=!current||current!==missing.claimed_by_generation_uuid?'terminal-return-incarnation-changed':digest(missing.body)!==missing.body_hash||contract.destination!==missing.destination||contract.bodyHash!==missing.body_hash?'terminal-return-contract-drift':scopeHeld?'checkpoint-quiescence':this.workerEffectDebt(missing.destination)?'uncertain-worker-effect':null;
+    const reason=!current||current!==missing.claimed_by_generation_uuid?'terminal-return-incarnation-changed':digest(missing.body)!==missing.body_hash||contract.destination!==missing.destination||contract.bodyHash!==missing.body_hash||!this.authority.terminalReturnResourcesRetained(rigId,missing.package_key,contract)?'terminal-return-contract-drift':scopeHeld?'checkpoint-quiescence':this.workerEffectDebt(missing.destination)?'uncertain-worker-effect':null;
     if(reason){result.push({key:'terminal-return:'+missing.package_key,state:'held',queueId:missing.queue_id,reason,deadline:Date.parse(missing.ts_updated)+1200000});continue;}
     let queueId='qitem-coordination-terminal-return-'+digest(rigId+':'+missing.queue_id+':'+current).slice(0,24);const deadline=this.now()+1200000;
     const latest=this.db.prepare("SELECT q.qitem_id,q.body,o.receipt FROM coordinator_operations o JOIN queue_items q ON q.qitem_id=o.operation_id WHERE o.rig_id=? AND o.kind='native-terminal-return-control' AND json_extract(o.receipt,'$.originalQueueId')=? AND json_extract(o.receipt,'$.workerGeneration')=? ORDER BY q.ts_created DESC,q.rowid DESC LIMIT 1").get(rigId,missing.queue_id,current) as {qitem_id:string;body:string;receipt:string}|undefined;
     if(latest&&JSON.parse(latest.receipt).bodyHash===digest(latest.body))queueId=latest.qitem_id;
     const existing=this.repo.getById(queueId);if(existing&&(!['pending','in-progress','blocked'].includes(existing.state)||!existing.expiresAt||Date.parse(existing.expiresAt)<=this.now())){result.push({key:'terminal-return:'+missing.package_key,state:'held',queueId,reason:'terminal-return-duty-exhausted',deadline:existing.expiresAt?Date.parse(existing.expiresAt):Date.parse(missing.ts_updated)+1200000});continue;}
+    if(existing&&['in-progress','blocked'].includes(existing.state)&&!JSON.parse(existing.body).disposeContract&&!this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-continuation'").get(rigId,'native-return-continuation:'+queueId)){
+     try{this.continueTerminalReturn(actor,generation,{rigId,controlQueueId:queueId,controlBodyHash:digest(existing.body),workerGeneration:current!,deadline:Math.min(Date.parse(existing.expiresAt!),this.now()+1200000)});}catch(error){if(!(error instanceof CoordinatorFenceError))throw error;result.push({key:'terminal-return:'+missing.package_key,state:'held',queueId,reason:error.code,deadline:Date.parse(existing.expiresAt!)});continue;}
+    }
     try{
      this.db.transaction(()=>{if(!this.repo.getById(queueId)){this.repo.createNativeTerminalReturnDuty(actor,generation,rigId,{qitemId:queueId,sourceSession:'watchdog@system',destinationSession:missing.destination,expiresAt:new Date(deadline).toISOString(),body:JSON.stringify({action:'record-exact-native-terminal-return',rigId,packageKey:missing.package_key,originalQueueId:missing.queue_id,recipientGeneration:current,inputDigest:contract.inputDigest,returnContract:contract.returnContract,disposeContract:{rigId,packageKey:missing.package_key,dispositionId:'<new worker-authored typed-return queue item ID>'},deadline,grantsAuthority:false,required:'Claim this bounded return duty under your genuine current native identity. Reuse retained evidence from your own original assignment; author its exact typed durable return and use supported coordinator disposition. Close this duty with the actual receipt. Do not reopen or redo work, fabricate evidence, release locks directly, accept work, merge, deploy, or claim another incarnation’s results. Preserve uncertainty and explicit scope limits; report a concrete supported API refusal to the current Lead.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});this.repo.stageWakeIntent(queueId,'watchdog@system',missing.destination,'system:operator-authorized-coordination',true,current!);}})();
      result.push({key:'terminal-return:'+missing.package_key,state:'pending-native-terminal-return',queueId,deadline:Date.parse(this.repo.getById(queueId)!.expiresAt!)});
@@ -227,7 +399,7 @@ export class CoordinationRecoveryService {
     const queueId='qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:plan!.revision,operatorGeneration:plan!.operatorGeneration,packageKey:task.packageKey,reason:held.reason,queueId:held.queueId??null})).slice(0,24);
     try {this.db.transaction(()=>{if(!this.repo.getById(queueId)){
      const deadline=this.now()+1200000;
-     this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:new Date(deadline).toISOString(),body:JSON.stringify({action:'resolve-exact-coordination-task-hold',rigId,planRevision:plan!.revision,packageKey:task.packageKey,taskOwner:task.owner,reason:held.reason,retainedQueueId:held.queueId??null,recipientGeneration:plan!.operatorGeneration,deadline,grantsAuthority:false,returnPath:a!.owner_session,required:'Claim this bounded recovery and inspect the exact current task, native identity and custody. Repair an expired admission only from current qualified evidence. Reconcile uncertain effects through supported disposition without assuming delivery or retrying unknown effects. For a retained pre-ledger row, preserve it and have the current Lead define a distinct admitted follow-up contract when needed; never forge an assignment or reopen terminal history. Return supported resolution evidence or a named protected boundary. Reconcile eligible independent product frontier afterward; this control item grants no acceptance, product qualification, checkpoint release or dispatch authority.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
+     this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:new Date(deadline).toISOString(),body:JSON.stringify({action:'resolve-exact-coordination-task-hold',rigId,planRevision:plan!.revision,packageKey:task.packageKey,taskOwner:task.owner,reason:held.reason,retainedQueueId:held.queueId??null,recipientGeneration:plan!.operatorGeneration,deadline,grantsAuthority:false,returnPath:a!.owner_session,...(held.reason==='terminal-return-duty-exhausted'?{nextAction:'For an expired still-claimed control: claim this intake genuinely; the registered Operator observer can stage finite failure-only retirement when native idle and effects are proven. The original worker records failed/canceled; then use coordination-return-successor. Never extend expiry or cancel on the worker behalf.'}:{}),required:'Claim this bounded recovery and inspect the exact current task, native identity and custody. Repair an expired admission only from current qualified evidence. Reconcile uncertain effects through supported disposition without assuming delivery or retrying unknown effects. For a retained pre-ledger row, preserve it and have the current Lead define a distinct admitted follow-up contract when needed; never forge an assignment or reopen terminal history. Return supported resolution evidence or a named protected boundary. Reconcile eligible independent product frontier afterward; this control item grants no acceptance, product qualification, checkpoint release or dispatch authority.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
      this.repo.stageWakeIntent(queueId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,plan!.operatorGeneration);
     }})();}catch(error){
      const code=heldDispatchCode(error);if(!code)throw error;
@@ -235,6 +407,7 @@ export class CoordinationRecoveryService {
      this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'coordination-intake-hold:'+digest(queueId+':'+code),'coordination-intake-hold',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
     }
    }
+   result.push(...lifecycle);
    // Observation ages are diagnostics, not new work or a new reconciliation state.
    const stableResult=result.map(({activityEvidence,...state})=>state);
    const operationId=`coordination-reconcile:${digest(JSON.stringify({revision:plan!.revision,epoch:a!.epoch,result:stableResult}))}`;
@@ -253,11 +426,11 @@ export class CoordinationRecoveryService {
   if(r.validUntil<=this.now())return 'dispatch-scope-expired';
   return r.packageKeys.includes(t.packageKey)?null:'checkpoint-quiescence';
  }
- private workerEffectDebt(session:string):boolean {
+ private workerEffectDebt(session:string,excludeEffect?:string):boolean {
   const addresses=rotationLocalAddresses(this.db,session);
   const rig=this.db.prepare('SELECT n.rig_id FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(session) as {rig_id:string}|undefined;
   const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session IN (?,?) OR destination_session IN (?,?))").all(...addresses,...addresses) as Record<string,unknown>[];
-  return effects.some(row=>!rig||!this.authority.isAdoptedHistoryContained(rig.rig_id,row));
+  return effects.some(row=>row.outbox_id!==excludeEffect&&(!rig||!this.authority.isAdoptedHistoryContained(rig.rig_id,row)));
  }
  private admittedNow(t:CoordinationTask):boolean {
   return t.admission.validUntil>this.now()&&t.admission.generation===this.authority.generation(t.owner)&&t.admission.configurationDigest===this.configurationDigest(t.owner);
@@ -277,6 +450,7 @@ export class CoordinationRecoveryService {
    if(prior){if(JSON.parse(prior.receipt).dispositionId!==dispositionId)fail('coordination_acceptance_conflict','Accepted result cannot change');return;}
    this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,id,'coordination-accept',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
    this.recordProgress(rigId);
+   const plan=this.plan(rigId);if(plan&&plan.operatorGeneration===this.authority.generation('operator-agent@kernel'))this.reconcile(actor,generation,rigId);
   }).immediate();
  }
  private progressDigest(rigId:string):string {
@@ -392,7 +566,7 @@ export class CoordinationRecoveryService {
     return [{key:'coordinator',state:'pending-reconciliation-recovery',queueId,reason:'expired-unacknowledged-transfer',deadline:a.lease_until+(plan.acknowledgmentWindowMs??300000)}];
    }
    if(a.state!=='active'||a.lease_until<=this.now()){const deadline=this.now()+plan.stallMs,reason='current-holder-acknowledgment-or-lease';const queueId=this.stageCoordinatorRecovery(rigId,a.epoch,plan.operatorGeneration,'reconcile-current-coordinator-lease',reason,deadline);return [{key:'coordinator',state:'recovery-required',queueId,reason,deadline}];}
-   return this.reconcile(a.owner_session,a.owner_generation,rigId);
+   return this.retireForAuthorizedObserver(rigId,plan.operatorGeneration,this.reconcile(a.owner_session,a.owner_generation,rigId));
   }).immediate();
  }
 

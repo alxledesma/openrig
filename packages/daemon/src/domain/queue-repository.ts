@@ -886,6 +886,19 @@ export class QueueRepository {
     }).immediate();
   }
 
+  stageCoordinatorLifecycleWake(queueId:string,recipient:string,generation:string):void {
+    if(!this.db.inTransaction||!this.outbox)throw new QueueRepositoryError('wake_intent_store_unavailable','Lifecycle duty requires atomic durable wake');
+    this.recordWakeIntent({outboxId:`${WAKE_INTENT_PREFIX}${queueId}`,auditPointer:queueId,fromSession:'watchdog@system',toSession:recipient,identityProvenance:'system:operator-authorized-coordination',bareBody:`Read and genuinely claim exact lifecycle duty ${queueId}; retain all existing acceptance, qualification and scope gates.`,tags:['queue:coordinator-lifecycle',`queue:recipient-generation:${generation}`]});
+  }
+
+  stageNativeTerminalReturnContinuation(input:{controlQueueId:string;worker:string;workerGeneration:string;proofId:string;body:string}):string {
+    if(!this.db.inTransaction||!this.outbox)throw new QueueRepositoryError('wake_intent_store_unavailable','Native continuation requires an atomic durable wake store');
+    const outboxId=`${WAKE_INTENT_PREFIX}${input.proofId}`;
+    if(this.outbox.getById(outboxId))throw new QueueRepositoryError('native_continuation_conflict','Existing correction effect cannot be rewritten or replayed');
+    this.recordWakeIntent({outboxId,auditPointer:input.controlQueueId,fromSession:'watchdog@system',toSession:input.worker,identityProvenance:'system:operator-authorized-coordination',bareBody:input.body,tags:['queue:native-return-continuation',input.proofId,`queue:recipient-generation:${input.workerGeneration}`]});
+    return outboxId;
+  }
+
   private recordWakeIntent(input: {
     outboxId: string;
     auditPointer: string;
@@ -963,6 +976,7 @@ export class QueueRepository {
    * — handoff / handoff-and-complete today, Mission Control / Workflow via P34.
    */
   private assertNativeTerminalReturnCompleted(qitemId:string):void {
+    if(this.coordinatorAuthority.coordinationRecovery?.isLifecycleControl(qitemId)&&!this.coordinatorAuthority.coordinationRecovery.lifecycleControlCompleted(qitemId))throw new QueueRepositoryError('coordinator_lifecycle_incomplete','Exact native acceptance, genuinely active distinct recovery, or current plan materialization must precede successful lifecycle duty closure; prose is not completion');
     const op=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE operation_id=? AND kind='native-terminal-return-control'").get(qitemId) as {rig_id:string;receipt:string}|undefined;
     if(!op)return;
     const r=JSON.parse(op.receipt),a=this.db.prepare('SELECT disposition_id FROM coordinator_assignments WHERE rig_id=? AND queue_id=? AND package_key=?').get(op.rig_id,r.originalQueueId,r.packageKey) as {disposition_id:string|null}|undefined;
@@ -1043,6 +1057,8 @@ export class QueueRepository {
         const reservation=this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(entry.destinationSession,entry.destinationSession);
         current=!reservation&&!!proof&&!!authority&&authority.state==='active'&&authority.epoch===proof.epoch&&authority.owner_session===entry.senderSession&&authority.owner_generation===proof.generation&&authority.lease_until>Date.now()&&this.coordinatorAuthority.generation(entry.senderSession)===proof.generation&&this.coordinatorAuthority.generation(entry.destinationSession)===proof.recipientGeneration;
       }
+      if(safeTags.includes('queue:coordinator-lifecycle'))current=tagsValid&&safeTags.length===2&&entry.outboxId===`${WAKE_INTENT_PREFIX}${entry.auditPointer}`&&this.coordinatorAuthority.coordinationRecovery?.validLifecycleControlWake(entry.senderSession,entry.destinationSession,entry.auditPointer!)===true;
+      if(safeTags.includes('queue:native-return-continuation')){const proof=safeTags[1];current=tagsValid&&safeTags.length===3&&typeof proof==='string'&&entry.outboxId===`${WAKE_INTENT_PREFIX}${proof}`&&this.coordinatorAuthority.coordinationRecovery?.validTerminalReturnContinuationWake(entry.senderSession,entry.destinationSession,proof)===true;}
       const resumePrefix = `${WAKE_INTENT_PREFIX}blocker-`;
       if (current && entry.outboxId.startsWith(resumePrefix)) {
         const expected = Number(entry.outboxId.slice(resumePrefix.length));
@@ -1092,7 +1108,7 @@ export class QueueRepository {
     const qitemId = intent.auditPointer ?? outboxId;
     // MF4: send the FROZEN envelope stored on the intent verbatim (no re-resolution).
     const outcome = await this.performWakeSend(
-      qitemId, intent.destinationSession, intent.senderSession, undefined, group.map(entry => entry.body).join("\n"), group.map(entry => entry.outboxId),
+      qitemId, intent.destinationSession, intent.senderSession, undefined, group.map(entry => entry.body).join("\n"), group.map(entry => entry.outboxId), intent.tags?.includes('queue:native-return-continuation') ? intent.tags[1] : undefined,
     );
     const finalState = outcome.classified === "verified" ? "delivered" : outcome.classified;
     for (const member of group) {
@@ -1288,6 +1304,7 @@ export class QueueRepository {
     bodyOverride?: string,
     prebuiltText?: string,
     committedOutboxIds?: string[],
+    queueProofId?: string,
   ): Promise<{ classified: "verified" | "indeterminate" | "failed" | "retained"; nudgeResult: string }> {
     // DEFECT FIX qitem-20260827065907-b9ae334c (S1-class, 3 live specimens): a virtual
     // @external destination has NO pane — the queue row ITSELF is the gateway
@@ -1353,7 +1370,7 @@ export class QueueRepository {
       text = held.body;
     }
     try {
-      const res = await this.transport!.send(destinationSession, text, { queueAssignmentId: qitemId, verify: true, stampISO, actorSession: sourceSession, committedOutboxIds, deliveryId: committedOutboxIds ? undefined : deliveryId, auditPointer: qitemId });
+      const res = await this.transport!.send(destinationSession, text, { queueAssignmentId: queueProofId ?? qitemId, verify: true, stampISO, actorSession: sourceSession, committedOutboxIds, deliveryId: committedOutboxIds ? undefined : deliveryId, auditPointer: qitemId });
       // OPR.0.3.2.21.FR-4(c) — wording rename: the prior literal
       // "sent-unverified" read as a failure even in the common case
       // (delivery confirmed but the synchronous ack window expired,

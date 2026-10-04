@@ -10,6 +10,7 @@ import {createDb} from '../src/db/connection.js';import {EventBus} from '../src/
 import {QueueRepository} from '../src/domain/queue-repository.js';import {OutboxHandler} from '../src/domain/outbox-handler.js';
 import {CoordinationRecoveryService,coordinationIdle,type CoordinationActivity,type CoordinationTask,type CoordinationPlan} from '../src/domain/coordination-recovery-service.js';
 import {SeatActivityService} from '../src/domain/seat-activity-service.js';
+import {RuntimeOutcomeAssessment} from '../src/domain/runtime-outcome-assessment.js';
 import {digest} from '../src/domain/coordinator-authority-service.js';import {seed,token} from './helpers/coordinator-fixture.js';
 describe('durable coordination recovery',()=>{
  let dir:string,db:Database.Database,repo:QueueRepository,svc:CoordinationRecoveryService,clock:number,samples:Map<string,CoordinationActivity>;
@@ -22,6 +23,81 @@ describe('durable coordination recovery',()=>{
  beforeEach(async()=>{vi.useFakeTimers({toFake:['Date']});clock=Date.now();dir=mkdtempSync(join(tmpdir(),'coordination-'));db=createDb(join(dir,'db'));seed(db);db.prepare("INSERT INTO self_host_identity VALUES(1,'fixture-host',?,?)").run(new Date(clock).toISOString(),new Date(clock).toISOString());const bus=new EventBus(db);repo=new QueueRepository(db,bus,{resolveOccupantGeneration:s=>repo.coordinatorAuthority.generation(s)});repo.attachOutbox(new OutboxHandler(db));await repo.create({qitemId:'baton',sourceSession:'operator-agent@kernel',destinationSession:'lead@xv',body:'coordinate',nudge:false});repo.coordinatorAuthority.enable('operator-agent@kernel','operator-agent-g1',{rigId:'xv',batonId:'baton',owner:'lead@xv',ownerGeneration:'lead-g1',coordinators:['lead@xv','peer@xv'],leaseMs:60000,operationId:'enable'});repo.coordinatorAuthority.acknowledge('lead@xv',token,{operationId:'ack',obligationsDigest:repo.coordinatorAuthority.reconciliationDigest('xv')});samples=new Map();refresh();svc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock);repo.coordinatorAuthority.coordinationRecovery=svc;});
  afterEach(()=>{db.close();rmSync(dir,{recursive:true,force:true});vi.useRealTimers();});
  const normal=()=>[task('product'),task('repair','architect@xv',{recoveryFor:'product'})];
+ async function finishTyped(packageKey:string,owner:string,queueId:string,returnId:string){
+  repo.claim({qitemId:queueId,destinationSession:owner,identityProvenance:'transport:v1'});repo.update({qitemId:queueId,actorSession:owner,state:'done',closureReason:'no-follow-on'});
+  await repo.create({qitemId:returnId,sourceSession:owner,destinationSession:'lead@xv',body:JSON.stringify({packageKey,inputDigest:digest(packageKey),evidence:[{kind:'report',ref:'actual/'+packageKey+'.md'}]}),nudge:false});
+  repo.coordinatorAuthority.dispose(owner,repo.coordinatorAuthority.generation(owner)!,'xv',packageKey,returnId);db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+ }
+ it('central lifecycle follows an outside-plan typed return through genuine acceptance and actual next worker pickup',async()=>{
+  configure([task('next','reviewer@xv',{predecessors:[{queueId:'outside-product',dispositionId:'outside-return'}]}),task('next-repair','architect@xv',{recoveryFor:'next'})]);
+  repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv','outside',{inputDigest:digest('outside'),destination:'builder@xv',bodyHash:digest('outside'),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+  await repo.create({qitemId:'outside-product',sourceSession:'lead@xv',destinationSession:'builder@xv',body:'outside',dispatch:{token,packageKey:'outside'},nudge:false});await finishTyped('outside','builder@xv','outside-product','outside-return');
+  const first=svc.reconcile('lead@xv','lead-g1','xv'),duty=first.find(r=>r.key==='acceptance:outside')!;expect(duty.state).toBe('pending-native-acceptance');expect(first.find(r=>r.key==='next')?.reason).toBe('predecessor-disposition');
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='acceptance:outside')?.queueId).toBe(duty.queueId);
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordinator-lifecycle-control'").get()).toEqual({n:1});
+  expect(()=>repo.coordinatorAuthority.assertManagedSend('watchdog@system','lead@xv',duty.queueId)).not.toThrow();repo.claim({qitemId:duty.queueId!,destinationSession:'lead@xv',identityProvenance:'transport:v1'});
+  expect(()=>repo.update({qitemId:duty.queueId!,actorSession:'lead@xv',state:'done',closureReason:'no-follow-on'})).toThrow('Exact native acceptance');
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();svc.accept('lead@xv','lead-g1','xv','outside','outside-return','actual/outside-acceptance.md');
+  repo.update({qitemId:duty.queueId!,actorSession:'lead@xv',state:'done',closureReason:'no-follow-on'});
+  const next=db.prepare("SELECT queue_id FROM coordinator_assignments WHERE package_key='next'").get() as any;expect(next).toBeTruthy();repo.claim({qitemId:next.queue_id,destinationSession:'reviewer@xv',identityProvenance:'transport:v1'});expect(repo.getById(next.queue_id)?.state).toBe('in-progress');
+ });
+ it('central lifecycle requires distinct genuinely owned recovery for classifier-incomplete return',async()=>{
+  configure(normal());const original=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;await finishTyped('product','builder@xv',original,'incomplete-return');
+  const assessment=new RuntimeOutcomeAssessment(repo,{},()=>clock);repo.coordinatorAuthority.runtimeOutcomeAssessment=assessment;
+  const policy={rigId:'xv',revision:'fixture-enforce',mode:'enforce'};db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run('xv','fixture-policy','runtime-outcome-policy',JSON.stringify(policy),'fixture');
+  db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run('xv','fixture-incomplete','runtime-outcome-recovery',JSON.stringify({packageKey:'product',dispositionId:'incomplete-return',policyRevision:policy.revision}),'fixture');
+  const results=svc.reconcile('lead@xv','lead-g1','xv'),duty=results.find(r=>r.key==='acceptance:product')!,repair=results.find(r=>r.key==='repair')!;repo.claim({qitemId:duty.queueId!,destinationSession:'lead@xv',identityProvenance:'transport:v1'});
+  expect(()=>svc.accept('lead@xv','lead-g1','xv','product','incomplete-return','prose.md')).toThrow('Incomplete/unverified');expect(()=>repo.update({qitemId:duty.queueId!,actorSession:'lead@xv',state:'done',closureReason:'no-follow-on'})).toThrow('Exact native acceptance');
+  const input={rigId:'xv',dutyQueueId:duty.queueId!,recoveryPackageKey:'repair',recoveryQueueId:repair.queueId!,evidenceRef:'actual/recovery-pickup.json'};
+  expect(()=>svc.recordLifecycleRecovery('lead@xv','lead-g1',input)).toThrow('genuinely active recovery');repo.claim({qitemId:repair.queueId!,destinationSession:'architect@xv',identityProvenance:'transport:v1'});db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();svc.recordLifecycleRecovery('lead@xv','lead-g1',input);
+  repo.update({qitemId:duty.queueId!,actorSession:'lead@xv',state:'done',closureReason:'no-follow-on'});expect(repo.getById(repair.queueId!)?.state).toBe('in-progress');expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='coordination-accept'").get()).toBeUndefined();
+ });
+ it.each(['failed','denied','canceled'] as const)('central lifecycle keeps outside-plan disposed %s accountable through genuine recovery-only ownership',async(state)=>{
+  const retained=configure([task('independent','reviewer@xv',{boundary:'owner-material'}),task('independent-repair','peer@xv',{recoveryFor:'independent'})]);
+  const original=task('outside'),repair=task('outside-repair','architect@xv',{recoveryFor:'outside'});
+  repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv','outside',{inputDigest:digest('outside'),destination:original.owner,bodyHash:digest(original.body),resources:['failed-source.ts'],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+  await repo.create({qitemId:'outside-failure',sourceSession:'lead@xv',destinationSession:original.owner,body:original.body,dispatch:{token,packageKey:original.packageKey},nudge:false});repo.claim({qitemId:'outside-failure',destinationSession:original.owner,identityProvenance:'transport:v1'});repo.update({qitemId:'outside-failure',actorSession:original.owner,state});
+  await repo.create({qitemId:'outside-failure-return',sourceSession:original.owner,destinationSession:'lead@xv',body:JSON.stringify({packageKey:original.packageKey,inputDigest:digest('outside'),evidence:[{kind:'report',ref:'actual/failed-report.md'}]}),nudge:false});repo.coordinatorAuthority.dispose(original.owner,'builder-g1','xv',original.packageKey,'outside-failure-return');
+  const first=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='recovery:outside')!;expect(first.state).toBe('pending-native-recovery');expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='recovery:outside')?.queueId).toBe(first.queueId);
+  const packet=JSON.parse(repo.getById(first.queueId!)!.body);expect(packet.action).toBe('own-exact-failed-return-recovery');expect(packet.acceptContract).toBeUndefined();expect(packet.terminalState).toBe(state);expect(packet.originalQueueId).toBe('outside-failure');expect(()=>repo.coordinatorAuthority.assertManagedSend('watchdog@system','lead@xv',first.queueId)).not.toThrow();
+  repo.claim({qitemId:first.queueId!,destinationSession:'lead@xv',identityProvenance:'transport:v1'});expect(()=>repo.update({qitemId:first.queueId!,actorSession:'lead@xv',state:'done',closureReason:'no-follow-on'})).toThrow('Exact native acceptance');expect(()=>svc.accept('lead@xv','lead-g1','xv',original.packageKey,'outside-failure-return','prose.md')).toThrow('Exact successful');
+  repo.update({qitemId:first.queueId!,actorSession:'lead@xv',state:'canceled'});db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',repair.packageKey,{inputDigest:digest(repair.key),destination:repair.owner,bodyHash:digest(repair.body),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+  svc.configure('operator-agent@kernel','operator-agent-g1',{...retained,revision:'actual-failure-recovery-r2',tasks:[...retained.tasks,original,repair]});
+  const ready=svc.reconcile('lead@xv','lead-g1','xv'),duty=ready.find(r=>r.key==='recovery:outside')!,assignment=ready.find(r=>r.key===repair.key)!;expect(duty.queueId).not.toBe(first.queueId);expect(assignment.state).toBe('pending-pickup');repo.claim({qitemId:duty.queueId!,destinationSession:'lead@xv',identityProvenance:'transport:v1'});
+  const input={rigId:'xv',dutyQueueId:duty.queueId!,recoveryPackageKey:repair.packageKey,recoveryQueueId:assignment.queueId!,evidenceRef:'actual/failed-recovery-custody.json'};expect(()=>svc.recordLifecycleRecovery('lead@xv','lead-g1',input)).toThrow('genuinely active recovery');repo.claim({qitemId:assignment.queueId!,destinationSession:repair.owner,identityProvenance:'transport:v1'});db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();svc.recordLifecycleRecovery('lead@xv','lead-g1',input);repo.update({qitemId:duty.queueId!,actorSession:'lead@xv',state:'done',closureReason:'no-follow-on'});
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='recovery:outside')).toMatchObject({state:'owned-recovery',queueId:duty.queueId});expect(repo.getById('outside-failure')?.state).toBe(state);expect(repo.getById(assignment.queueId!)?.state).toBe('in-progress');expect(db.prepare("SELECT disposition_id FROM coordinator_assignments WHERE queue_id='outside-failure'").get()).toEqual({disposition_id:'outside-failure-return'});expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='coordination-accept'").get()).toBeUndefined();expect(db.prepare("SELECT 1 FROM coordinator_resources WHERE package_key='outside'").get()).toBeUndefined();
+ });
+ it.each(['expiry','generation','epoch','plan'] as const)('central lifecycle delivery rejects %s without granting acceptance',async(kind)=>{
+  configure(normal());const q=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;await finishTyped('product','builder@xv',q,'guarded-return');const duty=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='acceptance:product')!;
+  if(kind==='expiry'){clock=duty.deadline+1;vi.setSystemTime(clock);db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+60000);}else if(kind==='generation')db.prepare("UPDATE occupant_tenures SET generation_uuid='lead-g2' WHERE node_id='lead@xv'").run();else if(kind==='epoch')db.prepare('UPDATE coordinator_authority SET epoch=epoch+1').run();else svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'guarded-plan-r2'});
+  expect(()=>repo.coordinatorAuthority.assertManagedSend('watchdog@system','lead@xv',duty.queueId)).toThrow('finite lifecycle duty');expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='coordination-accept'").get()).toBeUndefined();
+ });
+ it('central lifecycle records a genuine return duty for a zero-resource completed assignment',()=>{
+  configure(normal());const q=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;repo.claim({qitemId:q,destinationSession:'builder@xv',identityProvenance:'transport:v1'});repo.update({qitemId:q,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  const r=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='terminal-return:product')!;expect(r.state).toBe('pending-native-terminal-return');expect(JSON.parse(repo.getById(r.queueId!)!.body).originalQueueId).toBe(q);expect(db.prepare("SELECT disposition_id FROM coordinator_assignments WHERE queue_id=?").get(q)).toEqual({disposition_id:null});expect(db.prepare('SELECT count(*) n FROM coordinator_resources').get()).toEqual({n:0});
+ });
+ it('central lifecycle materializes a current admitted frontier while preserving exact accepted parent and dormant backup history',async()=>{
+  const historical=configure(normal()),q=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;await finishTyped('product','builder@xv',q,'historical-return');svc.accept('lead@xv','lead-g1','xv','product','historical-return','actual/accepted-parent.md');
+  clock+=60001;vi.setSystemTime(clock);refresh();db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+60000);
+  const next=task('new-frontier','reviewer@xv',{predecessors:[{queueId:q,dispositionId:'historical-return'}]}),backup=task('z-new-backup','peer@xv',{recoveryFor:next.key});
+  for(const t of [next,backup])repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+  const observed=svc.reconcile('lead@xv','lead-g1','xv'),intake=observed.find(r=>r.key==='materialization:new-frontier')!;expect(intake.state).toBe('pending-native-materialization');
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='materialization:new-frontier')?.queueId).toBe(intake.queueId);const packet=JSON.parse(repo.getById(intake.queueId!)!.body);expect(packet.acceptedPredecessors).toContainEqual({queueId:q,dispositionId:'historical-return',evidenceRef:'actual/accepted-parent.md'});
+  repo.claim({qitemId:intake.queueId!,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});expect(()=>repo.update({qitemId:intake.queueId!,actorSession:'operator-agent@kernel',state:'done',closureReason:'no-follow-on'})).toThrow('Exact native acceptance');
+  const proposal={...historical,revision:'materialized-r2',tasks:[...historical.tasks,next,backup]};
+  for(const patch of [{body:'rewritten'},{admission:{...historical.tasks[0].admission,validUntil:clock+60000}},{predecessors:[{queueId:q,dispositionId:'changed'}]},{deadline:clock+20000}])expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...proposal,tasks:[{...historical.tasks[0],...patch},historical.tasks[1],next,backup]})).toThrow('history must retain');
+  expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...proposal,tasks:[...historical.tasks,{...next,admission:{...next.admission,validUntil:clock-1}},backup]})).toThrow('current generation/configuration');
+  svc.configure('operator-agent@kernel','operator-agent-g1',proposal);expect(svc.plan('xv')!.tasks.slice(0,2)).toEqual(historical.tasks);repo.update({qitemId:intake.queueId!,actorSession:'operator-agent@kernel',state:'done',closureReason:'no-follow-on'});
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();const ready=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key===next.key)!;expect(ready.state).toBe('pending-pickup');repo.claim({qitemId:ready.queueId!,destinationSession:next.owner,identityProvenance:'transport:v1'});
+  expect(db.prepare("SELECT count(*) n FROM coordinator_assignments WHERE package_key IN ('product','repair')").get()).toEqual({n:1});expect(repo.getById(q)?.state).toBe('done');
+ });
+ it('central lifecycle history exception rejects unaccepted parents and active backup scope',async()=>{
+  const old=configure(normal()),q=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;await finishTyped('product','builder@xv',q,'not-yet-accepted');
+  clock+=60001;vi.setSystemTime(clock);refresh();db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+60000);expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...old,revision:'unaccepted'})).toThrow('current generation/configuration');
+  svc.accept('lead@xv','lead-g1','xv','product','not-yet-accepted','actual/accepted.md');
+  db.prepare("INSERT INTO coordinator_resources VALUES ('xv','retained-backup-resource','repair')").run();expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...old,revision:'active-backup'})).toThrow('current generation/configuration');
+ });
  it('uses fresh deciding window evidence despite stale hook; queued is not pickup and repetition cannot duplicate',()=>{
   configure(normal());const a=svc.reconcile('lead@xv','lead-g1','xv');expect(a[0].state).toBe('pending-pickup');expect(svc.reconcile('lead@xv','lead-g1','xv')[0].state).toBe('pending-pickup');
   expect(db.prepare("SELECT count(*) n FROM coordinator_assignments").get()).toEqual({n:1});
@@ -165,6 +241,84 @@ describe('durable coordination recovery',()=>{
   expect(db.prepare('SELECT count(*) n FROM coordinator_resources WHERE package_key=?').get('product')).toEqual({n:0});
   expect(()=>repo.assertTerminalClosureHasIntent(first.queueId!,'uncreated-successor',false)).not.toThrow();
   expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='product')!.state).toBe('returned-awaiting-acceptance');
+ });
+ async function claimedLegacyReturnDuty(){
+  configure(normal(),{product:['source.ts']});const original=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;
+  repo.claim({qitemId:original,destinationSession:'builder@xv',identityProvenance:'transport:v1'});repo.update({qitemId:original,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  const queueId='qitem-coordination-terminal-return-'+digest('xv:'+original+':builder-g1').slice(0,24),deadline=clock+20000;
+  const body=JSON.stringify({action:'record-exact-native-terminal-return',rigId:'xv',packageKey:'product',originalQueueId:original,recipientGeneration:'builder-g1',inputDigest:digest('product'),returnContract:{destination:'lead@xv',evidenceRequired:['report']},deadline,grantsAuthority:false,required:'Legacy original return duty'});
+  db.transaction(()=>repo.createNativeTerminalReturnDuty('lead@xv','lead-g1','xv',{qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'builder@xv',expiresAt:new Date(deadline).toISOString(),body,identityProvenance:'system:operator-authorized-coordination',nudge:false}))();
+  repo.claim({qitemId:queueId,destinationSession:'builder@xv',identityProvenance:'transport:v1'});
+  await repo.create({qitemId:'legacy-real-return',sourceSession:'builder@xv',destinationSession:'lead@xv',body:JSON.stringify({packageKey:'product',inputDigest:digest('product'),evidence:[{kind:'report',ref:'retained/report.md'}]}),nudge:false});
+  return {original,queueId,body,deadline,input:{rigId:'xv',controlQueueId:queueId,controlBodyHash:digest(body),workerGeneration:'builder-g1',deadline}};
+ }
+ it('native return continuation keeps original claimed custody and automatically corrects legacy dispose schema exactly once',async()=>{
+  const duty=await claimedLegacyReturnDuty(),before=repo.getById(duty.queueId),assignments=db.prepare('SELECT * FROM coordinator_assignments').all(),resources=db.prepare('SELECT * FROM coordinator_resources').all();
+  const result=svc.reconcile('lead@xv','lead-g1','xv');expect(result.find(r=>r.key==='terminal-return:product')?.queueId).toBe(duty.queueId);
+  const rows=db.prepare("SELECT * FROM outbox_entries WHERE audit_pointer=? AND outbox_id LIKE 'wake-intent-native-return-continuation:%'").all(duty.queueId) as any[];
+  expect(rows).toHaveLength(1);expect(rows[0].body).toContain('legacy-real-return');expect(rows[0].body).toContain('disposeContract');
+  expect(repo.getById(duty.queueId)).toEqual(before);expect(db.prepare('SELECT * FROM coordinator_assignments').all()).toEqual(assignments);expect(db.prepare('SELECT * FROM coordinator_resources').all()).toEqual(resources);
+  svc.reconcile('lead@xv','lead-g1','xv');expect(db.prepare("SELECT count(*) n FROM outbox_entries WHERE outbox_id LIKE 'wake-intent-native-return-continuation:%'").get()).toEqual({n:1});
+  const proofId=JSON.parse(rows[0].tags)[1];expect(()=>repo.coordinatorAuthority.assertManagedSend('watchdog@system','builder@xv',proofId)).not.toThrow();
+  db.prepare("INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES ('continuation-binding','builder@xv','builder@xv','%3')").run();
+  const sent:string[]=[];repo.attachTransport({send:async(session,text,opts)=>{repo.coordinatorAuthority.assertManagedSend(opts?.actorSession,session,opts?.queueAssignmentId);sent.push(text);return {ok:true,verified:true};}});
+  await svc.deliverCommitted();await svc.deliverCommitted();expect(sent).toHaveLength(1);expect(repo.getById(duty.queueId)?.state).toBe('in-progress');
+  expect(()=>repo.update({qitemId:duty.queueId,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'})).toThrow('Original assignment still lacks');
+  repo.coordinatorAuthority.dispose('builder@xv','builder-g1','xv','product','legacy-real-return');repo.update({qitemId:duty.queueId,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
+  expect(db.prepare("SELECT count(*) n FROM coordinator_resources WHERE package_key='product'").get()).toEqual({n:0});expect(repo.getById(duty.original)?.state).toBe('done');
+ });
+ it.each(['expired','changed-worker','changed-holder','unknown','reserved','scope'] as const)('native return continuation refuses %s at staging and delivery',async(kind)=>{
+  const duty=await claimedLegacyReturnDuty();
+  const invalidate=()=>{
+   if(kind==='expired'){clock=duty.deadline;vi.setSystemTime(clock);}
+   if(kind==='changed-worker')db.prepare("UPDATE occupant_tenures SET generation_uuid='new-builder' WHERE node_id='builder@xv'").run();
+   if(kind==='changed-holder')db.prepare("UPDATE occupant_tenures SET generation_uuid='new-lead' WHERE node_id='lead@xv'").run();
+   if(kind==='unknown')repo.stageWakeIntent(duty.queueId,'watchdog@system','builder@xv','system:operator-authorized-coordination',true,'builder-g1');
+   if(kind==='reserved')db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES('cont-reservation','cont-rotation','builder@xv','builder@xv','builder-g1','native-old','operator-agent@kernel','operator-agent-g1','hash','{}','{}','reserved',?,?)").run(new Date(clock).toISOString(),new Date(clock).toISOString());
+   if(kind==='scope'){const p=svc.plan('xv')!;p.dispatchRestrictions=[{session:'builder@xv',generation:'builder-g1',packageKeys:['other'],validUntil:clock+30000,evidenceRef:'checkpoint.json'}];db.prepare("UPDATE coordinator_operations SET receipt=? WHERE kind='coordination-plan'").run(JSON.stringify(p));}
+  };
+  const staged=svc.continueTerminalReturn('operator-agent@kernel','operator-agent-g1',duty.input),proofId='native-return-continuation:'+duty.queueId;
+  expect(svc.continueTerminalReturn('operator-agent@kernel','operator-agent-g1',duty.input)).toEqual(staged);
+  expect(()=>svc.continueTerminalReturn('operator-agent@kernel','operator-agent-g1',{...duty.input,deadline:duty.deadline-1})).toThrow('one frozen');
+  invalidate();expect(svc.validTerminalReturnContinuationWake('watchdog@system','builder@xv',proofId)).toBe(false);
+  expect(()=>repo.coordinatorAuthority.assertManagedSend('watchdog@system','builder@xv',proofId)).toThrow();
+  // A fresh explicit request cannot mutate or stage another effect for this duty.
+  db.prepare("DELETE FROM coordinator_operations WHERE operation_id=? AND kind='native-terminal-return-continuation'").run(proofId);
+  expect(()=>svc.continueTerminalReturn('operator-agent@kernel','operator-agent-g1',duty.input)).toThrow();
+  expect(repo.getById(duty.queueId)?.state).toBe('in-progress');expect(db.prepare("SELECT count(*) n FROM coordinator_resources WHERE package_key='product'").get()).toEqual({n:1});
+ });
+ it('authorized observer retires expired native control failure-only before genuine successor and typed disposal',async()=>{
+  const duty=await claimedLegacyReturnDuty();const initial=svc.plan('xv')!;svc.configure('operator-agent@kernel','operator-agent-g1',{...initial,revision:'retirement-r2',allowIdlePeerTransfer:false});job();
+  clock=duty.deadline+1;vi.setSystemTime(clock);refresh();samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});
+  expect(()=>svc.continueTerminalReturn('operator-agent@kernel','operator-agent-g1',{...duty.input,deadline:clock+20000})).toThrow('unexpired');
+  svc.supervise('xv','j');const intake=(db.prepare("SELECT qitem_id FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_extract(body,'$.reason')='terminal-return-duty-exhausted'").get() as {qitem_id:string}).qitem_id;
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='native-terminal-return-retirement'").get()).toEqual({n:0});
+  repo.claim({qitemId:intake,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});const prior=repo.getById(duty.queueId),product=repo.getById(duty.original),resources=db.prepare('SELECT * FROM coordinator_resources').all();
+  const observed=svc.supervise('xv','j');expect(observed?.find(r=>r.key==='terminal-return:product')?.reason).toBe('native-retirement-notice-staged');
+  const rows=db.prepare("SELECT * FROM outbox_entries WHERE outbox_id LIKE 'wake-intent-native-return-retirement:%'").all() as any[];expect(rows).toHaveLength(1);expect(rows[0].body).toContain('failure-only');expect(rows[0].body).not.toContain('disposeContract');
+  expect(repo.getById(duty.queueId)).toEqual(prior);expect(repo.getById(duty.original)).toEqual(product);expect(db.prepare('SELECT * FROM coordinator_resources').all()).toEqual(resources);
+  svc.supervise('xv','j');expect(db.prepare("SELECT count(*) n FROM outbox_entries WHERE outbox_id LIKE 'wake-intent-native-return-retirement:%'").get()).toEqual({n:1});
+  db.prepare("INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES ('retirement-binding','builder@xv','builder@xv','%4')").run();const sends:string[]=[];
+  repo.attachTransport({send:async(session,text,opts)=>{repo.coordinatorAuthority.assertManagedSend(opts?.actorSession,session,opts?.queueAssignmentId);sends.push(text);return {ok:true,verified:true};}});
+  await svc.deliverCommitted();expect(sends).toHaveLength(1);expect(repo.getById(duty.queueId)?.state).toBe('in-progress');
+  // The genuine original worker records retirement; runtime did not cancel it.
+  repo.update({qitemId:duty.queueId,actorSession:'builder@xv',state:'canceled'});
+  const successor=svc.authorizeTerminalReturnSuccessor('operator-agent@kernel','operator-agent-g1',{rigId:'xv',intakeQueueId:intake,previousControlId:duty.queueId,previousBodyHash:digest(duty.body),workerGeneration:'builder-g1',holderGeneration:'lead-g1',deadline:clock+20000,operationId:'after-native-retirement'});
+  expect(repo.getById(duty.queueId)?.state).toBe('canceled');expect(repo.getById(duty.original)).toEqual(product);expect(db.prepare('SELECT * FROM coordinator_resources').all()).toEqual(resources);
+  repo.claim({qitemId:successor.queueId,destinationSession:'builder@xv',identityProvenance:'transport:v1'});repo.coordinatorAuthority.dispose('builder@xv','builder-g1','xv','product','legacy-real-return');repo.update({qitemId:successor.queueId,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
+  expect(db.prepare("SELECT count(*) n FROM coordinator_resources WHERE package_key='product'").get()).toEqual({n:0});expect(repo.getById(duty.original)?.state).toBe('done');
+ });
+ it('retirement requires genuine exhaustion intake and fresh idle, and preserves unknown effects at final delivery',async()=>{
+  const duty=await claimedLegacyReturnDuty();clock=duty.deadline+1;vi.setSystemTime(clock);refresh();samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});svc.reconcile('lead@xv','lead-g1','xv');
+  const intake=(db.prepare("SELECT qitem_id FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_extract(body,'$.reason')='terminal-return-duty-exhausted'").get() as {qitem_id:string}).qitem_id;
+  const input={rigId:'xv',intakeQueueId:intake,controlQueueId:duty.queueId,controlBodyHash:digest(duty.body),workerGeneration:'builder-g1',deadline:clock+20000};
+  expect(()=>svc.retireExpiredTerminalReturn('lead@xv','lead-g1',input)).toThrow('Genuine current Operator');expect(()=>svc.retireExpiredTerminalReturn('operator-agent@kernel','operator-agent-g1',input)).toThrow('genuinely claim');repo.claim({qitemId:intake,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});
+  samples.get('builder@xv')!.state.activity='working';expect(()=>svc.retireExpiredTerminalReturn('operator-agent@kernel','operator-agent-g1',input)).toThrow('native idle');samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});
+  const result=svc.retireExpiredTerminalReturn('operator-agent@kernel','operator-agent-g1',input);expect(svc.retireExpiredTerminalReturn('operator-agent@kernel','operator-agent-g1',input)).toEqual(result);
+  const proof='native-return-retirement:'+duty.queueId;expect(svc.validTerminalReturnContinuationWake('watchdog@system','builder@xv',proof)).toBe(true);
+  repo.stageWakeIntent(duty.queueId,'watchdog@system','builder@xv','system:operator-authorized-coordination',true,'builder-g1');expect(svc.validTerminalReturnContinuationWake('watchdog@system','builder@xv',proof)).toBe(false);
+  const sent:string[]=[];repo.attachTransport({send:async(_session,text)=>{sent.push(text);return {ok:true,verified:true};}});await svc.deliverCommitted();expect(sent).toHaveLength(0);expect(repo.getById(duty.queueId)?.state).toBe('in-progress');expect(db.prepare("SELECT count(*) n FROM coordinator_resources WHERE package_key='product'").get()).toEqual({n:1});
  });
  it('prospective worker probe refreshes native identity without product admission or authority',async()=>{
   configure([task('review','peer@xv',{boundary:'owner-material'})]);samples.delete('builder@xv');

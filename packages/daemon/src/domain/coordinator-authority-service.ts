@@ -517,6 +517,10 @@ export class CoordinatorAuthorityService {
    if(scope)reject("coordinator_raw_dispatch_refused","Raw managed sends cannot bypass admitted durable assignments in enabled rigs");
  }
  /** Only the INTERNAL committed-queue wake seam can bypass the raw-send prohibition. */
+ terminalReturnResourcesRetained(rigId:string,packageKey:string,contract:any):boolean {
+   const actual=(this.db.prepare('SELECT resource_key FROM coordinator_resources WHERE rig_id=? AND package_key=? ORDER BY resource_key').all(rigId,packageKey) as Array<{resource_key:string}>).map(r=>r.resource_key);
+   return Array.isArray(contract?.resources)&&JSON.stringify(actual)===JSON.stringify([...contract.resources].sort());
+ }
  registerNativeTerminalReturnControl(actor:string,generation:string,rigId:string,queueId:string,body:string):void {
    if(!this.db.inTransaction)reject('coordinator_transaction_required','Native return duty requires atomic control registration');
    const a=this.get(rigId);if(!a||a.owner_session!==actor||a.owner_generation!==generation||this.generation(actor)!==generation||a.state!=='active'||a.lease_until<=this.now())reject('coordinator_retired','Current genuine holder required');
@@ -528,7 +532,7 @@ export class CoordinatorAuthorityService {
    const expectedId='qitem-coordination-terminal-return-'+digest(rigId+':'+b.originalQueueId+':'+b.recipientGeneration+(b.authorizationId?':'+b.authorizationId:'')).slice(0,24);
    if(b.authorizationId&&(!successor||successor.queueId!==queueId||successor.originalQueueId!==b.originalQueueId||successor.packageKey!==b.packageKey||successor.workerGeneration!==b.recipientGeneration||successor.holderGeneration!==generation||successor.operatorGeneration!==this.generation('operator-agent@kernel')||successor.expiresAt!==b.deadline||successor.previousControlId!==b.previousControlId))reject('coordinator_terminal_return_control_required','Exact durable successor authorization required');
 
-   if(!plan||plan.operatorGeneration!==this.generation('operator-agent@kernel')||!original||original.disposition_id||!original.claimed_by_generation_uuid||!['done','failed','denied','canceled','handed-off'].includes(original.state)||original.claimed_by_generation_uuid!==this.generation(original.destination)||digest(original.body)!==original.body_hash||contract.destination!==original.destination||contract.bodyHash!==original.body_hash||b.action!=='record-exact-native-terminal-return'||b.rigId!==rigId||b.recipientGeneration!==original.claimed_by_generation_uuid||b.inputDigest!==contract.inputDigest||JSON.stringify(b.returnContract)!==JSON.stringify(contract.returnContract)||b.grantsAuthority!==false||!Number.isSafeInteger(b.deadline)||b.deadline<=this.now()||b.deadline>this.now()+1200000||queueId!==expectedId||!this.db.prepare('SELECT 1 FROM coordinator_resources WHERE rig_id=? AND package_key=?').get(rigId,b.packageKey))reject('coordinator_terminal_return_control_required','Exact original live claimant, immutable admitted contract and retained scope required');
+   if(!plan||plan.operatorGeneration!==this.generation('operator-agent@kernel')||!original||original.disposition_id||!original.claimed_by_generation_uuid||!['done','failed','denied','canceled','handed-off'].includes(original.state)||original.claimed_by_generation_uuid!==this.generation(original.destination)||digest(original.body)!==original.body_hash||contract.destination!==original.destination||contract.bodyHash!==original.body_hash||b.action!=='record-exact-native-terminal-return'||b.rigId!==rigId||b.recipientGeneration!==original.claimed_by_generation_uuid||b.inputDigest!==contract.inputDigest||JSON.stringify(b.returnContract)!==JSON.stringify(contract.returnContract)||b.grantsAuthority!==false||!Number.isSafeInteger(b.deadline)||b.deadline<=this.now()||b.deadline>this.now()+1200000||queueId!==expectedId||!this.terminalReturnResourcesRetained(rigId,b.packageKey,contract))reject('coordinator_terminal_return_control_required','Exact original live claimant, immutable admitted contract and retained scope required');
    this.assertRecipientDispatchScope(rigId,original.destination,b.packageKey);
    this.log(rigId,queueId,'native-terminal-return-control',{queueId,bodyHash:digest(body),originalQueueId:b.originalQueueId,packageKey:b.packageKey,worker:original.destination,workerGeneration:b.recipientGeneration,holder:actor,holderGeneration:generation,operatorGeneration:plan!.operatorGeneration,expiresAt:b.deadline},{actor,generation,body});
  }
@@ -542,6 +546,8 @@ export class CoordinatorAuthorityService {
    this.assertRecipientDispatchScope(record.rig_id,destination,r.packageKey);return true;
  }
  assertManagedSend(source:string|undefined,destination:string,queueAssignmentId?:string):void {
+   if(queueAssignmentId&&this.coordinationRecovery?.isLifecycleControl(queueAssignmentId)){if(this.coordinationRecovery.validLifecycleControlWake(source,destination,queueAssignmentId))return;reject('coordinator_lifecycle_wake_invalid','Exact current finite lifecycle duty proof required');}
+   if(queueAssignmentId&&this.coordinationRecovery?.validTerminalReturnContinuationWake(source,destination,queueAssignmentId))return;
    if(queueAssignmentId&&this.validNativeTerminalReturnWake(source,destination,queueAssignmentId))return;
    if(!this.scope(source,destination))return;
    if(queueAssignmentId){
