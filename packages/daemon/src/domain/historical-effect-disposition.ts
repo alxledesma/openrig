@@ -10,6 +10,7 @@ const canonical=(value:unknown):string=>Array.isArray(value)?`[${value.map(canon
 export const historicalDigest=(value:unknown):string=>createHash('sha256').update(canonical(value)).digest('hex');
 export interface HistoricalEffectRef {outboxId:string;rowHash:string;custodyHash:string}
 export interface HistoricalPlan {rigId:string;leadBatonId:string;leadGeneration:string;operatorGeneration:string;operationId:string;authorizationId:string;expiresAt:number;effects:HistoricalEffectRef[]}
+export interface HistoricalStartupBundle {schema:"historical-startup-bundle.v1";cohorts:HistoricalPlan[]}
 export interface HistoricalDisposition extends Omit<HistoricalPlan,'effects'> {quarantineOperationId:string;effect:HistoricalEffectRef;action:'withdraw-obsolete-wake'|'custodian-withdraw-unregistered-direct';reason:string;evidenceRef:string}
 export type HistoricalSnapshotInput=Pick<HistoricalPlan,'rigId'|'leadBatonId'|'leadGeneration'|'operatorGeneration'> & {outboxIds:string[]};
 type Row=Record<string,unknown> & {outbox_id:string;sender_session:string;destination_session:string;body:string;delivery_state:string;audit_pointer:string|null;guard_binding:string|null};
@@ -116,6 +117,21 @@ export function applyHistoricalStartupRecovery(db:Database.Database,mode:string|
  if(selected==='deliver'){if(manifestPath)refuse('historical_startup_manifest','Manifest requires observe mode');return null;}
  if(!manifestPath||!isAbsolute(manifestPath))refuse('historical_startup_manifest','Observe requires an absolute exact-cohort manifest');
  const st=lstatSync(manifestPath!);if(!st.isFile()||st.isSymbolicLink()||st.size>1048576)refuse('historical_startup_manifest','Regular manifest at most1MiB required');
- let p:HistoricalPlan;try{p=JSON.parse(readFileSync(manifestPath!,'utf8'));}catch{refuse('historical_startup_manifest','Invalid cohort manifest');}
- return new HistoricalEffectDispositionService(db).quarantine('operator-agent@kernel',p!.operatorGeneration,p!);
+ let parsed:unknown;try{parsed=JSON.parse(readFileSync(manifestPath!,'utf8'));}catch{refuse('historical_startup_manifest','Invalid cohort manifest');}
+ const record=parsed!==null&&typeof parsed==='object'&&!Array.isArray(parsed)?parsed as Record<string,unknown>:null;
+ if(!record)refuse('historical_startup_manifest','Typed cohort or versioned bundle required');
+ const service=new HistoricalEffectDispositionService(db);
+ if(record!.schema===undefined&&!Object.hasOwn(record!,'cohorts')){const p=record as unknown as HistoricalPlan;return service.quarantine('operator-agent@kernel',p.operatorGeneration,p);}
+ if(record!.schema!=='historical-startup-bundle.v1'||Object.keys(record!).sort().join(',')!=='cohorts,schema'||!Array.isArray(record!.cohorts)||record!.cohorts.length<1||record!.cohorts.length>32)refuse('historical_startup_manifest','Exact versioned bundle requires1..32 independently authorized cohorts');
+ const cohorts=record!.cohorts as HistoricalPlan[],effectIds=new Set<string>(),operations=new Set<string>(),authorizations=new Set<string>();let total=0;
+ for(const p of cohorts){
+  if(!p||typeof p!=='object'||Array.isArray(p)||['rigId','leadBatonId','leadGeneration','operatorGeneration','operationId','authorizationId'].some(k=>typeof (p as unknown as Record<string,unknown>)[k]!=='string')||!Number.isSafeInteger(p.expiresAt)||!Array.isArray(p.effects)||p.effects.length<1||p.effects.length>2000)refuse('historical_startup_manifest','Every bundle cohort retains exact typed bounded contract');
+  if(p.operatorGeneration!==cohorts[0]!.operatorGeneration||operations.has(p.operationId)||authorizations.has(p.authorizationId))refuse('historical_startup_manifest','One current Operator and distinct operation/authorization identities required');
+  operations.add(p.operationId);authorizations.add(p.authorizationId);total+=p.effects.length;
+  for(const e of p.effects){if(!e||typeof e!=='object'||Array.isArray(e)||['outboxId','rowHash','custodyHash'].some(k=>typeof (e as unknown as Record<string,unknown>)[k]!=='string')||effectIds.has(e.outboxId))refuse('historical_startup_manifest','Every effect must belong to exactly one enumerated cohort');effectIds.add(e.outboxId);}
+ }
+ if(total>32000)refuse('historical_startup_manifest','Bundle total exceeds32000 enumerated effects');
+ // Nested quarantine savepoints remain inside this single all-or-nothing admission.
+ // No startup drain/transport exists before this function returns successfully.
+ return db.transaction(()=>({schema:'historical-startup-bundle.v1',cohortCount:cohorts.length,effectCount:total,outboxMutations:0,deliveryConclusion:'unknown',receipts:cohorts.map(p=>service.quarantine('operator-agent@kernel',p.operatorGeneration,p))})).immediate();
 }
