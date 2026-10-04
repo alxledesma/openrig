@@ -11,7 +11,7 @@ export interface CoordinationTask {
  /** Owner boundary affects this slice only. Recovery work is a separate admitted task. */
  boundary?:"owner-access"|"owner-credential"|"owner-material"|"owner-irreversible";
 }
-export interface CoordinationPlan { rigId:string; revision:string; operatorGeneration:string; stallMs:number; allowIdlePeerTransfer:boolean; allowUnavailablePeerTransfer?:boolean; acknowledgmentWindowMs?:number; refreshDispatchIdentity?:boolean; dispatchRestrictions?:Array<{session:string;generation:string;packageKeys:string[];validUntil:number;evidenceRef:string}>; tasks:CoordinationTask[] }
+export interface CoordinationPlan { rigId:string; revision:string; operatorGeneration:string; stallMs:number; allowIdlePeerTransfer:boolean; allowUnavailablePeerTransfer?:boolean; acknowledgmentWindowMs?:number; refreshDispatchIdentity?:boolean; dispatchRestrictions?:Array<{session:string;generation:string;packageKeys:string[];validUntil:number;evidenceRef:string;checkpointDisposition?:'release-listed-packages'}>; tasks:CoordinationTask[] }
 export interface CoordinationResult { key:string; state:string; queueId?:string; reason?:string; deadline:number; activityEvidence?:Record<string,unknown> }
 const successfulReturn=(state:string,disposition:string|null):boolean=>!!disposition&&['done','handed-off'].includes(state);
 /** Only the exact migration091 refusal is normalized, never arbitrary SQL failures. */
@@ -49,6 +49,7 @@ export class CoordinationRecoveryService {
    if(plan.dispatchRestrictions!==undefined){
     if(!Array.isArray(plan.dispatchRestrictions)||new Set(plan.dispatchRestrictions.map(r=>r.session)).size!==plan.dispatchRestrictions.length)fail('coordination_invalid_dispatch_scope','Unique explicit dispatch restrictions required');
     for(const r of plan.dispatchRestrictions){
+     if(r.checkpointDisposition!==undefined&&r.checkpointDisposition!=='release-listed-packages')fail('coordination_invalid_checkpoint_disposition','Explicit listed-package checkpoint disposition required');
      if(!r.session||r.generation!==this.authority.generation(r.session)||!Array.isArray(r.packageKeys)||!r.packageKeys.length||new Set(r.packageKeys).size!==r.packageKeys.length||r.packageKeys.some(key=>!plan.tasks.some(t=>t.owner===r.session&&t.packageKey===key))||!Number.isFinite(r.validUntil)||r.validUntil<=this.now()||typeof r.evidenceRef!=='string'||!r.evidenceRef.trim())fail('coordination_invalid_dispatch_scope','Exact current owner, admitted packages, future expiry and evidence required');
     }
    }
@@ -83,6 +84,13 @@ export class CoordinationRecoveryService {
    // Do not replace unresolved contracts with a new plan and silently orphan work.
    if(prior&&prior.tasks.some(t=>!plan.tasks.some(n=>n.key===t.key&&stable(n)===stable(t))))fail("coordination_plan_obligation_lost","Retain all existing tasks unchanged in successor revision");
    this.db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(plan.rigId,id,"coordination-plan",JSON.stringify(plan),digest(JSON.stringify({actor,generation,plan})));
+   for(const r of plan.dispatchRestrictions??[]){
+    if(r.checkpointDisposition!=='release-listed-packages')continue;
+    const queueId='qitem-coordination-scope-'+digest(plan.rigId+':'+generation+':'+JSON.stringify(r)).slice(0,24);
+    if(!this.repo.getById(queueId)){this.repo.createWithinTransaction({qitemId:queueId,sourceSession:actor,destinationSession:r.session,expiresAt:new Date(r.validUntil).toISOString(),body:JSON.stringify({action:'checkpoint-scope-disposition',operator:actor,operatorGeneration:generation,rigId:plan.rigId,recipientGeneration:r.generation,packageKeys:r.packageKeys,evidenceRef:r.evidenceRef,validUntil:r.validUntil,instruction:'Current genuine Operator releases post-checkpoint quiescence ONLY for the listed already-admitted packages under the cited disposition. Rederive actual native identity/generation and read the disposition; claim and close this control notice honestly, then consume the existing matching assignment when present. Preserve quiescence for all other work, rotation and baton takeover. No duplicate assignment, source edit, historical-effect replay or acceptance waiver. This notice is not worker pickup or technical acceptance.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
+     this.repo.stageWakeIntent(queueId,actor,r.session,'system:operator-authorized-coordination',true,r.generation);
+    }
+   }
    this.recordProgress(plan.rigId);
    return plan;
   }).immediate();

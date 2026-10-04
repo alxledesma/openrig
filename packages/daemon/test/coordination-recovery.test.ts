@@ -71,6 +71,22 @@ describe('durable coordination recovery',()=>{
   for(const key of ['unrelated','repair'])expect(results.find(r=>r.key===key)).toMatchObject({state:'held',reason:'dispatch-scope-expired'});
   expect(db.prepare('select count(*) n from coordinator_assignments').get()).toEqual({n:0});
  });
+ it('explicit genuine Operator checkpoint disposition commits one recipient notice, never a release from a restriction alone',()=>{
+  const initial=configure([task('product'),task('repair','peer@xv',{recoveryFor:'product'})]);
+  const restriction={session:'peer@xv',generation:'peer-g1',packageKeys:['repair'],validUntil:clock+30000,evidenceRef:'native/qa-only.json'};
+  const restricted={...initial,revision:'scope-only',dispatchRestrictions:[restriction]};svc.configure('operator-agent@kernel','operator-agent-g1',restricted);
+  expect(db.prepare("SELECT count(*) n FROM queue_items WHERE source_session='operator-agent@kernel' AND destination_session='peer@xv'").get()).toEqual({n:0});
+  const released={...restricted,revision:'scoped-disposition',dispatchRestrictions:[{...restriction,checkpointDisposition:'release-listed-packages' as const}]};
+  expect(()=>svc.configure('lead@xv','lead-g1',released)).toThrow('Current genuine Operator');
+  svc.configure('operator-agent@kernel','operator-agent-g1',released);svc.configure('operator-agent@kernel','operator-agent-g1',released);
+  svc.configure('operator-agent@kernel','operator-agent-g1',{...released,revision:'same-disposition-new-plan'});
+  const rows=db.prepare("SELECT * FROM queue_items WHERE source_session='operator-agent@kernel' AND destination_session='peer@xv'").all() as any[];
+  expect(rows).toHaveLength(1);
+  const wakes=db.prepare('SELECT * FROM outbox_entries WHERE audit_pointer=?').all(rows[0].qitem_id) as any[];expect(wakes).toHaveLength(1);expect(wakes[0]).toMatchObject({sender_session:'operator-agent@kernel',destination_session:'peer@xv',delivery_state:'pending'});expect(JSON.parse(wakes[0].tags)).toContain('queue:recipient-generation:peer-g1');
+  expect(JSON.parse(rows[0].body)).toMatchObject({action:'checkpoint-scope-disposition',operatorGeneration:'operator-agent-g1',recipientGeneration:'peer-g1',packageKeys:['repair']});
+  expect(db.prepare('select count(*) n from coordinator_assignments').get()).toEqual({n:0});
+  repo.claim({qitemId:rows[0].qitem_id,destinationSession:'peer@xv',identityProvenance:'transport:v1'});expect(db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(rows[0].qitem_id)).toEqual({claimed_by_generation_uuid:'peer-g1'});
+ });
  it('restart has no swap yet real fresh idle remains eligible; actual pickup follows',()=>{
   configure(normal());const session='builder@xv',generation=repo.coordinatorAuthority.generation(session)!;
   const ladder=new SeatActivityService({tmux:{readPaneLastActivity:async()=>null},defaultWindowSeconds:3,now:()=>new Date(clock)});
