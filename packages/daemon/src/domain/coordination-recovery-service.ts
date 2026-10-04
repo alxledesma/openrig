@@ -34,8 +34,8 @@ export function coordinationIdle(sample:CoordinationActivity|null,generation:str
 /** Durable plans use the existing append-only operation store, with queue/resource
  * mutations in one SQLite transaction. Reconciliation never manufactures worker claims. */
 export class CoordinationRecoveryService {
- constructor(private repo:QueueRepository,private activity:(session:string)=>CoordinationActivity|null,private now:()=>number=Date.now,private refreshIdentity?:()=>Promise<void>){}
- async refreshActivity(rigId:string):Promise<void> {if(this.plan(rigId)?.refreshDispatchIdentity===true)await this.refreshIdentity?.();}
+ constructor(private repo:QueueRepository,private activity:(session:string)=>CoordinationActivity|null,private now:()=>number=Date.now,private refreshIdentity?:(sessions:readonly string[])=>Promise<void>){}
+ async refreshActivity(rigId:string):Promise<void> {const plan=this.plan(rigId);if(plan?.refreshDispatchIdentity===true){const coordinators=JSON.parse(this.authority.get(rigId)?.coordinators??'[]') as string[];await this.refreshIdentity?.([...new Set([...coordinators,...plan.tasks.map(t=>t.owner)])]);}}
  private get authority(){return this.repo.coordinatorAuthority;}
  private get db(){return this.authority.db;}
  configure(actor:string,generation:string,plan:CoordinationPlan):CoordinationPlan {

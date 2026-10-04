@@ -48,9 +48,10 @@ describe('durable coordination recovery',()=>{
  it('native identity refresh enables only the checkpoint-authorized recovery, with genuine pickup and no Peer takeover',async()=>{
   const tasks=[task('product'),task('unrelated','peer@xv',{recoveryFor:'product'}),task('repair','peer@xv',{recoveryFor:'product'})];
   const initial=configure(tasks);job();samples.delete('builder@xv');samples.get('peer@xv')!.identityVerified=false;
-  svc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,async()=>{samples.set('peer@xv',sample('peer@xv'));});repo.coordinatorAuthority.coordinationRecovery=svc;
+  const refreshed=vi.fn(async(_sessions:readonly string[])=>{samples.set('peer@xv',sample('peer@xv'));});svc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,refreshed);repo.coordinatorAuthority.coordinationRecovery=svc;
   svc.configure('operator-agent@kernel','operator-agent-g1',{...initial,revision:'scoped-r2',refreshDispatchIdentity:true,dispatchRestrictions:[{session:'peer@xv',generation:'peer-g1',packageKeys:['repair'],validUntil:clock+30000,evidenceRef:'native/checkpoint-qa-only.json'}]});
   const e=await makeCoordinatorContinuityPolicy(repo.coordinatorAuthority).evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);
+  expect(refreshed).toHaveBeenCalledWith(expect.arrayContaining(['lead@xv','peer@xv','builder@xv']));
   const results=e.notes!.coordination as any[];
   expect(results.find(r=>r.key==='unrelated')).toMatchObject({state:'held',reason:'checkpoint-quiescence'});
   const repair=results.find(r=>r.key==='repair');expect(repair.state).toBe('pending-pickup');

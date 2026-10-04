@@ -132,10 +132,12 @@ export class SeatIdentityReconciler {
 
   /** Decision consumers await the actual native sweep, including an in-flight
    * sweep. Observation timestamps and all strict freshness gates stay intact. */
-  async reconcileFresh():Promise<void> {
-    if(this.pendingSweep)return this.pendingSweep;
+  async reconcileFresh(sessions?:readonly string[]):Promise<void> {
+    const requestGeneration=this.generation;
+    while(this.pendingSweep){await this.pendingSweep;if(!sessions||requestGeneration!==this.generation)return;}
+    if(requestGeneration!==this.generation)return;
     this.reconciling = true;
-    this.pendingSweep=this.reconcileSweep(this.generation);
+    this.pendingSweep=this.reconcileSweep(requestGeneration,sessions);
     try {
       await this.pendingSweep;
     } finally {
@@ -144,10 +146,11 @@ export class SeatIdentityReconciler {
     }
   }
 
-  private async reconcileSweep(generation: number): Promise<void> {
-    const seats = this.runningSeats();
+  private async reconcileSweep(generation: number, sessions?:readonly string[]): Promise<void> {
+    const allSeats = this.runningSeats();
+    const seats = sessions ? allSeats.filter(seat=>sessions.includes(seat.session_name)) : allSeats;
     // Prune verdicts for nodes no longer running (keep the table bounded).
-    this.store.pruneExcept(seats.map((s) => s.node_id));
+    this.store.pruneExcept(seats.map((s) => s.node_id),sessions);
     if (seats.length === 0) return;
 
     const observedAt = this.now().toISOString();

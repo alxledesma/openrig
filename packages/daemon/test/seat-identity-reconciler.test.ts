@@ -442,3 +442,26 @@ describe("SeatIdentityReconciler — bounded polling", () => {
     } finally { rec.stop(); db.close(); }
   });
 });
+
+it("scoped decision refresh reads target seats anew and preserves unrelated verdicts",async()=>{
+ const db=createFullTestDb();seedSeat(db,{nodeId:"target",sessionName:"target@rig",pane:"%1"});seedSeat(db,{nodeId:"other",sessionName:"other@rig",pane:"%2"});
+ const tmux=makeTmux({sessions:["target@rig","other@rig"],panePid:{"%1":42,"%2":43},paneCommand:{"%1":"claude","%2":"claude"}});let clock=NOW().getTime();const rec=new SeatIdentityReconciler({db,tmux,now:()=>new Date(clock)}),store=new SeatIdentityStore(db);
+ try{await rec.reconcileAll();const unrelated=store.getForNode("other");clock+=10000;vi.mocked(tmux.getPaneCommand).mockImplementation(async pane=>{if(pane==="%2")clock+=4000;return "claude";});
+  await rec.reconcileFresh(["target@rig"]);const target=store.getForNode("target")!;expect(target.verdict).toBe("verified");expect(clock-Date.parse(target.observedAt)).toBeLessThanOrEqual(3000);expect(store.getForNode("other")).toEqual(unrelated);
+ }finally{db.close();}
+});
+
+it("stop cancels a scoped waiter without starting another native probe",async()=>{
+ const db=createFullTestDb();seedSeat(db,{nodeId:"target",sessionName:"target@rig",pane:"%1"});const tmux=makeTmux({sessions:["target@rig"],panePid:{"%1":42},paneCommand:{"%1":"claude"}});let release!:()=>void;const gate=new Promise<void>(r=>{release=r;});vi.mocked(tmux.listSessions).mockImplementationOnce(async()=>{await gate;return [{name:"target@rig",windows:1,created:"",attached:false}];});const rec=new SeatIdentityReconciler({db,tmux});
+ try{const full=rec.reconcileAll();const scoped=rec.reconcileFresh(["target@rig"]);rec.stop();release();await Promise.all([full,scoped]);expect(tmux.listSessions).toHaveBeenCalledTimes(1);expect(tmux.getPanePid).not.toHaveBeenCalled();expect(new SeatIdentityStore(db).getForNode("target")).toBeNull();}finally{db.close();}
+});
+
+it("a scoped waiter takes a new target observation after a slow full sweep",async()=>{
+ const db=createFullTestDb();seedSeat(db,{nodeId:"target",sessionName:"target@rig",pane:"%1"});seedSeat(db,{nodeId:"other",sessionName:"other@rig",pane:"%2"});const tmux=makeTmux({sessions:["target@rig","other@rig"],panePid:{"%1":42,"%2":43},paneCommand:{"%1":"claude","%2":"claude"}});let clock=NOW().getTime(),release!:()=>void;const gate=new Promise<void>(r=>{release=r;});vi.mocked(tmux.listSessions).mockImplementationOnce(async()=>{await gate;return [{name:"target@rig",windows:1,created:"",attached:false},{name:"other@rig",windows:1,created:"",attached:false}];});vi.mocked(tmux.getPaneCommand).mockImplementation(async pane=>{if(pane==="%2")clock+=4000;return "claude";});const rec=new SeatIdentityReconciler({db,tmux,now:()=>new Date(clock)});
+ try{const full=rec.reconcileAll();const scoped=rec.reconcileFresh(["target@rig"]);release();await Promise.all([full,scoped]);expect(tmux.listSessions).toHaveBeenCalledTimes(2);expect(tmux.getPaneCommand).toHaveBeenCalledTimes(3);expect(clock-Date.parse(new SeatIdentityStore(db).getForNode("target")!.observedAt)).toBe(0);}finally{db.close();}
+});
+
+it("scoped refresh invalidates a stopped target while preserving unrelated verdicts",async()=>{
+ const db=createFullTestDb();seedSeat(db,{nodeId:"target",sessionName:"target@rig",pane:"%1"});seedSeat(db,{nodeId:"other",sessionName:"other@rig",pane:"%2"});const tmux=makeTmux({sessions:["target@rig","other@rig"],panePid:{"%1":42,"%2":43},paneCommand:{"%1":"claude","%2":"claude"}});const rec=new SeatIdentityReconciler({db,tmux,now:NOW}),store=new SeatIdentityStore(db);
+ try{await rec.reconcileAll();const other=store.getForNode("other");expect(store.getForNode("target")!.verdict).toBe("verified");db.prepare("UPDATE sessions SET status='stopped' WHERE node_id='target'").run();await rec.reconcileFresh(["target@rig"]);expect(store.getForNode("target")).toBeNull();expect(store.getForNode("other")).toEqual(other);}finally{db.close();}
+});

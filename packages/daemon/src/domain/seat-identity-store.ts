@@ -129,15 +129,15 @@ export class SeatIdentityStore {
   }
 
   /** Drop verdicts for nodes no longer in the live set (memory/table hygiene). */
-  pruneExcept(liveNodeIds: string[]): void {
+  pruneExcept(liveNodeIds: string[], sessions?:readonly string[]): void {
     try {
       const existing = this.db.prepare(
-        "SELECT node_id FROM seat_identity_verdicts",
-      ).all() as Array<{ node_id: string }>;
+        "SELECT node_id,session_name FROM seat_identity_verdicts",
+      ).all() as Array<{ node_id: string;session_name:string|null }>;
       const live = new Set(liveNodeIds);
       const del = this.db.prepare("DELETE FROM seat_identity_verdicts WHERE node_id = ?");
       for (const r of existing) {
-        if (!live.has(r.node_id)) del.run(r.node_id);
+        if (!live.has(r.node_id)&&(!sessions||sessions.includes(r.session_name??''))) del.run(r.node_id);
       }
     } catch {
       // Table absent — nothing to prune.
