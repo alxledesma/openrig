@@ -1,0 +1,25 @@
+{
+  "production_only": true,
+  "daemon_url": "http://127.0.0.1:17433",
+  "rigs": [
+    "example"
+  ],
+  "managed_unattended_seats": [
+    "worker@example"
+  ],
+  "seat_policies": {
+    "worker@example": {
+      "validator_seat": "reviewer@example"
+    }
+  },
+  "prepare_percent": 75,
+  "rotate_percent": 85,
+  "compactions": 2,
+  "poll_seconds": 120,
+  "controller_enabled": false,
+  "automatic_cutover_enabled": false,
+  "automatic_trigger_enabled": false,
+  "operator_auto_execute_enabled": false,
+  "allow_manual_canary": false,
+  "atomic_cutover_protocol": "generation-queue-runtime-idle-v1"
+}
