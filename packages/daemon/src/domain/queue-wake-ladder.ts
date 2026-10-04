@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { CoordinatorFenceError } from "./coordinator-authority-service.js";
 import { findQueueRecovery, recoveryTag } from "./queue-recovery.js";
 import { lastMeaningfulTransition, type WaitingView } from "./queue-waiting.js";
 // S01 (OPR.0.5.5.1) — WAKE OR ESCALATE ON BATONS. A handoff whose wake fails must never
@@ -199,6 +201,7 @@ export interface WakeLadderAction {
 }
 
 export interface WakeLadderTickResult {
+  refusals?: Array<{ qitemId: string; phase: string; code: string; recoveryQueueId?: string; recoveryError?: string }>;
   outcome: "clean" | "actions" | "failed";
   actions: WakeLadderAction[];
   error?: string;
@@ -529,20 +532,84 @@ async function ensureUsageLimitBlocker(
  * no memory (F6). Never throws: a tick that cannot run is loud on the status surface
  * and the log, because a silent skip is the exact class this slice kills.
  */
+const OPERATOR = "operator-agent@kernel";
+const digest = (text: string) => createHash("sha256").update(text).digest("hex");
+function sourceFacts(row: QueueItem): string {
+  return JSON.stringify([row.qitemId, row.sourceSession, row.destinationSession, digest(row.body),
+    row.state, row.tsUpdated, row.claimedAt, row.closureTarget]);
+}
+
+/** A detector notice is distinct from the refused assignment. Current Operator
+ * control only; no borrowed creator, dispatch envelope, package, or resource. */
+function stageRefusalRecovery(deps: WakeLadderDeps, c: { row: QueueItem; kind: string; evidenceAt: string; route: string }, code: string, now: Date):
+  { qitemId: string; action: "created" | "refreshed" } {
+  return deps.db.transaction(() => {
+    const authority = deps.queueRepo.coordinatorAuthority;
+    const generation = authority.generation(OPERATOR);
+    if (!generation) throw new CoordinatorFenceError("wake_ladder_operator_unavailable", "Actual current Operator required for accountable wake recovery");
+    authority.assertCurrentOperator(OPERATOR, generation);
+    const current = deps.queueRepo.getById(c.row.qitemId);
+    if (!current || sourceFacts(current) !== sourceFacts(c.row)) {
+      throw new CoordinatorFenceError("wake_ladder_source_changed", "Source facts changed; next tick must reconcile current evidence");
+    }
+    const recoveryKey = digest(JSON.stringify([sourceFacts(current), c.kind, c.evidenceAt, code, generation]));
+    const previous = deps.db.prepare(`SELECT qitem_id,state FROM queue_items
+      WHERE source_session='watchdog@system' AND destination_session=? AND json_valid(body)
+        AND json_extract(body,'$.wakeLadderRecoveryKey')=? ORDER BY rowid DESC LIMIT 1`)
+      .get(OPERATOR, recoveryKey) as { qitem_id: string; state: string } | undefined;
+    if (previous && ["pending", "in-progress", "blocked"].includes(previous.state)) {
+      return { qitemId: previous.qitem_id, action: "refreshed" as const };
+    }
+    const queueId = "qitem-wake-ladder-control-" + digest(recoveryKey + ":" + (previous?.qitem_id ?? "initial")).slice(0, 24);
+    deps.queueRepo.createWithinTransaction({
+      qitemId: queueId, sourceSession: "watchdog@system", destinationSession: OPERATOR,
+      body: JSON.stringify({ action: "reconcile-refused-wake-ladder", wakeLadderRecoveryKey: recoveryKey,
+        previousQueueId: previous?.qitem_id ?? null, reason: code, kind: c.kind,
+        original: { qitemId: current.qitemId, sourceSession: current.sourceSession,
+          destinationSession: current.destinationSession, bodyHash: digest(current.body),
+          state: current.state, evidenceAt: c.evidenceAt, factsHash: digest(sourceFacts(current)) },
+        intendedRoute: c.route, recipientGeneration: generation, deadline: now.getTime() + 60000,
+        required: "Preserve exact original source/body/claims/resources and unknown effects. Read current facts and admission; use supported current-owner/Operator control to repair or record a concrete protected boundary. Do not fabricate dispatch envelopes, admit a diagnostic as product work, or replay uncertain delivery. Continue independent ready work.",
+        returnPath: { queueId, actor: OPERATOR, generation,
+          completion: "Claim this exact recovery notice and return supported reconciliation evidence through queue update. Recheck original custody; notice closure is not original-work completion.",
+          failure: "Block this same claimed notice with exact remaining guard, accountable next action and finite deadline." } }),
+      summary: `Wake recovery refused: ${code} on ${current.qitemId}`,
+      evidenceRef: `rig queue show ${current.qitemId}`, tags: ["wake-ladder-accountability"],
+      identityProvenance: "system:operator-authorized-coordination", nudge: true,
+    });
+    deps.queueRepo.stageWakeIntent(queueId, "watchdog@system", OPERATOR,
+      "system:operator-authorized-coordination", true, generation);
+    return { qitemId: queueId, action: "created" as const };
+  }).immediate();
+}
+
 export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadderTickResult> {
   const log = deps.log ?? ((line: string) => console.error(line));
   const status = deps.status;
+  const actions: WakeLadderAction[] = [];
+  const refusals: Array<{ qitemId: string; phase: string; code: string; recoveryQueueId?: string; recoveryError?: string }> = [];
+  const refuse = async (row: QueueItem, phase: string, error: unknown) => {
+    const code = typeof (error as {code?:unknown})?.code === "string" ? (error as {code:string}).code : error instanceof Error ? error.message : "wake_ladder_refused";
+    const refusal: typeof refusals[number] = { qitemId: row.qitemId, phase, code }; refusals.push(refusal);
+    try {
+      const recovery = stageRefusalRecovery(deps, {row,kind:phase,evidenceAt:String(row.tsUpdated),route:row.destinationSession},code,deps.now??new Date());
+      refusal.recoveryQueueId=recovery.qitemId;
+      if(recovery.action === "created") await deps.queueRepo.deliverWakeForSuccessor(recovery.qitemId, OPERATOR, true, "watchdog@system");
+    } catch(e) { refusal.recoveryError = e instanceof Error ? e.message : String(e); }
+  };
   try {
     const now = deps.now ?? new Date();
     // Retire only aggregates whose explicitly tagged underlying members all
     // resolved. Legacy untagged history is not interpreted from its body.
     const aggregates = deps.db.prepare("SELECT qitem_id, source_session, tags, ts_created FROM queue_items WHERE state IN ('pending','in-progress','blocked') AND tags LIKE ?").all(`%"${WAKE_ESCALATION_TAG}"%`) as Array<{ qitem_id: string; source_session: string; tags: string; ts_created: string }>;
     for (const aggregate of aggregates) {
+      try {
       const ids = (JSON.parse(aggregate.tags) as string[]).filter(t => t.startsWith("recovery-for:")).map(t => t.slice("recovery-for:".length));
       if (ids.length && ids.every(id => {
         const row = deps.queueRepo.getById(id);
         return row && (!["pending", "in-progress", "blocked"].includes(row.state) || row.lastNudgeResult === "verified" || Boolean(row.claimedAt && row.claimedAt > aggregate.ts_created));
       })) await deps.queueRepo.update({ qitemId: aggregate.qitem_id, actorSession: aggregate.source_session, state: "done", closureReason: "no-follow-on", transitionNote: "wake recovery resolved: tagged obligations no longer require delivery recovery" });
+      } catch(error) { const row=deps.queueRepo.getById(aggregate.qitem_id); if(row) await refuse(row,"aggregate-retirement",error); }
     }
     const intervalS = deps.retryIntervalSeconds ?? resolveWakeRetryIntervalSeconds();
     const cap = deps.retryCap ?? resolveWakeRetryCap();
@@ -557,7 +624,6 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
         return deps.queueRepo.getById(qitemId)?.lastNudgeResult ?? "indeterminate:no transport available";
       });
 
-    const actions: WakeLadderAction[] = [];
     let exhaustedThisTick = 0;
     const usagePoolBySeat = new Map<string, UsageLimitPool>();
     if (deps.getProviderReadModel) {
@@ -640,6 +706,7 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
     for (const { qitem_id } of [...batonRows, ...parkedOwnerFailureRows]) {
       const row = deps.queueRepo.getById(qitem_id);
       if (!row) continue;
+      try {
       const usagePool = usagePoolBySeat.get(row.destinationSession);
       // OPR.0.5.6.24: the usage-limit PARK mutation applies only to pending
       // batons — a claimed in-progress row is someone's live work and is never
@@ -731,11 +798,13 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
       const dest = row.destinationSession;
       if (!escalating.has(dest)) escalating.set(dest, []);
       escalating.get(dest)!.push({ row, view, mode, reason, due, suspended });
+      } catch(error) { await refuse(row,"candidate",error); }
     }
 
     // F3 — per-destination aggregation: ONE escalation carrying the row list, refreshed
     // not duplicated (the S02 idempotency shape), and rung markers on every member baton.
     for (const [dest, members] of escalating) {
+      try {
       const orch = resolveOrch(dest);
 
       // F3 — the aggregate refresh is detection-gated (the S02 idempotency shape): a
@@ -811,6 +880,7 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
           exhaustedThisTick += 1;
         }
       }
+      } catch(error) { await refuse(members[0]!.row,"destination-escalation",error); }
     }
 
     const escalationsOpen = (
@@ -821,14 +891,14 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
         )
         .get(`%"${WAKE_ESCALATION_TAG}"%`) as { n: number }
     ).n;
-    const outcome = actions.length > 0 ? "actions" : "clean";
-    status?.record(outcome, { active: activeLadders, escalations: escalationsOpen, exhausted: exhaustedThisTick });
-    return { outcome, actions };
+    const outcome = refusals.length ? "failed" : actions.length > 0 ? "actions" : "clean";
+    status?.record(outcome, { active: activeLadders, escalations: escalationsOpen, exhausted: exhaustedThisTick, ...(refusals.length ? {error: refusals.map(r=>`${r.phase}:${r.qitemId}:${r.code}`).join("; ")} : {}) });
+    return { outcome, actions, ...(refusals.length ? {refusals} : {}) };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log(`[wake-ladder] TICK FAILED (skipping loudly): ${message}`);
     status?.record("failed", { error: message });
-    return { outcome: "failed", actions: [], error: message };
+    return { outcome: "failed", actions, error: message, ...(refusals.length ? {refusals} : {}) };
   }
 }
 
