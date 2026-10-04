@@ -203,6 +203,13 @@ describe('durable coordination recovery',()=>{
   const tasks=[task('product'),task('dependent','reviewer@xv',{predecessors:[{queueId:q('product'),dispositionId:'product-return'}]}),task('repair','architect@xv',{recoveryFor:'product',predecessors:[{queueId:q('dependent'),dispositionId:'dependent-return'}]}),task('dependent-repair','builder@xv',{recoveryFor:'dependent'})];
   expect(()=>configure(tasks)).toThrow('transitively');expect(svc.plan('xv')).toBeNull();expect(db.prepare('SELECT count(*) n FROM coordinator_assignments').get()).toEqual({n:0});
  });
+ it.each(['matching','conflicting'] as const)('retained deterministic queue row without assignment holds its slice (%s) while independent work proceeds',async(kind)=>{
+  configure([task('review','peer@xv'),task('review-repair','architect@xv',{recoveryFor:'review'}),...normal()]);
+  const id='qitem-coordination-'+digest('xv:review').slice(0,24);await repo.create({qitemId:id,sourceSession:'operator-agent@kernel',destinationSession:'peer@xv',body:kind==='matching'?'review':'different historical row',nudge:false});
+  repo.claim({qitemId:id,destinationSession:'peer@xv'});repo.update({qitemId:id,state:'done',actorSession:'peer@xv',closureReason:'no-follow-on',note:'Retained historical completion'});
+  const before=repo.getById(id);const result=svc.reconcile('lead@xv','lead-g1','xv');
+  expect(result.find(r=>r.key==='review')).toMatchObject({state:'held',queueId:id,reason:kind==='matching'?'existing-queue-without-assignment':'deterministic-queue-conflict'});expect(result.find(r=>r.key==='product')?.state).toBe('pending-pickup');expect(repo.getById(id)).toEqual(before);expect(db.prepare("SELECT 1 FROM coordinator_assignments WHERE package_key='review'").get()).toBeUndefined();
+ });
  it('unknown SQLite failure still aborts instead of being swallowed as seat reservation',()=>{
   configure(normal());db.exec("CREATE TRIGGER unknown_failure BEFORE INSERT ON queue_items WHEN NEW.destination_session='builder@xv' BEGIN SELECT RAISE(ABORT,'unrecognized_data_corruption'); END");expect(()=>svc.reconcile('lead@xv','lead-g1','xv')).toThrow('unrecognized_data_corruption');expect(db.prepare('SELECT count(*) n FROM coordinator_assignments').get()).toEqual({n:0});
  });

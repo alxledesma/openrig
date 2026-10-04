@@ -148,6 +148,10 @@ export class CoordinationRecoveryService {
     // An unrelated queue claim is an exclusive worker obligation, even while idle.
     if(this.db.prepare("SELECT 1 FROM queue_items WHERE destination_session IN (?,?) AND state IN ('pending','in-progress','blocked')").get(...rotationLocalAddresses(this.db,t.owner))){result.push({key:t.key,state:'held',reason:'existing-worker-custody',deadline:t.deadline});continue;}
     const queueId=`qitem-coordination-${digest(rigId+':'+t.packageKey).slice(0,24)}`;
+    // A retained pre-ledger row is history, not a new assignment. Never recreate
+    // it or manufacture ownership; keep this slice accountable and continue others.
+    const retained=this.repo.getById(queueId);
+    if(retained){result.push({key:t.key,state:'held',queueId,reason:retained.destinationSession===t.owner&&digest(retained.body)===digest(t.body)?'existing-queue-without-assignment':'deterministic-queue-conflict',deadline:t.deadline});continue;}
     try {
      this.db.transaction(()=>this.repo.createWithinTransaction({qitemId:queueId,sourceSession:actor,destinationSession:t.owner,body:t.body,dispatch:{token,packageKey:t.packageKey},identityProvenance:'system:operator-authorized-coordination',nudge:true}))();
     } catch(error) {
