@@ -166,6 +166,37 @@ describe('durable coordination recovery',()=>{
   expect(()=>repo.assertTerminalClosureHasIntent(first.queueId!,'uncreated-successor',false)).not.toThrow();
   expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='product')!.state).toBe('returned-awaiting-acceptance');
  });
+ it('Operator successor control requires exact native intake and refuses uncertainty, drift and replay changes',async()=>{
+  configure(normal(),{product:['source.ts']});const original=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;
+  repo.claim({qitemId:original,destinationSession:'builder@xv',identityProvenance:'transport:v1'});repo.update({qitemId:original,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();const prior=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='terminal-return:product')!.queueId!;
+  repo.claim({qitemId:prior,destinationSession:'builder@xv',identityProvenance:'transport:v1'});repo.update({qitemId:prior,actorSession:'builder@xv',state:'canceled'});db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();svc.reconcile('lead@xv','lead-g1','xv');
+  const intake=(db.prepare("SELECT qitem_id FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_extract(body,'$.reason')='terminal-return-duty-exhausted'").get() as {qitem_id:string}).qitem_id;
+  const input={rigId:'xv',intakeQueueId:intake,previousControlId:prior,previousBodyHash:digest(repo.getById(prior)!.body),workerGeneration:'builder-g1',holderGeneration:'lead-g1',deadline:clock+30000,operationId:'bounded-return-r2'};
+  expect(()=>svc.authorizeTerminalReturnSuccessor('operator-agent@kernel','operator-agent-g1',input)).toThrow('Exact claimed exhaustion');
+  repo.claim({qitemId:intake,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});
+  await repo.create({qitemId:'forged-exhaustion',sourceSession:'builder@xv',destinationSession:'operator-agent@kernel',body:repo.getById(intake)!.body,nudge:false});repo.claim({qitemId:'forged-exhaustion',destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});
+  expect(()=>svc.authorizeTerminalReturnSuccessor('operator-agent@kernel','operator-agent-g1',{...input,intakeQueueId:'forged-exhaustion'})).toThrow('Exact native exhaustion intake');
+  expect(()=>svc.authorizeTerminalReturnSuccessor('operator-agent@kernel','operator-agent-g1',{...input,previousBodyHash:'drift'})).toThrow();
+  db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE audit_pointer=?").run(prior);
+  expect(()=>svc.authorizeTerminalReturnSuccessor('operator-agent@kernel','operator-agent-g1',input)).toThrow('Reconcile unknown effects');
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  const result=svc.authorizeTerminalReturnSuccessor('operator-agent@kernel','operator-agent-g1',input);
+  expect(result.queueId).not.toBe(prior);expect(repo.getById(prior)!.state).toBe('canceled');expect(repo.getById(result.queueId)!.state).toBe('pending');
+  expect(svc.authorizeTerminalReturnSuccessor('operator-agent@kernel','operator-agent-g1',input)).toEqual(result);
+  expect(()=>svc.authorizeTerminalReturnSuccessor('operator-agent@kernel','operator-agent-g1',{...input,operationId:'duplicate-r3'})).toThrow('one authorized successor');
+  expect(()=>svc.authorizeTerminalReturnSuccessor('operator-agent@kernel','operator-agent-g1',{...input,deadline:clock+31000})).toThrow('Frozen successor');
+  expect(()=>repo.coordinatorAuthority.assertManagedSend('watchdog@system','builder@xv',result.queueId)).not.toThrow();
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='terminal-return:product')).toMatchObject({state:'pending-native-terminal-return',queueId:result.queueId});
+  expect(db.prepare("SELECT count(*) n FROM coordinator_resources WHERE package_key='product'").get()).toEqual({n:1});
+  repo.claim({qitemId:result.queueId,destinationSession:'builder@xv',identityProvenance:'transport:v1'});
+  expect(()=>repo.update({qitemId:result.queueId,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'})).toThrow('Original assignment still lacks');
+  await repo.create({qitemId:'successor-real-return',sourceSession:'builder@xv',destinationSession:'lead@xv',body:JSON.stringify({packageKey:'product',inputDigest:digest('product'),evidence:[{kind:'report',ref:'retained/report.md'}]}),nudge:false});
+  repo.coordinatorAuthority.dispose('builder@xv','builder-g1','xv','product','successor-real-return');
+  repo.update({qitemId:result.queueId,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
+  expect(db.prepare("SELECT count(*) n FROM coordinator_resources WHERE package_key='product'").get()).toEqual({n:0});
+ });
  it('missing terminal returns respect checkpoint quiescence and never assign a changed incarnation',()=>{
   const initial=configure([...normal(),task('other','builder@xv',{boundary:'owner-material'})],{product:['source.ts']});
   const original=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='product')!.queueId!;
