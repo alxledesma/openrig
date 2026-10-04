@@ -218,7 +218,15 @@ export class CoordinatorAuthorityService {
    if(!op||!receipt||receipt.kind!=='historical-quarantine'||receipt.rigId!==h.rig_id||receipt.operationId!==h.operation_id||receipt.actor!=='operator-agent@kernel'||typeof receipt.generation!=='string'||typeof receipt.lead!=='string'||typeof receipt.leadGeneration!=='string'||receipt.deliveryConclusion!=='unknown'||receipt.outboxMutations!==0||!Array.isArray(receipt.effects)||!receipt.effects.includes(row.outbox_id)||receipt.admittedUntil!==h.admitted_until)return null;
    return {outboxId:String(row.outbox_id),rowHash:digest(canonical(row)),custodyHash:digest(canonical(this.historyCustody(row))),quarantineHash:digest(canonical(h)),operationHash:digest(canonical(op))};
  }
- /** Only exact debt explicitly adopted by this rig can cease being executable uncertainty. */
+ /** Static containment permits ordinary dispatch; finite recovery still gates takeover. */
+ isAdoptedHistoryContained(rigId:string,row:Record<string,unknown>):boolean {
+   const adopted=this.db.prepare('SELECT * FROM coordinator_held_history WHERE rig_id=? AND outbox_id=?').get(rigId,row.outbox_id) as Record<string,unknown>|undefined;
+   const held=adopted?this.containedHistory(row):null;
+   if(!held||adopted!.original_row_hash!==held.rowHash||adopted!.quarantine_hash!==held.quarantineHash||adopted!.quarantine_operation_hash!==held.operationHash||adopted!.post_custody_hash!==held.custodyHash)return false;
+   let receipt:any;try{receipt=JSON.parse(String(adopted!.receipt));}catch{return false;}
+   return !!receipt&&receipt.kind==='coordinator-held-history-adoption.v1'&&receipt.actor==='operator-agent@kernel'&&typeof receipt.generation==='string'&&receipt.deliveryConclusion==='unknown'&&receipt.originalMutations===0&&receipt.pre?.outboxId===row.outbox_id&&receipt.pre?.rowHash===held.rowHash&&receipt.pre?.quarantineHash===held.quarantineHash&&receipt.pre?.operationHash===held.operationHash&&receipt.postCustody!==null&&typeof receipt.postCustody==='object'&&digest(canonical(receipt.postCustody))===adopted!.post_custody_hash;
+ }
+ /** Takeover additionally needs live accountable recovery. */
  private adoptedHistoryContained(rigId:string,row:Record<string,unknown>):boolean {
    const adopted=this.db.prepare('SELECT * FROM coordinator_held_history WHERE rig_id=? AND outbox_id=?').get(rigId,row.outbox_id) as Record<string,unknown>|undefined;
    const held=adopted?this.containedHistory(row):null;

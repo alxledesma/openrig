@@ -147,7 +147,9 @@ export class CoordinationRecoveryService {
  }
  private workerEffectDebt(session:string):boolean {
   const addresses=rotationLocalAddresses(this.db,session);
-  return !!this.db.prepare("SELECT 1 FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session IN (?,?) OR destination_session IN (?,?)) LIMIT 1").get(...addresses,...addresses);
+  const rig=this.db.prepare('SELECT n.rig_id FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(session) as {rig_id:string}|undefined;
+  const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session IN (?,?) OR destination_session IN (?,?))").all(...addresses,...addresses) as Record<string,unknown>[];
+  return effects.some(row=>!rig||!this.authority.isAdoptedHistoryContained(rig.rig_id,row));
  }
  private admittedNow(t:CoordinationTask):boolean {
   return t.admission.validUntil>this.now()&&t.admission.generation===this.authority.generation(t.owner)&&t.admission.configurationDigest===this.configurationDigest(t.owner);
