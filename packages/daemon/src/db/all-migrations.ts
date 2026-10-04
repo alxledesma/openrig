@@ -1,9 +1,10 @@
+import { coordinatorHeldHistorySchema } from "./migrations/095_coordinator_held_history.js";
 import { historicalEffectDispositionsSchema } from "./migrations/094_historical_effect_dispositions.js";
 import { reservationAttemptLocksSchema } from "./migrations/093_reservation_attempt_locks.js";
 import { seatDispatchReservationsSchema } from "./migrations/091_seat_dispatch_reservations.js";
 import { reservedClaimReleaseSchema } from "./migrations/092_reserved_claim_release.js";
 import { coordinatorAuthoritySchema } from "./migrations/090_coordinator_authority.js";
-// The canonical ordered migration list (001 → 094). SINGLE SOURCE: the daemon boot path
+// The canonical ordered migration list (001 → 095). SINGLE SOURCE: the daemon boot path
 // (startup.ts) and any test/tool that needs a schema-faithful DB both migrate from THIS array,
 // so a reader DB is never seeded from a stale hand-copied subset (the perf-fixture-migration-parity
 // trap). Append new migrations to the END, in order.
@@ -195,4 +196,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   reservedClaimReleaseSchema,
   reservationAttemptLocksSchema,
   historicalEffectDispositionsSchema,
+  coordinatorHeldHistorySchema,
 ];

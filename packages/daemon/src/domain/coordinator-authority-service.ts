@@ -10,10 +10,11 @@ export interface PackageContract {
  inputDigest: string; destination: string; bodyHash: string;
  resources: string[]; returnContract: { destination: string; evidenceRequired: string[]; transitions?: Array<{source:string;destination:string;bodyHash:string}> };
 }
-export interface LegacyInventory { rows: Array<{queueId:string;rowHash:string}>; uncertainEffects: string[]; snapshotDigest:string }
+export interface HeldHistoryRef {outboxId:string;rowHash:string;custodyHash:string;quarantineHash:string;operationHash:string}
+export interface LegacyInventory { heldHistory?:HeldHistoryRef[]; rows: Array<{queueId:string;rowHash:string}>; uncertainEffects: string[]; snapshotDigest:string }
 export interface LegacyEnrollment {
  rigId:string;batonId:string;owner:string;ownerGeneration:string;coordinators:string[];leaseMs:number;operationId:string;
- authorizationId:string;inventory:LegacyInventory;
+ authorizationId:string;inventory:LegacyInventory; heldHistoryRecovery?:{queueId:string;rowHash:string};
  obligations:Array<{queueId:string;kind:"coordination"|"work";evidenceRef:string;packageKey?:string;contract?:PackageContract;resourceScope?:"exclusive"|"read-only"}>;
 }
 export const legacyProposalDigest=(input:LegacyEnrollment):string=>digest(canonical(input));
@@ -133,7 +134,7 @@ export class CoordinatorAuthorityService {
    }).immediate();
  }
  /** Read-only immutable inventory. Full private row bytes are hashed, never returned. */
- legacyInventory(rigId:string,authorizationId:string):LegacyInventory {
+ legacyInventory(rigId:string,authorizationId:string,adoptHeldHistory=false):LegacyInventory {
    const rig=this.db.prepare("SELECT name FROM rigs WHERE id=?").get(rigId) as {name:string}|undefined;
    if(!rig)reject("coordinator_wrong_rig","Known immutable rig required");
    // Include unresolved/host-qualified addresses naming this rig; missing identity
@@ -142,8 +143,13 @@ export class CoordinatorAuthorityService {
    const rows=this.db.prepare("SELECT * FROM queue_items WHERE state NOT IN ('done','failed','denied','canceled','cancelled','handed-off') AND qitem_id<>? ORDER BY qitem_id").all(authorizationId) as Array<Record<string,unknown>>;
    const owned=rows.filter(q=>touches(q.source_session)||touches(q.destination_session));
    const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired')").all() as Array<Record<string,unknown>>;
-   const uncertain=effects.filter(e=>touches(e.sender_session)||touches(e.destination_session)).map(e=>digest(canonical(e))).sort();
-   const inventory={rows:owned.map(q=>({queueId:String(q.qitem_id),rowHash:digest(canonical(q))})),uncertainEffects:uncertain};
+   const heldHistory:HeldHistoryRef[]=[];
+   const uncertain=effects.filter(e=>touches(e.sender_session)||touches(e.destination_session)).flatMap(e=>{
+     const held=adoptHeldHistory?this.containedHistory(e):null;
+     if(held){heldHistory.push(held);return [];}
+     return [digest(canonical(e))];
+   }).sort();heldHistory.sort((a,b)=>a.outboxId.localeCompare(b.outboxId));
+   const inventory={rows:owned.map(q=>({queueId:String(q.qitem_id),rowHash:digest(canonical(q))})),uncertainEffects:uncertain,...(adoptHeldHistory?{heldHistory}:{})};
    return {...inventory,snapshotDigest:digest(canonical(inventory))};
  }
  /** Explicit attributed adoption of existing custody; no queue mutation or wake. */
@@ -158,9 +164,12 @@ export class CoordinatorAuthorityService {
      const auth=this.db.prepare("SELECT * FROM queue_items WHERE qitem_id=?").get(input.authorizationId) as Record<string,unknown>|undefined;
      let receipt:{kind?:string;proposalDigest?:string}|undefined;try{receipt=auth?JSON.parse(String(auth.body)):undefined;}catch{}
      if(!auth||auth.source_session!==input.owner||auth.destination_session!==actor||auth.minting_generation_uuid!==input.ownerGeneration||auth.state!=='in-progress'||auth.claimed_by_generation_uuid!==generation||receipt?.kind!=="coordinator-legacy-enrollment"||receipt.proposalDigest!==legacyProposalDigest(input))reject("coordinator_migration_authorization","Current Lead durable exact proposal authorization required");
-     const actual=this.legacyInventory(input.rigId,input.authorizationId);
+     const actual=this.legacyInventory(input.rigId,input.authorizationId,input.inventory.heldHistory!==undefined);
      if(canonical(actual)!==canonical(input.inventory))reject("coordinator_migration_drift","Queue/claim/body/effect inventory changed; reconcile and reauthorize");
      if(actual.uncertainEffects.length)reject("coordinator_legacy_effects","Uncertain delivery effects must be reconciled before import");
+     const held=actual.heldHistory??[];
+     const recoveryBinding=held.length?this.validateHeldRecovery(actor,generation,input,held):null;
+     if(!held.length&&input.heldHistoryRecovery)reject("coordinator_held_history_contract","Recovery must bind actual held debt");
      if(input.obligations.length!==actual.rows.length||new Set(input.obligations.map(o=>o.queueId)).size!==actual.rows.length||actual.rows.some(q=>!input.obligations.some(o=>o.queueId===q.queueId)))reject("coordinator_migration_incomplete","Every exact nonterminal obligation requires explicit attributed classification");
      const baton=this.db.prepare("SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?").get(input.batonId) as {destination_session:string;state:string;claimed_by_generation_uuid:string|null}|undefined;
      if(!baton||baton.destination_session!==input.owner||!['pending','in-progress'].includes(baton.state)||(baton.state==='in-progress'&&baton.claimed_by_generation_uuid!==input.ownerGeneration))reject("coordinator_baton_mismatch","Preserved baton must have current exact custody");
@@ -185,9 +194,72 @@ export class CoordinatorAuthorityService {
        for(const resource of c.resources){if(this.db.prepare("SELECT 1 FROM coordinator_resources WHERE rig_id=? AND resource_key=?").get(input.rigId,resource))reject("coordinator_resource_conflict","Imported work overlaps exclusive scope");this.db.prepare("INSERT INTO coordinator_resources VALUES (?,?,?)").run(input.rigId,resource,packageKey);}
        this.db.prepare("INSERT INTO coordinator_assignments VALUES (?,?,?,?,?,?,?,?,NULL,?)").run(input.rigId,packageKey,obligation.queueId,destination,c.bodyHash,input.owner,input.ownerGeneration,1,null);
      }
+     for(const h of held){
+       const row=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(h.outboxId) as Record<string,unknown>;
+       const post=this.historyCustody(row);
+       this.db.prepare('INSERT INTO coordinator_held_history VALUES (?,?,?,?,?,?,?,?,?,?)').run(input.rigId,h.outboxId,input.operationId,h.rowHash,h.quarantineHash,h.operationHash,h.custodyHash,digest(canonical(post)),input.heldHistoryRecovery!.queueId,JSON.stringify({kind:'coordinator-held-history-adoption.v1',actor,generation,owner:input.owner,ownerGeneration:input.ownerGeneration,pre:h,postCustody:post,recovery:input.heldHistoryRecovery,recoveryBinding,deliveryConclusion:'unknown',originalMutations:0}));
+     }
      const result=this.get(input.rigId)!;this.log(input.rigId,input.operationId,"legacy-enrollment",result,operationRequest);return result;
    }).immediate();
  }
+ /** Complete pre-import custody; never overwrite the historical quarantine receipt. */
+ private historyCustody(row:Record<string,unknown>):unknown {
+   const q=row.audit_pointer?this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(row.audit_pointer):null;
+   const assignment=row.audit_pointer?this.db.prepare('SELECT * FROM coordinator_assignments WHERE queue_id=?').all(row.audit_pointer):[];
+   const resources=(assignment as {rig_id:string;package_key:string}[]).flatMap(a=>this.db.prepare('SELECT * FROM coordinator_resources WHERE rig_id=? AND package_key=? ORDER BY resource_key').all(a.rig_id,a.package_key));
+   return {queue:q??null,assignment,resources};
+ }
+ private containedHistory(row:Record<string,unknown>):HeldHistoryRef|null {
+   if(!['pending','indeterminate'].includes(String(row.delivery_state)))return null;
+   const h=this.db.prepare("SELECT * FROM outbox_historical_quarantines WHERE outbox_id=? AND state='held'").get(row.outbox_id) as Record<string,unknown>|undefined;
+   if(!h||h.original_hash!==digest(canonical(row)))return null;
+   const op=this.db.prepare("SELECT * FROM outbox_historical_operations WHERE rig_id=? AND operation_id=? AND kind='quarantine'").get(h.rig_id,h.operation_id) as Record<string,unknown>|undefined;
+   let receipt:Record<string,unknown>|undefined;try{receipt=op?JSON.parse(String(op.receipt)):undefined;}catch{}
+   if(!op||!receipt||receipt.kind!=='historical-quarantine'||receipt.rigId!==h.rig_id||receipt.operationId!==h.operation_id||receipt.actor!=='operator-agent@kernel'||typeof receipt.generation!=='string'||typeof receipt.lead!=='string'||typeof receipt.leadGeneration!=='string'||receipt.deliveryConclusion!=='unknown'||receipt.outboxMutations!==0||!Array.isArray(receipt.effects)||!receipt.effects.includes(row.outbox_id)||receipt.admittedUntil!==h.admitted_until)return null;
+   return {outboxId:String(row.outbox_id),rowHash:digest(canonical(row)),custodyHash:digest(canonical(this.historyCustody(row))),quarantineHash:digest(canonical(h)),operationHash:digest(canonical(op))};
+ }
+ /** Only exact debt explicitly adopted by this rig can cease being executable uncertainty. */
+ private adoptedHistoryContained(rigId:string,row:Record<string,unknown>):boolean {
+   const adopted=this.db.prepare('SELECT * FROM coordinator_held_history WHERE rig_id=? AND outbox_id=?').get(rigId,row.outbox_id) as Record<string,unknown>|undefined;
+   const held=adopted?this.containedHistory(row):null;
+   if(!held||adopted!.original_row_hash!==held.rowHash||adopted!.quarantine_hash!==held.quarantineHash||adopted!.quarantine_operation_hash!==held.operationHash)return false;
+   let binding:any;try{binding=JSON.parse(String(adopted!.receipt)).recoveryBinding;
+     const renewals=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='held-history-recovery-binding' ORDER BY rowid DESC").all(rigId) as {receipt:string}[];
+     for(const renewal of renewals){const r=JSON.parse(renewal.receipt);if(r.effects.includes(row.outbox_id)){binding=r.binding;break;}}
+   }catch{reject('coordinator_held_history_recovery_required','Malformed adopted recovery binding; current Lead must issue a finite claimed replacement');}
+   this.assertHeldRecoveryCurrent(binding);
+   return true;
+ }
+ private validateHeldRecovery(actor:string,generation:string,input:LegacyEnrollment,held:HeldHistoryRef[]):Record<string,unknown> {
+   const ref=input.heldHistoryRecovery;
+   if(!ref||Object.keys(ref).sort().join(',')!=='queueId,rowHash'||typeof ref!.queueId!=='string'||typeof ref!.rowHash!=='string')reject('coordinator_held_history_contract','Exact accountable claimed recovery required');
+   const q=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(ref!.queueId) as Record<string,unknown>|undefined;
+   let b:Record<string,unknown>|undefined;try{b=q?JSON.parse(String(q.body)):undefined;}catch{}
+   const creation=this.db.prepare("SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? AND transition_note='created' ORDER BY transition_id LIMIT 1").get(ref!.queueId) as {actor_session:string;identity_provenance:string}|undefined;
+   const expected={kind:'coordinator-held-history-recovery.v1',rigId:input.rigId,operationId:input.operationId,owner:actor,generation,lead:input.owner,leadGeneration:input.ownerGeneration,effects:held.map(h=>h.outboxId),action:'reconcile-preserved-unknown-history',returnPath:{session:input.owner,queueId:ref!.queueId}};
+   const deadline=b?.deadline;
+   if(!q||digest(canonical(q))!==ref!.rowHash||q.source_session!==input.owner||q.destination_session!==actor||q.minting_generation_uuid!==input.ownerGeneration||q.claimed_by_generation_uuid!==generation||q.state!=='in-progress'||creation?.actor_session!==input.owner||creation.identity_provenance!=='transport:v1'||!b||Object.keys(b).sort().join(',')!==[...Object.keys(expected),'deadline'].sort().join(',')||!Number.isSafeInteger(deadline)||(deadline as number)<=this.now()||(deadline as number)>this.now()+1200000||!q.expires_at||!Number.isFinite(Date.parse(String(q.expires_at)))||Date.parse(String(q.expires_at))<=this.now()||Date.parse(String(q.expires_at))>(deadline as number)||Object.entries(expected).some(([k,v])=>canonical(b![k])!==canonical(v)))reject('coordinator_held_history_contract','Finite current Lead-authored actual Operator claimed recovery and exact effects required');
+   return {queueId:ref!.queueId,bodyHash:digest(String(q!.body)),actor,generation,lead:input.owner,leadGeneration:input.ownerGeneration,expiresAt:q!.expires_at,deadline};
+ }
+ private assertHeldRecoveryCurrent(binding:any):void {
+   const fail=()=>reject('coordinator_held_history_recovery_required','Adopted history needs current Lead-authored, Operator-claimed finite recovery; use held-history-recovery-bind');
+   if(!binding||typeof binding.queueId!=='string')fail();
+   const q=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(binding.queueId) as Record<string,unknown>|undefined;
+   if(!q||q.state!=='in-progress'||q.source_session!==binding.lead||q.destination_session!==binding.actor||q.minting_generation_uuid!==binding.leadGeneration||q.claimed_by_generation_uuid!==binding.generation||this.generation(binding.actor)!==binding.generation||this.generation(binding.lead)!==binding.leadGeneration||digest(String(q.body))!==binding.bodyHash||q.expires_at!==binding.expiresAt||!Number.isSafeInteger(binding.deadline)||binding.deadline<=this.now()||!Number.isFinite(Date.parse(String(q.expires_at)))||Date.parse(String(q.expires_at))<=this.now())fail();
+ }
+ /** Append a replacement accountability receipt; old adoption and claims remain immutable. */
+ bindHeldHistoryRecovery(actor:string,generation:string,input:{rigId:string;operationId:string;effects:HeldHistoryRef[];recovery:{queueId:string;rowHash:string}}):unknown {
+   return this.db.transaction(()=>{
+     this.operator(actor,generation);if(!input||Object.keys(input).sort().join(',')!=='effects,operationId,recovery,rigId'||typeof input.rigId!=='string'||typeof input.operationId!=='string'||!input.operationId||!Array.isArray(input.effects))reject('coordinator_held_history_contract','Exact typed recovery binding required');const a=this.get(input.rigId);if(!a)reject('coordinator_not_enabled','Adoption authority required');this.caller(a!.owner_session,a!.owner_generation);
+     const rows=this.db.prepare("SELECT e.* FROM coordinator_held_history h JOIN outbox_entries e ON e.outbox_id=h.outbox_id WHERE h.rig_id=? AND e.delivery_state IN ('pending','indeterminate') ORDER BY e.outbox_id").all(input.rigId) as Record<string,unknown>[];
+     const refs=rows.map(row=>{const h=this.containedHistory(row),old=this.db.prepare('SELECT * FROM coordinator_held_history WHERE rig_id=? AND outbox_id=?').get(input.rigId,row.outbox_id) as any;if(!h||old.original_row_hash!==h.rowHash||old.quarantine_hash!==h.quarantineHash||old.quarantine_operation_hash!==h.operationHash)reject('coordinator_held_history_contract','Immutable adopted containment changed');return h!;});
+     if(!refs.length||canonical(refs)!==canonical(input.effects))reject('coordinator_held_history_contract','Exact exhaustive current adopted effect references required');
+     const binding=this.validateHeldRecovery(actor,generation,{rigId:input.rigId,operationId:input.operationId,owner:a!.owner_session,ownerGeneration:a!.owner_generation,heldHistoryRecovery:input.recovery} as LegacyEnrollment,refs);
+     const request={actor,generation,input};const prior=this.replay(input.rigId,input.operationId,'held-history-recovery-binding',request);if(prior){this.assertHeldRecoveryCurrent((prior as any).binding);return prior;}
+     const receipt={kind:'coordinator-held-history-recovery-binding.v1',actor,generation,effects:refs.map(h=>h.outboxId),binding,originalMutations:0};this.log(input.rigId,input.operationId,'held-history-recovery-binding',receipt,request);return receipt;
+   }).immediate();
+ }
+
  private validLease(ms: number): void { if (!Number.isSafeInteger(ms)||ms<1000||ms>3600000) reject("coordinator_invalid_lease","Lease must be 1 second to 1 hour"); }
  private assertOwner(actor:string, token:CoordinatorToken, allowReconcile=false): Authority {
    const r=this.get(token.rigId);
@@ -288,10 +360,10 @@ export class CoordinatorAuthorityService {
    if(!(JSON.parse(r!.coordinators) as string[]).includes(input.recipient)||input.recipient===r!.owner_session)reject('coordinator_ineligible_recipient','Exact existing peer required');
    this.caller(r!.owner_session,r!.owner_generation);this.caller(input.recipient,input.recipientGeneration);this.validLease(input.leaseMs);
    // An uncertain transport effect may have already started coordination work.
-   const effects=this.db.prepare("SELECT sender_session,destination_session FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired')").all() as {sender_session:string;destination_session:string}[];
+   const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired')").all() as Record<string,unknown>[];
    const rigName=(this.db.prepare('SELECT name FROM rigs WHERE id=?').get(input.rigId) as {name:string}).name;
    const touches=(session:string)=>this.local(session)?.rig_id===input.rigId||session.split('@')[1]===rigName;
-   if(effects.some(e=>touches(e.sender_session)||touches(e.destination_session)))reject('coordinator_uncertain_effects','Reconcile uncertain effects before stalled-live takeover');
+   if(effects.some(e=>(touches(String(e.sender_session))||touches(String(e.destination_session)))&&!this.adoptedHistoryContained(input.rigId,e)))reject('coordinator_uncertain_effects','Reconcile uncertain effects before stalled-live takeover');
    const baton=this.db.prepare('SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(r!.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string}|undefined;
    if(!baton||baton.destination_session!==r!.owner_session||baton.state!=='in-progress'||baton.claimed_by_generation_uuid!==r!.owner_generation)reject('coordinator_baton_mismatch','Actual old holder claim required');
    const epoch=r!.epoch+1,ts=new Date(this.now()).toISOString();
@@ -319,8 +391,8 @@ export class CoordinatorAuthorityService {
    if(!this.coordinationRecovery?.canTransferUnavailable(input.rigId,input.recipient,input.recipientGeneration))reject('coordination_unavailable_not_ready','Fresh idle unoccupied Peer and current nonexpired task admissions required');
    const rigName=(this.db.prepare('SELECT name FROM rigs WHERE id=?').get(input.rigId) as {name:string}).name;
    const touches=(session:string)=>this.local(session)?.rig_id===input.rigId||session.split('@')[1]===rigName;
-   const effects=this.db.prepare("SELECT sender_session,destination_session FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired')").all() as {sender_session:string;destination_session:string}[];
-   if(effects.some(e=>touches(e.sender_session)||touches(e.destination_session)))reject('coordinator_uncertain_effects','Uncertain effects require exact recovery before takeover');
+   const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired')").all() as Record<string,unknown>[];
+   if(effects.some(e=>(touches(String(e.sender_session))||touches(String(e.destination_session)))&&!this.adoptedHistoryContained(input.rigId,e)))reject('coordinator_uncertain_effects','Uncertain effects require exact recovery before takeover');
    const baton=this.db.prepare('SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(a!.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string}|undefined;
    if(!baton||baton.destination_session!==a!.owner_session||baton.state!=='in-progress'||baton.claimed_by_generation_uuid!==a!.owner_generation)reject('coordinator_baton_mismatch','Exact predecessor claimed canonical baton required');
    const epoch=a!.epoch+1,ts=new Date(this.now()).toISOString(),operationId='unavailable-owner:'+epoch;
