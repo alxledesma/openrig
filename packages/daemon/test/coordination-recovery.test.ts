@@ -152,7 +152,10 @@ describe('durable coordination recovery',()=>{
   repo.claim({qitemId:first.queueId!,destinationSession:'builder@xv',identityProvenance:'transport:v1'});
   svc.reconcile('lead@xv','lead-g1','xv');expect(db.prepare("SELECT count(*) n FROM queue_items WHERE qitem_id LIKE 'qitem-coordination-terminal-return-%'").get()).toEqual({n:1});
   db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE audit_pointer=?").run(first.queueId!);
-  repo.update({qitemId:first.queueId!,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
+  expect(()=>repo.update({qitemId:first.queueId!,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'})).toThrow('Original assignment still lacks');
+  expect(()=>repo.assertTerminalClosureHasIntent(first.queueId!,'uncreated-successor',false)).toThrow('Original assignment still lacks');
+  expect(repo.getById(first.queueId!)!.state).toBe('in-progress');
+  repo.update({qitemId:first.queueId!,actorSession:'builder@xv',state:'canceled'});
   expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='terminal-return:product')?.reason).toBe('terminal-return-duty-exhausted');
   expect(db.prepare("SELECT count(*) n FROM queue_items WHERE qitem_id LIKE 'qitem-coordination-terminal-return-%'").get()).toEqual({n:1});
   expect(db.prepare("SELECT count(*) n FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_extract(body,'$.reason')='terminal-return-duty-exhausted'").get()).toEqual({n:1});
@@ -160,6 +163,7 @@ describe('durable coordination recovery',()=>{
   await repo.create({qitemId:'native-terminal-receipt',sourceSession:'builder@xv',destinationSession:'lead@xv',body:JSON.stringify({packageKey:'product',inputDigest:digest('product'),evidence:[{kind:'report',ref:'retained/report.md'}]}),nudge:false});
   repo.coordinatorAuthority.dispose('builder@xv','builder-g1','xv','product','native-terminal-receipt');
   expect(db.prepare('SELECT count(*) n FROM coordinator_resources WHERE package_key=?').get('product')).toEqual({n:0});
+  expect(()=>repo.assertTerminalClosureHasIntent(first.queueId!,'uncreated-successor',false)).not.toThrow();
   expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='product')!.state).toBe('returned-awaiting-acceptance');
  });
  it('missing terminal returns respect checkpoint quiescence and never assign a changed incarnation',()=>{

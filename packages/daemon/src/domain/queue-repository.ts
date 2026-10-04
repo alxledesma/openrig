@@ -962,11 +962,19 @@ export class QueueRepository {
    * close+successor writer runs this as the LAST statement of its own transaction
    * — handoff / handoff-and-complete today, Mission Control / Workflow via P34.
    */
+  private assertNativeTerminalReturnCompleted(qitemId:string):void {
+    const op=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE operation_id=? AND kind='native-terminal-return-control'").get(qitemId) as {rig_id:string;receipt:string}|undefined;
+    if(!op)return;
+    const r=JSON.parse(op.receipt),a=this.db.prepare('SELECT disposition_id FROM coordinator_assignments WHERE rig_id=? AND queue_id=? AND package_key=?').get(op.rig_id,r.originalQueueId,r.packageKey) as {disposition_id:string|null}|undefined;
+    if(!a?.disposition_id)throw new QueueRepositoryError('native_terminal_return_incomplete','Original assignment still lacks its attributed typed disposition. Create a genuine queue return to its admitted return destination with JSON {packageKey,inputDigest,evidence:[{kind,ref}]}, including every required evidence kind; then invoke supported coordinator dispose for that original package and return queue ID before closing this duty. A prose handoff is not completion.');
+  }
+
   assertTerminalClosureHasIntent(
     sourceQitemId: string,
     successorQitemId: string,
     nudge: boolean | undefined,
   ): void {
+    this.assertNativeTerminalReturnCompleted(sourceQitemId);
     if (nudge === false) return; // no wake intended ⇒ no intent required
     // MF2: fail CLOSED. A nudge-intended terminal act with no intent store cannot
     // make its wake durable, so the guarantee is impossible — refuse the close
@@ -2017,6 +2025,7 @@ export class QueueRepository {
       );
     }
 
+    this.assertNativeTerminalReturnCompleted(input.qitemId);
     const ts = new Date().toISOString();
     const events: Array<import("./types.js").RigEvent> = [];
 
@@ -2347,6 +2356,7 @@ export class QueueRepository {
         `qitem ${input.qitemId} not found`
       );
     }
+    if(input.state==='done'||input.state==='handed-off')this.assertNativeTerminalReturnCompleted(input.qitemId);
     const hasNote = typeof input.transitionNote === "string" && input.transitionNote.trim().length > 0;
     const isGuardedTerminal = (["done", "canceled", "handed-off"] as const).includes(
       qitem.state as "done" | "canceled" | "handed-off",
