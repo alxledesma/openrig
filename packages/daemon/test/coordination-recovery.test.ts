@@ -166,6 +166,18 @@ describe('durable coordination recovery',()=>{
   expect(()=>repo.assertTerminalClosureHasIntent(first.queueId!,'uncreated-successor',false)).not.toThrow();
   expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='product')!.state).toBe('returned-awaiting-acceptance');
  });
+ it('prospective worker probe refreshes native identity without product admission or authority',async()=>{
+  configure([task('review','peer@xv',{boundary:'owner-material'})]);samples.delete('builder@xv');
+  const refresh=vi.fn(async(sessions:readonly string[])=>{expect(sessions).toEqual(['builder@xv']);samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});});
+  const service=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,refresh);
+  await expect(service.probeWorker('operator-agent@kernel','retired',{rigId:'xv',worker:'builder@xv'})).rejects.toThrow('Genuine current');
+  await expect(service.probeWorker('operator-agent@kernel','operator-agent-g1',{rigId:'other',worker:'builder@xv'})).rejects.toThrow('Existing native');
+  expect(await service.probeWorker('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv'})).toMatchObject({generation:'builder-g1',identityVerified:true,idle:true,grantsAuthority:false});
+  expect(refresh).toHaveBeenCalledTimes(1);expect(db.prepare('SELECT count(*) n FROM coordinator_assignments').get()).toEqual({n:0});
+  expect(await service.probeWorker('lead@xv','lead-g1',{rigId:'xv',worker:'builder@xv'})).toMatchObject({idle:true,grantsAuthority:false});
+  const changed=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,async()=>{db.prepare("UPDATE occupant_tenures SET generation_uuid='new-builder' WHERE node_id='builder@xv'").run();});
+  await expect(changed.probeWorker('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv'})).rejects.toThrow('Worker changed');
+ });
  it('Operator successor control requires exact native intake and refuses uncertainty, drift and replay changes',async()=>{
   configure(normal(),{product:['source.ts']});const original=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;
   repo.claim({qitemId:original,destinationSession:'builder@xv',identityProvenance:'transport:v1'});repo.update({qitemId:original,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
@@ -193,6 +205,7 @@ describe('durable coordination recovery',()=>{
   repo.claim({qitemId:result.queueId,destinationSession:'builder@xv',identityProvenance:'transport:v1'});
   expect(()=>repo.update({qitemId:result.queueId,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'})).toThrow('Original assignment still lacks');
   await repo.create({qitemId:'successor-real-return',sourceSession:'builder@xv',destinationSession:'lead@xv',body:JSON.stringify({packageKey:'product',inputDigest:digest('product'),evidence:[{kind:'report',ref:'retained/report.md'}]}),nudge:false});
+  expect(()=>repo.coordinatorAuthority.dispose('builder@xv','builder-g1','xv','product',undefined as any)).toThrow('Expected {rigId,packageKey,dispositionId}');
   repo.coordinatorAuthority.dispose('builder@xv','builder-g1','xv','product','successor-real-return');
   repo.update({qitemId:result.queueId,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
   expect(db.prepare("SELECT count(*) n FROM coordinator_resources WHERE package_key='product'").get()).toEqual({n:0});

@@ -562,6 +562,7 @@ export class CoordinatorAuthorityService {
    }).immediate();
  }
  dispose(actor:string,generation:string,rigId:string,packageKey:string,dispositionId:string): void {
+   if([rigId,packageKey,dispositionId].some(v=>typeof v!=="string"||!v.trim()))reject("coordinator_dispose_contract_required","Expected {rigId,packageKey,dispositionId}; dispositionId is the new worker-authored typed JSON return queue item, not the original assignment or duty ID. The original worker disposes its own terminal return; coordinator-holder role is not required.");
    this.db.transaction(() => {
      this.caller(actor,generation);
      const a=this.db.prepare(`SELECT a.*,q.state,q.claimed_by_generation_uuid FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=?`).get(rigId,packageKey) as {destination:string;state:string;claimed_by_generation_uuid:string;disposition_id:string|null}|undefined;
