@@ -219,6 +219,7 @@ interface QueueItemRow {
  * minimal shape so test code can supply a stub.
  */
 export interface QueueNudgeTransport {
+  attachCoordinatorAuthority?(authority: CoordinatorAuthorityService): void;
   deliveryTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
   retentionTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
   send(
@@ -771,6 +772,7 @@ export class QueueRepository {
    * handoff / handoff-and-complete will start nudging on the next call.
    */
   attachTransport(transport: QueueNudgeTransport): void {
+    transport.attachCoordinatorAuthority?.(this.coordinatorAuthority);
     this.transport = transport;
   }
 

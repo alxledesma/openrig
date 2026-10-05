@@ -590,6 +590,13 @@ export class SessionTransport {
     this.listProcesses = deps.listProcesses;
   }
 
+  /** Queue delivery must use the same registered authority/controller as the
+   * queue issuer. A standalone transport remains fail-closed for internal duties. */
+  attachCoordinatorAuthority(authority: CoordinatorAuthorityService): void {
+    if (authority.db !== this.db) throw new Error("Transport coordinator authority DB mismatch");
+    this.coordinatorAuthority = authority;
+  }
+
   /**
    * Slice-05 D5/D6 — when a live transport op (send/capture) observes that the
    * seat's tmux session is genuinely gone (a `probeSession` result of `absent`

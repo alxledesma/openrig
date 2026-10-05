@@ -7,6 +7,9 @@ import {coordinatorRoutes} from '../src/routes/coordinator.js';
 import {OutboxHandler} from '../src/domain/outbox-handler.js';
 import {SeatDeliveryGuard,resolveGuardTarget} from '../src/domain/seat-delivery-guard.js';
 import {SessionRegistry} from '../src/domain/session-registry.js';
+import {SessionTransport} from '../src/domain/session-transport.js';
+import {RigRepository} from '../src/domain/rig-repository.js';
+import type {TmuxAdapter} from '../src/adapters/tmux.js';
 import {QueueRepository} from '../src/domain/queue-repository.js';
 import {EventBus} from '../src/domain/event-bus.js';
 import {Hono} from 'hono';
@@ -47,6 +50,12 @@ it('fixed administrative notification reaches an existing unnotified current aut
 });
 it('future native issuance automatically delivers its fixed administrative notice with exact target UNKNOWN preserved',async()=>{
  await enableRig();const p=packet(),before=outbox.getById(p.outboxId),sent=attachNativeNotificationTransport();await repo.issueOutboxAbandonAuthorization('operator-agent@kernel','operator-agent-g1',issuance(p),guard);expect(sent).toHaveLength(1);expect(outbox.getById(p.outboxId)).toEqual(before);expect(repo.getById(p.authorizationId)?.state).toBe('pending');expect(repo.waitingView(p.authorizationId)?.nextBackstop.mechanism).toContain('delivered');
+});
+it.each([true,false])('real SessionTransport shares registered administrative proof with guard and preserves terminal notice, successful=%s',async(successful)=>{
+ await enableRig();db.prepare("INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES ('admin-real-binding','builder@xv','builder@xv','%7')").run();db.prepare("UPDATE nodes SET runtime='codex' WHERE id='builder@xv'").run();const p=packet(),input=issuance(p),before=outbox.getById(p.outboxId),typed:string[]=[],keys:string[][]=[];let pane='› ';
+ const tmux={deliveryGuard:guard,probeSession:async()=>({state:'present'}),getPaneCommand:async()=> 'codex',capturePaneContent:async()=>pane,sendText:async(_target:string,body:string)=>{typed.push(body);if(successful)pane+=body;return {ok:successful};},sendKeys:async(_target:string,k:string[])=>{keys.push(k);return {ok:true};}} as unknown as TmuxAdapter;
+ const transport=new SessionTransport({db,rigRepo:new RigRepository(db),sessionRegistry:new SessionRegistry(db),tmuxAdapter:tmux});repo.attachTransport(transport);await repo.issueOutboxAbandonAuthorization('operator-agent@kernel','operator-agent-g1',input,guard);const noticeId='wake-intent-outbox-abandon-notification:'+p.authorizationId;expect(typed).toHaveLength(1);expect(typed[0]).toContain('claim-exact-outbox-abandon-authorization');expect(outbox.getById(noticeId)?.deliveryState).toBe(successful?'delivered':'failed');expect(keys).toHaveLength(successful?1:0);expect(outbox.getById(p.outboxId)).toEqual(before);expect(repo.getById(p.authorizationId)?.state).toBe('pending');
+ await repo.notifyOutboxAbandonAuthorization('operator-agent@kernel','operator-agent-g1',{authorizationId:p.authorizationId},guard);await repo.drainPendingWakeIntents();expect(typed).toHaveLength(1);expect(outbox.getById(noticeId)?.deliveryState).toBe(successful?'delivered':'failed');const raw=await transport.send('builder@xv','arbitrary text',{actorSession:'operator-agent@kernel',queueAssignmentId:p.authorizationId,committedOutboxIds:[noticeId]});expect(raw.ok).toBe(false);expect(typed).toHaveLength(1);expect(outbox.getById(p.outboxId)).toEqual(before);
 });
 it('administrative recovery notification preserves multiple direct audits and terminal wake uncertainty without granting product dispatch',async()=>{
  await enableRig();const p=packet(),input=issuance(p),target=outbox.getById(p.outboxId),history:string[]=[];
