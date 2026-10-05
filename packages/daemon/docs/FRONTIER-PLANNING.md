@@ -30,9 +30,13 @@ table and no second duty engine.
    citations are bound into the admitted contract.
 5. **Operator confirmation duty** (`frontier-confirmation`, binding `currentOperator`). A
    `frontier-complete` is Lead self-attestation until the genuine current Operator confirms that exact
-   completion digest as a duty. Every scope item must map to an **accepted product package whose contract
-   cites that exact scope ref**, or to an explicit owner-attributed deferral. Legacy and administrative
-   accepted work can never support completeness.
+   completion digest **on that exact planning duty** as a duty. A confirmation is bound to the planning
+   duty that recorded it, by `planningQueueId` in the lookup and in the confirmation duty's semantic
+   key, so it never carries across a reopen: after a reopen the successor planning duty has a distinct
+   id and re-recording a byte-identical mapping still requires a fresh Operator confirmation. Every
+   scope item must map to an **accepted product package whose contract cites that exact scope ref**, or
+   to an explicit owner-attributed deferral. Legacy and administrative accepted work can never support
+   completeness.
 6. **Reopen.** A blocked, completed or declined disposition is never a silent permanent stall. The
    accountable boundary, its recorded unblock condition and the owning Operator are written durably once,
    and only the genuine current Operator recording the discharged disposition reopens planning, as a

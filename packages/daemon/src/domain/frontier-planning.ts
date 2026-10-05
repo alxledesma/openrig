@@ -329,9 +329,12 @@ export class FrontierPlanning {
  }
 
  /** The Lead's completion stands only once the genuine current Operator has
-  *  independently confirmed that exact completion digest. */
+  *  independently confirmed that exact completion digest **on that exact planning
+  *  duty**. A confirmation never carries across a reopen: a reopen issues a
+  *  distinct successor planning duty with a distinct id, so re-recording an
+  *  identical mapping still requires a fresh Operator confirmation. */
  private confirmedCompletion(rigId:string,receipt:FrontierPlanReceipt):FrontierConfirmationReceipt|null {
-  const row=this.seam.db.prepare("SELECT operation_id FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='frontier-confirmation' AND json_extract(receipt,'$.completionDigest')=? ORDER BY rowid DESC LIMIT 1").get(rigId,receipt.completionDigest) as {operation_id:string}|undefined;
+  const row=this.seam.db.prepare("SELECT operation_id FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='frontier-confirmation' AND json_extract(receipt,'$.completionDigest')=? AND json_extract(receipt,'$.planningQueueId')=? ORDER BY rowid DESC LIMIT 1").get(rigId,receipt.completionDigest,receipt.dutyQueueId) as {operation_id:string}|undefined;
   const recorded=row?this.confirmationDisposition(rigId,row.operation_id):null;
   return recorded&&recorded.completionDigest===receipt.completionDigest?recorded:null;
  }
@@ -339,7 +342,7 @@ export class FrontierPlanning {
  private confirmationResult(snapshot:FrontierSnapshot,receipt:FrontierPlanReceipt):CoordinationResult[] {
   const operatorGeneration=this.seam.generation('operator-agent@kernel');
   if(!operatorGeneration)return [{key:'frontier',state:'held',reason:'frontier-operator-absent',deadline:this.seam.now()}];
-  const duty=this.seam.issueLifecycleDuty({rigId:snapshot.rigId,kind:CONFIRMATION_DUTY_KIND,packageKey:CONFIRMATION_DUTY_PACKAGE_KEY,recipient:'operator-agent@kernel',recipientGeneration:operatorGeneration,semanticKey:receipt.completionDigest!,
+  const duty=this.seam.issueLifecycleDuty({rigId:snapshot.rigId,kind:CONFIRMATION_DUTY_KIND,packageKey:CONFIRMATION_DUTY_PACKAGE_KEY,recipient:'operator-agent@kernel',recipientGeneration:operatorGeneration,semanticKey:`${receipt.completionDigest}:${receipt.dutyQueueId}`,
    details:{completionDigest:receipt.completionDigest,frontierDigest:receipt.frontierDigest,planningQueueId:receipt.dutyQueueId,scopeSourcesDigest:receipt.scopeSourcesDigest,mapping:receipt.mapping,grantsAuthority:false,
     confirmationContract:{recordOperation:"coordination-frontier-confirm",body:{rigId:snapshot.rigId,completionDigest:receipt.completionDigest,dutyQueueId:'<this exact duty queue item ID>',evidenceRef:'<actual independent confirmation evidence>'}}}});
   return [{...duty,key:'frontier'}];

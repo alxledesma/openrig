@@ -268,4 +268,37 @@ describe('frontier planning review regressions',()=>{
   expect(scopeSources).toEqual([BRIEF,ROADMAP]);
   expect(planning.queueId).not.toBe(duty.queueId);
  });
+
+ it('requires a fresh genuine Operator confirmation after a reopened completion is resubmitted identically',async()=>{
+  await scopeBoundAcceptedPackage();
+  const duty=stabilize(['stabilizing']),body=dutyPacket(duty.queueId!),input={rigId:'xv',dutyQueueId:duty.queueId!,frontierDigest:body.frontierDigest as string};
+  repo.claim({qitemId:duty.queueId!,destinationSession:'lead@xv',identityProvenance:'transport:v1'});
+  const mapping=[{ref:ROADMAP.ref,acceptedPackageKey:'next-frontier'},{ref:BRIEF.ref,deferral:{reason:'Not yet addressed',authorizationRef:'owner/roadmap-r2'}}];
+  const first=svc.recordFrontierPlan('lead@xv','lead-g1',{...input,disposition:'frontier-complete',mapping});
+  const firstConfirmation=frontierResult()!;
+  expect(firstConfirmation).toMatchObject({state:'pending-native-frontier-confirmation'});
+  repo.claim({qitemId:firstConfirmation.queueId!,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});
+  svc.recordFrontierConfirmation('operator-agent@kernel','operator-agent-g1',{rigId:'xv',dutyQueueId:firstConfirmation.queueId!,completionDigest:first.completionDigest!,evidenceRef:'operator/first-review.json'});
+  expect(frontierResult()).toMatchObject({state:'frontier-complete'});
+  // The Operator reviews again, finds the deferral invalid, and reopens with evidence.
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  const reopened=svc.recordFrontierReopen('operator-agent@kernel','operator-agent-g1',{rigId:'xv',dutyQueueId:duty.queueId!,dispositionDigest:first.dispositionDigest!,evidenceRef:'operator/deferral-invalid.json'});
+  expect(reopened.reopenDigest).toBeTruthy();
+  expect(frontierResult()?.state).not.toBe('frontier-complete');
+  // The Lead re-records the byte-identical mapping on the reopen successor duty.
+  const successor=stabilize(['stabilizing']);
+  expect(successor.state).toBe('pending-native-frontier-planning');
+  expect(successor.queueId).not.toBe(duty.queueId);
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  repo.claim({qitemId:successor.queueId!,destinationSession:'lead@xv',identityProvenance:'transport:v1'});
+  const second=svc.recordFrontierPlan('lead@xv','lead-g1',{rigId:'xv',dutyQueueId:successor.queueId!,frontierDigest:dutyPacket(successor.queueId!).frontierDigest,disposition:'frontier-complete',mapping});
+  expect(second.completionDigest).toBe(first.completionDigest);
+  // The earlier confirmation must not carry over: a fresh Operator confirmation is required.
+  const secondConfirmation=frontierResult()!;
+  expect(secondConfirmation).toMatchObject({state:'pending-native-frontier-confirmation'});
+  expect(secondConfirmation.queueId).not.toBe(firstConfirmation.queueId);
+  repo.claim({qitemId:secondConfirmation.queueId!,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});
+  svc.recordFrontierConfirmation('operator-agent@kernel','operator-agent-g1',{rigId:'xv',dutyQueueId:secondConfirmation.queueId!,completionDigest:second.completionDigest!,evidenceRef:'operator/second-review.json'});
+  expect(frontierResult()).toMatchObject({state:'frontier-complete'});
+ });
 });
