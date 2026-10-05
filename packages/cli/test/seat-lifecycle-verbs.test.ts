@@ -4,6 +4,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { Command } from "commander";
 import { seatCommand } from "../src/commands/seat.js";
+import { terminalAuthHeaders } from "../src/client.js";
 import { STATE_FILE, type DaemonState, type LifecycleDeps } from "../src/daemon-lifecycle.js";
 import type { StatusDeps } from "../src/commands/status.js";
 
@@ -35,6 +36,26 @@ function makeDeps(response: { status: number; data: unknown }, calls: Array<{ pa
       post: vi.fn(async (path: string, body: unknown) => { calls.push({ path, body }); return response; }),
     }) as unknown as ReturnType<StatusDeps["clientFactory"]>,
   };
+}
+
+/** Records the FULL request-options object each post() receives, so a test can assert on the
+ * timeout and headers the CLI actually passed, not merely that a post happened. */
+function makeOptionDeps(
+  response: { status: number; data: unknown },
+  posts: Array<{ path: string; body: unknown; options: unknown }>,
+): { deps: StatusDeps; postCalls: () => number } {
+  const post = vi.fn(async (path: string, body: unknown, options?: unknown) => {
+    posts.push({ path, body, options });
+    return response;
+  });
+  const deps: StatusDeps = {
+    lifecycleDeps: mockLifecycleDeps(),
+    clientFactory: () => ({
+      get: vi.fn(async () => response),
+      post,
+    }) as unknown as ReturnType<StatusDeps["clientFactory"]>,
+  };
+  return { deps, postCalls: () => post.mock.calls.length };
 }
 
 function applyExitOverride(cmd: Command): void {
@@ -181,6 +202,101 @@ describe("rig seat clean", () => {
     expect(logs.join("\n")).toContain("Sessions marked exited: dev-impl@seat-rig");
     expect(logs.join("\n")).toContain("binding cleared: yes");
     expect(logs.join("\n")).toContain("launchable again");
+  });
+});
+
+// Production Handy rehost CLI timed out at the client default 5000ms while the daemon had
+// already completed the rehost durably (durable event + strict native proof). These assert
+// the REQUEST OPTIONS, so a future refactor cannot silently drop the extended timeout or
+// reintroduce a shortened one, and cannot strip terminal auth from the rehost call.
+describe("rehost-runner request timeout", () => {
+  const REHOST_ARGS = ["node", "rig", "seat", "rehost-runner", "intake-lead@app-handy-conveyor", "--reason", "same generation rehost", "--operator", "operator-agent@kernel"];
+
+  it("posts rehost-runner with an explicit 60000ms timeout AND the terminal auth headers", async () => {
+    const posts: Array<{ path: string; body: unknown; options: unknown }> = [];
+    const { deps, postCalls } = makeOptionDeps({ status: 200, data: { ok: true, code: "rehost_runner_ok" } }, posts);
+    // terminalAuthHeaders() reads the bearer token from the environment, so a real token is
+    // set here; otherwise it returns {} and "auth retained" would be vacuously true.
+    const previousToken = process.env.OPENRIG_TERMINAL_BEARER_TOKEN;
+    process.env.OPENRIG_TERMINAL_BEARER_TOKEN = "test-terminal-token";
+    try {
+      await captureLogs(async () => { await makeCommand(deps).parseAsync(REHOST_ARGS); });
+    } finally {
+      if (previousToken === undefined) delete process.env.OPENRIG_TERMINAL_BEARER_TOKEN;
+      else process.env.OPENRIG_TERMINAL_BEARER_TOKEN = previousToken;
+    }
+    expect(postCalls()).toBe(1);
+    expect(posts[0]!.path).toBe("/api/seat/rehost-runner/intake-lead%40app-handy-conveyor");
+    // The whole point of the fix: 60000ms, not the 5000ms client default.
+    expect((posts[0]!.options as { timeoutMs: number }).timeoutMs).toBe(60_000);
+    expect((posts[0]!.options as { timeoutMs: number }).timeoutMs).not.toBe(5_000);
+    // Terminal auth must survive alongside the timeout.
+    const headers = (posts[0]!.options as { headers: Record<string, string> }).headers;
+    expect(headers).toBeDefined();
+    expect(headers.Authorization).toBe("Bearer test-terminal-token");
+  });
+
+  it("passes the auth headers unchanged: the timeout is added, terminalAuthHeaders is preserved", async () => {
+    const posts: Array<{ path: string; body: unknown; options: unknown }> = [];
+    const { deps } = makeOptionDeps({ status: 200, data: { ok: true } }, posts);
+    await captureLogs(async () => { await makeCommand(deps).parseAsync(REHOST_ARGS); });
+    const options = posts[0]!.options as { headers: Record<string, string>; timeoutMs: number };
+    // Compare against the real helper, not a hand-written guess.
+    expect(options.headers).toEqual(terminalAuthHeaders());
+    expect(options.timeoutMs).toBe(60_000);
+  });
+
+  it("keeps every OTHER lifecycle verb on the unchanged default timeout (no explicit value)", async () => {
+    const others: Array<[string, string[]]> = [
+      ["stop", ["node", "rig", "seat", "stop", "s@r", "--reason", "x"]],
+      ["clean", ["node", "rig", "seat", "clean", "s@r", "--reason", "x"]],
+      ["set-model", ["node", "rig", "seat", "set-model", "s@r", "--model", "m", "--reason", "x"]],
+      ["set-permissions", ["node", "rig", "seat", "set-permissions", "s@r", "--mode", "floor", "--reason", "x"]],
+    ];
+    for (const [name, argv] of others) {
+      const posts: Array<{ path: string; body: unknown; options: unknown }> = [];
+      const { deps, postCalls } = makeOptionDeps({ status: 200, data: { ok: true } }, posts);
+      await captureLogs(async () => { await makeCommand(deps).parseAsync(argv); });
+      expect(postCalls(), `${name} should post once`).toBe(1);
+      const options = posts[0]!.options as { timeoutMs?: number } | undefined;
+      // Absent means the client default (5000ms) still applies: unchanged behaviour.
+      expect(options?.timeoutMs, `${name} must not receive an explicit timeout`).toBeUndefined();
+    }
+  });
+
+  it("keeps set-cwd and set-codex-profile on auth headers WITHOUT a timeout", async () => {
+    for (const argv of [
+      ["node", "rig", "seat", "set-cwd", "s@r", "--cwd", "/new", "--reason", "x"],
+      ["node", "rig", "seat", "set-codex-profile", "s@r", "--profile", "xv-sol61-low-continuity", "--reason", "x"],
+    ]) {
+      const posts: Array<{ path: string; body: unknown; options: unknown }> = [];
+      const { deps } = makeOptionDeps({ status: 200, data: { ok: true } }, posts);
+      await captureLogs(async () => { await makeCommand(deps).parseAsync(argv); });
+      const options = posts[0]!.options as { headers: Record<string, string>; timeoutMs?: number };
+      expect(options.headers).toEqual(terminalAuthHeaders());
+      expect(options.timeoutMs).toBeUndefined();
+    }
+  });
+
+  it("sends the rehost exactly once: no retry is layered on top of the longer timeout", async () => {
+    const posts: Array<{ path: string; body: unknown; options: unknown }> = [];
+    const { deps, postCalls } = makeOptionDeps({ status: 200, data: { ok: true } }, posts);
+    await captureLogs(async () => { await makeCommand(deps).parseAsync(REHOST_ARGS); });
+    // A rehost must never be issued twice; the longer timeout must not become a retry.
+    expect(postCalls()).toBe(1);
+    expect(posts).toHaveLength(1);
+  });
+
+  it("still surfaces a rehost refusal verbatim with --json and exit 1, unchanged by the timeout", async () => {
+    const posts: Array<{ path: string; body: unknown; options: unknown }> = [];
+    const refusal = { ok: false, code: "rehost_pane_root_unresolved", message: "refused before any signal", guidance: "read the pane" };
+    const { deps } = makeOptionDeps({ status: 409, data: refusal }, posts);
+    const { logs, exitCode } = await captureLogs(async () => {
+      await makeCommand(deps).parseAsync([...REHOST_ARGS, "--json"]);
+    });
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(logs.join(""))).toEqual(refusal);
+    expect((posts[0]!.options as { timeoutMs: number }).timeoutMs).toBe(60_000);
   });
 });
 

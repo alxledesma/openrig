@@ -467,6 +467,9 @@ Examples:
   // S5 (OPR.0.5.4.7) — the seat-lifecycle verb surface: set-model / stop / clean.
   // Thin CLI over the daemon's SeatLifecycleService; refusals print message +
   // guidance + match list exactly as the daemon named them.
+  //
+  // Per-request timeout for rehost-runner ONLY. Named so it is greppable and testable.
+  const REHOST_TIMEOUT_MS = 60_000;
   const runLifecycleVerb = async (
     path: "set-cwd" | "set-model" | "set-codex-profile" | "set-permissions" | "launch" | "stop" | "clean" | "rehost-runner",
     seat: string,
@@ -479,9 +482,20 @@ Examples:
     if (!daemonStatusGuard(daemon)) return;
     const client = deps.clientFactory(getDaemonUrl(daemon));
     const endpoint = `/api/seat/${path}/${encodeURIComponent(seat)}`;
-    const res = (path === "set-codex-profile" || path === "set-cwd" || path === "rehost-runner")
-      ? await client.post<Record<string, unknown>>(endpoint, body, { headers: terminalAuthHeaders() })
-      : await client.post<Record<string, unknown>>(endpoint, body);
+    // A rehost is the ONLY verb whose server-side work is bounded by native process
+    // behaviour rather than a fast local write: it proves the pane root, waits for the
+    // runner to actually exit, types a same-file resume and polls the launch sidecar, which
+    // can legitimately take ~35s. The client default is 5000ms, so the CLI used to abort
+    // at 5s and report a timeout even though the daemon completed the rehost durably.
+    // This is a per-request timeout for that one call only. It does not change the client
+    // default, the global timeout, or any other verb, and it is NOT a retry: a timed-out
+    // request stays failed and is never re-sent, because a rehost is exactly the kind of
+    // effect that must not be issued twice.
+    const res = (path === "rehost-runner")
+      ? await client.post<Record<string, unknown>>(endpoint, body, { headers: terminalAuthHeaders(), timeoutMs: REHOST_TIMEOUT_MS })
+      : (path === "set-codex-profile" || path === "set-cwd")
+        ? await client.post<Record<string, unknown>>(endpoint, body, { headers: terminalAuthHeaders() })
+        : await client.post<Record<string, unknown>>(endpoint, body);
     if (opts.json) {
       console.log(JSON.stringify(res.data, null, 2));
       if (res.status >= 400) process.exitCode = res.status >= 500 ? 2 : 1;
