@@ -1622,13 +1622,16 @@ export class QueueRepository {
         AND EXISTS (SELECT 1 FROM nodes n JOIN sessions s ON s.node_id=n.id
           WHERE n.rig_id=? AND s.session_name IN (e.sender_session,e.destination_session))
       ORDER BY e.ts_dispatched,e.rowid LIMIT 2000`).all(rigId) as Array<{outbox_id:string;sender_session:string;destination_session:string}>;
+    const heldPreflights=new Set<string>(); // Refusals only, scoped to this uninterrupted read-only segment.
     for(const e of candidates){const touches=this.db.prepare('SELECT 1 FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE n.rig_id=? AND s.session_name IN (?,?)').get(rigId,e.sender_session,e.destination_session);if(!touches)continue;const generation=this.coordinatorAuthority.generation(e.destination_session),senderGeneration=this.coordinatorAuthority.generation(e.sender_session);if(!generation||!senderGeneration)continue;
+      const preflightKey=JSON.stringify([e.sender_session,senderGeneration,e.destination_session,generation,plan.operatorGeneration,a.owner_session,a.owner_generation,a.epoch,plan.revision,jobId]);if(heldPreflights.has(preflightKey))continue;
       const queueId='qitem-outbox-recipient-duty-'+createHash('sha256').update(JSON.stringify([e.outbox_id,e.destination_session,generation])).digest('hex').slice(0,32);if(this.getById(queueId)||this.recipientAckDuty(queueId))continue;
       if(this.db.prepare("SELECT 1 FROM queue_items q JOIN coordinator_operations o ON o.operation_id=q.qitem_id AND o.kind='outbox-recipient-duty' WHERE q.destination_session=? AND q.state IN ('pending','in-progress','blocked')").get(e.destination_session))continue;
       let evidence;try{evidence=this.outbox.recipientAcknowledgmentContract(e.destination_session,generation,e.outbox_id);}catch{continue;}
       const r={rigId,jobId,queueId,effectId:e.outbox_id,sender:e.sender_session,senderGeneration,recipient:e.destination_session,recipientGeneration:generation,operatorGeneration:plan.operatorGeneration,holder:a.owner_session,holderGeneration:a.owner_generation,epoch:a.epoch,planRevision:plan.revision,deadline:Date.now()+1200000,contract:evidence.contract};
       const nodes=[r.sender,r.recipient,'operator-agent@kernel',r.holder].map(session=>(this.db.prepare('SELECT node_id FROM sessions WHERE session_name=? ORDER BY id DESC LIMIT 1').get(session) as {node_id:string}|undefined)?.node_id);if(nodes.some(n=>!n))continue;
-      if(!this.recipientAckProtection(r))continue;
+      if(!this.recipientAckProtection(r)){heldPreflights.add(preflightKey);continue;}
+      heldPreflights.clear(); // No remembered refusal survives an await or guarded mutation.
       try{await guard.lifecycle([...new Set(nodes as string[])],async()=>this.db.transaction(()=>{
         if(!this.recipientAckProtection(r)||this.getById(queueId)||this.outbox!.getById(WAKE_INTENT_PREFIX+queueId))return;
         if(this.db.prepare("SELECT 1 FROM queue_items q JOIN coordinator_operations o ON o.operation_id=q.qitem_id AND o.kind='outbox-recipient-duty' WHERE q.destination_session=? AND q.state IN ('pending','in-progress','blocked')").get(r.recipient)||JSON.stringify(this.outbox!.recipientAcknowledgmentContract(r.recipient,r.recipientGeneration,r.effectId).contract)!==JSON.stringify(r.contract))return;
@@ -1636,7 +1639,7 @@ export class QueueRepository {
         const input:QueueCreateInput={qitemId:queueId,sourceSession:'watchdog@system',destinationSession:r.recipient,body,expiresAt:new Date(r.deadline).toISOString(),nudge:false,identityProvenance:'system:operator-authorized-coordination'};this.recipientAckDuties.add(input);try{this.createWithinTransaction(input);}finally{this.recipientAckDuties.delete(input);}
         const noticeId=this.recordWakeIntent({outboxId:WAKE_INTENT_PREFIX+queueId,auditPointer:queueId,fromSession:'watchdog@system',toSession:r.recipient,identityProvenance:'system:operator-authorized-coordination',bareBody:body,tags:['queue:outbox-recipient-duty','queue:recipient-generation:'+r.recipientGeneration]})!;
         this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,queueId,'outbox-recipient-duty',JSON.stringify({...r,queueBodyHash:createHash('sha256').update(body).digest('hex'),noticeBodyHash:createHash('sha256').update(this.outbox!.getById(noticeId)!.body).digest('hex')}),createHash('sha256').update(JSON.stringify(r)).digest('hex'));
-      }).immediate());}catch(error){if(!['typing_guard_enabled','seat_dispatch_reserved','guard_target_changed'].includes(String((error as {code?:string}).code)))throw error;}
+      }).immediate());}catch(error){if(!['typing_guard_enabled','seat_dispatch_reserved','guard_target_changed'].includes(String((error as {code?:string}).code)))throw error;}finally{heldPreflights.clear();}
     }
   }
   private async resumeAdministrativeDuties(rigId:string,jobId:string):Promise<void> {
