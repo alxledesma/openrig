@@ -89,6 +89,11 @@ describe("rig queue CLI", () => {
     process.exitCode = undefined;
   });
 
+  it("outbox-acknowledge sends fixed exact native receipt contract once and rejects identity/body additions",async()=>{
+    vi.stubEnv("OPENRIG_OCCUPANT_GENERATION","native-test-generation");const dir=fs.mkdtempSync(path.join(os.tmpdir(),"ack-cli-")),file=path.join(dir,"contract.json"),body={outboxId:"actual-direct-effect",bodySha256:"a".repeat(64),effectSnapshotSha256:"b".repeat(64),expectedState:"indeterminate",acknowledged:true,reason:"I actually read this exact report"};
+    try{fs.writeFileSync(file,JSON.stringify(body));const {deps,calls}=makeDeps({routes:{"POST /api/queue/outbox/acknowledge":{status:200,data:{receiptId:"fixed-terminal-receipt",entry:{deliveryState:"delivered"}}}}});await createProgram({queueDeps:deps}).parseAsync(["node","rig","queue","outbox-acknowledge",file,"--json"]);expect(calls.filter(c=>c.method==="POST")).toEqual([{method:"POST",path:"/api/queue/outbox/acknowledge",body}]);for(const patch of [{actor:"forged"},{body:"arbitrary"},{acknowledged:false}]){fs.writeFileSync(file,JSON.stringify({...body,...patch}));await expect(createProgram({queueDeps:deps}).parseAsync(["node","rig","queue","outbox-acknowledge",file])).rejects.toThrow("Exact six-field");}vi.stubEnv("OPENRIG_OCCUPANT_GENERATION","");await expect(createProgram({queueDeps:deps}).parseAsync(["node","rig","queue","outbox-acknowledge",file])).rejects.toThrow("Native recipient transport missing");expect(calls.filter(c=>c.method==="POST")).toHaveLength(1);}finally{fs.rmSync(dir,{recursive:true,force:true});}
+  });
+
   it("outbox-abandon-uncertain sends exact native consumer contract once and refuses caller identity fields locally",async()=>{
     vi.stubEnv("OPENRIG_OCCUPANT_GENERATION","native-test-generation");
     const dir=fs.mkdtempSync(path.join(os.tmpdir(),"abandon-cli-")),file=path.join(dir,"contract.json");const body={outboxId:"actual-effect",bodySha256:"a".repeat(64),expectedState:"indeterminate",operationId:"actual-retirement",authorizationId:"actual-claimed-auth",reason:"preserve UNKNOWN",evidenceRef:"actual-confirmations.json"};

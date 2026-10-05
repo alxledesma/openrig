@@ -1,5 +1,6 @@
 import { historicalQuarantineExists, isHistoricalQuarantined } from "./historical-effect-disposition.js";
 import type { SeatDeliveryGuard } from "./seat-delivery-guard.js";
+import { QueueTransitionLog } from "./queue-transition-log.js";
 import { EventBus } from "./event-bus.js";
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
@@ -320,6 +321,33 @@ export class OutboxHandler {
         sender:entry.senderSession,destination:entry.destinationSession,bodySha256:createHash("sha256").update(entry.body).digest("hex"),
         outcome,dispatchedAt:entry.tsDispatched});
       return outcome === "delivered" ? this.markDelivered(entry.outboxId) : outcome === "failed" ? this.markFailed(entry.outboxId) : this.markIndeterminate(entry.outboxId);
+    }).immediate();
+  }
+
+  /** Fixed native recipient receipt; terminal evidence only, no generic queue dispatch or transport. */
+  acknowledgeRecipientDelivery(actor:string,generation:string,input:{outboxId:string;bodySha256:string;effectSnapshotSha256:string;expectedState:"pending"|"indeterminate";acknowledged:true;reason:string}):{receiptId:string;entry:OutboxEntry} {
+    return this.db.transaction(()=>{
+      const hash=(v:string)=>createHash("sha256").update(v).digest("hex"),refuse=(code:string,message:string):never=>{throw new OutboxHandlerError(code,message);};
+      if(!input||Object.keys(input).sort().join(',')!=='acknowledged,bodySha256,effectSnapshotSha256,expectedState,outboxId,reason'||input.acknowledged!==true||!["pending","indeterminate"].includes(input.expectedState)||[input.outboxId,input.reason].some(v=>typeof v!=='string'||!v.trim())||[input.bodySha256,input.effectSnapshotSha256].some(v=>typeof v!=='string'||! /^[a-f0-9]{64}$/.test(v)))refuse('outbox_ack_contract_required','Exact frozen effect and explicit actual-reading acknowledgment required');
+      const node=this.db.prepare('SELECT node_id FROM sessions WHERE session_name=? ORDER BY id DESC LIMIT 1').get(actor) as {node_id:string}|undefined;
+      const tenure=node?this.db.prepare('SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1').get(node.node_id) as {generation_uuid:string}|undefined:undefined;
+      const entry=this.getById(input.outboxId);
+      if(!entry||!actor||!generation||tenure?.generation_uuid!==generation||entry.destinationSession!==actor||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||entry.guardBinding||this.isHistoricalQuarantined(entry.outboxId))refuse('outbox_ack_recipient_required','Current actual native recipient and non-executable unquarantined direct effect required');
+      const receiptId='qitem-outbox-recipient-ack-'+hash(JSON.stringify([input.outboxId,actor,generation]));
+      const requestDigest=hash(JSON.stringify({actor,generation,input:{outboxId:input.outboxId,bodySha256:input.bodySha256,effectSnapshotSha256:input.effectSnapshotSha256,expectedState:input.expectedState,acknowledged:input.acknowledged,reason:input.reason}}));
+      const saved=this.db.prepare("SELECT payload FROM events WHERE type='outbox.recipient_acknowledged' AND json_extract(payload,'$.receiptId')=? ORDER BY seq LIMIT 1").get(receiptId) as {payload:string}|undefined;
+      const receipt=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(receiptId) as Record<string,unknown>|undefined;
+      if(saved){let proof:any;try{proof=JSON.parse(saved.payload);}catch{}if(!proof||proof.requestDigest!==requestDigest||!receipt||proof.receiptSnapshotSha256!==hash(JSON.stringify(receipt))||entry!.deliveryState!=='delivered')refuse('outbox_ack_conflict','Acknowledgment replay differs from immutable saved request/receipt');return {receiptId,entry:this.reconcileRecipientDelivery({outboxId:input.outboxId,receiptId,actor,generation,reason:input.reason})};}
+      if(receipt)refuse('outbox_ack_conflict','Deterministic receipt ID already exists without internal acknowledgment provenance');
+      if(entry!.deliveryState!==input.expectedState||hash(entry!.body)!==input.bodySha256||hash(JSON.stringify(entry))!==input.effectSnapshotSha256)refuse('outbox_ack_drift','Exact effect snapshot/body/state changed; no receipt or reconciliation');
+      const ts=new Date().toISOString(),body=JSON.stringify({kind:'outbox-delivery-ack',outboxId:input.outboxId,bodySha256:input.bodySha256});
+      this.db.prepare("INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body,minting_generation_uuid,closure_reason,summary) VALUES (?,?,?,?,?,'done',?,?,'no-follow-on','Exact recipient delivery acknowledgment; terminal evidence only')").run(receiptId,ts,ts,actor,entry!.senderSession,body,generation);
+      new QueueTransitionLog(this.db).append({qitemId:receiptId,state:'done',actorSession:actor,transitionNote:'created',identityProvenance:'transport:v1',closureReason:'no-follow-on'});
+      // Existing origin/recipient/receipt checks run inside this same transaction. Any refusal rolls back the fixed receipt.
+      const result=this.reconcileRecipientDelivery({outboxId:input.outboxId,receiptId,actor,generation,reason:input.reason});
+      const fixed=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(receiptId);
+      new EventBus(this.db).persistWithinTransaction({type:'outbox.recipient_acknowledged',schemaVersion:1,outboxId:input.outboxId,receiptId,actor,generation,requestDigest,receiptSnapshotSha256:hash(JSON.stringify(fixed)),originalState:input.expectedState,bodySha256:input.bodySha256});
+      return {receiptId,entry:result};
     }).immediate();
   }
 

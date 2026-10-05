@@ -1169,6 +1169,14 @@ export function queueRoutes(): Hono {
     } catch(err) { if(err instanceof OutboxHandlerError)return c.json({error:err.code,message:err.message},409);throw err; }
   });
 
+  app.post("/outbox/acknowledge",async c=>{
+    const token=c.get("terminalBearerToken" as never) as string|null;if(!token)return c.json({error:"outbox_ack_authenticated_control_required"},503);
+    const auth=await authBearerTokenMiddleware({expectedToken:token})(c,async()=>{});if(auth)return auth;
+    const actor=transportSenderSession(c),generation=c.req.header("X-OpenRig-Occupant-Generation");if(!actor||!generation)return c.json({error:"outbox_ack_recipient_required"},403);
+    try{return c.json(getOutbox(c).acknowledgeRecipientDelivery(actor,generation,await c.req.json()));}
+    catch(err){if(err instanceof OutboxHandlerError)return c.json({error:err.code,message:err.message},409);if(err instanceof SyntaxError)return c.json({error:"invalid_json"},400);throw err;}
+  });
+
   app.post("/outbox/reconcile-delivery", async (c) => {
     const body: Record<string, unknown> = await c.req.json<Record<string, unknown>>().catch(() => ({}));
     const actor = transportSenderSession(c), generation = c.req.header("X-OpenRig-Occupant-Generation");

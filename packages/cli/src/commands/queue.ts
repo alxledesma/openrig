@@ -1278,6 +1278,16 @@ Examples:
       });
     });
 
+  cmd.command("outbox-acknowledge <contractFile>")
+    .description("Acknowledge a direct message you actually read: exact {outboxId,bodySha256,effectSnapshotSha256,expectedState,acknowledged:true,reason}; fixed terminal receipt, no send or work dispatch")
+    .option("--json","JSON output for agents")
+    .action(async(file:string,opts:{json?:boolean})=>{
+      if(!readOpenRigEnv("OPENRIG_SESSION_NAME","RIGGED_SESSION_NAME")?.trim()||!process.env.OPENRIG_OCCUPANT_GENERATION?.trim())throw new Error("Native recipient transport missing: use your genuine managed recipient session/generation; do not forge headers");
+      const contract=JSON.parse(fs.readFileSync(file,"utf8"));
+      if(!contract||Object.keys(contract).sort().join(',')!=="acknowledged,bodySha256,effectSnapshotSha256,expectedState,outboxId,reason"||contract.acknowledged!==true||!["pending","indeterminate"].includes(contract.expectedState)||["outboxId","reason"].some(k=>typeof contract[k]!=="string"||!contract[k].trim())||["bodySha256","effectSnapshotSha256"].some(k=>typeof contract[k]!=="string"||! /^[a-f0-9]{64}$/.test(contract[k])))throw new Error("Exact six-field actual-reading acknowledgment contract required; recipient identity/generation derive from native transport");
+      await withClient(getDeps(),async client=>{const res=await client.post<unknown>("/api/queue/outbox/acknowledge",contract,{headers:terminalAuthHeaders()});printResult(opts.json??false,res.data,res.status);});
+    });
+
   cmd.command("outbox-abandon-uncertain <contractFile>")
     .description("Consume your genuinely claimed finite authorization: exact {outboxId,bodySha256,expectedState,operationId,authorizationId,reason,evidenceRef}; preserves UNKNOWN, never asserts delivery")
     .option("--json", "JSON output for agents")
