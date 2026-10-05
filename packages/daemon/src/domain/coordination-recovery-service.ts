@@ -305,6 +305,9 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
    if('qitem-resilience-rollout-'+digest(rolloutKey+':'+(body.previousQueueId??'initial')).slice(0,24)!==qid)return null;
   }else if(action===CoordinationRecoveryService.SYSTEM_WAKE_HOLD){
    if(!this.validAccountableIntake(body.rigId,qid,q)&&!(typeof body.rootQueueId==='string'&&this.validAccountableIntakeChainItem(body.rigId,q,body.rootQueueId)))return null;
+  }else if(action==='reconcile-transferred-baton'){
+   if(!Number.isInteger(body.epoch)||body.epoch<1||typeof body.batonId!=='string'||!body.batonId)return null;
+   if('qitem-coordination-peer-'+digest(body.rigId+':'+body.epoch).slice(0,24)!==qid)return null;
   }else if(CoordinationRecoveryService.SYSTEM_COORDINATOR_RECOVERY_ACTIONS.includes(action)){
    // Recompute the producer's key and chain id. Native custody contains only the
    // pointer wake; it does not resolve the recovery or confer holder authority.
@@ -342,7 +345,16 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
   if(task.body.recipientGeneration!==this.systemTaskGeneration(task))return null;
   const generation=this.authority.generation(String(row.destination_session??''));
   if(!generation||!this.systemNativeCustody(id.slice('wake-intent-'.length),String(row.destination_session??''),task.body.recipientGeneration))return null;
-  if(!this.systemWakeAuthority(rigId,String(row.destination_session??''),generation,task.action))return null;
+  if(task.action==='reconcile-transferred-baton'){
+   // A native claim alone is insufficient for a baton-transfer notice. Its
+   // exact epoch must have a genuine acknowledge receipt and native done closure.
+   // Historical acknowledgment proves consumption, never current lease authority.
+   const qid=id.slice('wake-intent-'.length),q=this.repo.getById(qid);
+   const terminal=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(qid) as any;
+   if(q?.state!=='done'||terminal?.state!=='done'||terminal.actor_session!==row.destination_session||terminal.identity_provenance!=='transport:v1')return null;
+   const ack=this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind='acknowledge' AND json_valid(receipt) AND json_extract(receipt,'$.rig_id')=? AND json_extract(receipt,'$.epoch')=? AND json_extract(receipt,'$.baton_id')=? AND json_extract(receipt,'$.owner_session')=? AND json_extract(receipt,'$.owner_generation')=? AND json_extract(receipt,'$.state')='active'").get(rigId,rigId,task.body.epoch,task.body.batonId,row.destination_session,generation);
+   if(!ack||!this.plan(rigId))return null;
+  }else if(!this.systemWakeAuthority(rigId,String(row.destination_session??''),generation,task.action))return null;
   return {task,generation};
  }
  private systemTaskGeneration(task:any):string {return String(task.body.recipientGeneration??'');}
@@ -378,7 +390,7 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
    const qid=String(proof.task.rigId===rigId?row.outbox_id.slice('wake-intent-'.length):'');
    const terminal=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(qid) as any;
    const plan=this.plan(rigId);
-   const receipt={outboxId:row.outbox_id,noticeSnapshotHash:digest(JSON.stringify(row)),taskQueueId:qid,taskBodyHash:proof.task.bodyHash,action:proof.task.action,rigId,recipient:row.destination_session,recipientGeneration:proof.generation,claimTransitionId:(this.db.prepare("SELECT transition_id FROM queue_transitions WHERE qitem_id=? AND transition_note='claimed' AND actor_session=? AND identity_provenance='transport:v1' ORDER BY transition_id LIMIT 1").get(qid,row.destination_session) as any)?.transition_id??null,taskStateAtRecord:this.repo.getById(qid)!.state,...(terminal&&['done','failed','canceled'].includes(terminal.state)?{terminal:{transitionId:terminal.transition_id,state:terminal.state}}:{}),authorityBasis:{operatorGeneration:proof.generation,planRevision:plan?.revision??null},deliveryConclusion:'unknown',originalMutations:0,outcomeOnly:true,nonExecutable:true,grantsAuthority:false};
+   const receipt={outboxId:row.outbox_id,noticeSnapshotHash:digest(JSON.stringify(row)),taskQueueId:qid,taskBodyHash:proof.task.bodyHash,action:proof.task.action,rigId,recipient:row.destination_session,recipientGeneration:proof.generation,claimTransitionId:(this.db.prepare("SELECT transition_id FROM queue_transitions WHERE qitem_id=? AND transition_note='claimed' AND actor_session=? AND identity_provenance='transport:v1' ORDER BY transition_id LIMIT 1").get(qid,row.destination_session) as any)?.transition_id??null,taskStateAtRecord:this.repo.getById(qid)!.state,...(terminal&&['done','failed','canceled'].includes(terminal.state)?{terminal:{transitionId:terminal.transition_id,state:terminal.state}}:{}),authorityBasis:{...(proof.task.action==='reconcile-transferred-baton'?{acknowledgedEpoch:proof.task.body.epoch,recipientGeneration:proof.generation}:{operatorGeneration:proof.generation}),planRevision:plan?.revision??null},deliveryConclusion:'unknown',originalMutations:0,outcomeOnly:true,nonExecutable:true,grantsAuthority:false};
    this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'system-wake-outcome:'+row.outbox_id,'system-wake-outcome',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
   }
    scanned+=rows.length;from=Number((rows[rows.length-1] as any).scan_rowid);

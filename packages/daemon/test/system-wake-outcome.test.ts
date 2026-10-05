@@ -199,6 +199,29 @@ describe('system-origin administrative wake outcome convergence',()=>{
   expect(svc.noticeOutcomeContained('xv',wake)).toBe(false);
  });
 
+ it('contains completed transfer pointer custody only with exact native epoch acknowledgment, even after lease expiry',()=>{
+  configureAdminOnly();
+  repo.coordinatorAuthority.transfer('lead@xv','lead-g1',{expected:token,oldOwner:'lead@xv',recipient:'peer@xv',recipientGeneration:'peer-g1',operationId:'sw-transfer',leaseMs:60000});
+  const qid='qitem-coordination-peer-'+digest('xv:2').slice(0,24);
+  db.transaction(()=>repo.createWithinTransaction({qitemId:qid,sourceSession:'watchdog@system',destinationSession:'peer@xv',body:JSON.stringify({action:'reconcile-transferred-baton',rigId:'xv',epoch:2,batonId:'baton',deadline:clock+60000,recipientGeneration:'peer-g1'}),identityProvenance:'system:operator-authorized-coordination',nudge:false}))();
+  repo.stageWakeIntent(qid,'watchdog@system','peer@xv','system:operator-authorized-coordination',true,'peer-g1');
+  db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+qid);
+  const before=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid) as any;
+  repo.claim({qitemId:qid,destinationSession:'peer@xv',actorGeneration:'peer-g1',identityProvenance:'transport:v1'});
+  const record=()=>{(svc as any).recordSystemWakeOutcomes('xv');return svc.noticeOutcomeContained('xv',db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid));};
+  expect(record()).toBe(false);
+  repo.coordinatorAuthority.acknowledge('peer@xv',{rigId:'xv',epoch:2,generation:'peer-g1'},{operationId:'sw-peer-ack',obligationsDigest:repo.coordinatorAuthority.reconciliationDigest('xv')});
+  expect(record()).toBe(false); // ACK alone does not close the intake.
+  repo.update({qitemId:qid,actorSession:'peer@xv',actorGeneration:'peer-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+  expect(record()).toBe(true);
+  expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid)).toEqual(before);
+  db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock-1);
+  expect(record()).toBe(true); // Historical consumption, not lease renewal.
+  expect(repo.coordinatorAuthority.get('xv')!.lease_until).toBe(clock-1);
+  db.prepare("DELETE FROM coordinator_operations WHERE operation_id='sw-peer-ack'").run();
+  expect(record()).toBe(false);
+ });
+
  it('a pre-plan rollout item is recorded through the registered Operator observer path',async()=>{
   // No plan and no holder: rollout items exist precisely when a rig has neither.
   expect(svc.plan('xv')).toBeNull();
