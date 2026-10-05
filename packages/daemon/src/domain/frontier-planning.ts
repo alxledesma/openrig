@@ -16,15 +16,15 @@ import type { CoordinationPlan, CoordinationResult, CoordinationTask } from "./c
  */
 
 /** Kind-table rows. `dutyKinds` carries the binding/effect pair; the Complete
- *  and Act facets are `planPostcondition`/`admissionPostcondition` and their
- *  `*ActAllowed` counterparts below. */
+ *  and Act facets are the `*Postcondition` / `*ActAllowed` counterparts below. */
 export const PLANNING_DUTY_KIND = "frontier-planning";
 export const ADMISSION_DUTY_KIND = "frontier-admission";
+export const CONFIRMATION_DUTY_KIND = "frontier-confirmation";
 /** Reserved package keys. They are never registered products; they only give
  *  the shared duty mechanism a scope key for checkpoint dispatch restrictions. */
 export const PLANNING_DUTY_PACKAGE_KEY = "frontier-planning";
 export const ADMISSION_DUTY_PACKAGE_KEY = "frontier-admission";
-
+export const CONFIRMATION_DUTY_PACKAGE_KEY = "frontier-confirmation";
 export type WorkClass = "product"|"recovery"|"administrative"|"inquiry";
 export const WORK_CLASSES:readonly WorkClass[] = ["product","recovery","administrative","inquiry"];
 /** The existing owner boundary vocabulary plus the missing-scope boundary. */
@@ -56,16 +56,24 @@ export interface FrontierPlanReceipt {
   dutyQueueId:string; frontierDigest:string; scopeSourcesDigest:string; disposition:FrontierDisposition; actor:string; generation:string;
   proposal?:{packages:ProposedPackage[]; proposalDigest:string};
   mapping?:ScopeMapping[]; boundary?:FrontierBoundary; unblockCondition?:string;
+  /** Identifies this exact attributed disposition so a reopen can reference it. */
+  dispositionDigest?:string;
+  /** frontier-complete only: the digest the current Operator independently confirms. */
+  completionDigest?:string;
 }
 export interface FrontierAdmissionReceipt {
   dutyQueueId:string; proposalDigest:string; actor:string; generation:string;
-  admitted:Array<{packageKey:string;contractHash:string}>; declined?:{reason:string};
+  admitted:Array<{packageKey:string;contractHash:string;scopeCitations:ScopeSource[]}>; declined?:{reason:string};
 }
+export interface FrontierConfirmationReceipt { dutyQueueId:string; completionDigest:string; actor:string; generation:string; evidenceRef:string }
+export interface FrontierReopenReceipt { dutyQueueId:string; dispositionDigest:string; reopenDigest:string; frontierDigest:string; actor:string; generation:string; evidenceRef:string; boundary?:FrontierBoundary }
 
+export type FrontierDutyKind = typeof PLANNING_DUTY_KIND|typeof ADMISSION_DUTY_KIND|typeof CONFIRMATION_DUTY_KIND;
 /** The whole D10 integration surface, in one structural type. Everything the
  *  planner needs from the shared service is read-only except `issueLifecycleDuty`
- *  (one kind-table row) and `admitPackage` (the existing supported Operator
- *  admission, never reached without a genuine Operator caller). */
+ *  (kind-table rows), `actAllowed` (the shared Act facet, never reimplemented
+ *  here) and `admitPackage` (the existing supported Operator admission, never
+ *  reached without a genuine Operator caller). */
 export interface FrontierPlanningSeam {
   readonly db:Database.Database;
   now():number;
@@ -73,12 +81,14 @@ export interface FrontierPlanningSeam {
   authorityRecord(rigId:string):{owner_session:string;owner_generation:string;epoch:number;state:string;lease_until:number}|null;
   plan(rigId:string):CoordinationPlan|null;
   lifecycleControlCompleted(queueId:string):boolean;
-  issueLifecycleDuty(input:{rigId:string;kind:typeof PLANNING_DUTY_KIND|typeof ADMISSION_DUTY_KIND;packageKey:string;recipient:string;recipientGeneration:string;semanticKey:string;details:Record<string,unknown>}):CoordinationResult;
+  /** The shared duty Act facet for this exact duty and claimant. D10: dutyFacts().act */
+  actAllowed(queueId:string,actor:string,generation:string):boolean;
+  issueLifecycleDuty(input:{rigId:string;kind:FrontierDutyKind;packageKey:string;recipient:string;recipientGeneration:string;semanticKey:string;details:Record<string,unknown>}):CoordinationResult;
   admittedNow(task:CoordinationTask):boolean;
   dispatchScopeHold(plan:CoordinationPlan,task:CoordinationTask):string|null;
   effectDebt(session:string):boolean;
   requiresRecovery(rigId:string,packageKey:string):boolean;
-  admitPackage(actor:string,generation:string,rigId:string,packageKey:string,contract:PackageContract&{workClass?:WorkClass}):void;
+  admitPackage(actor:string,generation:string,rigId:string,packageKey:string,contract:PackageContract&{workClass?:WorkClass;scopeCitations?:ScopeSource[]}):void;
 }
 
 const fail:(code:string,message:string)=>never=(code,message)=>{throw new CoordinatorFenceError(code,message);};
@@ -86,6 +96,7 @@ const text=(value:unknown):value is string=>typeof value==="string"&&value.trim(
 const successfulReturn=(state:string,disposition:string|null):boolean=>!!disposition&&['done','handed-off'].includes(state);
 /** Each disposition accepts exactly its own payload and nothing smuggled beside it. */
 const PAYLOAD_BY_DISPOSITION:Record<string,readonly string[]>={'plan-proposal':['proposal'],'frontier-complete':['mapping'],'frontier-blocked':['boundary','unblockCondition']};
+const SHA256=/^[0-9a-f]{64}$/;
 function canonical(value:unknown):string {
  if(Array.isArray(value))return `[${value.map(canonical).join(",")}]`;
  if(value!==null&&typeof value==="object")return `{${Object.keys(value as Record<string,unknown>).sort().map(k=>`${JSON.stringify(k)}:${canonical((value as Record<string,unknown>)[k])}`).join(",")}}`;
@@ -212,11 +223,15 @@ export class FrontierPlanning {
  }
 
  /** An accepted package key is one this rig actually admitted and accepted. */
- private acceptedPackageKeys(rigId:string):Set<string> {
-  const keys=new Set<string>();
-  for(const row of this.seam.db.prepare("SELECT a.package_key,a.queue_id,a.disposition_id FROM coordinator_assignments a WHERE a.rig_id=? AND a.disposition_id IS NOT NULL").all(rigId) as Array<{package_key:string;queue_id:string;disposition_id:string}>)
-   if(this.exactAccepted(rigId,row.queue_id,row.disposition_id))keys.add(row.package_key);
-  return keys;
+ private acceptedScopeClasses(rigId:string):Map<string,{workClass:string;scopeCitations:Array<{ref:string;digest:string}>}> {
+  const classes=new Map<string,{workClass:string;scopeCitations:Array<{ref:string;digest:string}>}>();
+  const rows=this.seam.db.prepare("SELECT a.package_key,a.queue_id,a.disposition_id,p.contract FROM coordinator_assignments a JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.disposition_id IS NOT NULL").all(rigId) as Array<{package_key:string;queue_id:string;disposition_id:string;contract:string}>;
+  for(const row of rows){
+   if(!this.exactAccepted(rigId,row.queue_id,row.disposition_id))continue;
+   const c=JSON.parse(row.contract) as PackageContract&{workClass?:string;scopeCitations?:Array<{ref:string;digest:string}>};
+   classes.set(row.package_key,{workClass:WORK_CLASSES.includes(c.workClass as WorkClass)?c.workClass as WorkClass:'legacy',scopeCitations:Array.isArray(c.scopeCitations)?c.scopeCitations:[]});
+  }
+  return classes;
  }
 
  // -------------------------------------------------------------- observation
@@ -228,47 +243,42 @@ export class FrontierPlanning {
    return receipt.kind===kind?receipt:null;
  }
 
- /** Trailing run of observations that agree with the current frontier. Any
-  *  different state, digest or epoch ends the run, so a transient gap between
-  *  acceptance and the next reconcile can never accumulate into an obligation. */
+ /** Trailing run of observations for the exact current (digest, epoch, state).
+  *  Any change to one of those three ends the run, so a transient gap between
+  *  acceptance and the next reconcile can never accumulate into an obligation.
+  *  The query is keyed, never a full-table scan. */
  private observationRun(rigId:string,frontierDigest:string,epoch:number,state:string):{observations:number;since:number} {
-   const rows=this.seam.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='frontier-observation' ORDER BY rowid").all(rigId) as Array<{receipt:string}>;
-   let observations=0,since=this.seam.now();
-   for(let i=rows.length-1;i>=0;i--){
-    let o:any;try{o=JSON.parse(rows[i]!.receipt);}catch{break;}
-    if(o.frontierDigest!==frontierDigest||o.epoch!==epoch||o.state!==state)break;
-    observations++;since=o.observedAt;
-   }
-   return {observations,since};
+  const rows=this.seam.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='frontier-observation' AND json_extract(receipt,'$.frontierDigest')=? AND json_extract(receipt,'$.epoch')=? AND json_extract(receipt,'$.state')=? ORDER BY rowid").all(rigId,frontierDigest,epoch,state) as Array<{receipt:string}>;
+  let since=this.seam.now();
+  for(let i=rows.length-1;i>=0;i--){let o:unknown;try{o=JSON.parse(rows[i]!.receipt);}catch{break;}if(o&&typeof o==='object'&&'observedAt' in o&&typeof o.observedAt==='number')since=o.observedAt;}
+  return {observations:rows.length,since};
  }
 
- /** Append-only census. A row is written when the frontier changes, and on every
-  *  EXHAUSTED observation because those carry the stabilization count and dwell.
-  *  An unchanged non-exhausted frontier writes nothing. */
+ /** Append-only census, bounded by construction. Observations are written only
+  *  until the stabilization decision for this exact (digest, epoch, state) is
+  *  durable plus one decision row, so a permanently exhausted rig stops growing. */
  private observe(snapshot:FrontierSnapshot):void {
-   const db=this.seam.db,now=this.seam.now();
-   const latest=db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='frontier-observation' ORDER BY rowid DESC LIMIT 1").get(snapshot.rigId) as {receipt:string}|undefined;
-   let prior:any=null;try{prior=latest?JSON.parse(latest.receipt):null;}catch{prior=null;}
-   const same=!!prior&&prior.frontierDigest===snapshot.frontierDigest&&prior.epoch===snapshot.epoch&&prior.state===snapshot.state;
-   if(same&&snapshot.state!=="EXHAUSTED")return;
-   if(same&&prior.observedAt===now)return;
-   const receipt={rigId:snapshot.rigId,state:snapshot.state,frontierDigest:snapshot.frontierDigest,scopeSourcesDigest:snapshot.scopeSourcesDigest,epoch:snapshot.epoch,holder:snapshot.holder,holderGeneration:snapshot.holderGeneration,observedAt:now,reason:snapshot.reason,grantsAuthority:false};
-   db.prepare("INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)").run(snapshot.rigId,'frontier-observation:'+digest(snapshot.rigId+':'+snapshot.frontierDigest+':'+snapshot.epoch+':'+snapshot.state+':'+now),'frontier-observation',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+  const db=this.seam.db,now=this.seam.now(),run=this.observationRun(snapshot.rigId,snapshot.frontierDigest,snapshot.epoch,snapshot.state);
+  const ceiling=this.stabilization(this.seam.plan(snapshot.rigId)).requiredObservations+1;
+  if(run.observations>=ceiling)return;
+  if(run.observations&&now===run.since)return;
+  const receipt={rigId:snapshot.rigId,state:snapshot.state,frontierDigest:snapshot.frontierDigest,scopeSourcesDigest:snapshot.scopeSourcesDigest,epoch:snapshot.epoch,holder:snapshot.holder,holderGeneration:snapshot.holderGeneration,observedAt:now,reason:snapshot.reason,grantsAuthority:false};
+  db.prepare("INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)").run(snapshot.rigId,'frontier-observation:'+digest(snapshot.rigId+':'+snapshot.frontierDigest+':'+snapshot.epoch+':'+snapshot.state+':'+now),'frontier-observation',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
  }
 
 
- private planningDutyResult(snapshot:FrontierSnapshot):CoordinationResult {
-   const recipient=snapshot.holder,recipientGeneration=snapshot.holderGeneration;
-   const details:Record<string,unknown>={
-    frontierDigest:snapshot.frontierDigest,scopeSources:snapshot.scopeSources,scopeSourcesDigest:snapshot.scopeSourcesDigest,
-    frontierState:snapshot.state,epoch:snapshot.epoch,grantsAuthority:false,
-    planningContract:{
-     dispositions:["plan-proposal","frontier-complete","frontier-blocked"],
-     recordOperation:"coordination-frontier-plan",
-     body:{rigId:snapshot.rigId,frontierDigest:snapshot.frontierDigest,dutyQueueId:'<this exact duty queue item ID>',disposition:'<plan-proposal|frontier-complete|frontier-blocked>',proposal:'<only for plan-proposal>',mapping:'<only for frontier-complete>',boundary:'<only for frontier-blocked>',unblockCondition:'<only for frontier-blocked>'},
-     scopeSources:snapshot.scopeSources.length?snapshot.scopeSources:[]
-    }};
-   return this.seam.issueLifecycleDuty({rigId:snapshot.rigId,kind:PLANNING_DUTY_KIND,packageKey:PLANNING_DUTY_PACKAGE_KEY,recipient,recipientGeneration,semanticKey:snapshot.frontierDigest,details});
+ private planningDutyResult(snapshot:FrontierSnapshot,reopenDigest?:string):CoordinationResult {
+  const recipient=snapshot.holder,recipientGeneration=snapshot.holderGeneration;
+  const details:Record<string,unknown>={
+   frontierDigest:snapshot.frontierDigest,scopeSources:snapshot.scopeSources,scopeSourcesDigest:snapshot.scopeSourcesDigest,
+   frontierState:snapshot.state,epoch:snapshot.epoch,grantsAuthority:false,...(reopenDigest?{reopenDigest}:{}),
+   planningContract:{
+    dispositions:["plan-proposal","frontier-complete","frontier-blocked"],
+    recordOperation:"coordination-frontier-plan",
+    body:{rigId:snapshot.rigId,frontierDigest:snapshot.frontierDigest,dutyQueueId:'<this exact duty queue item ID>',disposition:'<plan-proposal|frontier-complete|frontier-blocked>',proposal:'<only for plan-proposal>',mapping:'<only for frontier-complete>',boundary:'<only for frontier-blocked>',unblockCondition:'<only for frontier-blocked>'},
+    scopeSources:snapshot.scopeSources.length?snapshot.scopeSources:[]
+   }};
+  return this.seam.issueLifecycleDuty({rigId:snapshot.rigId,kind:PLANNING_DUTY_KIND,packageKey:PLANNING_DUTY_PACKAGE_KEY,recipient,recipientGeneration,semanticKey:reopenDigest?`${snapshot.frontierDigest}:reopen:${reopenDigest}`:snapshot.frontierDigest,details});
  }
 
  private admissionDutyResult(snapshot:FrontierSnapshot,receipt:FrontierPlanReceipt):CoordinationResult {
@@ -288,14 +298,70 @@ export class FrontierPlanning {
   if(!snapshot)return [];
   this.observe(snapshot);
   if(snapshot.state!=="EXHAUSTED")return [];
-  const disposition=this.planningDisposition(rigId,snapshot.frontierDigest);
-  if(disposition?.disposition==='frontier-complete'&&this.completeMappingValid(rigId,disposition,snapshot))return [{key:'frontier',state:'frontier-complete',queueId:disposition.dutyQueueId,reason:'complete-as-of:'+snapshot.scopeSourcesDigest,deadline:this.seam.now()}];
-  if(disposition?.disposition==='frontier-blocked')return [{key:'frontier',state:'held',queueId:disposition.dutyQueueId,reason:disposition.boundary??'frontier-blocked',deadline:this.seam.now()}];
-  if(disposition?.disposition==='plan-proposal')return this.admissionResult(snapshot,disposition);
+  const disposition=this.activeDisposition(rigId,snapshot.frontierDigest);
+  if(disposition?.disposition==='frontier-complete'){
+   const confirmed=this.confirmedCompletion(rigId,disposition);
+   if(confirmed)return [{key:'frontier',state:'frontier-complete',queueId:disposition.dutyQueueId,reason:'complete-as-of:'+snapshot.scopeSourcesDigest,deadline:this.seam.now()}];
+   return this.confirmationResult(snapshot,disposition);
+  }
+  if(disposition?.disposition==='frontier-blocked'){
+   this.recordBoundaryIntake(rigId,'blocked',disposition.dutyQueueId,disposition.boundary,disposition.unblockCondition??'genuine current Operator records the unblock fact');
+   return [{key:'frontier',state:'held',queueId:disposition.dutyQueueId,reason:disposition.boundary??'frontier-blocked',deadline:this.seam.now()}];
+  }
+  if(disposition?.disposition==='plan-proposal'){
+   const result=this.admissionResult(snapshot,disposition);
+   if(result[0]?.state==='frontier-admission-declined')this.recordBoundaryIntake(rigId,'declined',disposition.dutyQueueId,undefined,'genuine current Operator records a fresh proposal disposition');
+   return result;
+  }
   if(!snapshot.stabilization.ready)return [{key:'frontier',state:'stabilizing',reason:'frontier-stabilization-pending',deadline:this.seam.now(),activityEvidence:{frontierDigest:snapshot.frontierDigest,observations:snapshot.stabilization.observations,requiredObservations:snapshot.stabilization.requiredObservations,elapsedMs:this.seam.now()-snapshot.stabilization.since,requiredMs:snapshot.stabilization.requiredMs}}];
-  const duty=this.planningDutyResult(snapshot);
+  const duty=this.planningDutyResult(snapshot,this.reopenByDigest(rigId,snapshot.frontierDigest)?.reopenDigest);
   if(duty.state==='held'&&duty.reason==='lifecycle-duty-exhausted')return [{key:'frontier',state:'held',queueId:duty.queueId,reason:'frontier-planning-duty-exhausted',deadline:duty.deadline,activityEvidence:{accountableBoundary:'operator-agent@kernel',escalation:'frontier-planning-exhausted',frontierDigest:snapshot.frontierDigest}}];
   return [{...duty,key:'frontier'}];
+ }
+
+ /** A disposition the current Operator has already reopened is no longer terminal. */
+ private activeDisposition(rigId:string,frontierDigest:string):FrontierPlanReceipt|null {
+  const disposition=this.planningDisposition(rigId,frontierDigest);
+  if(!disposition)return null;
+  if(this.reopenByDisposition(rigId,disposition.dispositionDigest))return null;
+  if(disposition.proposal&&this.reopenByDisposition(rigId,disposition.proposal.proposalDigest))return null;
+  return disposition;
+ }
+
+ /** The Lead's completion stands only once the genuine current Operator has
+  *  independently confirmed that exact completion digest. */
+ private confirmedCompletion(rigId:string,receipt:FrontierPlanReceipt):FrontierConfirmationReceipt|null {
+  const row=this.seam.db.prepare("SELECT operation_id FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='frontier-confirmation' AND json_extract(receipt,'$.completionDigest')=? ORDER BY rowid DESC LIMIT 1").get(rigId,receipt.completionDigest) as {operation_id:string}|undefined;
+  const recorded=row?this.confirmationDisposition(rigId,row.operation_id):null;
+  return recorded&&recorded.completionDigest===receipt.completionDigest?recorded:null;
+ }
+
+ private confirmationResult(snapshot:FrontierSnapshot,receipt:FrontierPlanReceipt):CoordinationResult[] {
+  const operatorGeneration=this.seam.generation('operator-agent@kernel');
+  if(!operatorGeneration)return [{key:'frontier',state:'held',reason:'frontier-operator-absent',deadline:this.seam.now()}];
+  const duty=this.seam.issueLifecycleDuty({rigId:snapshot.rigId,kind:CONFIRMATION_DUTY_KIND,packageKey:CONFIRMATION_DUTY_PACKAGE_KEY,recipient:'operator-agent@kernel',recipientGeneration:operatorGeneration,semanticKey:receipt.completionDigest!,
+   details:{completionDigest:receipt.completionDigest,frontierDigest:receipt.frontierDigest,planningQueueId:receipt.dutyQueueId,scopeSourcesDigest:receipt.scopeSourcesDigest,mapping:receipt.mapping,grantsAuthority:false,
+    confirmationContract:{recordOperation:"coordination-frontier-confirm",body:{rigId:snapshot.rigId,completionDigest:receipt.completionDigest,dutyQueueId:'<this exact duty queue item ID>',evidenceRef:'<actual independent confirmation evidence>'}}}});
+  return [{...duty,key:'frontier'}];
+ }
+
+ private reopenByDisposition(rigId:string,dispositionDigest:string|undefined):FrontierReopenReceipt|null {
+  if(!dispositionDigest)return null;
+  const row=this.seam.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='frontier-reopen' AND json_extract(receipt,'$.dispositionDigest')=? ORDER BY rowid DESC LIMIT 1").get(rigId,dispositionDigest) as {receipt:string}|undefined;
+  if(!row)return null;try{return JSON.parse(row.receipt) as FrontierReopenReceipt;}catch{return null;}
+ }
+
+ private reopenByDigest(rigId:string,frontierDigest:string):FrontierReopenReceipt|null {
+  const row=this.seam.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='frontier-reopen' AND json_extract(receipt,'$.frontierDigest')=? ORDER BY rowid DESC LIMIT 1").get(rigId,frontierDigest) as {receipt:string}|undefined;
+  if(!row)return null;try{return JSON.parse(row.receipt) as FrontierReopenReceipt;}catch{return null;}
+ }
+
+ /** A blocked or declined disposition is never a silent permanent stall: the
+  *  accountable boundary, its recorded unblock condition and the owning Operator
+  *  are written once, durably. Routing to a queue intake stays D10's change. */
+ private recordBoundaryIntake(rigId:string,reason:'blocked'|'declined',dutyQueueId:string,boundary:FrontierBoundary|undefined,condition:string):void {
+  const receipt={rigId,reason,dutyQueueId,boundary:boundary??null,unblockCondition:condition,accountableSession:'operator-agent@kernel',grantsAuthority:false};
+  this.seam.db.prepare("INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)").run(rigId,'frontier-boundary-intake:'+dutyQueueId,'frontier-boundary-intake',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
  }
 
  /** The Lead recorded a proposal; hand it to the current Operator through the
@@ -308,10 +374,13 @@ export class FrontierPlanning {
  }
 
  /** Duties are found by their frozen digest, never by predicting the shared
-  *  mechanism's queue id: that id deliberately excludes the plan revision. */
+ /** Duties are found by their frozen digest, never by predicting the shared
+  *  mechanism's queue id. A successor duty without its own disposition never
+  *  hides the disposition recorded on an earlier duty for the same digest. */
  private planningDisposition(rigId:string,frontierDigest:string):FrontierPlanReceipt|null {
-  const row=this.seam.db.prepare("SELECT operation_id FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='frontier-planning' AND json_extract(receipt,'$.frontierDigest')=? ORDER BY rowid DESC LIMIT 1").get(rigId,frontierDigest) as {operation_id:string}|undefined;
-  return row?this.planningReceipt(rigId,row.operation_id):null;
+  const rows=this.seam.db.prepare("SELECT operation_id FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='frontier-planning' AND json_extract(receipt,'$.frontierDigest')=? ORDER BY rowid DESC").all(rigId,frontierDigest) as Array<{operation_id:string}>;
+  for(const row of rows){const receipt=this.planningReceipt(rigId,row.operation_id);if(receipt)return receipt;}
+  return null;
  }
 
  private admissionDisposition(rigId:string,queueId:string|undefined):FrontierAdmissionReceipt|null {
@@ -325,28 +394,37 @@ export class FrontierPlanning {
   if(!row)return null;try{return JSON.parse(row.receipt) as FrontierPlanReceipt;}catch{return null;}
  }
 
- /** Every frozen scope item maps to an accepted package or to an explicit
-  *  owner-attributed deferral carrying its authorization reference. */
- private completeMappingValid(rigId:string,receipt:FrontierPlanReceipt,snapshot:FrontierSnapshot):boolean {
-   const mapping=receipt.mapping;
-   if(!Array.isArray(mapping)||!mapping.length)return false;
-   const frozen=new Set(snapshot.scopeSources.map(s=>s.ref));
-   if(mapping.length!==frozen.size||new Set(mapping.map(m=>m.ref)).size!==frozen.size)return false;
-   if(mapping.some(m=>!frozen.has(m.ref)))return false;
-   const accepted=this.acceptedPackageKeys(rigId);
-   return mapping.every(m=>!!m.acceptedPackageKey&&accepted.has(m.acceptedPackageKey)||!!m.deferral&&text(m.deferral.reason)&&text(m.deferral.authorizationRef));
+ /** Every frozen scope item maps to an accepted **product** package that cites
+  *  that exact scope ref, or to an explicit owner-attributed deferral carrying
+  *  its authorization reference. Legacy or administrative accepted work can
+  *  never support a completeness finding. */
+ private completeMappingValid(rigId:string,receipt:FrontierPlanReceipt,scopeSources:ScopeSource[]):boolean {
+  const mapping=receipt.mapping;
+  if(!Array.isArray(mapping)||!mapping.length)return false;
+  const frozen=new Map(scopeSources.map(s=>[s.ref,s.digest]));
+  if(mapping.length!==frozen.size||new Set(mapping.map(m=>m.ref)).size!==frozen.size)return false;
+  if(mapping.some(m=>!frozen.has(m.ref)))return false;
+  const accepted=this.acceptedScopeClasses(rigId);
+  return mapping.every(m=>(!!m.acceptedPackageKey&&this.scopeBoundAccepted(accepted,m.acceptedPackageKey,frozen.get(m.ref)!,m.ref))||(!!m.deferral&&text(m.deferral.reason)&&text(m.deferral.authorizationRef)));
+ }
+
+ private scopeBoundAccepted(accepted:Map<string,{workClass:string;scopeCitations:Array<{ref:string;digest:string}>}>,packageKey:string,digestValue:string,ref:string):boolean {
+  const entry=accepted.get(packageKey);
+  return !!entry&&entry.workClass==='product'&&entry.scopeCitations.some(c=>c.ref===ref&&c.digest===digestValue);
  }
 
  // ------------------------------------------------------------------ facets
 
  /** Complete facet for the Lead planning duty. */
+ /** Complete facet for the Lead planning duty. Monotone: it is evaluated against
+  *  the duty's own frozen scope sources, never against the current plan, so a
+  *  recorded completion never turns incomplete under a later re-measurement. */
  planPostcondition(rigId:string,duty:any):boolean {
-   const receipt=this.planningReceipt(rigId,duty.queueId);
-   if(!receipt||receipt.frontierDigest!==duty.frontierDigest||receipt.scopeSourcesDigest!==duty.scopeSourcesDigest)return false;
-   const snapshot=this.frontier(rigId);
-   if(!snapshot)return false;
-   if(receipt.disposition==='plan-proposal')return this.proposalValid(receipt.proposal?.packages??[],duty.scopeSources??[]);
-   if(receipt.disposition==='frontier-complete')return (duty.scopeSources??[]).length>0&&this.completeMappingValid(rigId,receipt,snapshot);
+  const receipt=this.planningReceipt(rigId,duty.queueId);
+  if(!receipt||receipt.frontierDigest!==duty.frontierDigest||receipt.scopeSourcesDigest!==duty.scopeSourcesDigest)return false;
+  const scopeSources=(duty.scopeSources??[]) as ScopeSource[];
+  if(receipt.disposition==='plan-proposal')return this.proposalValid(receipt.proposal?.packages??[],scopeSources);
+  if(receipt.disposition==='frontier-complete')return scopeSources.length>0&&!!receipt.completionDigest&&this.completeMappingValid(rigId,receipt,scopeSources);
   if(receipt.disposition!=='frontier-blocked')return false;
   return FRONTIER_BOUNDARIES.includes(receipt.boundary as FrontierBoundary)&&text(receipt.unblockCondition);
  }
@@ -373,44 +451,68 @@ export class FrontierPlanning {
    const receipt=this.planningReceipt(rigId,duty.planningQueueId);
    return !!receipt&&receipt.disposition==='plan-proposal'&&receipt.proposal?.proposalDigest===duty.proposalDigest;
  }
+ /** Complete facet for the Operator confirmation duty: the Lead's exact recorded
+  *  completion, independently confirmed by the genuine current Operator. */
+ confirmationPostcondition(rigId:string,duty:any):boolean {
+  const receipt=this.confirmationDisposition(rigId,duty.queueId);
+  return !!receipt&&receipt.completionDigest===duty.completionDigest;
+ }
+
+ /** Act facet for the Operator confirmation: the cited completion is still the
+  *  disposition recorded on the planning duty this confirmation binds. */
+ confirmationActAllowed(rigId:string,duty:any):boolean {
+  const recorded=this.planningReceipt(rigId,duty.planningQueueId);
+  return recorded?.disposition==='frontier-complete'&&recorded.completionDigest===duty.completionDigest;
+ }
+
+ private confirmationDisposition(rigId:string,queueId:string):FrontierConfirmationReceipt|null {
+  const row=this.seam.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='frontier-confirmation-disposition'").get(rigId,'frontier-confirmation:'+queueId) as {receipt:string}|undefined;
+  if(!row)return null;try{return JSON.parse(row.receipt) as FrontierConfirmationReceipt;}catch{return null;}
+ }
 
  // ------------------------------------------------------------- Lead record
 
  /** The Lead's one permitted act: record exactly one typed disposition. */
  recordFrontierPlan(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;frontierDigest:string;disposition:string;proposal?:unknown;mapping?:unknown;boundary?:unknown;unblockCondition?:unknown}):FrontierPlanReceipt {
-   return this.seam.db.transaction(()=>{
-    const db=this.seam.db,duty=this.control(input.rigId,PLANNING_DUTY_KIND,input.dutyQueueId);
-    if(!duty)fail('frontier_planning_duty_required','Exact current frontier planning duty required');
-    this.dutyCustody(input.rigId,input.dutyQueueId,duty,actor,generation);
-    if(input.frontierDigest!==duty.frontierDigest)fail('frontier_digest_drift','Disposition must bind this duty\'s frozen frontier digest');
-    const scopeSources=(duty.scopeSources??[]) as ScopeSource[];
-    const present=['proposal','mapping','boundary','unblockCondition'].filter(key=>input[key as keyof typeof input]!==undefined),expected=PAYLOAD_BY_DISPOSITION[input.disposition];
-    if(!expected)fail('frontier_disposition_required','Disposition must be plan-proposal, frontier-complete or frontier-blocked');
-    if(present.length!==expected.length||expected.some(key=>!present.includes(key)))fail('frontier_disposition_conflict','Exactly the disposition payload for this disposition is required');
-    let receipt:FrontierPlanReceipt={dutyQueueId:input.dutyQueueId,frontierDigest:duty.frontierDigest,scopeSourcesDigest:duty.scopeSourcesDigest,disposition:input.disposition as FrontierDisposition,actor,generation};
-    if(input.disposition==='plan-proposal'){
-     const packages=this.typedProposal(input.proposal);
-     if(!this.proposalValid(packages,scopeSources))fail('frontier_proposal_uncited','Every candidate must cite a frozen scope ref whose digest matches');
-     receipt={...receipt,proposal:{packages,proposalDigest:digest(canonical(packages))}};
-    }else if(input.disposition==='frontier-complete'){
-     // A project cannot be declared complete against an empty scope.
-     if(!scopeSources.length)fail('frontier_scope_required','Scope sources must be configured by the genuine current Operator before completeness can be asserted');
-     const mapping=this.typedMapping(input.mapping,scopeSources);
-     const provisional={...receipt,mapping} as FrontierPlanReceipt,snapshot=this.frontier(input.rigId);
-     if(!snapshot||!this.completeMappingValid(input.rigId,provisional,snapshot))fail('frontier_mapping_incomplete','Every scope item must map to an accepted package or an authorized deferral');
-     receipt=provisional;
-    }else{
-     const boundary=input.boundary;
-     if(typeof boundary!=='string'||!FRONTIER_BOUNDARIES.includes(boundary as FrontierBoundary))fail('frontier_boundary_required','Named boundary required');
-     if(!scopeSources.length&&boundary!=='scope-source-missing')fail('frontier_scope_boundary_required','Without configured scope sources the only accountable boundary is scope-source-missing');
-     if(!text(input.unblockCondition))fail('frontier_unblock_condition_required','Unblock condition required');
-     receipt={...receipt,boundary:boundary as FrontierBoundary,unblockCondition:String(input.unblockCondition)};
-    }
-    const id='frontier-disposition:'+input.dutyQueueId,prior=db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?").get(input.rigId,id) as {receipt:string}|undefined;
-    if(prior){if(prior.receipt!==JSON.stringify(receipt))fail('frontier_disposition_conflict','Frozen planning disposition cannot change');return JSON.parse(prior.receipt) as FrontierPlanReceipt;}
-    db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-plan-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
-    return receipt;
-   }).immediate();
+  return this.seam.db.transaction(()=>{
+   const db=this.seam.db,duty=this.control(input.rigId,PLANNING_DUTY_KIND,input.dutyQueueId);
+   if(!duty)fail('frontier_planning_duty_required','Exact current frontier planning duty required');
+   const id='frontier-disposition:'+input.dutyQueueId,prior=db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?").get(input.rigId,id) as {receipt:string}|undefined;
+   const receipt=this.buildPlanReceipt(input.rigId,duty,actor,generation,input);
+   // An exact replay is idempotent: it mints nothing and extends no expired authority.
+   if(prior){if(prior.receipt!==JSON.stringify(receipt))fail('frontier_disposition_conflict','Frozen planning disposition cannot change');return JSON.parse(prior.receipt) as FrontierPlanReceipt;}
+   this.dutyCustody(input.rigId,input.dutyQueueId,duty,actor,generation);
+   if(!this.seam.actAllowed(input.dutyQueueId,actor,generation))fail('frontier_act_not_allowed','Shared duty act facet refuses this disposition');
+   db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-plan-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   return receipt;
+  }).immediate();
+ }
+
+ /** Validation only: the exact receipt this request would persist. */
+ private buildPlanReceipt(rigId:string,duty:any,actor:string,generation:string,input:{frontierDigest:string;disposition:string;proposal?:unknown;mapping?:unknown;boundary?:unknown;unblockCondition?:unknown}):FrontierPlanReceipt {
+  if(input.frontierDigest!==duty.frontierDigest)fail('frontier_digest_drift','Disposition must bind this duty\'s frozen frontier digest');
+  const scopeSources=(duty.scopeSources??[]) as ScopeSource[];
+  const present=['proposal','mapping','boundary','unblockCondition'].filter(key=>input[key as keyof typeof input]!==undefined),expected=PAYLOAD_BY_DISPOSITION[input.disposition];
+  if(!expected)fail('frontier_disposition_required','Disposition must be plan-proposal, frontier-complete or frontier-blocked');
+  if(present.length!==expected.length||expected.some(key=>!present.includes(key)))fail('frontier_disposition_conflict','Exactly the disposition payload for this disposition is required');
+  let receipt:FrontierPlanReceipt={dutyQueueId:duty.queueId,frontierDigest:duty.frontierDigest,scopeSourcesDigest:duty.scopeSourcesDigest,disposition:input.disposition as FrontierDisposition,actor,generation};
+  if(input.disposition==='plan-proposal'){
+   const packages=this.typedProposal(input.proposal);
+   if(!this.proposalValid(packages,scopeSources))fail('frontier_proposal_uncited','Every candidate must cite a frozen scope ref whose digest matches');
+   receipt={...receipt,proposal:{packages,proposalDigest:digest(canonical(packages))}};
+  }else if(input.disposition==='frontier-complete'){
+   if(!scopeSources.length)fail('frontier_scope_required','Scope sources must be configured by the genuine current Operator before completeness can be asserted');
+   const mapping=this.typedMapping(input.mapping,scopeSources);
+   receipt={...receipt,mapping,completionDigest:digest(canonical({mapping,frontierDigest:duty.frontierDigest,scopeSourcesDigest:duty.scopeSourcesDigest}))};
+   if(!this.completeMappingValid(rigId,receipt,scopeSources))fail('frontier_mapping_incomplete','Every scope item must map to an accepted scope-bound product package or an authorized deferral');
+  }else{
+   const boundary=input.boundary;
+   if(typeof boundary!=='string'||!FRONTIER_BOUNDARIES.includes(boundary as FrontierBoundary))fail('frontier_boundary_required','Named boundary required');
+   if(!scopeSources.length&&boundary!=='scope-source-missing')fail('frontier_scope_boundary_required','Without configured scope sources the only accountable boundary is scope-source-missing');
+   if(!text(input.unblockCondition))fail('frontier_unblock_condition_required','Unblock condition required');
+   receipt={...receipt,boundary:boundary as FrontierBoundary,unblockCondition:String(input.unblockCondition)};
+  }
+  return {...receipt,dispositionDigest:digest(JSON.stringify(receipt))};
  }
 
  /** Structural validation only. The runtime judges no product correctness. */
@@ -422,7 +524,8 @@ export class FrontierPlanning {
    const p=raw as Record<string,unknown>,rc=p.returnContract as {destination?:unknown;evidenceRequired?:unknown}|undefined;
    if(!text(p.packageKey)||!Array.isArray(p.citations)||!p.citations.length||!Array.isArray(p.resources)||new Set(p.resources).size!==p.resources.length||p.resources.some(r=>!text(r)))fail('frontier_proposal_invalid','Exact package key, scope citations and unique resources required');
    if(!rc||!text(rc.destination)||!Array.isArray(rc.evidenceRequired)||!rc.evidenceRequired.length||rc.evidenceRequired.some((k:unknown)=>!text(k)))fail('frontier_proposal_invalid','Exact destination and non-empty required evidence kinds required');
-   const citations=(p.citations as unknown[]).map(c=>{const s=c as Record<string,unknown>;return {ref:s?.ref,digest:s?.digest};}) as ScopeSource[];
+   if((p.citations as unknown[]).some(c=>{const s=c as Record<string,unknown>|null;return !s||!text(s.ref)||!text(s.digest)||!SHA256.test(String(s.digest));}))fail('frontier_citation_invalid','Every candidate must cite a frozen scope ref with its exact digest');
+   const citations=(p.citations as unknown[]).map(c=>{const s=c as Record<string,unknown>;return {ref:String(s.ref),digest:String(s.digest)};}) as ScopeSource[];
    return {packageKey:String(p.packageKey),citations,resources:(p.resources as unknown[]).map(String),returnContract:{destination:String(rc.destination),evidenceRequired:(rc.evidenceRequired as unknown[]).map(String)}};
   });
  }
@@ -430,9 +533,9 @@ export class FrontierPlanning {
  /** The mechanical anti-invention check: a candidate must cite at least one
   *  scope ref that is in the duty's frozen snapshot, with a matching digest. */
  private proposalValid(packages:ProposedPackage[],scopeSources:ScopeSource[]):boolean {
-   if(!packages.length)return false;
-   const frozen=new Map(scopeSources.map(s=>[s.ref,s.digest]));
-   return packages.every(p=>p.citations.length>0&&p.citations.every(c=>frozen.get(c.ref)===c.digest)&&p.resources.every(r=>text(r))&&text(p.returnContract.destination)&&p.returnContract.evidenceRequired.length>0);
+  if(!packages.length||!scopeSources.length)return false;
+  const frozen=new Map(scopeSources.map(s=>[s.ref,s.digest]));
+  return packages.every(p=>p.citations.length>0&&p.citations.every(c=>text(c.ref)&&SHA256.test(c.digest)&&frozen.get(c.ref)===c.digest)&&p.resources.every(r=>text(r))&&text(p.returnContract.destination)&&p.returnContract.evidenceRequired.length>0);
  }
 
  private typedMapping(value:unknown,scopeSources:ScopeSource[]):ScopeMapping[] {
@@ -469,46 +572,100 @@ export class FrontierPlanning {
   *  candidates through the existing supported admission, or refuses them with
   *  an attributed reason. It never invents, qualifies or dispatches work. */
  admitFrontierProposal(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;proposalDigest:string;admitted?:unknown;declined?:unknown}):FrontierAdmissionReceipt {
-   return this.seam.db.transaction(()=>{
-    const db=this.seam.db,duty=this.control(input.rigId,ADMISSION_DUTY_KIND,input.dutyQueueId);
-    if(!duty)fail('frontier_admission_duty_required','Exact current frontier admission duty required');
-    if(actor!=='operator-agent@kernel'||!generation||this.seam.generation(actor)!==generation||duty.recipient!==actor||duty.recipientGeneration!==generation)fail('frontier_operator_required','Current genuine Operator required');
-    this.dutyCustody(input.rigId,input.dutyQueueId,duty,actor,generation);
-    if(input.proposalDigest!==duty.proposalDigest)fail('frontier_proposal_drift','Admission must bind this duty\'s frozen proposal digest');
-    const proposed=(duty.proposal??[]) as ProposedPackage[];
-    const hasAdmitted=input.admitted!==undefined,hasDeclined=input.declined!==undefined;
-    if(hasAdmitted===hasDeclined)fail('frontier_admission_required','Admit every proposed package or record one attributed refusal');
-    const id='frontier-admission:'+input.dutyQueueId;
-    if(hasDeclined){
-     const declined=input.declined as Record<string,unknown>;
-     if(!text(declined.reason))fail('frontier_declined_reason_required','Attributed refusal reason required');
-     const receipt:FrontierAdmissionReceipt={dutyQueueId:input.dutyQueueId,proposalDigest:duty.proposalDigest,actor,generation,admitted:[],declined:{reason:String(declined.reason)}};
-     const prior=db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?").get(input.rigId,id) as {receipt:string}|undefined;
-     if(prior){if(prior.receipt!==JSON.stringify(receipt))fail('frontier_admission_conflict','Frozen admission disposition cannot change');return JSON.parse(prior.receipt) as FrontierAdmissionReceipt;}
-     db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-admission-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
-     return receipt;
-    }
-    if(!Array.isArray(input.admitted))fail('frontier_admission_partial','Partial admission would silently drop cited candidates');
-    const candidates=input.admitted as unknown[];
-    if(candidates.length!==proposed.length)fail('frontier_admission_partial','Partial admission would silently drop cited candidates');
-    const byKey=new Map(proposed.map(p=>[p.packageKey,p]));
-    const admitted=candidates.map(raw=>{
-     const a=raw as Record<string,unknown>,key=text(a.packageKey)?String(a.packageKey):'';
-     if(!byKey.has(key))fail('frontier_admission_unknown_package','Only the cited candidate packages may be admitted');
-     const c=a.contract as Record<string,unknown>|undefined;
-     if(!c)fail('frontier_admission_contract','Exact supported package contract required');
-     const rc=c.returnContract as Record<string,unknown>|undefined;
-     if(!text(c.inputDigest)||!text(c.destination)||!text(c.bodyHash)||!Array.isArray(c.resources)||new Set(c.resources).size!==c.resources.length||c.resources.some(r=>!text(r))||!rc||!text(rc.destination)||!Array.isArray(rc.evidenceRequired)||!(rc.evidenceRequired as unknown[]).length)fail('frontier_admission_contract','Exact supported package contract required');
-     if(c.workClass!==undefined&&!WORK_CLASSES.includes(c.workClass as WorkClass))fail('frontier_work_class_invalid','Work class must be product, recovery, administrative or inquiry');
-     this.seam.admitPackage(actor,generation,input.rigId,key,c as unknown as PackageContract&{workClass?:WorkClass});
-     const row=db.prepare("SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?").get(input.rigId,key) as {contract_hash:string};
-     return {packageKey:key,contractHash:row.contract_hash};
-    });
-    const receipt:FrontierAdmissionReceipt={dutyQueueId:input.dutyQueueId,proposalDigest:duty.proposalDigest,actor,generation,admitted};
-    const prior=db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?").get(input.rigId,id) as {receipt:string}|undefined;
-    if(prior){if(prior.receipt!==JSON.stringify(receipt))fail('frontier_admission_conflict','Frozen admission disposition cannot change');return JSON.parse(prior.receipt) as FrontierAdmissionReceipt;}
-    db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-admission-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
-    return receipt;
-   }).immediate();
+  return this.seam.db.transaction(()=>{
+   const db=this.seam.db,duty=this.control(input.rigId,ADMISSION_DUTY_KIND,input.dutyQueueId);
+   if(!duty)fail('frontier_admission_duty_required','Exact current frontier admission duty required');
+   if(actor!=='operator-agent@kernel'||!generation||this.seam.generation(actor)!==generation||duty.recipient!==actor||duty.recipientGeneration!==generation)fail('frontier_operator_required','Current genuine Operator required');
+   const id='frontier-admission:'+input.dutyQueueId,prior=db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?").get(input.rigId,id) as {receipt:string}|undefined;
+   const proposed=(duty.proposal??[]) as ProposedPackage[];
+   const decision=this.admissionDecision(input,proposed);
+   // An exact replay validates and returns the receipt without registering anything.
+   if(prior){const replay=this.admissionReceipt(input.rigId,duty,actor,generation,decision);if(prior.receipt!==JSON.stringify(replay))fail('frontier_admission_conflict','Frozen admission disposition cannot change');return JSON.parse(prior.receipt) as FrontierAdmissionReceipt;}
+   this.dutyCustody(input.rigId,input.dutyQueueId,duty,actor,generation);
+   if(!this.seam.actAllowed(input.dutyQueueId,actor,generation))fail('frontier_act_not_allowed','Shared duty act facet refuses this admission');
+   for(const entry of decision.admitted)this.seam.admitPackage(actor,generation,input.rigId,entry.packageKey,entry.contract as unknown as PackageContract&{workClass?:WorkClass;scopeCitations?:ScopeSource[]});
+   const receipt=this.admissionReceipt(input.rigId,duty,actor,generation,decision);
+   db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-admission-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   return receipt;
+  }).immediate();
+ }
+
+ /** Validates the Operator's decision and binds the proposal's own scope citations
+  *  into the admitted contract, so a later completeness mapping stays traceable. */
+ private admissionDecision(input:{proposalDigest:string;admitted?:unknown;declined?:unknown},proposed:ProposedPackage[]):{admitted:Array<{packageKey:string;contract:Record<string,unknown>}>;declined?:{reason:string}} {
+  const hasAdmitted=input.admitted!==undefined,hasDeclined=input.declined!==undefined;
+  if(hasAdmitted===hasDeclined)fail('frontier_admission_required','Admit every proposed package or record one attributed refusal');
+  if(hasDeclined){
+   const declined=input.declined as Record<string,unknown>;
+   if(!text(declined.reason))fail('frontier_declined_reason_required','Attributed refusal reason required');
+   return {admitted:[],declined:{reason:String(declined.reason)}};
+  }
+  if(!Array.isArray(input.admitted))fail('frontier_admission_partial','Partial admission would silently drop cited candidates');
+  const candidates=input.admitted as unknown[];
+  if(candidates.length!==proposed.length)fail('frontier_admission_partial','Partial admission would silently drop cited candidates');
+  const byKey=new Map(proposed.map(p=>[p.packageKey,p]));
+  const admitted=candidates.map(raw=>{
+   const a=raw as Record<string,unknown>,key=text(a.packageKey)?String(a.packageKey):'',candidate=byKey.get(key);
+   if(!candidate)fail('frontier_admission_unknown_package','Only the cited candidate packages may be admitted');
+   const c=a.contract as Record<string,unknown>|undefined;
+   if(!c)fail('frontier_admission_contract','Exact supported package contract required');
+   const rc=c.returnContract as Record<string,unknown>|undefined;
+   if(!text(c.inputDigest)||!text(c.destination)||!text(c.bodyHash)||!Array.isArray(c.resources)||new Set(c.resources).size!==c.resources.length||c.resources.some(r=>!text(r))||!rc||!text(rc.destination)||!Array.isArray(rc.evidenceRequired)||!(rc.evidenceRequired as unknown[]).length)fail('frontier_admission_contract','Exact supported package contract required');
+   // Reclassifying a cited product proposal as administrative would silently stop
+   // planning, so refusing the whole proposal is the attributed alternative.
+   if(c.workClass!==undefined&&c.workClass!=='product')fail('frontier_work_class_invalid','Work class must be product for a cited scope-bound product proposal');
+   const resources=(c.resources as unknown[]).map(String),returnDestination=String(rc.destination),evidenceRequired=(rc.evidenceRequired as unknown[]).map(String);
+   if(JSON.stringify(resources)!==JSON.stringify(candidate.resources)||returnDestination!==candidate.returnContract.destination||JSON.stringify(evidenceRequired)!==JSON.stringify(candidate.returnContract.evidenceRequired))fail('frontier_admission_contract_drift','Admitted resources and return contract must match the frozen proposal');
+   return {packageKey:key,contract:{...c,resources,returnContract:{...rc,destination:returnDestination,evidenceRequired},workClass:'product',scopeCitations:candidate.citations}};
+  });
+  return {admitted};
+ }
+
+ private admissionReceipt(rigId:string,duty:any,actor:string,generation:string,decision:{admitted:Array<{packageKey:string}>;declined?:{reason:string}}):FrontierAdmissionReceipt {
+  return {dutyQueueId:duty.queueId,proposalDigest:duty.proposalDigest,actor,generation,
+   admitted:decision.admitted.map(entry=>{const row=this.seam.db.prepare("SELECT contract_hash,contract FROM coordinator_packages WHERE rig_id=? AND package_key=?").get(rigId,entry.packageKey) as {contract_hash:string;contract:string}|undefined;if(!row)fail('frontier_admission_contract','Admitted candidate must be registered');const contract=JSON.parse(row.contract) as PackageContract&{scopeCitations?:ScopeSource[]};return {packageKey:entry.packageKey,contractHash:row.contract_hash,scopeCitations:contract.scopeCitations??[]};}),
+   ...(decision.declined?{declined:decision.declined}:{})};
+ }
+
+ /** The genuine current Operator independently confirms the Lead's completion.
+  *  Confirmation is a duty, never a prose note on the proposal. */
+ recordFrontierConfirmation(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;completionDigest:string;evidenceRef:string}):FrontierConfirmationReceipt {
+  return this.seam.db.transaction(()=>{
+   const db=this.seam.db,duty=this.control(input.rigId,CONFIRMATION_DUTY_KIND,input.dutyQueueId);
+   if(!duty)fail('frontier_confirmation_duty_required','Exact current frontier confirmation duty required');
+   if(actor!=='operator-agent@kernel'||!generation||this.seam.generation(actor)!==generation||duty.recipient!==actor||duty.recipientGeneration!==generation)fail('frontier_operator_required','Current genuine Operator required');
+   if(!text(input.evidenceRef))fail('frontier_confirmation_evidence_required','Attributed confirmation evidence required');
+   const id='frontier-confirmation:'+input.dutyQueueId,prior=db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?").get(input.rigId,id) as {receipt:string}|undefined;
+   if(prior){const replay={dutyQueueId:input.dutyQueueId,completionDigest:input.completionDigest,actor,generation,evidenceRef:String(input.evidenceRef)} as FrontierConfirmationReceipt;if(prior.receipt!==JSON.stringify(replay))fail('frontier_confirmation_conflict','Frozen confirmation cannot change');return JSON.parse(prior.receipt) as FrontierConfirmationReceipt;}
+   this.dutyCustody(input.rigId,input.dutyQueueId,duty,actor,generation);
+   if(!this.seam.actAllowed(input.dutyQueueId,actor,generation))fail('frontier_act_not_allowed','Shared duty act facet refuses this confirmation');
+   if(input.completionDigest!==duty.completionDigest)fail('frontier_completion_drift','Confirmation must bind this duty\'s frozen completion digest');
+   const receipt:FrontierConfirmationReceipt={dutyQueueId:input.dutyQueueId,completionDigest:input.completionDigest,actor,generation,evidenceRef:String(input.evidenceRef)};
+   db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-confirmation-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   return receipt;
+  }).immediate();
+ }
+
+ /** The genuine current Operator records that a recorded blocked, completed or
+  *  declined disposition is discharged. This is the only way planning reopens,
+  *  so a terminal state is never a silent permanent stall. */
+ recordFrontierReopen(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;dispositionDigest:string;evidenceRef:string}):FrontierReopenReceipt {
+  return this.seam.db.transaction(()=>{
+   const db=this.seam.db,duty=this.control(input.rigId,PLANNING_DUTY_KIND,input.dutyQueueId);
+   if(!duty)fail('frontier_planning_duty_required','Exact current frontier planning duty required');
+   if(actor!=='operator-agent@kernel'||!generation||this.seam.generation(actor)!==generation)fail('frontier_operator_required','Current genuine Operator required');
+   if(!text(input.evidenceRef))fail('frontier_reopen_evidence_required','Attributed unblock evidence required');
+   const recorded=this.planningReceipt(input.rigId,input.dutyQueueId);
+   if(!recorded||(recorded.dispositionDigest!==input.dispositionDigest&&recorded.proposal?.proposalDigest!==input.dispositionDigest))fail('frontier_disposition_unknown','Reopen must reference the exact recorded blocked, completed or declined disposition');
+   const receipt:FrontierReopenReceipt={dutyQueueId:input.dutyQueueId,dispositionDigest:input.dispositionDigest,reopenDigest:digest(JSON.stringify({dispositionDigest:input.dispositionDigest,evidenceRef:String(input.evidenceRef)})),frontierDigest:duty.frontierDigest,actor,generation,evidenceRef:String(input.evidenceRef),...(recorded.boundary?{boundary:recorded.boundary}:{})};
+   const id='frontier-reopen:'+input.dutyQueueId+':'+input.dispositionDigest,prior=db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?").get(input.rigId,id) as {receipt:string}|undefined;
+   if(prior){if(prior.receipt!==JSON.stringify(receipt))fail('frontier_reopen_conflict','Frozen reopen disposition cannot change');return JSON.parse(prior.receipt) as FrontierReopenReceipt;}
+   // A reopen is an Operator-owned administrative disposition about a recorded Lead
+   // decision, so it never claims the Lead's duty. Where the referenced duty is
+   // itself Operator-owned the shared Act facet still applies unchanged.
+   if(duty.recipient===actor&&!this.seam.actAllowed(input.dutyQueueId,actor,generation))fail('frontier_act_not_allowed','Shared duty act facet refuses this reopen');
+   db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-reopen',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   return receipt;
+  }).immediate();
  }
 }

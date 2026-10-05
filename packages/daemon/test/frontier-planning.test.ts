@@ -160,7 +160,7 @@ describe('exhausted product frontier planning lifecycle',()=>{
   expect(reconcile().find(r=>r.key==='frontier')).toBeUndefined();
   repo.claim({qitemId:materialize.queueId!,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});
   const next=task('next-frontier','builder@xv'),backup=task('next-frontier-repair','architect@xv',{recoveryFor:'next-frontier'});
-  for(const t of [next,backup])repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{...contractFor(t.key),destination:t.owner,bodyHash:digest(t.body),inputDigest:digest(t.key)});
+  for(const t of [backup])repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{...contractFor(t.key),destination:t.owner,bodyHash:digest(t.body),inputDigest:digest(t.key)});
   // The genuine Operator refreshes the retained task's current admission for the successor revision.
   const retained=svc.plan('xv')!.tasks.map(t=>({...t,admission:{...t.admission,validUntil:clock+600000}}));
   svc.configure('operator-agent@kernel','operator-agent-g1',{...first,revision:'materialized-r2',tasks:[...retained,next,backup]});
@@ -180,10 +180,16 @@ describe('exhausted product frontier planning lifecycle',()=>{
   const duty=stabilize(['stabilizing']),body=dutyPacket(duty.queueId!),input={rigId:'xv',dutyQueueId:duty.queueId!,frontierDigest:body.frontierDigest as string};
   repo.claim({qitemId:duty.queueId!,destinationSession:'lead@xv',identityProvenance:'transport:v1'});
   expect(()=>svc.recordFrontierPlan('lead@xv','lead-g1',{...input,disposition:'frontier-complete',mapping:[{ref:BRIEF.ref},{ref:ROADMAP.ref}]})).toThrow('Map to exactly one');
-  expect(()=>svc.recordFrontierPlan('lead@xv','lead-g1',{...input,disposition:'frontier-complete',mapping:[{ref:BRIEF.ref,acceptedPackageKey:'never-admitted'},{ref:ROADMAP.ref,deferral:{reason:'later',authorizationRef:'owner/x'}}]})).toThrow('accepted package or an authorized deferral');
+  expect(()=>svc.recordFrontierPlan('lead@xv','lead-g1',{...input,disposition:'frontier-complete',mapping:[{ref:BRIEF.ref,acceptedPackageKey:'never-admitted'},{ref:ROADMAP.ref,deferral:{reason:'later',authorizationRef:'owner/x'}}]})).toThrow('authorized deferral');
   expect(()=>svc.recordFrontierPlan('lead@xv','lead-g1',{...input,disposition:'frontier-complete',mapping:[{ref:ROADMAP.ref,deferral:{reason:'later',authorizationRef:'owner/x'}}]})).toThrow('exactly one mapping');
-  const receipt=svc.recordFrontierPlan('lead@xv','lead-g1',{...input,disposition:'frontier-complete',mapping:[{ref:BRIEF.ref,acceptedPackageKey:'product'},{ref:ROADMAP.ref,deferral:{reason:'Deferred by the owner roadmap decision',authorizationRef:'owner/roadmap-decision-7'}}]});
+  const deferredBrief={ref:BRIEF.ref,deferral:{reason:'No admitted package carries this scope item',authorizationRef:'owner/roadmap-decision-3'}};
+  const receipt=svc.recordFrontierPlan('lead@xv','lead-g1',{...input,disposition:'frontier-complete',mapping:[deferredBrief,{ref:ROADMAP.ref,deferral:{reason:'Deferred by the owner roadmap decision',authorizationRef:'owner/roadmap-decision-7'}}]});
   expect(receipt.disposition).toBe('frontier-complete');
+  // A Lead completion is not complete until the genuine Operator confirms it.
+  const confirmation=frontierResult()!;
+  expect(confirmation).toMatchObject({state:'pending-native-frontier-confirmation'});
+  repo.claim({qitemId:confirmation.queueId!,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});
+  svc.recordFrontierConfirmation('operator-agent@kernel','operator-agent-g1',{rigId:'xv',dutyQueueId:confirmation.queueId!,completionDigest:receipt.completionDigest!,evidenceRef:'operator/frontier-review-r2'});
   expect(frontierResult()).toMatchObject({state:'frontier-complete',reason:'complete-as-of:'+receipt.scopeSourcesDigest});
   expect(planningControls()).toEqual({n:1});
   db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();

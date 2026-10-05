@@ -1,112 +1,109 @@
 # Frontier planning: exhausted authorized frontier to accountable next work
 
-## The gap this closes
-
-`centralLifecyclePass` emits a materialization duty only for packages that are **already registered**
-in `coordinator_packages`. Nothing above registration observes "this rig has run out of authorized
-work", and nothing owned the decision "what does this project do next". An empty frontier was
-therefore indistinguishable from a finished project, a protected hold, or a planning lapse. This
-document and `src/domain/frontier-planning.ts` close that gap. It adds two rows to the lifecycle
-duty kind table and no second duty engine.
+`src/domain/frontier-planning.ts` closes the gap where an empty frontier was indistinguishable from a
+finished project, a protected hold, or a planning lapse. It adds three rows to the lifecycle duty kind
+table and no second duty engine.
 
 ## Lifecycle
 
 1. **Classification** (`frontier()`), a pure read of durable facts, in strict precedence:
-   `ACTIVE` (admitted work ready or in custody) > `AWAITING-ACCEPTANCE` (typed return unauthenticated,
-   or owned recovery outstanding) > `PROTECTED-HOLD` (product work held by admission expiry, effect
-   debt, quiescence, reservation or an owner boundary) > `MATERIALIZABLE` (registered, unplanned
-   product package) > `EXHAUSTED`. Only an `EXHAUSTED` frontier raises the planning obligation.
-2. **Stabilization.** `EXHAUSTED` must hold across consecutive durable `frontier-observation` rows
-   *and* past a minimum dwell, so a transient gap between acceptance and the next reconcile never
-   accumulates into an obligation. Both numbers are genuine Operator plan configuration
-   (`plan.frontierPlanning`); the built-in defaults are the review's stated floor of two observations
-   and five minutes. This is not a retry budget and not a new duty window: the duty itself reuses
-   the shared finite-duty convention unchanged.
-3. **Planning duty** (`frontier-planning`, binding `currentHolder`). The genuine current Lead claims
-   it and records exactly one typed disposition through
-   `POST /api/coordinator/coordination-frontier-plan`:
-   - `plan-proposal` — candidate packages, each citing at least one scope ref from the duty's frozen
-     snapshot with a matching digest, plus its resources and return contract.
-   - `frontier-complete` — every frozen scope item mapped to an **accepted** package or to an explicit
-     owner-attributed deferral carrying its authorization reference.
-   - `frontier-blocked` — a named accountable boundary and its unblock condition.
-   Prose, silence and an empty frontier are not completion.
+   `ACTIVE` > `AWAITING-ACCEPTANCE` > `PROTECTED-HOLD` > `MATERIALIZABLE` > `EXHAUSTED`. Only an
+   `EXHAUSTED` frontier raises the planning obligation. Dormant recovery backups are excluded using the
+   same test as `dormantRecoveryHistory`; unplanned legacy-class packages keep their existing
+   materialization duty and never support a completeness finding.
+2. **Stabilization.** `EXHAUSTED` must hold across consecutive durable `frontier-observation` rows and
+   past a minimum dwell. Both numbers are genuine Operator plan configuration (`plan.frontierPlanning`);
+   the built-in defaults are the review's stated floor. Observations are bounded: rows are written only
+   until the stabilization decision for a given `(digest, epoch, state)` is durable, so a permanently
+   exhausted rig stops growing. This is not a retry budget and not a new duty window.
+3. **Planning duty** (`frontier-planning`, binding `currentHolder`). The genuine current Lead claims it
+   and records exactly one typed disposition through `POST /api/coordinator/coordination-frontier-plan`:
+   `plan-proposal`, `frontier-complete` or `frontier-blocked`. Every citation must name a scope ref in
+   the duty's frozen snapshot with a matching sha256 digest; a malformed, empty or unknown citation is
+   refused, and an empty frozen scope admits no proposal at all. Prose, silence and an empty frontier
+   are not completion.
 4. **Operator admission duty** (`frontier-admission`, binding `currentOperator`). The proposer (Lead)
    and the admitter (Operator) differ and neither is the implementing worker. The Operator registers
-   every cited candidate through the existing supported package admission, or refuses the whole
-   proposal once with an attributed reason. Partial admission is refused.
-5. **Existing chain.** A registered, unplanned product package now matches the existing
+   every cited candidate through the existing supported package admission, or refuses the whole proposal
+   once with an attributed reason. Partial admission, a non-product work class and any divergence from
+   the frozen proposal resources or return contract are refused. The proposal's own verified scope
+   citations are bound into the admitted contract.
+5. **Operator confirmation duty** (`frontier-confirmation`, binding `currentOperator`). A
+   `frontier-complete` is Lead self-attestation until the genuine current Operator confirms that exact
+   completion digest as a duty. Every scope item must map to an **accepted product package whose contract
+   cites that exact scope ref**, or to an explicit owner-attributed deferral. Legacy and administrative
+   accepted work can never support completeness.
+6. **Reopen.** A blocked, completed or declined disposition is never a silent permanent stall. The
+   accountable boundary, its recorded unblock condition and the owning Operator are written durably once,
+   and only the genuine current Operator recording the discharged disposition reopens planning, as a
+   genuinely distinct successor duty.
+7. **Existing chain.** A registered, unplanned product package now matches the existing
    `centralLifecyclePass` unplanned loop, so the unchanged materialization duty, plan write, qualified
-   dispatch and `accept()` path carry the work forward. Nothing new is created automatically.
+   dispatch and `accept()` path carry the work forward.
 
 ## Operator contract
 
 - **Scope sources.** `plan.scopeSources: [{ref, digest}]` is set only by the genuine current Operator
-  through supported plan configuration (`POST /api/coordinator/coordination-plan`). The runtime
-  snapshots refs and digests, passes them to the Lead, and never reads or interprets their contents.
-  A prepared snapshot is not permission.
-- **Work class.** `PackageContract.workClass ∈ {product, recovery, administrative, inquiry}` is set
-  at Operator registration. Absent means a legacy contract: its frozen bytes are never rewritten, an
-  unplanned non-backup legacy package still receives its existing materialization duty, and it never
-  supports a completeness finding.
+  through supported plan configuration. The runtime snapshots refs and digests and never reads or
+  interprets their contents. A prepared snapshot is not permission.
+- **Work class.** `PackageContract.workClass` is set at Operator registration. Absent means a legacy
+  contract whose frozen bytes are never rewritten and which never supports a completeness finding.
+- **Scope citations.** `PackageContract.scopeCitations` is bound at admission from the cited proposal.
+  Absent means a package that can never support a completeness mapping.
 - **Stabilization.** `plan.frontierPlanning = {stabilizationObservations, stabilizationMs}`.
 
 ## Invariants this preserves
 
-- No package, plan task, qualification, acceptance, delivery or dispatch status is ever invented. The
-  runtime issues obligations and records receipts; the Operator admits, the Lead decides, the worker
-  executes, the Lead accepts.
+- No package, plan task, qualification, acceptance, delivery or dispatch status is ever invented.
 - **Missing scope has an accountable boundary.** With no configured `scopeSources`, `frontier-complete`
-  is refused and `scope-source-missing` is the only acceptable `frontier-blocked` boundary. A project
-  is never declared complete against an empty scope.
-- **Source drift fences stale completion.** `frontier-complete` is bound to the current
-  `frontierDigest` and `scopeSourcesDigest`. When the Operator re-measures a source, the digest moves,
-  the record is stale, and a fresh duty is issued under a new digest.
-- **Protected unknowns, quiescence, locks and immutable history are untouched.** No facet mutates an
-  outbox row, an UNKNOWN notice stays UNKNOWN and is never retried, an expired duty is never extended,
-  and accepted or dormant-backup task bytes are never rewritten.
-- A `frontier` result row is emitted by every reconcile: `stabilizing`, `pending-native-frontier-planning`,
-  `held`, `frontier-complete`, `pending-native-frontier-admission`, `frontier-admission-complete`,
-  `frontier-admission-declined` or `frontier-admission-incomplete`. Never `frontier-complete` is
-  inferred from an empty frontier alone.
+  is refused and `scope-source-missing` is the only acceptable `frontier-blocked` boundary.
+- **Source drift fences stale completion.** Completeness is bound to the current `frontierDigest` and
+  `scopeSourcesDigest`; re-measuring a source makes the record stale and issues a fresh duty.
+- **Every record path passes the shared Act facet.** `recordFrontierPlan`, `admitFrontierProposal`,
+  `recordFrontierConfirmation` and the Operator-owned reopen all consult `seam.actAllowed` in the same
+  transaction as the write, so a recorded disposition cannot outlive the authority that issued the duty.
+- **Replays are idempotent and monotone.** An exact replay returns the stored receipt before expiry is
+  considered, and the Complete facet is evaluated against the duty's own frozen scope sources.
+- Protected unknowns, quiescence, locks and immutable history are untouched. No facet mutates an outbox
+  row, an UNKNOWN notice stays UNKNOWN, an expired duty is never extended, and accepted or dormant-backup
+  task bytes are never rewritten.
 
 ## D10 integration seam
 
-All planning logic lives in `src/domain/frontier-planning.ts` behind `FrontierPlanningSeam`. The
-entire touch to the shared finite-duty mechanism is six lines in
-`src/domain/coordination-recovery-service.ts`:
+All planning logic lives behind `FrontierPlanningSeam`. The touch to the shared finite-duty mechanism:
 
 | Location | Change |
 |---|---|
-| `lifecycleDuty` parameter type | `'frontier-planning'\|'frontier-admission'` added to the kind union |
-| `lifecycleDuty` action ternary | the two new action names |
-| `lifecycleDuty` follow-up block | the two duty instruction texts |
-| `lifecycleControlCompleted` | `if(r.kind===PLANNING_DUTY_KIND) …` / `if(r.kind===ADMISSION_DUTY_KIND) …` before the recovery fallthrough |
+| `lifecycleDuty` parameter type | three frontier kinds added to the kind union |
+| `lifecycleDuty` action and instruction blocks | the three new action names and duty texts |
+| `lifecycleControlCompleted` | three explicit branches before the recovery fallthrough |
 | `validLifecycleControlFrame` | the matching Act-facet branches before the acceptance/recovery fallthrough |
-| `centralLifecyclePass` | `result.push(...this.frontierPlanning().pass(rigId));` |
+| `centralLifecyclePass` | one `pass(rigId)` call |
 
-When the shared duty mechanism is replaced by its facet refactor, rebase exactly these five kinds:
+Rebase onto the facet refactor:
 
-1. `DutyKind` union gains `'frontier-planning'|'frontier-admission'`.
-2. `dutyKinds` gains
-   `{'frontier-planning':{binding:'currentHolder',effectClass:'state-changing'}, 'frontier-admission':{binding:'currentOperator',effectClass:'state-changing'}}`.
-   The shared facets then pick both kinds up automatically.
-3. `dutyPostcondition` needs explicit branches **before** its recovery-binding fallthrough:
-   `planPostcondition(rigId, r)` and `admissionPostcondition(rigId, r)`.
-4. `dutySubjectReady` needs explicit branches **before** its acceptance/recovery fallthrough:
-   `planActAllowed(rigId, r)` and `admissionActAllowed(rigId, r)`.
+1. `DutyKind` union gains `frontier-planning`, `frontier-admission`, `frontier-confirmation`.
+2. `dutyKinds` gains `{binding:'currentHolder',effectClass:'state-changing'}` for planning and
+   `{binding:'currentOperator',effectClass:'state-changing'}` for admission and confirmation.
+3. `dutyPostcondition` needs explicit branches **before** its recovery-binding fallthrough.
+4. `dutySubjectReady` needs explicit branches **before** its acceptance/recovery fallthrough.
 5. `centralLifecyclePass` gains the same single `pass(rigId)` call.
+6. `seam.actAllowed` is the one place the record paths consult the shared Act facet. Rebase it onto
+   `lifecycleControlActAllowed` / `dutyFacts().act`; never reimplement the gates inside the planner.
 
-The semantic key passed for both duties is the frozen digest (`frontierDigest` and `proposalDigest`),
-never the plan revision, so a plan revision bump cannot mint a competing duty for the same frontier.
+Both duties are keyed by a frozen digest (`frontierDigest`, `proposalDigest`, `completionDigest`), never
+by plan revision, so a revision bump cannot mint a competing duty. Duties are located by that digest in
+`coordinator_operations`, never by predicting the mechanism's queue id. Routing an exhausted or
+recipient-protected frontier duty into the shared task-hold intake stays D10's change; the frontier module
+records a durable `frontier-boundary-intake` row naming the accountable boundary instead.
 
 ## Durable rows
 
 | kind | meaning |
 |---|---|
-| `frontier-observation` | append-only census row per supervise observation |
+| `frontier-observation` | append-only census row, bounded to the stabilization decision |
 | `frontier-plan-disposition` | the Lead's one attributed typed disposition |
 | `frontier-admission-disposition` | the Operator's attributed admission or refusal |
-
-`coordinator-lifecycle-control` rows of kind `frontier-planning` / `frontier-admission` are the duties
-themselves and flow through the unchanged shared claim, send, act and close gates.
+| `frontier-confirmation-disposition` | the Operator's independent confirmation of a completion |
+| `frontier-reopen` | the Operator's attributed discharge of a blocked or declined disposition |
+| `frontier-boundary-intake` | the accountable boundary, unblock condition and owning Operator |
