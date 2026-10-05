@@ -91,6 +91,10 @@ export function readWaitingView(db: Database.Database, id: string, readActivity?
     view.nextBackstop.dueAt = base ? new Date(Date.parse(base) + delay * 1000).toISOString() : null;
     view.nextBackstop.mechanism = row.state === "pending" ? "queue-stuck-sweep:unclaimed" : "queue-stuck-sweep:pickup (activity checked at detection)";
   }
+  // Exact issued administrative controls have a finite pickup boundary; the
+  // ordinary hour-long unclaimed threshold cannot represent their deadline.
+  const admin=db.prepare("SELECT 1 FROM sqlite_master WHERE name='coordinator_operations'").get()?db.prepare("SELECT receipt FROM coordinator_operations WHERE operation_id=? AND kind='outbox-abandon-authorization'").get('outbox-abandon-authorization:'+id) as {receipt:string}|undefined:undefined;
+  if(admin&&['pending','in-progress'].includes(row.state)){const r=JSON.parse(admin.receipt),notice=db.prepare('SELECT delivery_state FROM outbox_entries WHERE outbox_id=?').get('wake-intent-outbox-abandon-notification:'+id) as {delivery_state:string}|undefined;view.deadlineAt=new Date(r.deadline).toISOString();view.nextBackstop={owner:r.operator,mechanism:'coordination:administrative-notification:'+ (notice?.delivery_state??'not-staged'),dueAt:view.deadlineAt,intervalSeconds:60,note:'Existing current Operator coordination observer owns this finite authorization; expired or uncertain notices remain held, never retried or renewed.'};}
   // Typed detector controls use the existing persisted deadline field. This is
   // an accountability backstop, never a queue expiry/implicit closure operation.
   if (row.state === "pending" && row.source_session === "watchdog@system" && row.destination_session === "operator-agent@kernel") {

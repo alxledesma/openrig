@@ -444,7 +444,7 @@ export class CoordinationRecoveryService {
      this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'coordination-intake-hold:'+digest(queueId+':'+code),'coordination-intake-hold',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
     }
    }
-   result.push(...lifecycle);
+   result.push(...lifecycle,...this.repo.observeOutboxAbandonNotifications(rigId,plan!.operatorGeneration));
    // Observation ages are diagnostics, not new work or a new reconciliation state.
    const stableResult=result.map(({activityEvidence,...state})=>state);
    const operationId=`coordination-reconcile:${digest(JSON.stringify({revision:plan!.revision,epoch:a!.epoch,result:stableResult}))}`;

@@ -702,6 +702,7 @@ export class QueueRepository {
     this.eventBus = eventBus;
     this.transitionLog = new QueueTransitionLog(db);
     this.coordinatorAuthority = new CoordinatorAuthorityService(db, eventBus, this.transitionLog);
+    this.coordinatorAuthority.outboxAbandonAuthorizationWake=(source,destination,id,proof)=>!!proof&&proof.ids?.length===1&&proof.ids[0]===WAKE_INTENT_PREFIX+'outbox-abandon-notification:'+id&&proof.body===this.outbox?.getById(proof.ids[0])?.body&&this.validOutboxAbandonAuthorizationWake(source,destination,id);
     this.wakeRepo = new QueueWakeRepository(db);
     this.validateRig = opts?.validateRig ?? (() => true);
     this.transport = opts?.transport;
@@ -1059,6 +1060,7 @@ export class QueueRepository {
         const reservation=this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(entry.destinationSession,entry.destinationSession);
         current=!reservation&&!!proof&&!!authority&&authority.state==='active'&&authority.epoch===proof.epoch&&authority.owner_session===entry.senderSession&&authority.owner_generation===proof.generation&&authority.lease_until>Date.now()&&this.coordinatorAuthority.generation(entry.senderSession)===proof.generation&&this.coordinatorAuthority.generation(entry.destinationSession)===proof.recipientGeneration;
       }
+      if(safeTags.includes('queue:outbox-abandon-authorization'))current=tagsValid&&safeTags.length===2&&this.validOutboxAbandonAuthorizationWake(entry.senderSession,entry.destinationSession,entry.auditPointer!)&&entry.outboxId===WAKE_INTENT_PREFIX+'outbox-abandon-notification:'+entry.auditPointer;
       if(safeTags.includes('queue:coordinator-lifecycle'))current=tagsValid&&safeTags.length===2&&entry.outboxId===`${WAKE_INTENT_PREFIX}${entry.auditPointer}`&&this.coordinatorAuthority.coordinationRecovery?.validLifecycleControlWake(entry.senderSession,entry.destinationSession,entry.auditPointer!)===true;
       if(safeTags.includes('queue:native-return-continuation')){const proof=safeTags[1];current=tagsValid&&safeTags.length===3&&typeof proof==='string'&&entry.outboxId===`${WAKE_INTENT_PREFIX}${proof}`&&this.coordinatorAuthority.coordinationRecovery?.validTerminalReturnContinuationWake(entry.senderSession,entry.destinationSession,proof)===true;}
       const resumePrefix = `${WAKE_INTENT_PREFIX}blocker-`;
@@ -1483,6 +1485,53 @@ export class QueueRepository {
    */
   /** Internal-only validated completion control; JSON queue requests cannot forge
    * the object-identity capability or bypass ordinary dispatch admission. */
+  private abandonmentAuthorization(authorizationId:string):{rigId:string;receipt:any}|null {
+    if(!this.coordinatorAuthority.available())return null;
+    const row=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE operation_id=? AND kind='outbox-abandon-authorization'").get('outbox-abandon-authorization:'+authorizationId) as {rig_id:string;receipt:string}|undefined;
+    return row?{rigId:row.rig_id,receipt:JSON.parse(row.receipt)}:null;
+  }
+  private currentAbandonmentAuthorization(authorizationId:string):{rigId:string;receipt:any}|null {
+    const op=this.abandonmentAuthorization(authorizationId);if(!op||!this.outbox)return null;const r=op.receipt,q=this.getById(authorizationId),effect=this.outbox.getById(r.outboxId),hash=(v:string)=>createHash('sha256').update(v).digest('hex');
+    if(!q||q.sourceSession!==r.operator||q.destinationSession!==r.sender||q.state!=='pending'||q.claimedAt||!q.expiresAt||Date.parse(q.expiresAt)!==r.deadline||r.deadline<=Date.now()||hash(q.body)!==r.bodyHash||!effect||effect.outboxId.startsWith(WAKE_INTENT_PREFIX)||effect.guardBinding||this.outbox.isHistoricalQuarantined(effect.outboxId)||hash(JSON.stringify(effect))!==r.effectSnapshotHash||r.operator!=='operator-agent@kernel'||this.coordinatorAuthority.generation(r.operator)!==r.operatorGeneration||this.coordinatorAuthority.generation(r.sender)!==r.senderGeneration||this.coordinatorAuthority.generation(r.recipient)!==r.recipientGeneration)return null;
+    const provenance=this.db.prepare('SELECT minting_generation_uuid FROM queue_items WHERE qitem_id=?').get(authorizationId) as any,creation=this.db.prepare("SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? AND transition_note='created' ORDER BY transition_id LIMIT 1").get(authorizationId) as any;
+    if(provenance?.minting_generation_uuid!==r.operatorGeneration||creation?.actor_session!==r.operator||creation.identity_provenance!=='transport:v1')return null;
+    const plan=this.coordinatorAuthority.coordinationRecovery?.plan(op.rigId),noticeId=WAKE_INTENT_PREFIX+'outbox-abandon-notification:'+authorizationId;
+    for(const session of [r.sender,r.recipient,r.operator]){
+      if(this.db.prepare("SELECT 1 FROM seat_delivery_guards WHERE (desired=1 OR effective=1) AND node_id IN (SELECT node_id FROM sessions WHERE session_name=?)").get(session)||plan?.dispatchRestrictions?.some(scope=>scope.session===session)||this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(session,session))return null;
+      const unknown=this.db.prepare("SELECT outbox_id FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session=? OR destination_session=?)").all(session,session) as Array<{outbox_id:string}>;
+      if(unknown.some(e=>e.outbox_id!==r.outboxId&&e.outbox_id!==noticeId))return null;
+    }
+    return op;
+  }
+  private stageAbandonmentNotification(authorizationId:string):{authorizationId:string;outboxId:string;deadline:number} {
+    const id='outbox-abandon-notification:'+authorizationId,saved=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE operation_id=? AND kind='outbox-abandon-notification'").get(id) as {receipt:string}|undefined;
+    if(saved)return JSON.parse(saved.receipt);
+    const op=this.currentAbandonmentAuthorization(authorizationId);if(!op)throw new CoordinatorFenceError('outbox_notification_protected','Exact unexpired pending authorization, native identities, unchanged effect and unprotected lifecycle scope required; unrelated uncertainty cannot be bypassed');
+    const r=op.receipt,outboxId=WAKE_INTENT_PREFIX+id,contract=JSON.parse(this.getById(authorizationId)!.body),body=JSON.stringify({action:'claim-exact-outbox-abandon-authorization',authorizationId,deadline:r.deadline,grantsAuthority:false,abandonContract:{outboxId:contract.outboxId,bodySha256:contract.bodySha256,expectedState:contract.expectedState,operationId:contract.operationId,authorizationId,reason:contract.reason,evidenceRef:contract.evidenceRef},required:'Under your genuine current sender identity, read and claim ONLY this exact finite administrative authorization using rig queue show/claim. Invoke the existing supported outbox/abandon-uncertain endpoint with exactly abandonContract; sender identity/generation derive from native transport. Preserve UNKNOWN delivery, original evidence, product custody and locks; after actual successful abandonment, handoff-and-complete this freshly claimed authorization to the admitted current coordinator with the actual UNKNOWN retirement receipt as the new body, using rig queue handoff-and-complete <authorizationId> --to <admitted-current-coordinator> --body-file <actual-retirement-receipt.json> --no-nudge. Preserve prior DONE confirmation obligations as immutable history; do not reopen or handoff them. This notice grants no product work, acceptance, rerun, arbitrary send, or disposition of another effect. Do not act after the finite deadline.'});
+    this.recordWakeIntent({outboxId,auditPointer:authorizationId,fromSession:r.operator,toSession:r.sender,identityProvenance:'transport:v1',bareBody:body,tags:['queue:outbox-abandon-authorization','queue:recipient-generation:'+r.senderGeneration]});
+    const effect=this.outbox!.getById(outboxId)!,receipt={authorizationId,outboxId,deadline:r.deadline,bodyHash:createHash('sha256').update(effect.body).digest('hex')};
+    this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(op.rigId,id,'outbox-abandon-notification',JSON.stringify(receipt),createHash('sha256').update(authorizationId).digest('hex'));return receipt;
+  }
+  async notifyOutboxAbandonAuthorization(actor:string,generation:string,input:{authorizationId:string},guard:SeatDeliveryGuard|undefined):Promise<{authorizationId:string;outboxId:string;deadline:number}> {
+    this.coordinatorAuthority.assertCurrentOperator(actor,generation);
+    if(!input||Object.keys(input).join(',')!=='authorizationId'||typeof input.authorizationId!=='string'||!input.authorizationId.trim())throw new CoordinatorFenceError('outbox_notification_contract_required','Only exact issued authorizationId is supported; arbitrary notification text is forbidden');
+    const op=this.abandonmentAuthorization(input.authorizationId);if(!op||op.receipt.operator!==actor||op.receipt.operatorGeneration!==generation||op.receipt.deadline<=Date.now()||!guard||guard.db!==this.db)throw new CoordinatorFenceError('outbox_notification_expired','Exact current Operator issued unexpired authorization and lifecycle guard required');
+    const r=op.receipt,sessions=[r.sender,r.recipient,r.operator],nodes=sessions.map(s=>(this.db.prepare('SELECT node_id FROM sessions WHERE session_name=? ORDER BY id DESC LIMIT 1').get(s) as {node_id:string}|undefined)?.node_id);
+    if(nodes.some(n=>!n))throw new CoordinatorFenceError('outbox_notification_generation_required','Current local native participants required');
+    const result=await guard.lifecycle(nodes as string[],async()=>this.db.transaction(()=>{this.coordinatorAuthority.assertCurrentOperator(actor,generation);if(!this.currentAbandonmentAuthorization(input.authorizationId))throw new CoordinatorFenceError('outbox_notification_protected','Current finite authorization/effect/identity and protection must still match');return this.stageAbandonmentNotification(input.authorizationId);}).immediate());
+    await this.drainPendingWakeIntents();return result;
+  }
+  validOutboxAbandonAuthorizationWake(source:string|undefined,destination:string,authorizationId:string):boolean {
+    const op=this.currentAbandonmentAuthorization(authorizationId);if(!op||source!==op.receipt.operator||destination!==op.receipt.sender)return false;
+    const saved=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE operation_id=? AND kind='outbox-abandon-notification'").get('outbox-abandon-notification:'+authorizationId) as {receipt:string}|undefined;
+    if(!saved)return false;const r=JSON.parse(saved.receipt),effect=this.outbox!.getById(r.outboxId);
+    return !!effect&&r.authorizationId===authorizationId&&r.deadline===op.receipt.deadline&&r.outboxId===WAKE_INTENT_PREFIX+'outbox-abandon-notification:'+authorizationId&&effect.senderSession===source&&effect.destinationSession===destination&&effect.auditPointer===authorizationId&&['pending','sending'].includes(effect.deliveryState)&&createHash('sha256').update(effect.body).digest('hex')===r.bodyHash;
+  }
+  observeOutboxAbandonNotifications(rigId:string,operatorGeneration:string):Array<{key:string;state:string;queueId:string;reason?:string;deadline:number}> {
+    const rows=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='outbox-abandon-authorization'").all(rigId) as Array<{receipt:string}>;
+    return rows.map(row=>{const r=JSON.parse(row.receipt),q=this.getById(r.authorizationId),notice=this.outbox?.getById(WAKE_INTENT_PREFIX+'outbox-abandon-notification:'+r.authorizationId),actual=this.db.prepare("SELECT 1 FROM events WHERE type='outbox.uncertain_abandoned' AND json_extract(payload,'$.authorizationId')=? AND json_extract(payload,'$.outboxId')=?").get(r.authorizationId,r.outboxId),expired=r.deadline<=Date.now(),state=actual?'abandoned-unknown-preserved':expired?'held':q?.state==='in-progress'?'picked-up':notice?.deliveryState==='delivered'?'delivered-awaiting-pickup':notice&&['sending','indeterminate','retained','failed','retired'].includes(notice.deliveryState)?'held':'pending-native-administrative-notification',reason=actual?undefined:expired?'administrative-authorization-expired':state==='held'?'administrative-notification-'+notice!.deliveryState:r.operatorGeneration!==operatorGeneration?'administrative-operator-changed':undefined;
+      const result={key:'outbox-abandon:'+r.authorizationId,state:reason?'held':state,queueId:r.authorizationId,...(reason?{reason}:{}),deadline:r.deadline},id='outbox-abandon-observation:'+createHash('sha256').update(JSON.stringify(result)).digest('hex');this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,id,'outbox-abandon-observation',JSON.stringify(result),id);return result;});
+  }
   /** Genuine Operator administrative issuance only; the internal capability cannot
    * be supplied by JSON queue requests or grant a product assignment. */
   async issueOutboxAbandonAuthorization(actor:string,generation:string,input:{authorizationId:string;deadline:number;contract:{kind:'outbox-abandon-authorization';outboxId:string;bodySha256:string;expectedState:'pending'|'indeterminate';operationId:string;senderGeneration:string;reason:string;evidenceRef:string}},guard:SeatDeliveryGuard|undefined):Promise<{authorizationId:string;sender:string;deadline:number}> {
@@ -1511,9 +1560,10 @@ export class QueueRepository {
       this.outboxAbandonAuthorizations.add(item);try{created=this.createWithinTransaction(item).persistedEvent;}finally{this.outboxAbandonAuthorizations.delete(item);}
       const receipt={authorizationId:input.authorizationId,outboxId:c.outboxId,bodyHash:hash(body),effectSnapshotHash:snapshotHash,deadline:input.deadline,sender:entry!.senderSession,senderGeneration:c.senderGeneration,recipient:entry!.destinationSession,recipientGeneration:nodes[1]!.generation,operator:actor,operatorGeneration:generation};
       this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,id,'outbox-abandon-authorization',JSON.stringify(receipt),requestHash);
+      this.stageAbandonmentNotification(input.authorizationId);
       return {authorizationId:input.authorizationId,sender:entry!.senderSession,deadline:input.deadline};
     }).immediate());
-    if(created)this.eventBus.notifySubscribers(created);return result;
+    if(created)this.eventBus.notifySubscribers(created);await this.drainPendingWakeIntents();return result;
   }
   createNativeTerminalReturnDuty(actor:string,generation:string,rigId:string,input:QueueCreateInput) {
     if(!input.qitemId||input.sourceSession!=='watchdog@system'||input.identityProvenance!=='system:operator-authorized-coordination'||input.expiresAt!==new Date(JSON.parse(input.body).deadline).toISOString())throw new QueueRepositoryError('invalid_terminal_return_control','Exact internal finite completion control required');

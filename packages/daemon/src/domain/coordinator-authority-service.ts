@@ -43,6 +43,7 @@ export class CoordinatorAuthorityService {
    private now: () => number = Date.now) {}
  resilienceRollout?: import('./resilience-rollout-service.js').ResilienceRolloutService;
  runtimeOutcomeAssessment?: import("./runtime-outcome-assessment.js").RuntimeOutcomeAssessment;
+ outboxAbandonAuthorizationWake?:(source:string|undefined,destination:string,authorizationId:string,proof?:{body:string;ids?:string[]})=>boolean;
  coordinationRecovery?: import("./coordination-recovery-service.js").CoordinationRecoveryService;
  private runtimeObserver?: (session:string)=>Promise<RuntimeAvailability|null>;
  private runtimeEvidence=new Map<string,RuntimeAvailability>();
@@ -545,7 +546,8 @@ export class CoordinatorAuthorityService {
    if(!q||q.source_session!==source||q.destination_session!==destination||r.worker!==destination||digest(q.body)!==r.bodyHash||!['pending','in-progress','blocked'].includes(q.state)||Date.parse(q.expires_at)!==r.expiresAt||r.expiresAt<=this.now()||r.workerGeneration!==this.generation(destination)||!original||original.disposition_id||original.claimed_by_generation_uuid!==r.workerGeneration||!a||a.state!=='active'||a.lease_until<=this.now()||a.owner_session!==r.holder||a.owner_generation!==r.holderGeneration||this.generation(r.holder)!==r.holderGeneration||r.operatorGeneration!==this.generation('operator-agent@kernel'))return false;
    this.assertRecipientDispatchScope(record.rig_id,destination,r.packageKey);return true;
  }
- assertManagedSend(source:string|undefined,destination:string,queueAssignmentId?:string):void {
+ assertManagedSend(source:string|undefined,destination:string,queueAssignmentId?:string,proof?:{body:string;ids?:string[]}):void {
+   if(queueAssignmentId&&this.outboxAbandonAuthorizationWake?.(source,destination,queueAssignmentId,proof))return;
    if(queueAssignmentId&&this.coordinationRecovery?.isLifecycleControl(queueAssignmentId)){if(this.coordinationRecovery.validLifecycleControlWake(source,destination,queueAssignmentId))return;reject('coordinator_lifecycle_wake_invalid','Exact current finite lifecycle duty proof required');}
    if(queueAssignmentId&&this.coordinationRecovery?.validTerminalReturnContinuationWake(source,destination,queueAssignmentId))return;
    if(queueAssignmentId&&this.validNativeTerminalReturnWake(source,destination,queueAssignmentId))return;
