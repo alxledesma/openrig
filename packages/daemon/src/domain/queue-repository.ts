@@ -1499,14 +1499,20 @@ export class QueueRepository {
     for(const session of [r.sender,r.recipient,r.operator]){
       if(this.db.prepare("SELECT 1 FROM seat_delivery_guards WHERE (desired=1 OR effective=1) AND node_id IN (SELECT node_id FROM sessions WHERE session_name=?)").get(session)||plan?.dispatchRestrictions?.some(scope=>scope.session===session)||this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(session,session))return null;
       const unknown=this.db.prepare("SELECT outbox_id FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session=? OR destination_session=?)").all(session,session) as Array<{outbox_id:string}>;
-      if(unknown.some(e=>e.outbox_id!==r.outboxId&&e.outbox_id!==noticeId))return null;
+      // This fixed recovery notice grants no product work. Preserve non-runnable
+      // evidence debt: indeterminate/retained cannot pass delivery CAS; direct
+      // audit pending rows are outside the executable wake selector. Quarantined
+      // pending history is excluded by both selector and CAS. Active transport
+      // still blocks: sending, or pending executable/guard-bound input. Ordinary
+      // assignment uncertainty fences are unchanged.
+      if(unknown.some(e=>{if(e.outbox_id===r.outboxId||e.outbox_id===noticeId)return false;const debt=this.outbox!.getById(e.outbox_id)!;return debt.deliveryState==='sending'||debt.deliveryState==='pending'&&(!!debt.guardBinding||debt.outboxId.startsWith(WAKE_INTENT_PREFIX)&&!this.outbox!.isHistoricalQuarantined(debt.outboxId));}))return null;
     }
     return op;
   }
   private stageAbandonmentNotification(authorizationId:string):{authorizationId:string;outboxId:string;deadline:number} {
     const id='outbox-abandon-notification:'+authorizationId,saved=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE operation_id=? AND kind='outbox-abandon-notification'").get(id) as {receipt:string}|undefined;
     if(saved)return JSON.parse(saved.receipt);
-    const op=this.currentAbandonmentAuthorization(authorizationId);if(!op)throw new CoordinatorFenceError('outbox_notification_protected','Exact unexpired pending authorization, native identities, unchanged effect and unprotected lifecycle scope required; unrelated uncertainty cannot be bypassed');
+    const op=this.currentAbandonmentAuthorization(authorizationId);if(!op)throw new CoordinatorFenceError('outbox_notification_protected','Exact unexpired pending authorization, native identities, unchanged effect and unprotected lifecycle scope required; active unrelated transport cannot be bypassed');
     const r=op.receipt,outboxId=WAKE_INTENT_PREFIX+id,contract=JSON.parse(this.getById(authorizationId)!.body),body=JSON.stringify({action:'claim-exact-outbox-abandon-authorization',authorizationId,deadline:r.deadline,grantsAuthority:false,abandonContract:{outboxId:contract.outboxId,bodySha256:contract.bodySha256,expectedState:contract.expectedState,operationId:contract.operationId,authorizationId,reason:contract.reason,evidenceRef:contract.evidenceRef},required:'Under your genuine current sender identity, read and claim ONLY this exact finite administrative authorization using rig queue show/claim. Invoke the existing supported outbox/abandon-uncertain endpoint with exactly abandonContract; sender identity/generation derive from native transport. Preserve UNKNOWN delivery, original evidence, product custody and locks; after actual successful abandonment, handoff-and-complete this freshly claimed authorization to the admitted current coordinator with the actual UNKNOWN retirement receipt as the new body, using rig queue handoff-and-complete <authorizationId> --to <admitted-current-coordinator> --body-file <actual-retirement-receipt.json> --no-nudge. Preserve prior DONE confirmation obligations as immutable history; do not reopen or handoff them. This notice grants no product work, acceptance, rerun, arbitrary send, or disposition of another effect. Do not act after the finite deadline.'});
     this.recordWakeIntent({outboxId,auditPointer:authorizationId,fromSession:r.operator,toSession:r.sender,identityProvenance:'transport:v1',bareBody:body,tags:['queue:outbox-abandon-authorization','queue:recipient-generation:'+r.senderGeneration]});
     const effect=this.outbox!.getById(outboxId)!,receipt={authorizationId,outboxId,deadline:r.deadline,bodyHash:createHash('sha256').update(effect.body).digest('hex')};
