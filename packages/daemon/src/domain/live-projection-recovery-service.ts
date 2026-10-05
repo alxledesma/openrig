@@ -93,7 +93,7 @@ export class LiveProjectionRecoveryService {
 
     const requestHash = digest({ actor, generation, input });
     try {
-      const prior = this.db.prepare("SELECT request_hash, receipt FROM coordinator_operations WHERE kind='live-projection-recovery' AND operation_id=?").get(`live-projection-recover:${input.operationId}`) as { request_hash: string; receipt: string } | undefined;
+      const prior = this.db.prepare("SELECT request_hash, receipt FROM live_projection_recovery_operations WHERE operation_id=?").get(`live-projection-recover:${input.operationId}`) as { request_hash: string; receipt: string } | undefined;
       if (prior) {
         if (prior.request_hash !== requestHash) return { ok: false, code: "live_projection_replay_conflict", message: "Operation ID already carries a different recovery payload." };
         return { ok: true, code: "already_recovered", receipt: JSON.parse(prior.receipt) };
@@ -138,7 +138,9 @@ export class LiveProjectionRecoveryService {
         if (this.fences(post)) throw new ProjectionDrift();
         const changed = this.db.prepare("UPDATE sessions SET status='running', last_seen_at=? WHERE id=? AND status='detached'").run(at, input.sessionId).changes;
         if (changed !== 1) throw new ProjectionDrift();
-        this.db.prepare("INSERT INTO coordinator_operations (rig_id,operation_id,kind,receipt,request_hash) VALUES (?,?,?,?,?)").run(pre.rigId, `live-projection-recover:${input.operationId}`, "live-projection-recovery", JSON.stringify(receipt), requestHash);
+        // Dedicated generic ledger: tied to rig/node/session only, never to
+        // coordinator-authority enrollment, so unenrolled rigs recover cleanly.
+        this.db.prepare("INSERT INTO live_projection_recovery_operations(operation_id,rig_id,node_id,session_id,request_hash,receipt,created_at) VALUES (?,?,?,?,?,?,?)").run(`live-projection-recover:${input.operationId}`, pre.rigId, pre.row.node_id, pre.row.id, requestHash, JSON.stringify(receipt), at);
         this.events.persistWithinTransaction({ type: "session.live_projection_recovered", sessionId: input.sessionId, nodeId: input.nodeId, sessionName: input.sessionName, rigId: pre.rigId, actor, actorGeneration: generation, operationId: input.operationId, at });
       }).immediate();
     } catch (error) {

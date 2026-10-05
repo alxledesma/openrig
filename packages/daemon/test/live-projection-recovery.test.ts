@@ -9,7 +9,7 @@ import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
-import { OutboxHandler } from "../src/domain/outbox-handler.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
 import { LiveProjectionRecoveryService, type LiveProjectionRecoveryInput } from "../src/domain/live-projection-recovery-service.js";
 import { seed } from "./helpers/coordinator-fixture.js";
 
@@ -36,9 +36,8 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "lpr-")); db = createDb(join(dir, "db")); seed(db);
   db.prepare("INSERT INTO self_host_identity VALUES(1,'fixture-host',?,?)").run(new Date(clock).toISOString(), new Date(clock).toISOString());
   repo = new QueueRepository(db, new EventBus(db), { resolveOccupantGeneration: s => repo.coordinatorAuthority.generation(s) });
-  repo.attachOutbox(new OutboxHandler(db));
-  await repo.create({ qitemId: "baton", sourceSession: "operator-agent@kernel", destinationSession: "lead@xv", body: "coordinate", nudge: false });
-  repo.coordinatorAuthority.enable("operator-agent@kernel", "operator-agent-g1", { rigId: "xv", batonId: "baton", owner: "lead@xv", ownerGeneration: "lead-g1", coordinators: ["lead@xv", "peer@xv"], leaseMs: 60000, operationId: "enable-1" });
+  // Deliberately NO coordinator authority enrollment and no baton: recovery
+  // must work on disposable rigs (real-schema class boundary R4).
   setupPiSeat();
 });
 afterEach(() => { db.close(); rmSync(dir, { recursive: true, force: true }); vi.useRealTimers(); });
@@ -53,12 +52,38 @@ describe("live-projection recovery", () => {
     expect(db.prepare("SELECT status FROM sessions WHERE id='lead@xv'").get()).toEqual({ status: "running" });
     expect(db.prepare("SELECT * FROM occupant_tenures WHERE node_id='lead@xv'").all()).toEqual(tenuresBefore);
     expect(db.prepare("SELECT * FROM bindings WHERE node_id='lead@xv'").get()).toEqual(bindingsBefore);
-    const receipt = db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='live-projection-recovery' AND operation_id='live-projection-recover:op-1'").get() as { receipt: string };
+    const receipt = db.prepare("SELECT receipt FROM live_projection_recovery_operations WHERE operation_id='live-projection-recover:op-1'").get() as { receipt: string };
     const parsed = JSON.parse(receipt.receipt);
     expect(parsed.preserved).toEqual({ tenureMinted: false, adopted: false, relaunched: false, inputSent: false, authorityChanged: false, custodyTouched: false });
     expect(parsed.evidence.axis).toBe("pi_native_lineage");
     expect(receipt.receipt).not.toContain("/state/pi/"); // token appears only as digest
     expect(db.prepare("SELECT 1 FROM events WHERE type='session.live_projection_recovered'").get()).toBeTruthy();
+  });
+
+  it("recovers on a rig with NO coordinator authority enrollment, touching only the dedicated ledger", async () => {
+    expect(db.prepare("SELECT COUNT(*) AS c FROM coordinator_authority").get()).toEqual({ c: 0 });
+    expect(db.prepare("SELECT COUNT(*) AS c FROM coordinator_operations").get()).toEqual({ c: 0 });
+    const r = service({ piProve: present() });
+    expect((await r.recover("operator-agent@kernel", "operator-agent-g1", input())).code).toBe("recovered");
+    expect(db.prepare("SELECT rig_id,node_id,session_id FROM live_projection_recovery_operations WHERE operation_id='live-projection-recover:op-1'").get()).toMatchObject({ rig_id: "xv", node_id: "lead@xv", session_id: "lead@xv" });
+    expect((await r.recover("operator-agent@kernel", "operator-agent-g1", input())).code).toBe("already_recovered");
+    expect((await r.recover("operator-agent@kernel", "operator-agent-g1", input({ nodeId: "peer@xv" }))).code).toBe("live_projection_replay_conflict");
+    expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE operation_id LIKE 'live-projection-recover%'").get()).toBeUndefined();
+    expect(db.prepare("SELECT COUNT(*) AS c FROM coordinator_authority").get()).toEqual({ c: 0 });
+    expect(() => db.prepare("UPDATE live_projection_recovery_operations SET receipt='{}' WHERE operation_id='live-projection-recover:op-1'").run()).toThrow(/immutable/);
+    expect(() => db.prepare("DELETE FROM live_projection_recovery_operations WHERE operation_id='live-projection-recover:op-1'").run()).toThrow(/immutable/);
+  });
+
+  it("a durable recovery receipt never blocks supported node and rig teardown", async () => {
+    const rigRepo = new RigRepository(db);
+    expect((await service({ piProve: present() }).recover("operator-agent@kernel", "operator-agent-g1", input())).code).toBe("recovered");
+    rigRepo.deleteNode("lead@xv");
+    rigRepo.deleteRig("xv");
+    expect(db.prepare("SELECT 1 FROM nodes WHERE id='lead@xv'").get()).toBeUndefined();
+    expect(db.prepare("SELECT 1 FROM rigs WHERE id='xv'").get()).toBeUndefined();
+    expect(db.prepare("SELECT operation_id,node_id,session_id FROM live_projection_recovery_operations WHERE operation_id='live-projection-recover:op-1'").get()).toMatchObject({ node_id: "lead@xv", session_id: "lead@xv" });
+    expect(() => db.prepare("UPDATE live_projection_recovery_operations SET receipt='{}' WHERE operation_id='live-projection-recover:op-1'").run()).toThrow(/immutable/);
+    expect(() => db.prepare("DELETE FROM live_projection_recovery_operations WHERE operation_id='live-projection-recover:op-1'").run()).toThrow(/immutable/);
   });
 
   it("exact replay returns the stored receipt; payload reuse under one operation ID is refused", async () => {
@@ -70,16 +95,16 @@ describe("live-projection recovery", () => {
     const diff = await r.recover("operator-agent@kernel", "operator-agent-g1", { ...input(), sessionName: "lead@xv" });
     expect(diff.code).toBe("already_recovered");
     // differing payload under the same operation id:
-    const before = db.prepare("SELECT request_hash FROM coordinator_operations WHERE operation_id='live-projection-recover:op-1'").get();
+    const before = db.prepare("SELECT request_hash FROM live_projection_recovery_operations WHERE operation_id='live-projection-recover:op-1'").get();
     expect((await r.recover("operator-agent@kernel", "operator-agent-g1", input({ nodeId: "peer@xv" }))).code).toBe("live_projection_replay_conflict");
-    expect(db.prepare("SELECT request_hash FROM coordinator_operations WHERE operation_id='live-projection-recover:op-1'").get()).toEqual(before);
+    expect(db.prepare("SELECT request_hash FROM live_projection_recovery_operations WHERE operation_id='live-projection-recover:op-1'").get()).toEqual(before);
   });
 
   it("non-current Operator identity refuses without any write", async () => {
     const out = await service({ piProve: present() }).recover("operator-agent@kernel", "bogus-generation", input());
     expect(out).toMatchObject({ ok: false, code: "operator_unauthorized" });
     expect(db.prepare("SELECT status FROM sessions WHERE id='lead@xv'").get()).toEqual({ status: "detached" });
-    expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='live-projection-recovery'").get()).toBeUndefined();
+    expect(db.prepare("SELECT 1 FROM live_projection_recovery_operations").get()).toBeUndefined();
   });
 
   it.each([
@@ -135,13 +160,21 @@ describe("live-projection recovery", () => {
     const r = service({ piProve: async () => { db.prepare("UPDATE sessions SET status='superseded' WHERE id='lead@xv'").run(); return { state: "present" as const, generation: "lead-g1", launchId: "L", fingerprint: "{}" }; } });
     expect((await r.recover("operator-agent@kernel", "operator-agent-g1", input())).code).toBe("state_changed_during_probe");
     expect(db.prepare("SELECT status FROM sessions WHERE id='lead@xv'").get()).toEqual({ status: "superseded" });
-    expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='live-projection-recovery'").get()).toBeUndefined();
+    expect(db.prepare("SELECT 1 FROM live_projection_recovery_operations").get()).toBeUndefined();
   });
 
   it("a seat delivery guard engaged during the probe aborts inside the transaction with zero writes", async () => {
     const r = service({ piProve: async () => { db.prepare("INSERT INTO seat_delivery_guards(node_id,desired,effective,actor,reason,changed_at) VALUES ('lead@xv',1,0,'watchdog@system','quiescing',?)").run(new Date(clock).toISOString()); return { state: "present" as const, generation: "lead-g1", launchId: "L", fingerprint: "{}" }; } });
     expect((await r.recover("operator-agent@kernel", "operator-agent-g1", input())).code).toBe("state_changed_during_probe");
     expect(db.prepare("SELECT status FROM sessions WHERE id='lead@xv'").get()).toEqual({ status: "detached" });
-    expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='live-projection-recovery'").get()).toBeUndefined();
+    expect(db.prepare("SELECT 1 FROM live_projection_recovery_operations").get()).toBeUndefined();
+  });
+
+  it("drift rollback leaves no ledger row even on an unenrolled rig", async () => {
+    const r = service({ piProve: async () => { db.prepare("UPDATE occupant_tenures SET generation_uuid='lead-gX' WHERE node_id='lead@xv'").run(); return { state: "present" as const, generation: "lead-g1", launchId: "L", fingerprint: "{}" }; } });
+    expect((await r.recover("operator-agent@kernel", "operator-agent-g1", input())).code).toBe("state_changed_during_probe");
+    expect(db.prepare("SELECT status FROM sessions WHERE id='lead@xv'").get()).toEqual({ status: "detached" });
+    expect(db.prepare("SELECT 1 FROM live_projection_recovery_operations").get()).toBeUndefined();
+    expect(db.prepare("SELECT 1 FROM events WHERE type='session.live_projection_recovered'").get()).toBeUndefined();
   });
 });
