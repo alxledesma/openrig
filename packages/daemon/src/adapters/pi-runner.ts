@@ -24,7 +24,7 @@ import readline from "node:readline";
 import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { spawn } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import {
   piSeatPaths, buildPiChildArgs, buildPiChildEnv, buildPendingRunnerState, parsePiRunnerState,
@@ -217,7 +217,9 @@ export function mapPiEvent(event: Record<string, unknown>): MirrorAndActivity {
     case "compaction_start":
       return { mirrorLines: ["[pi] compacting context…"], activity: { hookEvent: "active", subtype: "compaction" } };
     case "compaction_end":
-      return { mirrorLines: ["[pi] compaction done"] };
+      if (event.aborted === true) return { mirrorLines: ["[pi] compaction aborted"] };
+      if (event.errorMessage != null) return { mirrorLines: ["[pi] compaction failed"], errorNotice: errorNotice(event.errorMessage) };
+      return { mirrorLines: [event.result != null ? "[pi] compaction done" : "[pi] compaction ended without a result"] };
     case "auto_retry_start":
       return { mirrorLines: ["[pi] transient error — retrying"], activity: { hookEvent: "active", subtype: "auto_retry" } };
     case "auto_retry_end":
@@ -620,6 +622,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     sessionFile: args.sessionFile,
     forkRef: args.forkRef,
   });
+
+  const boundedCompactionExtension = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), "pi-bounded-compaction-extension.ts");
+  if (!fs.existsSync(boundedCompactionExtension)) throw new Error("Bounded Pi compaction extension missing from package");
+  childArgs.push("--extension", boundedCompactionExtension);
 
   console.log(`[pi-runner] starting pi --mode rpc (seat ${args.sessionName})`);
   console.log(`[pi-runner] send text normally; prefixes: "/followup <text>" queues after the turn, "/abort" cancels`);

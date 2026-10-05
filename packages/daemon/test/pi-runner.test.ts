@@ -398,6 +398,15 @@ describe("mapPiEvent", () => {
     expect(failed.mirrorLines[0]).toContain("FAILED");
   });
 
+  it("compaction completion distinguishes success, failure, cancellation and missing evidence", () => {
+    expect(mapPiEvent({ type: "compaction_end", result: { summary: "retained" }, aborted: false }).mirrorLines).toEqual(["[pi] compaction done"]);
+    const failed = mapPiEvent({ type: "compaction_end", errorMessage: "Context overflow recovery failed", aborted: false });
+    expect(failed.mirrorLines).toEqual(["[pi] compaction failed"]);
+    expect(failed.errorNotice).toBeDefined();
+    expect(mapPiEvent({ type: "compaction_end", aborted: true }).mirrorLines).toEqual(["[pi] compaction aborted"]);
+    expect(mapPiEvent({ type: "compaction_end" }).mirrorLines).toEqual(["[pi] compaction ended without a result"]);
+  });
+
   it("compaction and retry map to their honest states", () => {
     expect(mapPiEvent({ type: "compaction_start" }).activity).toEqual({ hookEvent: "active", subtype: "compaction" });
     expect(mapPiEvent({ type: "auto_retry_start" }).activity).toEqual({ hookEvent: "active", subtype: "auto_retry" });
