@@ -2,7 +2,7 @@ import {inspectQueueRecovery} from "../domain/queue-recovery-inspection.js";
 import { HistoricalEffectDispositionService, HistoricalEffectError } from "../domain/historical-effect-disposition.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import { CoordinatorFenceError, AssignmentReplay, type DispatchEnvelope } from "../domain/coordinator-authority-service.js";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { EventBus } from "../domain/event-bus.js";
 import type {
@@ -316,6 +316,7 @@ export function queueRoutes(): Hono {
   ): Promise<Response> {
     const repo = getRepo(c);
     const source = repo.getById(qitemId);
+    try{repo.assertAdministrativeClaimant(qitemId,body.fromSession,c.req.header("X-OpenRig-Occupant-Generation"),transportSenderSession(c as Context)===body.fromSession?"transport:v1":null);}catch(error){return errorResponse(c,error);}
     if (!source) return c.json({ error: "qitem_not_found", message: `qitem ${qitemId} not found` }, 404);
 
     // The deterministic successor identity is also the local custody key.
@@ -379,6 +380,8 @@ export function queueRoutes(): Hono {
       closed = repo.closeCrossHostHandoffSource({
         qitemId: source.qitemId,
         fromSession: body.fromSession,
+        actorGeneration: c.req.header("X-OpenRig-Occupant-Generation"),
+        identityProvenance: transportSenderSession(c as Context)===body.fromSession?"transport:v1":null,
         toSession: body.toSession,
         closureTarget: closeTarget,
         terminalState,
@@ -573,6 +576,7 @@ export function queueRoutes(): Hono {
       const item = getRepo(c).update({
         qitemId,
         actorSession,
+        actorGeneration: c.req.header("X-OpenRig-Occupant-Generation"),
         state: body.state,
         reopen: body.reopen,
         transitionNote: body.transitionNote,
@@ -652,6 +656,7 @@ export function queueRoutes(): Hono {
     try {
       const result = await getRepo(c).handoff({
         dispatch: body.dispatch,        qitemId,
+        actorGeneration: c.req.header("X-OpenRig-Occupant-Generation"),
         fromSession,
         toSession: body.toSession,
         body: body.body,
@@ -728,6 +733,7 @@ export function queueRoutes(): Hono {
     try {
       const result = await getRepo(c).handoffAndComplete({
         dispatch: body.dispatch,        qitemId,
+        actorGeneration: c.req.header("X-OpenRig-Occupant-Generation"),
         fromSession,
         toSession: body.toSession,
         body: body.body,

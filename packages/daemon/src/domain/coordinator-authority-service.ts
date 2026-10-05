@@ -43,6 +43,7 @@ export class CoordinatorAuthorityService {
    private now: () => number = Date.now) {}
  resilienceRollout?: import('./resilience-rollout-service.js').ResilienceRolloutService;
  runtimeOutcomeAssessment?: import("./runtime-outcome-assessment.js").RuntimeOutcomeAssessment;
+ resumeAdministrativeDuties?:(rigId:string,jobId:string)=>Promise<void>;
  outboxAbandonAuthorizationWake?:(source:string|undefined,destination:string,authorizationId:string,proof?:{body:string;ids?:string[]})=>boolean;
  coordinationRecovery?: import("./coordination-recovery-service.js").CoordinationRecoveryService;
  private runtimeObserver?: (session:string)=>Promise<RuntimeAvailability|null>;

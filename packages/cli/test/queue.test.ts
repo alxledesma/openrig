@@ -89,6 +89,11 @@ describe("rig queue CLI", () => {
     process.exitCode = undefined;
   });
 
+  it("outbox-abandon-uncertain sends exact native consumer contract once and refuses caller identity fields locally",async()=>{
+    const dir=fs.mkdtempSync(path.join(os.tmpdir(),"abandon-cli-")),file=path.join(dir,"contract.json");const body={outboxId:"actual-effect",bodySha256:"a".repeat(64),expectedState:"indeterminate",operationId:"actual-retirement",authorizationId:"actual-claimed-auth",reason:"preserve UNKNOWN",evidenceRef:"actual-confirmations.json"};
+    try{fs.writeFileSync(file,JSON.stringify(body));const {deps,calls}=makeDeps({routes:{"POST /api/queue/outbox/abandon-uncertain":{status:200,data:{deliveryState:"retired",deliveryConclusion:"unknown"}}}});await createProgram({queueDeps:deps}).parseAsync(["node","rig","queue","outbox-abandon-uncertain",file,"--json"]);expect(calls.filter(c=>c.method==="POST")).toEqual([{method:"POST",path:"/api/queue/outbox/abandon-uncertain",body}]);fs.writeFileSync(file,JSON.stringify({...body,actor:"forged"}));await expect(createProgram({queueDeps:deps}).parseAsync(["node","rig","queue","outbox-abandon-uncertain",file])).rejects.toThrow("Exact seven-field");expect(calls.filter(c=>c.method==="POST")).toHaveLength(1);}finally{fs.rmSync(dir,{recursive:true,force:true});}
+  });
+
   it("queue is registered on createProgram with all R1 subcommands", async () => {
     const { deps } = makeDeps();
     const program = createProgram({ queueDeps: deps });

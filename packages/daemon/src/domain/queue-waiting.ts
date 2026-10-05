@@ -94,7 +94,7 @@ export function readWaitingView(db: Database.Database, id: string, readActivity?
   // Exact issued administrative controls have a finite pickup boundary; the
   // ordinary hour-long unclaimed threshold cannot represent their deadline.
   const admin=db.prepare("SELECT 1 FROM sqlite_master WHERE name='coordinator_operations'").get()?db.prepare("SELECT receipt FROM coordinator_operations WHERE operation_id=? AND kind='outbox-abandon-authorization'").get('outbox-abandon-authorization:'+id) as {receipt:string}|undefined:undefined;
-  if(admin&&['pending','in-progress'].includes(row.state)){const r=JSON.parse(admin.receipt),notice=db.prepare('SELECT delivery_state FROM outbox_entries WHERE outbox_id=?').get('wake-intent-outbox-abandon-notification:'+id) as {delivery_state:string}|undefined;view.deadlineAt=new Date(r.deadline).toISOString();view.nextBackstop={owner:r.operator,mechanism:'coordination:administrative-notification:'+ (notice?.delivery_state??'not-staged'),dueAt:view.deadlineAt,intervalSeconds:60,note:'Existing current Operator coordination observer owns this finite authorization; expired or uncertain notices remain held, never retried or renewed.'};}
+  if(admin&&['pending','in-progress','blocked'].includes(row.state)){const r=JSON.parse(admin.receipt),saved=db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='outbox-abandon-continuation' AND json_extract(receipt,'$.authorizationId')=? ORDER BY rowid DESC LIMIT 1").get(id) as {receipt:string}|undefined,c=saved?JSON.parse(saved.receipt):null,notice=db.prepare('SELECT delivery_state FROM outbox_entries WHERE outbox_id=?').get(c?.outboxId??'wake-intent-outbox-abandon-notification:'+id) as {delivery_state:string}|undefined;view.deadlineAt=new Date(r.deadline).toISOString();view.nextBackstop={owner:r.operator,mechanism:'coordination:administrative-'+(c?.mode??'notification')+':'+(notice?.delivery_state??'not-staged'),dueAt:new Date(c?.deadline??r.deadline).toISOString(),intervalSeconds:60,note:'Registered current Operator observer owns this exact custody. Original authorization deadline is immutable; a new failure-only notice permits only native claimant failure/cancel reporting. Unknown started notices remain held and never replayed.'};}
   // Typed detector controls use the existing persisted deadline field. This is
   // an accountability backstop, never a queue expiry/implicit closure operation.
   if (row.state === "pending" && row.source_session === "watchdog@system" && row.destination_session === "operator-agent@kernel") {
@@ -110,7 +110,7 @@ export function readWaitingView(db: Database.Database, id: string, readActivity?
       }
     } catch { /* malformed control remains unknown, never gains authority */ }
   }
-  if (row.state === "blocked") {
+  if (row.state === "blocked" && !admin) {
     const hasTimers = db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'queue_transition_wakes'").get();
     const timer = hasTimers ? db.prepare(`SELECT j.job_id, j.last_evaluation_at, j.registered_at, j.interval_seconds, j.spec_yaml
       FROM queue_transition_wakes w JOIN watchdog_jobs j ON j.job_id = w.wake_ref
