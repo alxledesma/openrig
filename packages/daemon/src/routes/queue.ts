@@ -503,7 +503,7 @@ export function queueRoutes(): Hono {
     if (!identity.ok) return identity.response;
     const destinationSession = identity.session;
     try {
-      const item = getRepo(c).claim({ qitemId, destinationSession, identityProvenance: resolveRecordedProvenance(c, identity) });
+      const item = getRepo(c).claim({ qitemId, destinationSession, actorGeneration:c.req.header("X-OpenRig-Occupant-Generation"), identityProvenance: resolveRecordedProvenance(c, identity) });
       return c.json(item);
     } catch (err) {
       return errorResponse(c, err);
@@ -1167,6 +1167,12 @@ export function queueRoutes(): Hono {
         operationId:body.operationId as string,authorizationId:body.authorizationId as string,reason:body.reason as string,evidenceRef:body.evidenceRef as string,
         expectedState:body.expectedState,actor,generation},adapter?.deliveryGuard));
     } catch(err) { if(err instanceof OutboxHandlerError)return c.json({error:err.code,message:err.message},409);throw err; }
+  });
+
+  app.get("/outbox/ack-contract/:id",async c=>{
+    const token=c.get("terminalBearerToken" as never) as string|null;if(!token)return c.json({error:"outbox_ack_authenticated_control_required"},503);const auth=await authBearerTokenMiddleware({expectedToken:token})(c,async()=>{});if(auth)return auth;
+    const actor=transportSenderSession(c),generation=c.req.header("X-OpenRig-Occupant-Generation");if(!actor||!generation)return c.json({error:"outbox_ack_recipient_required"},403);
+    try{return c.json(getOutbox(c).recipientAcknowledgmentContract(actor,generation,c.req.param('id')));}catch(error){if(error instanceof OutboxHandlerError)return c.json({error:error.code,message:error.message},409);throw error;}
   });
 
   app.post("/outbox/acknowledge",async c=>{

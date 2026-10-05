@@ -324,6 +324,17 @@ export class OutboxHandler {
     }).immediate();
   }
 
+  /** Read-only current recipient evidence; displaying bytes is not testimony or execution. */
+  recipientAcknowledgmentContract(actor:string,generation:string,outboxId:string):{body:string;contract:{outboxId:string;bodySha256:string;effectSnapshotSha256:string;expectedState:"pending"|"indeterminate";acknowledged:true;reason:string}} {
+    const entry=this.getById(outboxId),hash=(v:string)=>createHash('sha256').update(v).digest('hex');
+    const node=this.db.prepare('SELECT node_id FROM sessions WHERE session_name=? ORDER BY id DESC LIMIT 1').get(actor) as {node_id:string}|undefined;
+    const current=node?this.db.prepare('SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1').get(node.node_id) as {generation_uuid:string}|undefined:undefined;
+    const attempt=this.db.prepare("SELECT payload FROM events WHERE type='outbox.direct_attempt' AND json_extract(payload,'$.outboxId')=? ORDER BY seq LIMIT 1").get(outboxId) as {payload:string}|undefined;let origin:any;try{origin=attempt?JSON.parse(attempt.payload):null;}catch{}
+    if(!entry||!generation||current?.generation_uuid!==generation||entry.destinationSession!==actor||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||entry.guardBinding||this.isHistoricalQuarantined(outboxId)||!['pending','indeterminate'].includes(entry.deliveryState)||origin?.schemaVersion!==1||origin.sender!==entry.senderSession||origin.destination!==entry.destinationSession||origin.bodySha256!==hash(entry.body)||origin.dispatchedAt!==entry.tsDispatched||origin.outcome!=='indeterminate')throw new OutboxHandlerError('outbox_ack_evidence_required','Current exact recipient and unresolved real non-executable unquarantined direct attempt required');
+    return {body:entry.body,contract:{outboxId,bodySha256:hash(entry.body),effectSnapshotSha256:hash(JSON.stringify(entry)),expectedState:entry.deliveryState as 'pending'|'indeterminate',acknowledged:true,reason:'I actually read this exact direct message; acknowledgment grants no work or acceptance authority'}};
+  }
+  onRecipientAcknowledgment?:(actor:string,generation:string,outboxId:string,receiptId:string)=>void;
+
   /** Fixed native recipient receipt; terminal evidence only, no generic queue dispatch or transport. */
   acknowledgeRecipientDelivery(actor:string,generation:string,input:{outboxId:string;bodySha256:string;effectSnapshotSha256:string;expectedState:"pending"|"indeterminate";acknowledged:true;reason:string}):{receiptId:string;entry:OutboxEntry} {
     return this.db.transaction(()=>{
@@ -347,6 +358,7 @@ export class OutboxHandler {
       const result=this.reconcileRecipientDelivery({outboxId:input.outboxId,receiptId,actor,generation,reason:input.reason});
       const fixed=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(receiptId);
       new EventBus(this.db).persistWithinTransaction({type:'outbox.recipient_acknowledged',schemaVersion:1,outboxId:input.outboxId,receiptId,actor,generation,requestDigest,receiptSnapshotSha256:hash(JSON.stringify(fixed)),originalState:input.expectedState,bodySha256:input.bodySha256});
+      this.onRecipientAcknowledgment?.(actor,generation,input.outboxId,receiptId);
       return {receiptId,entry:result};
     }).immediate();
   }
