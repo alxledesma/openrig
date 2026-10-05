@@ -1585,8 +1585,8 @@ export class QueueRepository {
       // Only the recipient receives input. Other participants' unrelated transports
       // retain their own fences; they cannot deadlock independent receipt reading.
       if(session!==r.recipient)continue;
-      const effects=this.db.prepare("SELECT outbox_id FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session=? OR destination_session=?)").all(session,session) as Array<{outbox_id:string}>;
-      for(const e of effects){if(e.outbox_id===noticeId)continue;const debt=this.outbox!.getById(e.outbox_id)!;if(debt.deliveryState==='sending'||debt.guardBinding||debt.outboxId.startsWith(WAKE_INTENT_PREFIX))return false;try{const g=this.coordinatorAuthority.generation(debt.destinationSession);if(!g)return false;this.outbox!.recipientAcknowledgmentContract(debt.destinationSession,g,debt.outboxId);}catch{return false;}}
+      const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session=? OR destination_session=?)").all(session,session) as Array<Record<string,unknown>&{outbox_id:string}>;
+      for(const e of effects){if(e.outbox_id===noticeId||this.coordinatorAuthority.isAdoptedHistoryContained(r.rigId,e))continue;const debt=this.outbox!.getById(e.outbox_id)!;if(debt.deliveryState==='sending'||debt.guardBinding||debt.outboxId.startsWith(WAKE_INTENT_PREFIX))return false;try{const g=this.coordinatorAuthority.generation(debt.destinationSession);if(!g)return false;this.outbox!.recipientAcknowledgmentContract(debt.destinationSession,g,debt.outboxId);}catch{return false;}}
     }
     return true;
   }
