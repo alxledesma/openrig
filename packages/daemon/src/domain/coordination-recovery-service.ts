@@ -162,9 +162,16 @@ export class CoordinationRecoveryService {
    }
    return excluded;
   }
+  // Qualification only refreshes exact policy metadata: it cannot replay or
+  // dispose historical effects, accept work, or authorize product dispatch.
+  // Historical pending/UNKNOWN notices remain intact; active sends still fence
+  // this bounded probe. Its own predecessor checks remain in lifecycleDuty.
+  private qualificationProbeDebtReady(recipient:string):boolean {
+   return !this.db.prepare("SELECT 1 FROM outbox_entries WHERE delivery_state='sending' AND (sender_session=? OR destination_session=?)").get(recipient,recipient);
+  }
   private lifecycleRecipientReady(rigId:string,recipient:string,packageKey:string,excludeEffect?:string|string[],administrative=false):boolean {
    const plan=this.plan(rigId),scope=plan?.dispatchRestrictions?.find(r=>r.session===recipient),excluded=administrative?[...(Array.isArray(excludeEffect)?excludeEffect:excludeEffect?[excludeEffect]:[]),...this.administrativeIntakeNotices(rigId,recipient)]:excludeEffect;
-   return !!plan&&(!scope||(scope.generation===this.authority.generation(recipient)&&scope.validUntil>this.now()&&scope.packageKeys.includes(packageKey)))&&!this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(recipient,recipient)&&(administrative?this.repo.heldHistoryAuthoringDebtReady(rigId,recipient,excluded):!this.workerEffectDebt(recipient,excludeEffect));
+   return !!plan&&!this.db.prepare("SELECT 1 FROM seat_delivery_guards WHERE (desired=1 OR effective=1) AND node_id IN (SELECT node_id FROM sessions WHERE session_name=?)").get(recipient)&&(!scope||(scope.generation===this.authority.generation(recipient)&&scope.validUntil>this.now()&&scope.packageKeys.includes(packageKey)))&&!this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(recipient,recipient)&&(administrative?this.qualificationProbeDebtReady(recipient):!this.workerEffectDebt(recipient,excludeEffect));
   }
  private stageDutyRetirement(rigId:string,parent:any,targetQueueId=parent.queueId):string|undefined {
   const target=this.repo.getById(targetQueueId);if(!target||!target.expiresAt||Date.parse(target.expiresAt)>this.now()||!['pending','in-progress','blocked'].includes(target.state))return;
@@ -544,7 +551,7 @@ private dutyProtection(rigId:string,r:any):boolean {
    const plan=this.plan(rigId),administrative=this.administrativeDuty(r.kind),excluded=[...this.dutyExcludedNotices(r),...(administrative?this.administrativeIntakeNotices(rigId,r.recipient):[])];if(!plan)return false;
   const sessions=r.kind.startsWith('held-history-')?[r.recipient,r.holder,'operator-agent@kernel']:[r.recipient];
   for(const session of new Set(sessions)){const restriction=plan.dispatchRestrictions?.find(t=>t.session===session);if(restriction&&(restriction.generation!==this.authority.generation(session)||restriction.validUntil<=this.now()||!restriction.packageKeys.includes(r.packageKey)))return false;if(this.db.prepare('SELECT 1 FROM seat_delivery_guards WHERE (desired=1 OR effective=1) AND node_id IN (SELECT node_id FROM sessions WHERE session_name=?)').get(session)||this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(session,session))return false;}
-  return r.kind.startsWith('held-history-')||this.administrativeDuty(r.kind)?this.repo.heldHistoryAuthoringDebtReady(rigId,r.recipient,excluded):!this.workerEffectDebt(r.recipient,excluded);
+  return administrative?this.qualificationProbeDebtReady(r.recipient):r.kind.startsWith('held-history-')?this.repo.heldHistoryAuthoringDebtReady(rigId,r.recipient,excluded):!this.workerEffectDebt(r.recipient,excluded);
  }
  private dutySubjectReady(rigId:string,r:any):boolean {
   if(dutyKinds[r.kind as DutyKind]?.effectClass==='report-only'){const q=this.repo.getById(r.targetQueueId);return !!q&&q.destinationSession===r.recipient&&digest(q.body)===r.targetBodyHash&&!!q.expiresAt&&Date.parse(q.expiresAt)<=this.now()&&['pending','in-progress','blocked'].includes(q.state);}

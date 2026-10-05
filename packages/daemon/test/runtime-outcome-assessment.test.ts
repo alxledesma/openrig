@@ -53,7 +53,7 @@ describe('runtime outcome enforcement',()=>{
   const id=r.stagePolicyBoundary('xv')!;expect(r.stagePolicyBoundary('xv')).toBe(id);const q=repo.getById(id)!;expect(q.destinationSession).toBe('operator-agent@kernel');expect(JSON.parse(q.body)).toMatchObject({action:'refresh-exact-expired-outcome-qualification',queueId:id,recipientGeneration:'operator-agent-g1',policyRevision:policy.revision,grantsAuthority:false,qualificationRefreshContract:{rigId:'xv',dutyQueueId:id,policyRevision:policy.revision,policyDigest:digest(JSON.stringify(storedPolicy()))}});expect(r.policy('xv')).toEqual(policy);expect(vi.mocked(f)).not.toHaveBeenCalled();
   const wakes=db.prepare('SELECT * FROM outbox_entries WHERE audit_pointer=?').all(id) as any[];expect(wakes).toHaveLength(1);expect(wakes[0].delivery_state).toBe('pending');expect(JSON.parse(wakes[0].tags)).toContain('queue:recipient-generation:operator-agent-g1');
   repo.attachTransport({send:async()=>({ok:true,verified:true})});await svc.deliverCommitted();repo.claim({qitemId:id,destinationSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1'});expect(db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(id)).toEqual({claimed_by_generation_uuid:'operator-agent-g1'});
-  const originalDeadline=Date.parse(q.expiresAt!);clock=originalDeadline+1;vi.setSystemTime(clock);expect(r.stagePolicyBoundary('xv')).toBe(id);const retirement=JSON.parse((db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='lifecycle-retirement' AND json_extract(receipt,'$.targetQueueId')=?").get(id) as {receipt:string}).receipt);expect(retirement.deadline).toBeLessThanOrEqual(clock+1200000);expect(repo.getById(id)?.claimedAt).toBeTruthy();repo.update({qitemId:id,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'failed',transitionNote:'actual native expired-duty failure'});expect(svc.dutyFacts(id)).toMatchObject({failedByRecipient:true,retired:true});expect(r.stagePolicyBoundary('xv')).toBe(id);await svc.deliverCommitted();const successor=r.stagePolicyBoundary('xv')!;expect(successor).not.toBe(id);const successorReceipt=svc.lifecycleControlReceipt(successor);expect(successorReceipt).toMatchObject({kind:'outcome-qualification-refresh',previousQueueId:id,qualificationRef:policy.qualification.ref,deadline:expect.any(Number)});expect(successorReceipt.deadline).toBeLessThanOrEqual(clock+1200000);expect(repo.getById(id)?.expiresAt).toBe(q.expiresAt);expect(repo.getById(successor)?.expiresAt).not.toBe(q.expiresAt);
+  const originalDeadline=Date.parse(q.expiresAt!);clock=originalDeadline+1;vi.setSystemTime(clock);expect(r.stagePolicyBoundary('xv')).toBe(id);const retirement=JSON.parse((db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='lifecycle-retirement' AND json_extract(receipt,'$.targetQueueId')=?").get(id) as {receipt:string}).receipt);expect(retirement.deadline).toBeLessThanOrEqual(clock+1200000);expect(repo.getById(id)?.claimedAt).toBeTruthy();repo.update({qitemId:id,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'failed',transitionNote:'actual native expired-duty failure'});expect(svc.dutyFacts(id)).toMatchObject({failedByRecipient:true,retired:true});expect(r.stagePolicyBoundary('xv')).not.toBe(id);await svc.deliverCommitted();const successor=r.stagePolicyBoundary('xv')!;expect(successor).not.toBe(id);const successorReceipt=svc.lifecycleControlReceipt(successor);expect(successorReceipt).toMatchObject({kind:'outcome-qualification-refresh',previousQueueId:id,qualificationRef:policy.qualification.ref,deadline:expect.any(Number)});expect(successorReceipt.deadline).toBeLessThanOrEqual(clock+1200000);expect(repo.getById(id)?.expiresAt).toBe(q.expiresAt);expect(repo.getById(successor)?.expiresAt).not.toBe(q.expiresAt);
   db.prepare("UPDATE occupant_tenures SET generation_uuid='operator-agent-g2' WHERE node_id='operator-agent@kernel'").run();expect(r.stagePolicyBoundary('xv')).toBeNull();
  });
  it('qualification refresh is authorized only by the exact claimed expired-qualification duty, never another claimed Operator duty',()=>{
@@ -89,6 +89,19 @@ describe('runtime outcome enforcement',()=>{
    const id=r.stagePolicyBoundary('xv')!;expect(repo.getById(id)?.destinationSession).toBe('operator-agent@kernel');expect(JSON.parse(repo.getById(id)!.body)).toMatchObject({action:'refresh-exact-expired-outcome-qualification',policyRevision:p.revision});
    expect(svc.dutyFacts(id)).toMatchObject({claim:true});expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id=?").get(effect)).toEqual({delivery_state:'indeterminate'});
   });
+  it('pending historical effects cannot starve exact qualification and remain byte-identical',()=>{
+   configure(normal());const r=outcome(reply());const p=r.policy('xv')!;
+   const effect=operatorDirectEffect('historical pending report');db.prepare("UPDATE outbox_entries SET delivery_state='pending' WHERE outbox_id=?").run(effect);
+   const before=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(effect);
+   clock=p.qualification.validUntil+1;vi.setSystemTime(clock);
+   const id=r.stagePolicyBoundary('xv')!;expect(id).toBeTruthy();
+   expect(svc.lifecycleControlReceipt(id)).toMatchObject({kind:'outcome-qualification-refresh',recipient:'operator-agent@kernel'});
+   expect(svc.dutyFacts(id)).toMatchObject({claim:true});
+   repo.claim({qitemId:id,destinationSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1'});
+   r.refreshQualification('operator-agent@kernel','operator-agent-g1',qualificationRefresh(p,id));
+   expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(effect)).toEqual(before);
+   expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='package-acceptance'").get()).toMatchObject({n:0});
+  });
   it('in-flight direct effect blocks the administrative duty but produces one accountable intake instead of silence',()=>{
    configure(normal());const r=outcome(reply());const p=r.policy('xv')!;clock=p.qualification.validUntil+1;vi.setSystemTime(clock);
    const effect=operatorDirectEffect('unrelated direct effect still in flight');db.prepare("UPDATE outbox_entries SET delivery_state='sending' WHERE outbox_id=?").run(effect);
@@ -107,12 +120,12 @@ describe('runtime outcome enforcement',()=>{
    expect(db.prepare("SELECT 1 FROM queue_items WHERE qitem_id LIKE 'qitem-coordination-lifecycle-%'").get()).toBeUndefined();
    expect(db.prepare("SELECT 1 FROM queue_items WHERE json_valid(body) AND json_extract(body,'$.action')='refresh-exact-expired-outcome-qualification'").get()).toBeUndefined();
   });
-  it('accountable intake wake is not a debt exemption while pending, and the boundary clears once it is delivered',async()=>{
+  it('pending historical intake notice cannot block qualification after active sending ends',async()=>{
    configure(normal());const r=outcome(reply());const p=r.policy('xv')!;clock=p.qualification.validUntil+1;vi.setSystemTime(clock);
    const block=operatorDirectEffect('unrelated effect still in flight');db.prepare("UPDATE outbox_entries SET delivery_state='sending' WHERE outbox_id=?").run(block);
    expect(r.stagePolicyBoundary('xv')).toBeNull();const intakes=()=>db.prepare("SELECT qitem_id,body FROM queue_items WHERE json_valid(body) AND json_extract(body,'$.action')='resolve-exact-coordination-task-hold' AND json_extract(body,'$.reason')='lifecycle-recipient-protected'").all() as any[];
    expect(intakes()).toHaveLength(1);const notice='wake-intent-'+intakes()[0].qitem_id;expect((db.prepare('SELECT delivery_state FROM outbox_entries WHERE outbox_id=?').get(notice) as {delivery_state:string}).delivery_state).toBe('pending');
-   db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE outbox_id=?").run(block);expect(r.stagePolicyBoundary('xv')).toBeNull();expect(intakes()).toHaveLength(1);
+   db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE outbox_id=?").run(block);expect(r.stagePolicyBoundary('xv')).toBeTruthy();expect(intakes()).toHaveLength(1);
    operatorDirectEffect('acknowledged uncertain direct report');repo.attachTransport({send:async()=>({ok:true,verified:true})});await svc.deliverCommitted();
    expect(['delivered','failed']).toContain((db.prepare('SELECT delivery_state FROM outbox_entries WHERE outbox_id=?').get(notice) as {delivery_state:string}).delivery_state);
    expect(r.stagePolicyBoundary('xv')).toBeTruthy();expect(intakes()).toHaveLength(1);
@@ -140,52 +153,25 @@ describe('runtime outcome enforcement',()=>{
    expect((db.prepare("SELECT count(*) n FROM queue_items WHERE destination_session='operator-agent@kernel' AND state IN ('pending','in-progress','blocked') AND expires_at<=? AND json_valid(body) AND json_extract(body,'$.action')='resolve-exact-coordination-task-hold' AND json_extract(body,'$.reason')='lifecycle-recipient-protected'").get(new Date(clock).toISOString()) as {n:number}).n).toBe(3);
    expect((db.prepare("SELECT count(*) n FROM queue_items WHERE destination_session='operator-agent@kernel' AND state IN ('in-progress','blocked') AND json_valid(body)").get() as {n:number}).n).toBe(0);
   });
-  it('a renewal wake is exempt only through a genuine validated chain, not unrelated, spoofed, pending or sending rows',()=>{
-   configure(normal());const r=outcome(reply());const p=r.policy('xv')!;clock=p.qualification.validUntil+1;vi.setSystemTime(clock);
-   const block=operatorDirectEffect('unrelated effect still in flight');db.prepare("UPDATE outbox_entries SET delivery_state='sending' WHERE outbox_id=?").run(block);
+  it('historical UNKNOWN guarded notice is preserved while active delivery guard fences issue',()=>{
+   configure(normal());const r=outcome(reply());const p=r.policy('xv')!;
+   const id=operatorDirectEffect('historical guarded pointer');db.prepare("UPDATE outbox_entries SET guard_binding='{}' WHERE outbox_id=?").run(id);
+   const old=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(id);
+   clock=p.qualification.validUntil+1;vi.setSystemTime(clock);
+   db.prepare("INSERT INTO seat_delivery_guards(node_id,desired,effective,actor,reason,changed_at) VALUES ('operator-agent@kernel',1,1,'test','typing',datetime('now'))").run();
    expect(r.stagePolicyBoundary('xv')).toBeNull();
-   const ids=()=>db.prepare("SELECT qitem_id FROM queue_items WHERE json_valid(body) AND json_extract(body,'$.action')='resolve-exact-coordination-task-hold' AND json_extract(body,'$.reason')='lifecycle-recipient-protected' ORDER BY rowid").all() as Array<{qitem_id:string}>;
-   clock=Date.parse(repo.getById(ids()[0].qitem_id)!.expiresAt!)+1;vi.setSystemTime(clock);expect(r.stagePolicyBoundary('xv')).toBeNull();
-   const renewal=ids()[1].qitem_id,notice='wake-intent-'+renewal,untouched=repo.getById(renewal)!;
-   db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE outbox_id=?").run(block);
-   db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE outbox_id=?").run('wake-intent-'+ids()[0].qitem_id);
-   expect((db.prepare('SELECT delivery_state FROM outbox_entries WHERE outbox_id=?').get(notice) as {delivery_state:string}).delivery_state).toBe('pending');
-   // A pending renewal wake is never exempt: the boundary stays held and accountable.
-   expect(r.stagePolicyBoundary('xv')).toBeNull();
-   db.prepare("UPDATE outbox_entries SET delivery_state='sending' WHERE outbox_id=?").run(notice);
-   expect(r.stagePolicyBoundary('xv')).toBeNull();
-   // A same-shaped unrelated effect addressed to the same seat is not exempt.
-   const unrelated=operatorDirectEffect('unrelated indeterminate effect for the Operator seat');
-   db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run(unrelated);
-   expect(r.stagePolicyBoundary('xv')).toBeNull();
-   db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE outbox_id=?").run(unrelated);
-   // A real queue item shaped like this control plane's intake but never staged through
-   // the chain, carrying its own UNKNOWN wake, is not exempt.
-   const spoofed='qitem-coordination-task-hold-'+unrelated.replace(/[^a-f0-9]/g,'').slice(0,24),spoofBody=JSON.stringify({action:'resolve-exact-coordination-task-hold',rigId:'xv',planRevision:p.revision,packageKey:'outcome-qualification:'+p.revision,taskOwner:'operator-agent@kernel',reason:'lifecycle-recipient-protected',retainedQueueId:null,recipientGeneration:'operator-agent-g1',deadline:clock+1200000,grantsAuthority:false,renewsIntakeQueueId:'qitem-coordination-task-hold-ffffffffffffffffffffffff',previousIntakeQueueId:'qitem-coordination-task-hold-ffffffffffffffffffffffff'});
-   const nowIso=new Date(clock).toISOString();db.prepare("INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,priority,tier,expires_at,body) VALUES (?,?,?,'watchdog@system','operator-agent@kernel','pending','routine','interactive',?,?)").run(spoofed,nowIso,nowIso,new Date(clock+1200000).toISOString(),spoofBody);
-   db.prepare("INSERT INTO queue_transitions(qitem_id,state,actor_session,identity_provenance,transition_note,ts) VALUES (?,'pending','watchdog@system','system:operator-authorized-coordination','created',?)").run(spoofed,new Date(clock).toISOString());
-   db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,tags,delivery_state,ts_dispatched,audit_pointer) VALUES (?,'watchdog@system','operator-agent@kernel',?,'queue:coordination-intake','indeterminate',?,?)").run('wake-intent-'+spoofed,spoofBody,new Date(clock).toISOString(),spoofed);
-   expect(r.stagePolicyBoundary('xv')).toBeNull();
-   db.prepare("DELETE FROM outbox_entries WHERE outbox_id=?").run('wake-intent-'+spoofed);
-   // A chain item whose body changed after staging does not keep the exemption either.
-   db.prepare("UPDATE queue_items SET body=? WHERE qitem_id=?").run(JSON.stringify({...JSON.parse(untouched.body),note:'after-the-fact edit'}),renewal);
-   expect(r.stagePolicyBoundary('xv')).toBeNull();
-   db.prepare("UPDATE queue_items SET body=? WHERE qitem_id=?").run(untouched.body,renewal);
-   // Only the genuine validated chain notice, once indeterminate, stops counting.
-   const noticeBody=(db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(notice) as {body:string}).body;
-   db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run(notice);
-   expect(r.stagePolicyBoundary('xv')).toBeTruthy();
-   expect((db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(notice) as {body:string}).body).toBe(noticeBody);
-   expect(repo.getById(renewal)).toEqual(untouched);
-   // The spoofed item is not part of any validated chain and granted no new accountable
-   // item; the hold still has exactly its root and one renewal.
-   expect((db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordination-intake-chain' AND operation_id=?").get('coordination-intake-chain:'+spoofed) as {n:number}).n).toBe(0);
-   // A chain member is defined by its recorded, hash-bound receipt, not by body shape, so
-   // the spoof granted no accountable item despite mimicking action and reason exactly.
-   const genuine=db.prepare("SELECT operation_id FROM coordinator_operations WHERE kind='coordination-intake-chain' ORDER BY rowid").all() as Array<{operation_id:string}>;
-   expect(genuine.map(r=>r.operation_id.replace('coordination-intake-chain:',''))).toEqual([ids()[0].qitem_id,renewal]);
-   expect((db.prepare("SELECT count(*) n FROM queue_items WHERE qitem_id=?").get(spoofed) as {n:number}).n).toBe(1);
+   db.prepare("UPDATE seat_delivery_guards SET desired=0,effective=0 WHERE node_id='operator-agent@kernel'").run();
+   const duty=r.stagePolicyBoundary('xv')!;expect(duty).toBeTruthy();
+   expect(svc.dutyFacts(duty)).toMatchObject({claim:true});
+   db.prepare("UPDATE seat_delivery_guards SET desired=1,effective=1 WHERE node_id='operator-agent@kernel'").run();
+   expect(svc.dutyFacts(duty)).toMatchObject({claim:false});
+   db.prepare("UPDATE seat_delivery_guards SET desired=0,effective=0 WHERE node_id='operator-agent@kernel'").run();
+   db.prepare("UPDATE outbox_entries SET delivery_state='sending' WHERE outbox_id=?").run(id);
+   expect(svc.dutyFacts(duty)).toMatchObject({claim:false});
+   db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run(id);
+   expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(id)).toEqual(old);
   });
+
   it('observation and absent policy never add authority or semantic holds',async()=>{configure(normal());const r=outcome(reply(),'observe');await returned();await r.drain('xv');expect(r.requiresRecovery('xv','product')).toBe(false);svc.accept('lead@xv','lead-g1','xv','product','result','actual/review.md');expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordination-accept'").get()).toEqual({n:1});});
  it('unknown coverage negative advice remains expressly unqualified and only opt-in',async()=>{configure(normal());const r=outcome(reply('yes',false),'enforce',true);await returned();await r.drain('xv');const row=db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='runtime-outcome-finished'").get() as {receipt:string};expect(JSON.parse(row.receipt)).toMatchObject({status:'abstained',negativeAdvice:true,required:true,grantsAuthority:false});expect(JSON.parse(row.receipt).provenance.inputCoverage).not.toBe('reported_complete');});
  it('generation drift while provider pending cannot apply old advice',async()=>{configure(normal());const f=vi.fn(async()=>{db.prepare("UPDATE occupant_tenures SET generation_uuid='builder-g2' WHERE node_id='builder@xv'").run();return new Response(JSON.stringify({model:'qualified-fixture',answers:{outcome:{type:'choice',choice:'yes',probabilities:{yes:.9,no:.05,unknown:.05}}},usage:{input_tokens:150,output_tokens:0,truncated:false}}),{status:200});}) as unknown as typeof fetch;const r=outcome(f);await returned();await r.drain('xv');expect(r.requiresRecovery('xv','product')).toBe(false);const row=db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='runtime-outcome-finished'").get() as {receipt:string};expect(JSON.parse(row.receipt)).toMatchObject({reason:'state-changed',classification:'unknown',grantsAuthority:false});});
