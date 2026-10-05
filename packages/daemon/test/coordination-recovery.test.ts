@@ -20,6 +20,16 @@ describe('durable coordination recovery',()=>{
  function configure(tasks:CoordinationTask[],resources:Record<string,string[]>={}){for(const t of tasks)repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:resources[t.key]??[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});return svc.configure('operator-agent@kernel','operator-agent-g1',plan(tasks));}
  function refresh(){for(const s of ['lead@xv','peer@xv','builder@xv','reviewer@xv','architect@xv'])samples.set(s,sample(s));}
  function job(){db.prepare(`INSERT INTO watchdog_jobs(job_id,target_session,policy,interval_seconds,spec_yaml,state,registered_by_session,registered_at,registered_by_generation_uuid) VALUES ('j','operator-agent@kernel','coordinator-continuity',1,'context: {}','active','operator-agent@kernel',?,'operator-agent-g1')`).run(new Date(clock).toISOString());}
+ it('scope-only attachment preserves expired admissions without granting dispatch or replaying releases',()=>{
+  const tasks=[task('scope-main'),task('scope-recovery','architect@xv',{recoveryFor:'scope-main'})];
+  const original=configure(tasks);clock+=70000;vi.setSystemTime(clock);
+  const before=db.prepare('SELECT * FROM outbox_entries').all();
+  const next={...original,revision:'scope-connect',scopeSources:[{ref:'mission.md',digest:'a'.repeat(64)}],frontierPlanning:{stabilizationObservations:2}};
+  expect(svc.configure('operator-agent@kernel','operator-agent-g1',next).tasks).toEqual(original.tasks);
+  expect((svc as any).admittedNow(next.tasks[0])).toBe(false);
+  expect(db.prepare('SELECT * FROM outbox_entries').all()).toEqual(before);
+  expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...next,revision:'changed-deadline',tasks:next.tasks.map(t=>({...t,deadline:clock+20000}))})).toThrow('Exact current');
+ });
  beforeEach(async()=>{vi.useFakeTimers({toFake:['Date']});clock=Date.now();dir=mkdtempSync(join(tmpdir(),'coordination-'));db=createDb(join(dir,'db'));seed(db);db.prepare("INSERT INTO self_host_identity VALUES(1,'fixture-host',?,?)").run(new Date(clock).toISOString(),new Date(clock).toISOString());const bus=new EventBus(db);repo=new QueueRepository(db,bus,{resolveOccupantGeneration:s=>repo.coordinatorAuthority.generation(s)});repo.attachOutbox(new OutboxHandler(db));await repo.create({qitemId:'baton',sourceSession:'operator-agent@kernel',destinationSession:'lead@xv',body:'coordinate',nudge:false});repo.coordinatorAuthority.enable('operator-agent@kernel','operator-agent-g1',{rigId:'xv',batonId:'baton',owner:'lead@xv',ownerGeneration:'lead-g1',coordinators:['lead@xv','peer@xv'],leaseMs:60000,operationId:'enable'});repo.coordinatorAuthority.acknowledge('lead@xv',token,{operationId:'ack',obligationsDigest:repo.coordinatorAuthority.reconciliationDigest('xv')});samples=new Map();refresh();svc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock);repo.coordinatorAuthority.coordinationRecovery=svc;});
  afterEach(()=>{db.close();rmSync(dir,{recursive:true,force:true});vi.useRealTimers();});
  const normal=()=>[task('product'),task('repair','architect@xv',{recoveryFor:'product'})];

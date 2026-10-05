@@ -859,11 +859,16 @@ private dutyProtection(rigId:string,r:any):boolean {
   return this.db.transaction(()=>{
    if(actor!=="operator-agent@kernel"||this.authority.generation(actor)!==generation||plan.operatorGeneration!==generation)fail("coordination_operator_required","Current genuine Operator configures recovery");
    if(!this.authority.get(plan.rigId))fail("coordinator_not_enabled","Explicit legacy enrollment/admission required");
+   const prior=this.plan(plan.rigId);
+   const executionShape=(p:CoordinationPlan)=>JSON.stringify({...p,revision:undefined,operatorGeneration:undefined,scopeSources:undefined,frontierPlanning:undefined});
+   // Attaching scope is not renewed task admission or checkpoint release.
+   const scopeOnly=!!prior&&executionShape(prior)===executionShape(plan)&&JSON.stringify([prior.scopeSources,prior.frontierPlanning])!==JSON.stringify([plan.scopeSources,plan.frontierPlanning]);
+
    if(!Number.isSafeInteger(plan.stallMs)||plan.stallMs<10000||plan.stallMs>3600000||typeof plan.allowIdlePeerTransfer!=="boolean"||!plan.revision||!plan.tasks.length||new Set(plan.tasks.map(t=>t.key)).size!==plan.tasks.length||new Set(plan.tasks.map(t=>t.packageKey)).size!==plan.tasks.length)fail("coordination_invalid_plan","Unique immutable tasks/packages required");
    if(plan.acknowledgmentWindowMs!==undefined&&(!Number.isSafeInteger(plan.acknowledgmentWindowMs)||plan.acknowledgmentWindowMs<10000||plan.acknowledgmentWindowMs>900000))fail("coordination_invalid_ack_window","Acknowledgment window must be 10 seconds to 15 minutes");
    if(plan.allowUnavailablePeerTransfer!==undefined&&typeof plan.allowUnavailablePeerTransfer!=='boolean')fail('coordination_invalid_unavailable_optin','Unavailable-owner transfer requires strict explicit boolean');
    if(plan.refreshDispatchIdentity!==undefined&&typeof plan.refreshDispatchIdentity!=='boolean')fail('coordination_invalid_identity_refresh','Identity refresh requires strict explicit boolean');
-   if(plan.dispatchRestrictions!==undefined){
+   if(plan.dispatchRestrictions!==undefined&&!scopeOnly){
     if(!Array.isArray(plan.dispatchRestrictions)||new Set(plan.dispatchRestrictions.map(r=>r.session)).size!==plan.dispatchRestrictions.length)fail('coordination_invalid_dispatch_scope','Unique explicit dispatch restrictions required');
     for(const r of plan.dispatchRestrictions){
      if(r.checkpointDisposition!==undefined&&r.checkpointDisposition!=='release-listed-packages')fail('coordination_invalid_checkpoint_disposition','Explicit listed-package checkpoint disposition required');
@@ -872,7 +877,6 @@ private dutyProtection(rigId:string,r:any):boolean {
    }
   if(plan.scopeSources!==undefined&&(!Array.isArray(plan.scopeSources)||new Set(plan.scopeSources.map(s=>s?.ref)).size!==plan.scopeSources.length||plan.scopeSources.some(s=>!s||typeof s.ref!=='string'||!s.ref.trim()||typeof s.digest!=='string'||!/^[0-9a-f]{64}$/.test(s.digest))))fail('coordination_invalid_scope_sources','Unique scope refs with exact sha256 digests required');
   if(plan.frontierPlanning!==undefined&&(plan.frontierPlanning===null||typeof plan.frontierPlanning!=='object'||(plan.frontierPlanning.stabilizationObservations!==undefined&&(!Number.isSafeInteger(plan.frontierPlanning.stabilizationObservations)||plan.frontierPlanning.stabilizationObservations<1||plan.frontierPlanning.stabilizationObservations>64))||(plan.frontierPlanning.stabilizationMs!==undefined&&(!Number.isSafeInteger(plan.frontierPlanning.stabilizationMs)||plan.frontierPlanning.stabilizationMs<0||plan.frontierPlanning.stabilizationMs>3600000))))fail('coordination_invalid_frontier_planning','Bounded explicit stabilization configuration required');
-   const prior=this.plan(plan.rigId);
    const stable=(t:CoordinationTask)=>JSON.stringify({...t,admission:undefined,deadline:undefined});
    const keys=new Set(plan.tasks.map(t=>t.key));
    for(const t of plan.tasks){
@@ -880,7 +884,7 @@ private dutyProtection(rigId:string,r:any):boolean {
     if(historical&&JSON.stringify(old)!==JSON.stringify(t))fail('coordination_history_rewrite_refused','Accepted task and dormant backup history must retain full task, admission and deadline bytes');
     if(!t.key||!t.action.trim()||!Number.isFinite(t.deadline)||(t.deadline<=this.now()&&!prior?.tasks.some(old=>old.key===t.key&&stable(old)===stable(t)))||!t.body||!Array.isArray(t.predecessors))fail("coordination_invalid_task","Concrete action, future deadline, predecessors and exact body required");
     const ad=t.admission;
-    if(!historical&&(!ad||ad.generation!==this.authority.generation(t.owner)||ad.configurationDigest!==this.configurationDigest(t.owner)||!ad.qualificationRef||!ad.capacityRef||!ad.effortRef||!Number.isFinite(ad.validUntil)||ad.validUntil<=this.now()))fail('coordination_current_admission_required','Exact current generation/configuration, qualification/capacity/effort evidence and expiry required');
+    if(!historical&&!scopeOnly&&(!ad||ad.generation!==this.authority.generation(t.owner)||ad.configurationDigest!==this.configurationDigest(t.owner)||!ad.qualificationRef||!ad.capacityRef||!ad.effortRef||!Number.isFinite(ad.validUntil)||ad.validUntil<=this.now()))fail('coordination_current_admission_required','Exact current generation/configuration, qualification/capacity/effort evidence and expiry required');
     if(t.boundary&&!['owner-access','owner-credential','owner-material','owner-irreversible'].includes(t.boundary))fail("coordination_invalid_boundary","Unknown boundary");
     const row=this.db.prepare("SELECT contract FROM coordinator_packages WHERE rig_id=? AND package_key=?").get(plan.rigId,t.packageKey) as {contract:string}|undefined;
     if(!row)fail("coordination_package_not_admitted","Every task including recovery needs explicit admission");
@@ -905,7 +909,7 @@ private dutyProtection(rigId:string,r:any):boolean {
    // Do not replace unresolved contracts with a new plan and silently orphan work.
    if(prior&&prior.tasks.some(t=>!plan.tasks.some(n=>n.key===t.key&&stable(n)===stable(t))))fail("coordination_plan_obligation_lost","Retain all existing tasks unchanged in successor revision");
    this.db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(plan.rigId,id,"coordination-plan",JSON.stringify(plan),digest(JSON.stringify({actor,generation,plan})));
-   for(const r of plan.dispatchRestrictions??[]){
+   for(const r of scopeOnly?[]:plan.dispatchRestrictions??[]){
     if(r.checkpointDisposition!=='release-listed-packages')continue;
     const queueId='qitem-coordination-scope-'+digest(plan.rigId+':'+generation+':'+JSON.stringify(r)).slice(0,24);
     if(!this.repo.getById(queueId)){this.repo.createWithinTransaction({qitemId:queueId,sourceSession:actor,destinationSession:r.session,expiresAt:new Date(r.validUntil).toISOString(),body:JSON.stringify({action:'checkpoint-scope-disposition',operator:actor,operatorGeneration:generation,rigId:plan.rigId,recipientGeneration:r.generation,packageKeys:r.packageKeys,evidenceRef:r.evidenceRef,validUntil:r.validUntil,instruction:'Current genuine Operator releases post-checkpoint quiescence ONLY for the listed already-admitted packages under the cited disposition. Rederive actual native identity/generation and read the disposition; claim and close this control notice honestly, then consume the existing matching assignment when present. Preserve quiescence for all other work, rotation and baton takeover. No duplicate assignment, source edit, historical-effect replay or acceptance waiver. This notice is not worker pickup or technical acceptance.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
