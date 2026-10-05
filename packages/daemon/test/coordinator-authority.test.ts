@@ -57,6 +57,17 @@ describe("coordinator exclusion and custody",()=>{
  const contract=()=>({inputDigest:digest("inputs"),destination:"builder@xv",bodyHash:digest("build"),resources:["source/a"],returnContract:{destination:"lead@xv",evidenceRequired:["test-report"]}});
  const transfer=()=>svc.transfer("lead@xv","lead-g1",{expected:token,oldOwner:"lead@xv",recipient:"peer@xv",recipientGeneration:"peer-g1",leaseMs:10000,operationId:"transfer"});
  const create=()=>repo.create({qitemId:"work",sourceSession:"lead@xv",destinationSession:"builder@xv",body:"build",dispatch:{token,packageKey:"p1"},nudge:false});
+ it("discovers exact return evidence without writes and refuses body drift",async()=>{
+  svc.admit("operator-agent@kernel","operator-agent-g1","xv","p1",contract());await create();
+  const snapshot=()=>JSON.stringify(["coordinator_assignments","coordinator_resources","coordinator_authority","queue_items","coordinator_operations"].map(table=>db.prepare(`SELECT * FROM ${table}`).all()));
+  const before=snapshot();const instructions=svc.returnInstructionsFor("work");
+  expect(instructions?.returnDestination).toBe("lead@xv");
+  expect(instructions?.payloadTemplate).toEqual({packageKey:"p1",inputDigest:digest("inputs"),evidence:[{kind:"test-report",ref:null}]});
+  expect(instructions?.constitutesAcceptance).toBe(false);expect(snapshot()).toBe(before);
+  expect(svc.returnInstructionsFor("missing")).toBeNull();
+  db.prepare("UPDATE queue_items SET body='drift' WHERE qitem_id='work'").run();
+  expect(svc.returnInstructionsFor("work")).toBeNull();
+ });
  it("starts disabled for dispatch until exact acknowledgment",()=>{
   transfer();expect(()=>db.transaction(()=>svc.reserve("peer@xv","builder@xv","build","w",{token:{rigId:"xv",epoch:2,generation:"peer-g1"},packageKey:"p1"})).immediate()).toThrow("not reconciled");
  });

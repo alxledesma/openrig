@@ -623,6 +623,21 @@ export class CoordinatorAuthorityService {
      const r=this.get(token.rigId)!;this.log(token.rigId,operationId,"renew",r,{token,leaseMs});return r;
    }).immediate();
  }
+ /** Read-only discovery of the frozen return contract; never grants authority or acceptance. */
+ returnInstructionsFor(queueId:string) {
+   if(!this.available())return null;
+   const row=this.db.prepare(`SELECT a.rig_id,a.package_key,a.destination,a.body_hash,q.body,q.destination_session,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.queue_id=?`).get(queueId) as {rig_id:string;package_key:string;destination:string;body_hash:string;body:string;destination_session:string;contract:string}|undefined;
+   if(!row)return null;
+   let contract:PackageContract;try{contract=JSON.parse(row.contract);}catch{return null;}
+   if(digest(row.body)!==row.body_hash||contract.bodyHash!==row.body_hash||contract.destination!==row.destination||row.destination_session!==row.destination||!contract.inputDigest||!contract.returnContract?.destination||!Array.isArray(contract.returnContract.evidenceRequired))return null;
+   return {
+     rigId:row.rig_id,packageKey:row.package_key,assignmentQueueId:queueId,worker:row.destination,
+     returnDestination:contract.returnContract.destination,
+     payloadTemplate:{packageKey:row.package_key,inputDigest:contract.inputDigest,evidence:contract.returnContract.evidenceRequired.map(kind=>({kind,ref:null}))},
+     steps:["Fill every evidence ref with a real artifact reference; null placeholders are invalid.","Create a NEW native worker-authored return: rig queue create --destination <returnDestination> --body-file <payloadFile> --json","Close the original assignment using its truthful terminal outcome and required closure reason: rig queue update <assignmentQueueId> --state <terminalState> --closure-reason <reason> --json","Submit rig coordinator dispose <contractFile> with {rigId,packageKey,dispositionId}; dispositionId is the NEW return queue ID."],
+     grantsAuthority:false,constitutesAcceptance:false
+   };
+ }
  dispose(actor:string,generation:string,rigId:string,packageKey:string,dispositionId:string): void {
    if([rigId,packageKey,dispositionId].some(v=>typeof v!=="string"||!v.trim()))reject("coordinator_dispose_contract_required","Expected {rigId,packageKey,dispositionId}; dispositionId is the new worker-authored typed JSON return queue item, not the original assignment or duty ID. The original worker disposes its own terminal return; coordinator-holder role is not required.");
    this.db.transaction(() => {

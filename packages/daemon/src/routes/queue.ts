@@ -1005,9 +1005,11 @@ export function queueRoutes(): Hono {
   // GET /:qitemId — show one
   app.get("/:qitemId", (c) => {
     const qitemId = c.req.param("qitemId");
-    const item = getRepo(c).getById(qitemId);
+    const repo = getRepo(c);
+    const item = repo.getById(qitemId);
     if (!item) return c.json({ error: "qitem_not_found" }, 404);
-    return c.json(item);
+    const returnInstructions = repo.coordinatorAuthority?.returnInstructionsFor(qitemId);
+    return c.json(returnInstructions ? { ...item, returnInstructions } : item);
   });
 
   // ---- Inbox routes (mailbox) ----

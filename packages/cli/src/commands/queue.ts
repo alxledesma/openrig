@@ -987,7 +987,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
 
   cmd
     .command("show <qitemId>")
-    .description("Show one qitem and its derived waiting state (bounded preview; --full for complete body)")
+    .description("Show one qitem, waiting state and admitted worker return instructions (--full --json for complete record)")
     .option("--full", "Complete original record; may be large (use --full --json for lossless JSON)")
     .option("--json", "JSON preview with completeness, original byte size and exact full command")
     .action(async (qitemId: string, opts: { full?: boolean; json?: boolean }) => {
