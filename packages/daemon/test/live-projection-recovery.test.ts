@@ -177,4 +177,119 @@ describe("live-projection recovery", () => {
     expect(db.prepare("SELECT 1 FROM live_projection_recovery_operations").get()).toBeUndefined();
     expect(db.prepare("SELECT 1 FROM events WHERE type='session.live_projection_recovered'").get()).toBeUndefined();
   });
+
+  // --- Class-level effect fence: only guard-bound effects that can still move
+  // fence. Terminal UNKNOWN ('indeterminate') rows are preserved and reported.
+
+  const guarded = (id: string, state: string, seat = "lead@xv", binding: unknown = { nodeId: "lead@xv", session: "lead@xv", occupant: "lead-g1", pane: "%9" }) =>
+    db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state,guard_binding) VALUES (?,'watchdog@system',?,?,?,?,?)")
+      .run(id, seat, `wake ${id}`, new Date(clock).toISOString(), state, JSON.stringify(binding));
+  const outboxBytes = () => db.prepare("SELECT * FROM outbox_entries ORDER BY outbox_id").all();
+  const detachSeat = () => db.prepare("UPDATE sessions SET status='detached' WHERE id='lead@xv'").run();
+  const seatStatus = () => db.prepare("SELECT status FROM sessions WHERE id='lead@xv'").get();
+
+  function outboxEntriesReset(rows: unknown[]): void {
+    db.prepare("DELETE FROM outbox_entries").run();
+    const cols = ["outbox_id", "sender_session", "destination_session", "body", "ts_dispatched", "delivery_state", "guard_binding"] as const;
+    const insert = db.prepare(`INSERT INTO outbox_entries (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`);
+    db.transaction(() => { for (const row of rows as Array<Record<string, unknown>>) insert.run(...cols.map(c => row[c] as never)); }).immediate();
+  }
+
+  it("S1: terminal UNKNOWN guarded effects do not fence; outbox bytes are identical and the receipt records count and digest", async () => {
+    for (const id of ["wake-intent-1", "wake-intent-2", "wake-intent-3"]) guarded(id, "indeterminate");
+    const before = outboxBytes();
+    const out = await service({ piProve: present() }).recover("operator-agent@kernel", "operator-agent-g1", input());
+    expect(out).toMatchObject({ ok: true, code: "recovered" });
+    expect(seatStatus()).toEqual({ status: "running" });
+    // Byte identity across the whole operation: nothing retried, released,
+    // relabelled, retired or acknowledged; no row appeared or vanished.
+    expect(outboxBytes()).toEqual(before);
+    expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id='wake-intent-1'").get()).toEqual({ delivery_state: "indeterminate" });
+    const parsed = out.receipt as { unknownEffectsPreserved: { count: number; digest: string } };
+    expect(parsed.unknownEffectsPreserved.count).toBe(3);
+    expect(parsed.unknownEffectsPreserved.digest).toMatch(/^[0-9a-f]{64}$/);
+    const stored = JSON.parse((db.prepare("SELECT receipt FROM live_projection_recovery_operations WHERE operation_id='live-projection-recover:op-1'").get() as { receipt: string }).receipt);
+    expect(stored.unknownEffectsPreserved).toEqual(parsed.unknownEffectsPreserved);
+    // A seat with no UNKNOWN rows still reports an empty set, never an absent fact.
+    outboxEntriesReset([]);
+    detachSeat();
+    const clean = await service({ piProve: present() }).recover("operator-agent@kernel", "operator-agent-g1", input({ operationId: "op-clean" }));
+    expect(clean.ok).toBe(true);
+    expect(JSON.parse((db.prepare("SELECT receipt FROM live_projection_recovery_operations WHERE operation_id='live-projection-recover:op-clean'").get() as { receipt: string }).receipt).unknownEffectsPreserved)
+      .toEqual({ count: 0, digest: expect.stringMatching(/^[0-9a-f]{64}$/) });
+  });
+
+  it.each(["pending", "sending", "retained"] as const)("S2/S3: a %s guard-bound effect still fences and writes nothing", async state => {
+    guarded("w-movable", state);
+    const before = outboxBytes();
+    expect((await service({ piProve: present() }).recover("operator-agent@kernel", "operator-agent-g1", input())).code).toBe("delivery_fencing_active");
+    expect(seatStatus()).toEqual({ status: "detached" });
+    expect(outboxBytes()).toEqual(before);
+    expect(db.prepare("SELECT 1 FROM live_projection_recovery_operations").get()).toBeUndefined();
+    // Terminal rows alongside a movable one still fence: the movable one decides.
+    guarded("w-unknown", "indeterminate");
+    expect((await service({ piProve: present() }).recover("operator-agent@kernel", "operator-agent-g1", input())).code).toBe("delivery_fencing_active");
+  });
+
+  it("S4: a reservation opened during the probe aborts inside the transaction with zero writes", async () => {
+    const before = outboxBytes();
+    const r = service({ piProve: async () => {
+      db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES ('r-probe','o1','lead@xv','lead@xv','g0','n0','operator-agent@kernel','operator-agent-g1','h','{}','{}','started',?,?)").run(new Date(clock).toISOString(), new Date(clock).toISOString());
+      return { state: "present" as const, generation: "lead-g1", launchId: "L", fingerprint: "{}" };
+    } });
+    expect((await r.recover("operator-agent@kernel", "operator-agent-g1", input())).code).toBe("state_changed_during_probe");
+    expect(seatStatus()).toEqual({ status: "detached" });
+    expect(outboxBytes()).toEqual(before);
+    expect(db.prepare("SELECT 1 FROM live_projection_recovery_operations").get()).toBeUndefined();
+  });
+
+  it("S5: a terminal UNKNOWN row that changes during the probe aborts as drift with zero writes", async () => {
+    for (const id of ["wake-intent-a", "wake-intent-b"]) guarded(id, "indeterminate");
+    const before = outboxBytes();
+    const mutations: Array<[string, () => void]> = [
+      ["delivered", () => db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE outbox_id='wake-intent-a'").run()],
+      ["body rewritten", () => db.prepare("UPDATE outbox_entries SET body='rewritten' WHERE outbox_id='wake-intent-b'").run()],
+      ["guard unbound", () => db.prepare("UPDATE outbox_entries SET guard_binding=NULL WHERE outbox_id='wake-intent-b'").run()],
+      ["row added", () => db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state,guard_binding) VALUES ('wake-intent-c','watchdog@system','lead@xv','wake',?,'indeterminate','{\"pane\":\"%9\"}')").run(new Date(clock).toISOString())],
+    ];
+    for (const [name, mutate] of mutations) {
+      const pre = outboxBytes();
+      const r = service({ piProve: async () => { mutate(); return { state: "present" as const, generation: "lead-g1", launchId: "L", fingerprint: "{}" }; } });
+      const out = await r.recover("operator-agent@kernel", "operator-agent-g1", input());
+      expect(out.code, name).toBe("state_changed_during_probe");
+      expect(seatStatus(), name).toEqual({ status: "detached" });
+      expect(db.prepare("SELECT 1 FROM live_projection_recovery_operations").get(), name).toBeUndefined();
+      expect(db.prepare("SELECT 1 FROM events WHERE type='session.live_projection_recovered'").get(), name).toBeUndefined();
+      // Recovery itself wrote nothing; only the simulated external mutation moved a row.
+      expect(outboxBytes(), name).not.toEqual(pre);
+      outboxEntriesReset(pre);
+    }
+    outboxEntriesReset(before);
+    expect((await service({ piProve: present() }).recover("operator-agent@kernel", "operator-agent-g1", input())).code).toBe("recovered");
+  });
+
+  it("S6: UNKNOWN rows bound to a previous occupant are neither fenced nor touched", async () => {
+    guarded("wake-intent-prev", "indeterminate", "lead@xv", { nodeId: "lead@xv", session: "lead@xv", occupant: "lead-g0-retired", pane: "%9" });
+    guarded("wake-intent-none", "indeterminate", "lead@xv", { nodeId: "lead@xv", session: "lead@xv", occupant: null, pane: "%9" });
+    guarded("wake-intent-other-seat", "indeterminate", "peer@xv", { nodeId: "peer@xv", session: "peer@xv", occupant: "peer-g1", pane: "%3" });
+    const before = outboxBytes();
+    const out = await service({ piProve: present() }).recover("operator-agent@kernel", "operator-agent-g1", input());
+    expect(out).toMatchObject({ ok: true, code: "recovered" });
+    expect(outboxBytes()).toEqual(before);
+    // Only this seat's own UNKNOWN rows are reported; the other seat's are untouched.
+    expect((out.receipt as { unknownEffectsPreserved: { count: number } }).unknownEffectsPreserved.count).toBe(2);
+  });
+
+  it("the preservation digest is byte-sensitive and stable across exact replay", async () => {
+    guarded("wake-intent-1", "indeterminate");
+    const r = service({ piProve: present() });
+    const first = (await r.recover("operator-agent@kernel", "operator-agent-g1", input())).receipt as { unknownEffectsPreserved: { digest: string } };
+    const replay = (await r.recover("operator-agent@kernel", "operator-agent-g1", input())).receipt as { unknownEffectsPreserved: { digest: string } };
+    expect(replay.unknownEffectsPreserved.digest).toBe(first.unknownEffectsPreserved.digest);
+    // Same id, different bytes: a different digest, so identity is byte-based.
+    db.prepare("UPDATE outbox_entries SET body='different' WHERE outbox_id='wake-intent-1'").run();
+    detachSeat();
+    const second = (await service({ piProve: present() }).recover("operator-agent@kernel", "operator-agent-g1", input({ operationId: "op-2" }))).receipt as { unknownEffectsPreserved: { digest: string } };
+    expect(second.unknownEffectsPreserved.digest).not.toBe(first.unknownEffectsPreserved.digest);
+  });
 });

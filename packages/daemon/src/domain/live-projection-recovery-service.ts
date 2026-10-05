@@ -69,7 +69,15 @@ export interface LiveProjectionRecoveryDeps {
 
 interface SessionRow { id: string; node_id: string; session_name: string; status: string; resume_token: string | null }
 
-type Snapshot = { row: SessionRow; tenureId: string; runtime: string | null; rigId: string; pane: string | null; nativeBoot: string | null };
+type Snapshot = { row: SessionRow; tenureId: string; runtime: string | null; rigId: string; pane: string | null; nativeBoot: string | null; unknownEffects: UnknownEffects };
+
+/** Auditable preservation fact for the seat's TERMINAL UNKNOWN guard-bound
+ * effects: the count and a digest over (outbox id, delivery state, body hash) in
+ * stable id order. Nothing on this path writes the outbox, so a difference
+ * between the pre-probe snapshot and the write transaction means the UNKNOWN set
+ * itself moved while we were probing. It states what recovery left alone instead
+ * of requiring the set to be empty. */
+interface UnknownEffects { count: number; digest: string }
 
 export class LiveProjectionRecoveryService {
   private readonly db: Database.Database;
@@ -123,6 +131,7 @@ export class LiveProjectionRecoveryService {
       generation: input.expectedGeneration, actor, actorGeneration: generation,
       sessionRowHash: digest(pre.row), tenureId: pre.tenureId, resumeTokenHash: pre.row.resume_token ? digest(pre.row.resume_token) : null,
       evidence: probe.evidence, preserved: { tenureMinted: false, adopted: false, relaunched: false, inputSent: false, authorityChanged: false, custodyTouched: false },
+      unknownEffectsPreserved: { count: pre.unknownEffects.count, digest: pre.unknownEffects.digest },
       statusTransition: { from: "detached", to: "running" }, recoveredAt: at, grantsAuthority: false,
     };
 
@@ -135,6 +144,9 @@ export class LiveProjectionRecoveryService {
         const post = this.snapshot(input);
         if ("outcome" in post) throw new ProjectionDrift();
         if (JSON.stringify(post.row) !== JSON.stringify(pre.row) || post.tenureId !== pre.tenureId || post.pane !== pre.pane) throw new ProjectionDrift();
+        // The UNKNOWN set this recovery reports as preserved must still be
+        // byte-identical: any change is drift, not something to absorb.
+        if (post.unknownEffects.count !== pre.unknownEffects.count || post.unknownEffects.digest !== pre.unknownEffects.digest) throw new ProjectionDrift();
         if (this.fences(post)) throw new ProjectionDrift();
         const changed = this.db.prepare("UPDATE sessions SET status='running', last_seen_at=? WHERE id=? AND status='detached'").run(at, input.sessionId).changes;
         if (changed !== 1) throw new ProjectionDrift();
@@ -151,17 +163,32 @@ export class LiveProjectionRecoveryService {
   }
 
   /** Quiescence fences matching the coordination engine's own checks: every
-   * unreleased reservation (reserved/started/committed), any guarded undelivered
-   * effect, and any explicit seat delivery guard (desired or effective).
-   * Checkpoint rows carry no lifecycle state column, so none is invented. */
+   * unreleased reservation (reserved/started/committed), any guarded effect that
+   * can STILL MOVE to the seat, and any explicit seat delivery guard (desired or
+   * effective). Checkpoint rows carry no lifecycle state column, so none is invented.
+   *
+   * Effect scope (class-level remedy): a guard-bound effect in pending, sending or
+   * retained is the only legitimate content of an effect fence — it can still be
+   * written, released or retired. A terminal 'indeterminate' row is a UNKNOWN
+   * record whose bytes and state nothing will change, and the status flip this
+   * service performs cannot replay it or move its guard binding (guard targets are
+   * derived from nodes/bindings/tenure, never from sessions.status). Those rows are
+   * therefore preserved and reported, not treated as a fence; dispatch and takeover
+   * debt gates still count every one of them unchanged. */
   private fences(s: Snapshot): LiveProjectionRecoveryOutcome | null {
     if (this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE node_id=? AND state <> 'released' LIMIT 1").get(s.row.node_id))
       return { ok: false, code: "reservation_fencing_active", message: "Unreleased dispatch reservation fences projection recovery." };
-    if (this.db.prepare("SELECT 1 FROM outbox_entries WHERE destination_session=? AND guard_binding IS NOT NULL AND delivery_state NOT IN ('delivered','failed','retired') LIMIT 1").get(s.row.session_name))
-      return { ok: false, code: "delivery_fencing_active", message: "Guarded undelivered effect fences projection recovery." };
+    if (this.db.prepare("SELECT 1 FROM outbox_entries WHERE destination_session=? AND guard_binding IS NOT NULL AND delivery_state IN ('pending','sending','retained') LIMIT 1").get(s.row.session_name))
+      return { ok: false, code: "delivery_fencing_active", message: "Guarded effect that can still move fences projection recovery." };
     if (this.db.prepare("SELECT 1 FROM seat_delivery_guards WHERE node_id=? AND (desired=1 OR effective=1) LIMIT 1").get(s.row.node_id))
       return { ok: false, code: "delivery_fencing_active", message: "Explicit seat delivery guard fences projection recovery." };
     return null;
+  }
+
+  /** Count plus body-hash digest of the seat's terminal UNKNOWN guard-bound effects. */
+  private unknownEffects(session: string): UnknownEffects {
+    const rows = this.db.prepare("SELECT outbox_id, delivery_state, body FROM outbox_entries WHERE destination_session=? AND guard_binding IS NOT NULL AND delivery_state='indeterminate' ORDER BY outbox_id ASC").all(session) as Array<{ outbox_id: string; delivery_state: string; body: string }>;
+    return { count: rows.length, digest: digest(rows.map(r => [r.outbox_id, r.delivery_state, createHash("sha256").update(r.body).digest("hex")])) };
   }
 
   private snapshot(input: LiveProjectionRecoveryInput): Snapshot | { outcome: LiveProjectionRecoveryOutcome } {
@@ -178,7 +205,7 @@ export class LiveProjectionRecoveryService {
     const node = this.db.prepare("SELECT runtime,rig_id FROM nodes WHERE id=?").get(input.nodeId) as { runtime: string | null; rig_id: string } | undefined;
     if (!node) return { outcome: { ok: false, code: "node_missing", message: "Persisted node not found." } };
     const binding = this.db.prepare("SELECT tmux_pane FROM bindings WHERE node_id=?").get(input.nodeId) as { tmux_pane: string | null } | undefined;
-    return { row, tenureId: tenure.id, runtime: node.runtime ?? null, rigId: node.rig_id, pane: binding?.tmux_pane ?? null, nativeBoot: tenure.native_session_id_at_boot };
+    return { row, tenureId: tenure.id, runtime: node.runtime ?? null, rigId: node.rig_id, pane: binding?.tmux_pane ?? null, nativeBoot: tenure.native_session_id_at_boot, unknownEffects: this.unknownEffects(row.session_name) };
   }
 
   private async probe(row: SessionRow, runtime: string | null, pane: string | null, nativeBoot: string | null): Promise<{ evidence: Record<string, unknown> } | { outcome: LiveProjectionRecoveryOutcome }> {
