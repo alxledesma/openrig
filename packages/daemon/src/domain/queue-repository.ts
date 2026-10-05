@@ -905,6 +905,10 @@ export class QueueRepository {
     const q=this.getById(queueId);if(!q||q.sourceSession!=='watchdog@system'||q.destinationSession!=='operator-agent@kernel')throw new QueueRepositoryError('coordination_intake_required','Exact runtime intake required');
     return this.recordWakeIntent({outboxId:WAKE_INTENT_PREFIX+queueId,auditPointer:queueId,fromSession:'watchdog@system',toSession:'operator-agent@kernel',identityProvenance:'system:operator-authorized-coordination',bareBody:q.body,tags:['queue:coordination-intake-lineage','queue:recipient-generation:'+generation]})!;
   }
+  stageHeldHistoryAuthoringWake(queueId:string,recipient:string,generation:string):string {
+    const q=this.getById(queueId);if(!q||q.sourceSession!=='watchdog@system'||q.destinationSession!==recipient)throw new QueueRepositoryError('held_authoring_required','Exact fixed authoring duty required');
+    return this.recordWakeIntent({outboxId:WAKE_INTENT_PREFIX+queueId,auditPointer:queueId,fromSession:'watchdog@system',toSession:recipient,identityProvenance:'system:operator-authorized-coordination',bareBody:q.body,tags:['queue:coordinator-lifecycle','queue:recipient-generation:'+generation]})!;
+  }
   stageCoordinatorLifecycleWake(queueId:string,recipient:string,generation:string):void {
     if(!this.db.inTransaction||!this.outbox)throw new QueueRepositoryError('wake_intent_store_unavailable','Lifecycle duty requires atomic durable wake');
     this.recordWakeIntent({outboxId:`${WAKE_INTENT_PREFIX}${queueId}`,auditPointer:queueId,fromSession:'watchdog@system',toSession:recipient,identityProvenance:'system:operator-authorized-coordination',bareBody:`Read and genuinely claim exact lifecycle duty ${queueId}; retain all existing acceptance, qualification and scope gates.`,tags:['queue:coordinator-lifecycle',`queue:recipient-generation:${generation}`]});
@@ -996,6 +1000,7 @@ export class QueueRepository {
    */
   assertAdministrativeClaimant(qitemId:string,actor:string,generation:string|null|undefined,provenance:string|null|undefined):void {
     this.assertRecipientAckClaimant(qitemId,actor,generation,provenance);
+    const authoring=this.coordinatorAuthority.coordinationRecovery?.heldHistoryAuthoringControl(qitemId);if(authoring){const q=this.getById(qitemId),claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(qitemId) as any;if(!q?.claimedAt||!['in-progress','blocked'].includes(q.state)||actor!==authoring.recipient||generation!==authoring.recipientGeneration||this.coordinatorAuthority.generation(actor)!==generation||claim?.claimed_by_generation_uuid!==generation||provenance!=='transport:v1')throw new QueueRepositoryError('held_authoring_claim_required','Exact current native Lead claimant required for administrative authoring custody');}
     const issued=this.abandonmentAuthorization(qitemId);if(!issued)return;const r=issued.receipt,q=this.getById(qitemId),claimed=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(qitemId) as {claimed_by_generation_uuid:string}|undefined;
     if(provenance!=='transport:v1'||actor!==r.sender||!generation||generation!==r.senderGeneration||this.coordinatorAuthority.generation(actor)!==generation||!q?.claimedAt||q.destinationSession!==actor||claimed?.claimed_by_generation_uuid!==generation)throw new QueueRepositoryError('outbox_authorization_claimant_required','Only exact original claimed sender with current native transport generation/provenance may change administrative custody, report own failure/cancel, or return actual retirement receipt; Operator, replacement identity and body assertions cannot close it.');
   }
@@ -1610,6 +1615,22 @@ export class QueueRepository {
     const r=this.recipientAckDuty(id);if(!r||!this.outbox||source!=='watchdog@system'||destination!==r.recipient)return false;const q=this.getById(id),notice=this.outbox.getById(WAKE_INTENT_PREFIX+id),hash=(v:string)=>createHash('sha256').update(v).digest('hex');
     if(!q||q.state!=='pending'||q.claimedAt||q.expiresAt!==new Date(r.deadline).toISOString()||hash(q.body)!==r.queueBodyHash||!notice||!['pending','sending'].includes(notice.deliveryState)||notice.senderSession!==source||notice.destinationSession!==destination||notice.auditPointer!==id||hash(notice.body)!==r.noticeBodyHash||!this.recipientAckProtection(r,notice.outboxId)||!this.recipientAckPredecessor(r))return false;
     try{return JSON.stringify(this.outbox.recipientAcknowledgmentContract(r.recipient,r.recipientGeneration,r.effectId).contract)===JSON.stringify(r.contract);}catch{return false;}
+  }
+  /** Administrative authoring alone may coexist with an exact terminal receipt
+   * notice. UNKNOWN transport stays terminal and is never selected or replayed. */
+  heldHistoryAuthoringDebtReady(rigId:string,recipient:string,excludeEffect?:string):boolean {
+    if(!this.outbox)return false;
+    const rows=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session=? OR destination_session=?)").all(recipient,recipient) as Array<Record<string,unknown>&{outbox_id:string}>;
+    for(const row of rows){if(row.outbox_id===excludeEffect||this.coordinatorAuthority.isAdoptedHistoryContained(rigId,row))continue;
+      if(row.delivery_state!=='indeterminate')return false;
+      if(!row.outbox_id.startsWith(WAKE_INTENT_PREFIX)){if(row.guard_binding)return false;try{const effect=this.outbox.getById(row.outbox_id)!;const generation=this.coordinatorAuthority.generation(effect.destinationSession);if(!generation)return false;this.outbox.recipientAcknowledgmentContract(effect.destinationSession,generation,effect.outboxId);continue;}catch{return false;}}
+      const id=row.outbox_id.slice(WAKE_INTENT_PREFIX.length),r=this.recipientAckDuty(id),q=this.getById(id),last=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(id) as any,claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(id) as any;
+      if(!r||r.rigId!==rigId||r.recipient!==recipient||r.recipientGeneration!==this.coordinatorAuthority.generation(recipient)||!q||q.destinationSession!==recipient||q.sourceSession!=='watchdog@system'||createHash('sha256').update(q.body).digest('hex')!==r.queueBodyHash||row.sender_session!=='watchdog@system'||row.destination_session!==recipient||row.audit_pointer!==id||createHash('sha256').update(String(row.body)).digest('hex')!==r.noticeBodyHash)return false;
+      const failed=q.claimedAt&&['failed','canceled'].includes(q.state)&&claim?.claimed_by_generation_uuid===r.recipientGeneration&&last?.state===q.state&&last?.actor_session===recipient&&last?.identity_provenance==='transport:v1';
+      const receiptId='qitem-outbox-recipient-ack-'+createHash('sha256').update(JSON.stringify([r.effectId,recipient,r.recipientGeneration])).digest('hex'),ack=q.state==='done'&&this.outbox.recipientAcknowledgmentProof(recipient,r.recipientGeneration,r.effectId,receiptId);
+      if(!failed&&!ack)return false;
+    }
+    return true;
   }
   private recipientAckPredecessor(r:any):boolean {
     if(!r.previousQueueId)return true;
@@ -2481,6 +2502,7 @@ export class QueueRepository {
    * Mark a qitem `in-progress` (claim). Computes closure_required_at from tier.
    */
   claim(input: QueueClaimInput): QueueItem {
+    const authoring=this.coordinatorAuthority.coordinationRecovery?.heldHistoryAuthoringControl(input.qitemId);if(authoring&&(input.identityProvenance!=='transport:v1'||input.destinationSession!==authoring.recipient||input.actorGeneration!==authoring.recipientGeneration||!this.coordinatorAuthority.coordinationRecovery?.validLifecycleControlWake('watchdog@system',input.destinationSession,input.qitemId)))throw new QueueRepositoryError('held_authoring_claim_required','Exact current native Lead and live authoring duty proof required');
     const ack=this.recipientAckDuty(input.qitemId);if(ack&&(input.identityProvenance!=='transport:v1'||input.destinationSession!==ack.recipient||input.actorGeneration!==ack.recipientGeneration||this.coordinatorAuthority.generation(input.destinationSession)!==ack.recipientGeneration||ack.deadline<=Date.now()))throw new QueueRepositoryError('outbox_ack_claim_required','Exact current native recipient generation and unexpired acknowledgment duty required');
     const qitem = this.getById(input.qitemId);
     if (!qitem) {
@@ -2564,6 +2586,7 @@ export class QueueRepository {
   }
 
   unclaim(qitemId: string, destinationSession: string, reason: string, identityProvenance?: string | null): QueueItem {
+    if(this.coordinatorAuthority.coordinationRecovery?.heldHistoryAuthoringControl(qitemId))throw new QueueRepositoryError('held_authoring_custody_required','Fixed authoring custody cannot be unclaimed; only the genuine current Lead claimant own failed/canceled closure or exact supported binding completion is permitted');
     if(this.recipientAckDuty(qitemId))throw new QueueRepositoryError('outbox_ack_custody_required','Exact acknowledgment duty cannot be unclaimed or reopened; genuine current claimant reports actual receipt or own failed/canceled closure');
     if(this.abandonmentAuthorization(qitemId))throw new QueueRepositoryError('outbox_authorization_custody_required','Issued administrative custody cannot be unclaimed; only genuine current claimant own failed/canceled disposition or actual retirement receipt return is supported');
     const qitem = this.getById(qitemId);

@@ -257,6 +257,19 @@ export class CoordinatorAuthorityService {
    let receipt:any;try{receipt=JSON.parse(String(adopted!.receipt));}catch{return false;}
    return !!receipt&&receipt.kind==='coordinator-held-history-adoption.v1'&&receipt.actor==='operator-agent@kernel'&&typeof receipt.generation==='string'&&receipt.deliveryConclusion==='unknown'&&receipt.originalMutations===0&&receipt.pre?.outboxId===row.outbox_id&&receipt.pre?.rowHash===held.rowHash&&receipt.pre?.quarantineHash===held.quarantineHash&&receipt.pre?.operationHash===held.operationHash&&receipt.postCustody!==null&&typeof receipt.postCustody==='object'&&digest(canonical(receipt.postCustody))===adopted!.post_custody_hash;
  }
+ /** Exact immutable adopted cohort for a current Lead's administrative authoring duty.
+  * This is evidence, never a live recovery binding or delivery conclusion. */
+ heldHistoryAuthoringSnapshot(rigId:string):HeldHistoryRef[] {
+   const rows=this.db.prepare("SELECT e.* FROM coordinator_held_history h JOIN outbox_entries e ON e.outbox_id=h.outbox_id WHERE h.rig_id=? AND e.delivery_state IN ('pending','indeterminate') ORDER BY e.outbox_id LIMIT 2001").all(rigId) as Record<string,unknown>[];
+   if(!rows.length||rows.length>2000)reject('coordinator_held_history_contract','Exact nonempty bounded adopted cohort required');
+   return rows.map(row=>{if(!this.isAdoptedHistoryContained(rigId,row))reject('coordinator_held_history_contract','Immutable adopted containment changed');return this.containedHistory(row)!;});
+ }
+ heldHistoryAuthoringBindingComplete(rigId:string,operationId:string,refs:HeldHistoryRef[],queueId:string,lead:string,leadGeneration:string,operatorGeneration:string):boolean {
+   const row=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='held-history-recovery-binding'").get(rigId,operationId) as {receipt:string}|undefined;if(!row)return false;
+   try{const r=JSON.parse(row.receipt),q=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(queueId) as any,b=r.binding;this.assertHeldRecoveryCurrent(b);
+     return r.kind==='coordinator-held-history-recovery-binding.v1'&&r.actor==='operator-agent@kernel'&&r.generation===operatorGeneration&&r.originalMutations===0&&canonical(r.effects)===canonical(refs.map(h=>h.outboxId))&&canonical(this.heldHistoryAuthoringSnapshot(rigId))===canonical(refs)&&b.queueId===queueId&&b.lead===lead&&b.leadGeneration===leadGeneration&&!!q&&canonical(this.validateHeldRecovery(r.actor,r.generation,{rigId,operationId,owner:lead,ownerGeneration:leadGeneration,heldHistoryRecovery:{queueId,rowHash:digest(canonical(q))}} as LegacyEnrollment,refs))===canonical(b);
+   }catch{return false;}
+ }
  /** Takeover additionally needs live accountable recovery. */
  private adoptedHistoryContained(rigId:string,row:Record<string,unknown>):boolean {
    const adopted=this.db.prepare('SELECT * FROM coordinator_held_history WHERE rig_id=? AND outbox_id=?').get(rigId,row.outbox_id) as Record<string,unknown>|undefined;
