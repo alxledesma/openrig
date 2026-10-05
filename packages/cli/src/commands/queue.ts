@@ -1282,7 +1282,8 @@ Examples:
     .description("Consume your genuinely claimed finite authorization: exact {outboxId,bodySha256,expectedState,operationId,authorizationId,reason,evidenceRef}; preserves UNKNOWN, never asserts delivery")
     .option("--json", "JSON output for agents")
     .action(async(file:string,opts:{json?:boolean})=>{
-      const contract=JSON.parse(fs.readFileSync(file,"utf8"));
+      if(!readOpenRigEnv("OPENRIG_SESSION_NAME","RIGGED_SESSION_NAME")?.trim()||!process.env.OPENRIG_OCCUPANT_GENERATION?.trim())throw new Error("Native administrative transport missing: OPENRIG_SESSION_NAME and OPENRIG_OCCUPANT_GENERATION must come from your managed claimant environment. Do not forge headers or probe contract fields; the contract is not the missing identity.");
+      let contract;try{contract=JSON.parse(fs.readFileSync(file,"utf8"));}catch{throw new Error("Malformed administrative contract file: readable JSON with exactly seven abandonment fields required; native transport identity is present");}
       if(!contract||Object.keys(contract).sort().join(",")!=="authorizationId,bodySha256,evidenceRef,expectedState,operationId,outboxId,reason"||["outboxId","bodySha256","operationId","authorizationId","reason","evidenceRef"].some(k=>typeof contract[k]!=="string"||!contract[k].trim())||!/^[a-f0-9]{64}$/.test(contract.bodySha256)||!["pending","indeterminate"].includes(contract.expectedState))throw new Error("Exact seven-field abandonment contract required; native sender identity/generation derive from environment");
       await withClient(getDeps(),async client=>{const res=await client.post<unknown>("/api/queue/outbox/abandon-uncertain",contract,{headers:terminalAuthHeaders()});printResult(opts.json??false,res.data,res.status);});
     });

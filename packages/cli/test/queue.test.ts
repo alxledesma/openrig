@@ -90,9 +90,12 @@ describe("rig queue CLI", () => {
   });
 
   it("outbox-abandon-uncertain sends exact native consumer contract once and refuses caller identity fields locally",async()=>{
+    vi.stubEnv("OPENRIG_OCCUPANT_GENERATION","native-test-generation");
     const dir=fs.mkdtempSync(path.join(os.tmpdir(),"abandon-cli-")),file=path.join(dir,"contract.json");const body={outboxId:"actual-effect",bodySha256:"a".repeat(64),expectedState:"indeterminate",operationId:"actual-retirement",authorizationId:"actual-claimed-auth",reason:"preserve UNKNOWN",evidenceRef:"actual-confirmations.json"};
     try{fs.writeFileSync(file,JSON.stringify(body));const {deps,calls}=makeDeps({routes:{"POST /api/queue/outbox/abandon-uncertain":{status:200,data:{deliveryState:"retired",deliveryConclusion:"unknown"}}}});await createProgram({queueDeps:deps}).parseAsync(["node","rig","queue","outbox-abandon-uncertain",file,"--json"]);expect(calls.filter(c=>c.method==="POST")).toEqual([{method:"POST",path:"/api/queue/outbox/abandon-uncertain",body}]);fs.writeFileSync(file,JSON.stringify({...body,actor:"forged"}));await expect(createProgram({queueDeps:deps}).parseAsync(["node","rig","queue","outbox-abandon-uncertain",file])).rejects.toThrow("Exact seven-field");expect(calls.filter(c=>c.method==="POST")).toHaveLength(1);}finally{fs.rmSync(dir,{recursive:true,force:true});}
   });
+
+  it("outbox-abandon consumer distinguishes missing native transport from malformed JSON without HTTP",async()=>{const dir=fs.mkdtempSync(path.join(os.tmpdir(),"abandon-identity-")),file=path.join(dir,"bad.json");try{fs.writeFileSync(file,"not JSON");const {deps,calls}=makeDeps();vi.stubEnv("OPENRIG_OCCUPANT_GENERATION","");await expect(createProgram({queueDeps:deps}).parseAsync(["node","rig","queue","outbox-abandon-uncertain",file])).rejects.toThrow("Native administrative transport missing");vi.stubEnv("OPENRIG_OCCUPANT_GENERATION","native-test-generation");await expect(createProgram({queueDeps:deps}).parseAsync(["node","rig","queue","outbox-abandon-uncertain",file])).rejects.toThrow("Malformed administrative contract file");expect(calls).toHaveLength(0);}finally{fs.rmSync(dir,{recursive:true,force:true});}});
 
   it("queue is registered on createProgram with all R1 subcommands", async () => {
     const { deps } = makeDeps();

@@ -24,6 +24,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
    const svc=(c.get("queueRepo" as never) as QueueRepository).coordinatorAuthority;
    try {
      const operation=c.req.param("operation");
+     if(operation==="outbox-abandon-evidence"){const repo=c.get("queueRepo" as never) as QueueRepository,adapter=c.get("tmuxAdapter" as never) as import("../adapters/tmux.js").TmuxAdapter|undefined;return c.json(await repo.registerOutboxAbandonEvidence(actor,generation,await c.req.json(),adapter?.deliveryGuard));}
      if(operation==="outbox-abandon-continue"){const repo=c.get("queueRepo" as never) as QueueRepository,adapter=c.get("tmuxAdapter" as never) as import("../adapters/tmux.js").TmuxAdapter|undefined;return c.json(await repo.continueOutboxAbandonAuthorization(actor,generation,await c.req.json(),adapter?.deliveryGuard));}
      if(operation==="outbox-abandon-notify"){const repo=c.get("queueRepo" as never) as QueueRepository,adapter=c.get("tmuxAdapter" as never) as import("../adapters/tmux.js").TmuxAdapter|undefined;return c.json(await repo.notifyOutboxAbandonAuthorization(actor,generation,await c.req.json(),adapter?.deliveryGuard));}
      if(operation==="outbox-abandon-authorize"){const repo=c.get("queueRepo" as never) as QueueRepository,adapter=c.get("tmuxAdapter" as never) as import("../adapters/tmux.js").TmuxAdapter|undefined;return c.json(await repo.issueOutboxAbandonAuthorization(actor,generation,await c.req.json(),adapter?.deliveryGuard));}
