@@ -38,7 +38,7 @@ function readyCore(f = fakeIo()) {
   core.start();
   core.handlePiLine(JSON.stringify({
     type: "response", id: "pi-runner-get-state",
-    data: { sessionFile: SESSION_FILE, sessionId: "0197a2f0" },
+    data: { sessionFile: SESSION_FILE, sessionId: "0197a2f0", isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
   }));
   return { core, ...f };
 }
@@ -200,6 +200,42 @@ describe("runner input", () => {
 // ── stdin → RPC routing ──────────────────────────────────────────────────────
 
 describe("RunnerCore.handleUserBlock", () => {
+  it("native model and compact controls never become prompts and refuse unsettled turns", () => {
+    const { core, rpc } = readyCore();
+    core.handleUserBlock("/model openrouter/inclusionai/ling-3.1-flash");
+    expect(rpc.at(-1)).toEqual({ type: "set_model", provider: "openrouter", modelId: "inclusionai/ling-3.1-flash", id: "pi-runner-native-control" });
+    const before = rpc.length;
+    core.handleUserBlock("/compact");
+    expect(rpc).toHaveLength(before);
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-native-control", command: "set_model", success: true }));
+    core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    core.handleUserBlock("/compact");
+    expect(rpc.at(-1)?.type).not.toBe("compact");
+    core.handlePiLine(JSON.stringify({ type: "agent_settled" }));
+    core.handleUserBlock("/compact Preserve current assignments");
+    expect(rpc.at(-1)).toEqual({ type: "compact", customInstructions: "Preserve current assignments", id: "pi-runner-native-control" });
+  });
+
+  it("invalid model control is refused without prompt or RPC", () => {
+    const { core, rpc } = readyCore();
+    const before = rpc.length;
+    core.handleUserBlock("/model bad");
+    expect(rpc).toHaveLength(before);
+  });
+  it.each([{ isCompacting: true }, { pendingMessageCount: 1 }, { isCompacting: undefined }])("controls refuse busy or unknown native state %j without reannouncing identity", (patch) => {
+    const { core, rpc, activity, lines } = readyCore();
+    core.handleUserBlock("/model");
+    const announcements = activity.length, readyLines = lines.filter(l => l.startsWith(PI_RUNNER_READY_MARKER)).length;
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-native-control", command: "get_available_models", success: true, data: { models: [] } }));
+    expect(rpc.at(-1)).toEqual({ type: "get_state", id: "pi-runner-control-state" });
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-control-state", success: true, data: { isStreaming: false, isCompacting: false, pendingMessageCount: 0, ...patch } }));
+    const before = rpc.length;
+    core.handleUserBlock("/compact");
+    expect(rpc).toHaveLength(before);
+    expect(activity).toHaveLength(announcements);
+    expect(lines.filter(l => l.startsWith(PI_RUNNER_READY_MARKER))).toHaveLength(readyLines);
+  });
   it("idle → RPC prompt", () => {
     const { core, rpc } = readyCore();
     core.handleUserBlock("hello pi");

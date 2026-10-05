@@ -252,9 +252,16 @@ export interface RunnerIo {
 const GET_STATE_ID = "pi-runner-get-state";
 const CATCH_UP_ID = "pi-runner-catch-up";
 const CURSOR_REFRESH_ID = "pi-runner-cursor-refresh";
+const CONTROL_STATE_ID = "pi-runner-control-state";
+
+function piProcessing(data: Record<string, unknown>): boolean {
+  return data.isStreaming !== false || data.isCompacting !== false || data.pendingMessageCount !== 0;
+}
 
 export class RunnerCore {
   private streaming = false;
+  private processing = true;
+  private controlPending = false;
   private sessionFile: string | undefined;
   private sessionId: string | undefined;
   private lastEntryId: string | undefined;
@@ -307,6 +314,22 @@ export class RunnerCore {
 
   /** One aggregated paste block from pane stdin. */
   handleUserBlock(block: string): void {
+    if (block === "/model" || block.startsWith("/model ") || block === "/compact" || block.startsWith("/compact ")) {
+      if (!this.ready || this.processing || this.controlPending) {
+        this.io.mirrorLine("[pi-runner] control refused: wait for Pi to settle before changing model or compacting.");
+        return;
+      }
+      let command: Record<string, unknown>;
+      if (block === "/model") command = { type: "get_available_models" };
+      else if (block.startsWith("/model ")) {
+        const match = /^\/model ([^\s/]+)\/(\S+)$/.exec(block);
+        if (!match) { this.io.mirrorLine("[pi-runner] usage: /model provider/model-id"); return; }
+        command = { type: "set_model", provider: match[1], modelId: match[2] };
+      } else command = { type: "compact", ...(block === "/compact" ? {} : { customInstructions: block.slice(9) }) };
+      this.controlPending = true;
+      this.io.sendRpc({ ...command, id: "pi-runner-native-control" });
+      return;
+    }
     if (block === "/abort") {
       this.io.sendRpc({ type: "abort" });
       this.io.mirrorLine("[pi-runner] abort sent");
@@ -347,6 +370,20 @@ export class RunnerCore {
   }
 
   private handleResponse(record: Record<string, unknown>): void {
+    if (record.id === "pi-runner-native-control") {
+      this.controlPending = false;
+      const data = record.data as { models?: Array<{ provider?: string; id?: string }> } | undefined;
+      this.io.mirrorLine(record.success === true
+        ? `[pi-runner] ${String(record.command)} completed${record.command === "get_available_models" ? ": " + (data?.models ?? []).map(m => `${m.provider}/${m.id}`).join(", ") : ""}`
+        : `${PI_RUNNER_ERROR_MARKER} native control: ${String(record.error ?? "unverified response")}`);
+      this.processing = true;
+      this.io.sendRpc({ type: "get_state", id: CONTROL_STATE_ID });
+      return;
+    }
+    if (record.id === CONTROL_STATE_ID) {
+      this.processing = record.success !== true || piProcessing((record.data ?? {}) as Record<string, unknown>);
+      return;
+    }
     if (record.id === GET_STATE_ID) {
       const data = (record.data ?? record.state ?? record) as Record<string, unknown>;
       const sessionFile = typeof data.sessionFile === "string" ? data.sessionFile : undefined;
@@ -354,6 +391,7 @@ export class RunnerCore {
       this.sessionFile = sessionFile ?? this.sessionFile;
       this.sessionId = sessionId ?? this.sessionId;
       this.ready = true;
+      this.processing = piProcessing(data);
       this.writeSidecar({});
       this.io.mirrorLine(`${PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
       this.io.postActivity({
@@ -390,6 +428,8 @@ export class RunnerCore {
   }
 
   private handleEvent(event: Record<string, unknown>): void {
+    if (event.type === "agent_start" || event.type === "compaction_start") this.processing = true;
+    if (event.type === "agent_settled") this.processing = false;
     const message = event.message as Record<string, unknown> | undefined;
     if (event.type === "agent_start" || (event.type === "message_start" && message?.role === "assistant")) {
       this.assistantErrorShown = false;
