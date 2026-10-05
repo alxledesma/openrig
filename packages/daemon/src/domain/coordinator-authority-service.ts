@@ -9,6 +9,11 @@ export interface DispatchEnvelope { token: CoordinatorToken; packageKey: string 
 export interface PackageContract {
  inputDigest: string; destination: string; bodyHash: string;
  resources: string[]; returnContract: { destination: string; evidenceRequired: string[]; transitions?: Array<{source:string;destination:string;bodyHash:string}> };
+ /** Prospective classification, set at Operator registration. Absent means a legacy
+  * contract: its frozen bytes are never rewritten, and an unplanned non-backup legacy
+  * package still receives its existing materialization duty but never supports a
+  * completeness finding. */
+ workClass?: "product"|"recovery"|"administrative"|"inquiry";
 }
 export interface HeldHistoryRef {outboxId:string;rowHash:string;custodyHash:string;quarantineHash:string;operationHash:string}
 export interface LegacyInventory { heldHistory?:HeldHistoryRef[]; rows: Array<{queueId:string;rowHash:string}>; uncertainEffects: string[]; snapshotDigest:string }
@@ -486,7 +491,8 @@ export class CoordinatorAuthorityService {
  admit(actor:string,generation:string,rigId:string,packageKey:string,contract:PackageContract): void {
    this.db.transaction(() => {
      this.operator(actor,generation); if(!this.get(rigId)) reject("coordinator_not_enabled","Enable rig before admitting packages");
-     if(!packageKey||!contract.inputDigest||!contract.bodyHash||!Array.isArray(contract.resources)||new Set(contract.resources).size!==contract.resources.length||contract.resources.some(r=>!r)||!contract.returnContract?.destination||!Array.isArray(contract.returnContract.evidenceRequired)) reject("coordinator_invalid_package","Frozen input, resource and return contracts required");
+   if(!packageKey||!contract.inputDigest||!contract.bodyHash||!Array.isArray(contract.resources)||new Set(contract.resources).size!==contract.resources.length||contract.resources.some(r=>!r)||!contract.returnContract?.destination||!Array.isArray(contract.returnContract.evidenceRequired)) reject("coordinator_invalid_package","Frozen input, resource and return contracts required");
+   if(contract.workClass!==undefined&&!['product','recovery','administrative','inquiry'].includes(contract.workClass)) reject("coordinator_invalid_work_class","Work class must be product, recovery, administrative or inquiry");
      if(this.local(contract.destination)?.rig_id!==rigId) reject("coordinator_cross_host_refused","Only local worker destinations supported");
      for(const t of contract.returnContract.transitions??[]){if(!t.bodyHash||this.local(t.source)?.rig_id!==rigId||this.local(t.destination)?.rig_id!==rigId)reject("coordinator_invalid_package","Stage transitions require exact local endpoints and immutable body hash");}
      const value=canonical(contract), hash=digest(value);
