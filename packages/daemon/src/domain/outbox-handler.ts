@@ -285,8 +285,8 @@ export class OutboxHandler {
         || createHash("sha256").update(current.body).digest("hex") !== input.bodySha256) {
         refuse("outbox_abandon_drift","Frozen effect body/state changed; no abandonment.");
       }
-      const auth = this.db.prepare("SELECT source_session,destination_session,minting_generation_uuid,claimed_by_generation_uuid,state,body FROM queue_items WHERE qitem_id=?")
-        .get(input.authorizationId) as {source_session:string;destination_session:string;minting_generation_uuid:string|null;claimed_by_generation_uuid:string|null;state:string;body:string}|undefined;
+      const auth = this.db.prepare("SELECT source_session,destination_session,minting_generation_uuid,claimed_by_generation_uuid,state,body,expires_at FROM queue_items WHERE qitem_id=?")
+        .get(input.authorizationId) as {source_session:string;destination_session:string;minting_generation_uuid:string|null;claimed_by_generation_uuid:string|null;state:string;body:string;expires_at:string|null}|undefined;
       const creation = this.db.prepare("SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? AND transition_note='created' ORDER BY transition_id LIMIT 1")
         .get(input.authorizationId) as {actor_session:string;identity_provenance:string|null}|undefined;
       const contract = {kind:"outbox-abandon-authorization",outboxId:input.outboxId,bodySha256:input.bodySha256,expectedState:input.expectedState,
@@ -294,10 +294,12 @@ export class OutboxHandler {
       let proof:Record<string,unknown>|undefined;try{proof=auth?JSON.parse(auth.body):undefined;}catch{}
       if (!auth || auth.source_session !== operator || auth.destination_session !== input.actor || auth.minting_generation_uuid !== nodes[2]!.generation
         || auth.claimed_by_generation_uuid !== input.generation || auth.state !== "in-progress" || creation?.actor_session !== operator
-        || creation.identity_provenance !== "transport:v1" || !proof || Object.keys(proof).length !== Object.keys(contract).length
+        || creation.identity_provenance !== "transport:v1" || !auth.expires_at || !Number.isFinite(Date.parse(auth.expires_at)) || Date.parse(auth.expires_at)<=Date.now() || !proof || Object.keys(proof).length !== Object.keys(contract).length
         || Object.entries(contract).some(([k,v])=>proof![k]!==v)) {
         refuse("outbox_operator_authorization_required","Current Kernel Operator's exact transport-authored authorization must be claimed by the current sender.");
       }
+      const issued=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE operation_id=? AND kind='outbox-abandon-authorization'").get('outbox-abandon-authorization:'+input.authorizationId) as {receipt:string}|undefined;
+      if(issued){const r=JSON.parse(issued.receipt),hash=(v:string)=>createHash('sha256').update(v).digest('hex');if(r.authorizationId!==input.authorizationId||r.outboxId!==input.outboxId||r.deadline!==Date.parse(auth!.expires_at!)||r.bodyHash!==hash(auth!.body)||r.effectSnapshotHash!==hash(JSON.stringify(current))||r.sender!==input.actor||r.senderGeneration!==input.generation||r.recipient!==current!.destinationSession||r.recipientGeneration!==nodes[1]!.generation||r.operator!==operator||r.operatorGeneration!==nodes[2]!.generation)refuse('outbox_operator_authorization_required','Issued authorization differs from frozen effect or current native identities');}
       const changed = this.db.prepare("UPDATE outbox_entries SET delivery_state='retired',retired_at=?,retired_by=?,retirement_reason=? WHERE outbox_id=? AND delivery_state=?")
         .run(new Date().toISOString(),input.actor,`Uncertain effect explicitly abandoned: ${input.reason}`,input.outboxId,input.expectedState);
       if (changed.changes !== 1) refuse("outbox_abandon_drift","Concurrent effect disposition won; no abandonment.");

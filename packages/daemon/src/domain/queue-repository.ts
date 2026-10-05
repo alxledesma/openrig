@@ -1,4 +1,5 @@
-import { CoordinatorAuthorityService, AssignmentReplay, type DispatchEnvelope } from "./coordinator-authority-service.js";
+import type { SeatDeliveryGuard } from './seat-delivery-guard.js';
+import { CoordinatorAuthorityService, CoordinatorFenceError, AssignmentReplay, type DispatchEnvelope } from "./coordinator-authority-service.js";
 import { readWakeLadderBackstop } from "./queue-wake-ladder.js";
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -616,6 +617,7 @@ function isWakeTimeoutSignal(s: string | undefined): boolean {
 
 export class QueueRepository {
   private readonly nativeTerminalReturnControls=new WeakSet<QueueCreateInput>();
+  private readonly outboxAbandonAuthorizations=new WeakSet<QueueCreateInput>();
   readonly db: Database.Database;
   readonly transitionLog: QueueTransitionLog;
   private readonly eventBus: EventBus;
@@ -1481,6 +1483,38 @@ export class QueueRepository {
    */
   /** Internal-only validated completion control; JSON queue requests cannot forge
    * the object-identity capability or bypass ordinary dispatch admission. */
+  /** Genuine Operator administrative issuance only; the internal capability cannot
+   * be supplied by JSON queue requests or grant a product assignment. */
+  async issueOutboxAbandonAuthorization(actor:string,generation:string,input:{authorizationId:string;deadline:number;contract:{kind:'outbox-abandon-authorization';outboxId:string;bodySha256:string;expectedState:'pending'|'indeterminate';operationId:string;senderGeneration:string;reason:string;evidenceRef:string}},guard:SeatDeliveryGuard|undefined):Promise<{authorizationId:string;sender:string;deadline:number}> {
+    const refuse=(code:string,message:string):never=>{throw new CoordinatorFenceError(code,message);};
+    this.coordinatorAuthority.assertCurrentOperator(actor,generation);
+    if(!guard||guard.db!==this.db||!this.outbox)refuse('outbox_authorization_lifecycle_required','Same-database lifecycle guard and outbox store required');
+    const c=input?.contract,keys=['kind','outboxId','bodySha256','expectedState','operationId','senderGeneration','reason','evidenceRef'];
+    if(!input||Object.keys(input).sort().join(',')!=='authorizationId,contract,deadline'||typeof input.authorizationId!=='string'||!input.authorizationId.trim()||input.authorizationId.length>160||!c||Array.isArray(c)||Object.keys(c).sort().join(',')!==keys.sort().join(',')||c.kind!=='outbox-abandon-authorization'||!['pending','indeterminate'].includes(c.expectedState)||['outboxId','bodySha256','operationId','senderGeneration','reason','evidenceRef'].some(k=>typeof c[k as keyof typeof c]!=='string'||!String(c[k as keyof typeof c]).trim())||!/^[a-f0-9]{64}$/.test(c.bodySha256)||!Number.isSafeInteger(input.deadline))refuse('outbox_authorization_contract_required','Exact eight-field abandonment contract, authorizationId and finite deadline required');
+    const entry=this.outbox!.getById(c.outboxId);
+    if(!entry||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||entry.guardBinding)refuse('outbox_authorization_effect_refused','Only an existing unguarded non-executable direct effect can receive abandonment authorization');
+    const local=(session:string)=>{const parts=session.split('@');if(parts.length!==2)return undefined;const r=this.db.prepare('SELECT s.node_id,n.rig_id FROM sessions s JOIN nodes n ON n.id=s.node_id JOIN rigs r ON r.id=n.rig_id WHERE s.session_name=? AND r.name=? ORDER BY s.id DESC LIMIT 1').get(session,parts[1]) as {node_id:string;rig_id:string}|undefined;const gen=this.coordinatorAuthority.generation(session);return r&&gen?{...r,generation:gen}:undefined;};
+    const sessions=[entry!.senderSession,entry!.destinationSession,actor],nodes=sessions.map(local);
+    if(nodes.some(n=>!n)||nodes[0]!.generation!==c.senderGeneration||nodes[2]!.generation!==generation||!this.coordinatorAuthority.get(nodes[0]!.rig_id))refuse('outbox_authorization_generation_required','Exact current local sender, recipient, Operator and enabled sender rig required');
+    const rigId=nodes[0]!.rig_id,id='outbox-abandon-authorization:'+input.authorizationId,body=JSON.stringify(c),hash=(v:string)=>createHash('sha256').update(v).digest('hex'),requestHash=hash(JSON.stringify({actor,generation,input,nodes})),snapshotHash=hash(JSON.stringify(entry));
+    let created:PersistedEvent|undefined;
+    const result=await guard!.lifecycle(nodes.map(n=>n!.node_id),async()=>this.db.transaction(()=>{
+      this.coordinatorAuthority.assertCurrentOperator(actor,generation);
+      if(JSON.stringify(sessions.map(local))!==JSON.stringify(nodes)||nodes.some(n=>!guard!.ownsLifecycle(n!.node_id)))refuse('outbox_authorization_generation_changed','Native identity changed at lifecycle boundary');
+      const saved=this.db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='outbox-abandon-authorization'").get(rigId,id) as {receipt:string;request_hash:string}|undefined;
+      if(saved){const r=JSON.parse(saved.receipt),q=this.getById(input.authorizationId);if(saved.request_hash!==requestHash||!q||q.body!==body||q.sourceSession!==actor||q.destinationSession!==entry!.senderSession||Date.parse(q.expiresAt??'')!==input.deadline)refuse('outbox_authorization_conflict','Frozen abandonment authorization replay differs');return {authorizationId:input.authorizationId,sender:entry!.senderSession,deadline:input.deadline};}
+      if(input.deadline<=Date.now()||input.deadline>Date.now()+1200000)refuse('outbox_authorization_expired','Authorization must expire within twenty minutes; expired authority cannot be issued');
+      const current=this.outbox!.getById(c.outboxId);
+      if(hash(JSON.stringify(current))!==snapshotHash||current?.deliveryState!==c.expectedState||hash(current.body)!==c.bodySha256)refuse('outbox_authorization_effect_drift','Exact existing effect body/state changed at lifecycle boundary');
+      if(this.getById(input.authorizationId))refuse('outbox_authorization_conflict','Authorization queue ID already exists without this issuance receipt');
+      const item:QueueCreateInput={qitemId:input.authorizationId,sourceSession:actor,destinationSession:entry!.senderSession,body,expiresAt:new Date(input.deadline).toISOString(),identityProvenance:'transport:v1',nudge:false};
+      this.outboxAbandonAuthorizations.add(item);try{created=this.createWithinTransaction(item).persistedEvent;}finally{this.outboxAbandonAuthorizations.delete(item);}
+      const receipt={authorizationId:input.authorizationId,outboxId:c.outboxId,bodyHash:hash(body),effectSnapshotHash:snapshotHash,deadline:input.deadline,sender:entry!.senderSession,senderGeneration:c.senderGeneration,recipient:entry!.destinationSession,recipientGeneration:nodes[1]!.generation,operator:actor,operatorGeneration:generation};
+      this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,id,'outbox-abandon-authorization',JSON.stringify(receipt),requestHash);
+      return {authorizationId:input.authorizationId,sender:entry!.senderSession,deadline:input.deadline};
+    }).immediate());
+    if(created)this.eventBus.notifySubscribers(created);return result;
+  }
   createNativeTerminalReturnDuty(actor:string,generation:string,rigId:string,input:QueueCreateInput) {
     if(!input.qitemId||input.sourceSession!=='watchdog@system'||input.identityProvenance!=='system:operator-authorized-coordination'||input.expiresAt!==new Date(JSON.parse(input.body).deadline).toISOString())throw new QueueRepositoryError('invalid_terminal_return_control','Exact internal finite completion control required');
     this.coordinatorAuthority.registerNativeTerminalReturnControl(actor,generation,rigId,input.qitemId,input.body);
@@ -1545,7 +1579,7 @@ export class QueueRepository {
       if (!this.hasHumanIntentColumn) throw new QueueRepositoryError("invalid_human_notification", "Human notification fields require the current queue schema; they were not saved.");
     }
     const id = input.qitemId ?? newQitemId();
-    if(!this.nativeTerminalReturnControls.has(input))this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
+    if(!this.nativeTerminalReturnControls.has(input)&&!this.outboxAbandonAuthorizations.has(input))this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
     const ts = new Date().toISOString();
     const priority = input.priority ?? "routine";
     const tier = input.tier ?? null;

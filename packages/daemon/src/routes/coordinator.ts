@@ -1,3 +1,4 @@
+import { DeliveryGuardError } from '../domain/seat-delivery-guard.js';
 import { Hono } from "hono";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import { transportSenderSession } from "./require-sender-identity.js";
@@ -23,6 +24,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
    const svc=(c.get("queueRepo" as never) as QueueRepository).coordinatorAuthority;
    try {
      const operation=c.req.param("operation");
+     if(operation==="outbox-abandon-authorize"){const repo=c.get("queueRepo" as never) as QueueRepository,adapter=c.get("tmuxAdapter" as never) as import("../adapters/tmux.js").TmuxAdapter|undefined;return c.json(await repo.issueOutboxAbandonAuthorization(actor,generation,await c.req.json(),adapter?.deliveryGuard));}
      if(operation==="resilience-materialize"){if(!svc.resilienceRollout)throw new CoordinatorFenceError("resilience_unavailable","Service not wired");const receipt=svc.resilienceRollout.materialize(actor,generation,await c.req.json());await svc.resilienceRollout.deliver();return c.json(receipt);}
      if(operation==="outcome-configure"){if(!svc.runtimeOutcomeAssessment)throw new CoordinatorFenceError("runtime_outcome_unavailable","Service not wired");svc.runtimeOutcomeAssessment.configure(actor,generation,await c.req.json());return c.json({ok:true});}
      if(operation==="coordination-plan"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');return c.json(svc.coordinationRecovery.configure(actor,generation,b));}
@@ -59,6 +61,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
      }
      return c.json({error:"unknown_coordinator_operation"},404);
    } catch(err) {
+     if(err instanceof DeliveryGuardError)return c.json({error:err.code,message:err.message},409);
      if(err instanceof CoordinatorFenceError)return c.json({error:err.code,message:err.message,...err.meta},409);
      if(err instanceof SyntaxError)return c.json({error:"invalid_json"},400);
      throw err;
