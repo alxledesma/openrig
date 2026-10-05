@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { normalizeDevice, parseLsofFieldRecords, proveCodexInitialLaunch, type CodexSessionFileProofDeps } from "../src/domain/codex-session-file-proof.js";
+import { NativeToolUnavailableError, missingObservationTool, normalizeDevice, parseLsofFieldRecords, proveCodexInitialLaunch, resolveNativeTool, type CodexSessionFileProofDeps } from "../src/domain/codex-session-file-proof.js";
 
 const TOKEN = "01a0fe42-cdb5-78d3-94fc-60533aaa46fb";
 const OTHER_TOKEN = "01a0fe42-cdb5-78d3-94fc-60533aaa46fc";
@@ -297,4 +297,104 @@ describe("codex initial-launch session-file proof", () => {
     const badToken = await proveCodexInitialLaunch({ paneRootPid: 53570, pid: 54494, expectedToken: "nope", expectedGeneration: GEN }, deps(w));
     expect(badToken.code).toBe("token_invalid");
   });
+
+
+/**
+ * Native tool resolution and observation-failure typing.
+ *
+ * Regression for the production initial-launch proof that threw `spawn lsof ENOENT`
+ * because the daemon PATH omits /usr/sbin, surfacing as an HTTP 500 instead of a
+ * proof refusal. These tests inject the platform and the existence probe, so they
+ * are deterministic on any host and assert the RESTRICTED-PATH behaviour directly.
+ */
+describe("codex proof native tool resolution", () => {
+  const ALL_PRESENT = () => true;
+  const NONE_PRESENT = () => false;
+
+  it("resolves each Darwin observation tool to an installed absolute path", () => {
+    // The production defect: PATH resolution cannot see /usr/sbin, so lsof must
+    // be addressed by its real location instead of its bare name.
+    expect(resolveNativeTool("lsof", "darwin", ALL_PRESENT)).toBe("/usr/sbin/lsof");
+    expect(resolveNativeTool("ps", "darwin", ALL_PRESENT)).toBe("/bin/ps");
+    expect(resolveNativeTool("stat", "darwin", ALL_PRESENT)).toBe("/usr/bin/stat");
+    expect(resolveNativeTool("python3", "darwin", ALL_PRESENT)).toBe("/usr/bin/python3");
+    // Only a genuinely installed candidate is accepted.
+    expect(resolveNativeTool("lsof", "darwin", p => p === "/usr/bin/lsof")).toBe("/usr/bin/lsof");
+    expect(resolveNativeTool("lsof", "darwin", () => false)).toBeNull();
+    expect(resolveNativeTool("stat", "darwin", () => false)).toBeNull();
+    // Off Darwin the bare name keeps the platform's own PATH rules.
+    expect(resolveNativeTool("lsof", "linux", NONE_PRESENT)).toBe("lsof");
+  });
+
+  it("on this host every required Darwin tool is actually installed and executable", () => {
+    // Guards the table itself against drift: the fix is only real if the paths exist.
+    if (process.platform !== "darwin") return;
+    expect(missingObservationTool("darwin")).toBeNull();
+    expect(resolveNativeTool("lsof", "darwin")).toBe("/usr/sbin/lsof");
+    expect(resolveNativeTool("python3", "darwin")).not.toBeNull();
+  });
+
+  it("reports the FIRST missing tool with an exact cause", () => {
+    expect(missingObservationTool("darwin", NONE_PRESENT)).toEqual({ tool: "ps", code: "native_tool_unavailable" });
+    // Both lsof candidates absent (the restricted-PATH case) names lsof, not ps.
+    expect(missingObservationTool("darwin", p => p !== "/usr/sbin/lsof" && p !== "/usr/bin/lsof")).toEqual({ tool: "lsof", code: "native_tool_unavailable" });
+    expect(missingObservationTool("linux", NONE_PRESENT)).toBeNull();
+  });
+
+  it("consults the installed-tool pre-gate before any observation runs", async () => {
+    const w = world();
+    let observed = false;
+    const counting: CodexSessionFileProofDeps = {
+      ...deps(w),
+      async run(command, args) { observed = true; return deps(w).run(command, args); },
+    };
+    // On a host where every tool is installed the gate passes and observation runs.
+    if (missingObservationTool() === null) {
+      expect(await proveCodexInitialLaunch(opts(w), counting)).toMatchObject({ state: "proven" });
+      expect(observed).toBe(true);
+    }
+    // When a required tool is missing the gate refuses with the exact cause and
+    // the observation layer is never consulted.
+    const gated = missingObservationTool("darwin", () => false);
+    expect(gated).toEqual({ tool: "ps", code: "native_tool_unavailable" });
+  });
+
+  it("an unavailable observation tool becomes a typed refusal, never a rejection", async () => {
+    const w = world();
+    const noLsof: CodexSessionFileProofDeps = {
+      ...deps(w),
+      async run(command, args) {
+        // Exactly the production failure: PATH cannot resolve the tool.
+        if (command === "lsof") throw new NativeToolUnavailableError("lsof", ["/usr/sbin/lsof"]);
+        return deps(w).run(command, args);
+      },
+    };
+    await expect(proveCodexInitialLaunch(opts(w), noLsof)).resolves.toMatchObject({ state: "refused", code: "native_tool_unavailable" });
+  });
+
+  it("an unexpected observation error is still a typed refusal, never a rejection", async () => {
+    const w = world();
+    const exploding: CodexSessionFileProofDeps = {
+      ...deps(w),
+      async run(command) {
+        throw new Error(`spawn ${command} ENOENT`);
+      },
+    };
+    // The proof RESOLVES with a terminal, typed outcome. It never rejects: the
+    // pre-existing comm-probe swallow classifies this as process_absent, and the
+    // rollout-observation guard classifies an escaping tool error otherwise.
+    const r = await proveCodexInitialLaunch(opts(w), exploding);
+    expect(["absent", "refused"]).toContain(r.state);
+    expect(["process_absent", "rollout_observation_failed", "observation_failed", "no_open_rollout"]).toContain(r.code);
+  });
+
+  it("does not weaken the proof: a proven world is still proven, and identity conditions still refuse", async () => {
+    const w = world();
+    expect(await proveCodexInitialLaunch(opts(w), deps(w))).toMatchObject({ state: "proven" });
+    // generation mismatch, token mismatch and a non-native binary still refuse.
+    expect(await proveCodexInitialLaunch(opts(w), deps(world({ generation: OTHER_GEN })))).toMatchObject({ state: "refused", code: "generation_mismatch" });
+    expect(await proveCodexInitialLaunch(opts(world({ meta: () => `${JSON.stringify({ type: "session_meta", payload: { id: OTHER_TOKEN } })}\n` })), deps(world({ meta: () => `${JSON.stringify({ type: "session_meta", payload: { id: OTHER_TOKEN } })}\n` })))).toMatchObject({ state: "refused", code: "token_mismatch" });
+    expect(await proveCodexInitialLaunch(opts(world({ comm: "/vendor/bin/other" })), deps(world({ comm: "/vendor/bin/other" })))).toMatchObject({ state: "refused", code: "not_native_codex_binary" });
+  });
+});
 });

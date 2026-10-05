@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { accessSync, constants, statSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 const execute = promisify(execFile);
@@ -74,9 +75,67 @@ const PROC_ARGS_PY = [
   "print(''.join(f'{i}\\t{tok(i)}\\n' for i in map(int,sys.argv[1:])))",
 ].join("\n");
 
+/**
+ * Explicit, verified locations for the native observation tools on Darwin.
+ *
+ * The daemon does NOT inherit an operator PATH: `/usr/sbin` is frequently absent,
+ * so PATH-resolving `lsof` fails with spawn ENOENT. That failure used to escape as
+ * an unhandled rejection (an HTTP 500 at the route) rather than a proof refusal.
+ * Every tool is therefore resolved to an installed, executable absolute path, and
+ * an unresolvable tool is a TYPED refusal — never a throw and never a pass.
+ */
+const DARWIN_NATIVE_TOOLS: Record<string, readonly string[]> = {
+  ps: ["/bin/ps"],
+  lsof: ["/usr/sbin/lsof", "/usr/bin/lsof"],
+  stat: ["/usr/bin/stat"],
+  python3: ["/usr/bin/python3", "/opt/homebrew/bin/python3", "/usr/local/bin/python3"],
+};
+
+/** The tools one proof observation needs before it can say anything at all. */
+const REQUIRED_PROOF_TOOLS = ["ps", "lsof", "stat", "python3"] as const;
+
+/** Typed, catchable: an observation tool is absent or not executable. */
+export class NativeToolUnavailableError extends Error {
+  readonly code = "native_tool_unavailable";
+  constructor(readonly tool: string, readonly searched: readonly string[]) {
+    super(`native observation tool '${tool}' is not installed or not executable (searched ${searched.join(", ")})`);
+    this.name = "NativeToolUnavailableError";
+  }
+}
+
+export type NativeToolProbe = (path: string) => boolean;
+
+const installedExecutable: NativeToolProbe = (path) => {
+  try {
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Resolve one observation tool to an absolute path. On Darwin the candidates are
+ * the fixed system locations above; elsewhere the bare name is returned so the
+ * platform's own PATH rules apply unchanged. Returns null when nothing verified.
+ */
+export function resolveNativeTool(
+  command: string,
+  platform: string = process.platform,
+  probe: NativeToolProbe = installedExecutable,
+): string | null {
+  const candidates = platform === "darwin" ? DARWIN_NATIVE_TOOLS[command] : undefined;
+  if (!candidates) return command;
+  for (const candidate of candidates) if (probe(candidate)) return candidate;
+  return null;
+}
+
 export const defaultDeps: CodexSessionFileProofDeps = {
   async run(command, args) {
-    return (await execute(command, args, { timeout: 2000, maxBuffer: 8 * 1024 * 1024 })).stdout;
+    const resolved = resolveNativeTool(command);
+    if (!resolved) throw new NativeToolUnavailableError(command, DARWIN_NATIVE_TOOLS[command] ?? [command]);
+    return (await execute(resolved, args, { timeout: 2000, maxBuffer: 8 * 1024 * 1024 })).stdout;
   },
   async readPrefix(file, bytes) {
     const { open } = await import("node:fs/promises");
@@ -92,7 +151,9 @@ export const defaultDeps: CodexSessionFileProofDeps = {
   async occupantGeneration(pid) {
     if (process.platform !== "darwin") return "";
     try {
-      const { stdout } = await execute("python3", ["-c", PROC_ARGS_PY, String(pid)], { timeout: 2000, maxBuffer: 64 * 1024 });
+      const python = resolveNativeTool("python3");
+      if (!python) return "";
+      const { stdout } = await execute(python, ["-c", PROC_ARGS_PY, String(pid)], { timeout: 2000, maxBuffer: 64 * 1024 });
       const line = stdout.split("\n").find((l: string) => l.startsWith(`${pid}\t`));
       if (!line) return "";
       const token = line.slice(line.indexOf("\t") + 1).trim();
@@ -102,7 +163,9 @@ export const defaultDeps: CodexSessionFileProofDeps = {
     }
   },
   async ancestry(pid) {
-    const raw = await execute("ps", ["-o", "ppid=", "-p", String(pid)], { timeout: 2000, maxBuffer: 1024 * 1024 }).then(r => r.stdout).catch(() => "");
+    const ps = resolveNativeTool("ps");
+    if (!ps) return [];
+    const raw = await execute(ps, ["-o", "ppid=", "-p", String(pid)], { timeout: 2000, maxBuffer: 1024 * 1024 }).then(r => r.stdout).catch(() => "");
     const parent = Number(raw.trim());
     return Number.isSafeInteger(parent) && parent > 0 ? [parent] : [];
   },
@@ -133,6 +196,11 @@ export async function proveCodexInitialLaunch(
   if (!Number.isSafeInteger(pid) || pid <= 1) return { state: "refused", code: "pid_invalid" };
   if (!Number.isSafeInteger(paneRootPid) || paneRootPid <= 1) return { state: "refused", code: "pane_root_invalid" };
   if (!uuid.test(expectedToken)) return { state: "refused", code: "token_invalid" };
+  // Fail closed BEFORE any observation: an observation tool that is not installed
+  // and executable is a refusal with a named cause, never a probe that half-runs
+  // and then throws its way out to the route as an HTTP 500.
+  const missingTool = missingObservationTool();
+  if (missingTool) return { state: "refused", code: missingTool.code, paneRootPid: options.paneRootPid, pid: options.pid };
 
   const lineageToRoot = async (): Promise<number[] | null> => {
     const chain: number[] = [];
@@ -162,13 +230,15 @@ export async function proveCodexInitialLaunch(
     if (comm.split("/").pop() !== nativeCodexBinary) return { ok: false, code: "not_native_codex_binary" };
     const generation = (await deps.occupantGeneration(pid)).trim();
     if (!generation) return { ok: false, code: "generation_witness_absent" };
-    const rollouts = await readWriteRollouts(pid, deps);
+    const observed = await readWriteRollouts(pid, deps);
+    if (!observed.ok) return { ok: false, code: observed.code };
+    const rollouts = observed.rollouts;
     if (rollouts.length === 0) return { ok: false, code: "no_open_rollout" };
     if (rollouts.length !== 1) return { ok: false, code: "writer_ambiguous" };
     return { ok: true, generation, rollouts, lineage, comm };
   };
 
-  const first = await observe();
+  const first = await safeObserve(observe);
   if (!first.ok) return first.code === "process_absent" ? { state: "absent", code: first.code } : { state: "refused", code: first.code };
   // A witness that never equals the current generation is a mismatch; a witness
   // that matched and then moved is drift. Both refuse, but the cause is exact.
@@ -199,7 +269,7 @@ export async function proveCodexInitialLaunch(
   if (!afterRead || afterRead.inode !== bound.inode || afterRead.device !== bound.device)
     return { state: "refused", code: "descriptor_binding_mismatch" };
 
-  const second = await observe();
+  const second = await safeObserve(observe);
   if (!second.ok) return { state: "refused", code: second.code === "process_absent" ? "process_absent_drift" : second.code };
   const rebound = second.rollouts[0]!;
   if (second.generation !== first.generation) return { state: "refused", code: "generation_drift" };
@@ -265,11 +335,43 @@ export function parseLsofFieldRecords(raw: string): LsofFieldRecord[] {
 }
 
 /**
+/** The first observation tool that cannot be resolved, with its exact cause. */
+export function missingObservationTool(platform: string = process.platform, probe: NativeToolProbe = installedExecutable): { tool: string; code: string } | null {
+  for (const tool of REQUIRED_PROOF_TOOLS) {
+    if (!resolveNativeTool(tool, platform, probe)) return { tool, code: "native_tool_unavailable" };
+  }
+  return null;
+}
+
+/**
+ * Run one observation, converting ANY tool failure into a typed refusal. This is
+ * the guarantee the route needed: an observation can no longer reject, so a
+ * missing or failing native tool surfaces as a refusal code instead of a 500.
+ */
+async function safeObserve(
+  observe: () => Promise<{ ok: true; generation: string; rollouts: OpenRollout[]; lineage: number[]; comm: string } | { ok: false; code: string }>,
+): Promise<{ ok: true; generation: string; rollouts: OpenRollout[]; lineage: number[]; comm: string } | { ok: false; code: string }> {
+  try {
+    return await observe();
+  } catch (error) {
+    return { ok: false, code: error instanceof NativeToolUnavailableError ? error.code : "observation_failed" };
+  }
+}
+
+/**
  * The unique open read/write rollout files of one pid, using the HELD
  * descriptor's own inode rather than a path lookup alone.
  */
-async function readWriteRollouts(pid: number, deps: CodexSessionFileProofDeps): Promise<OpenRollout[]> {
-  const raw = await deps.run("lsof", ["-a", "-p", String(pid), "-d", "0-999", "-FaniD"]);
+async function readWriteRollouts(pid: number, deps: CodexSessionFileProofDeps): Promise<{ ok: true; rollouts: OpenRollout[] } | { ok: false; code: string }> {
+  let raw: string;
+  try {
+    raw = await deps.run("lsof", ["-a", "-p", String(pid), "-d", "0-999", "-FaniD"]);
+  } catch (error) {
+    // An absent or failing native tool is a REFUSAL with an exact cause. It is
+    // never an unhandled rejection, and never an empty set that would later be
+    // misreported as "no open rollout".
+    return { ok: false, code: error instanceof NativeToolUnavailableError ? error.code : "rollout_observation_failed" };
+  }
   const records = parseLsofFieldRecords(raw).filter(r => /[uw]/.test(r.mode) && /\/rollout-[^/]+\.jsonl$/.test(r.path));
   const unique = new Map<string, OpenRollout>();
   for (const record of records) {
@@ -286,7 +388,7 @@ async function readWriteRollouts(pid: number, deps: CodexSessionFileProofDeps): 
     const key = `${record.fd}:${record.inode}:${descriptorDevice}`;
     if (!unique.has(key)) unique.set(key, { fd: record.fd, inode: record.inode, device: descriptorDevice, path: record.path });
   }
-  return [...unique.values()];
+  return { ok: true, rollouts: [...unique.values()] };
 }
 
 /**
