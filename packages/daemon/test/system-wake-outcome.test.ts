@@ -175,6 +175,30 @@ describe('system-origin administrative wake outcome convergence',()=>{
   }
  });
 
+ it.each(['recover-unavailable-coordinator','recover-expired-idle-transfer','restore-current-held-history-binding','reconcile-current-coordinator-lease'])('records native custody of genuine %s recovery notices without granting authority',action=>{
+  configureAdminOnly();
+  const qid=(svc as any).stageCoordinatorRecovery('xv',1,'operator-agent-g1',action,'current-holder-acknowledgment-or-lease',clock+60000);
+  db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+qid);
+  const before=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid);
+  const authorityBefore=db.prepare('SELECT * FROM coordinator_authority').all();
+  reconcile();
+  expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE operation_id=?").get('system-wake-outcome:wake-intent-'+qid)).toBeUndefined();
+  const originalBody=repo.getById(qid)!.body;
+  db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(JSON.stringify({...JSON.parse(originalBody),recoveryKey:'forged'}),qid);
+  expect((svc as any).systemTaskProof(qid,'operator-agent@kernel')).toBeNull();
+  db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(originalBody,qid);
+  claimOperator(qid);reconcile();
+  const wake=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid) as any;
+  expect(svc.noticeOutcomeContained('xv',wake)).toBe(true);
+  expect(wake).toEqual(before);
+  expect(db.prepare('SELECT * FROM coordinator_authority').all()).toEqual(authorityBefore);
+  const receipt=db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='system-wake-outcome' AND operation_id=?").get('system-wake-outcome:wake-intent-'+qid) as any;
+  expect(JSON.parse(receipt.receipt)).toMatchObject({action,outcomeOnly:true,grantsAuthority:false,taskStateAtRecord:'in-progress'});
+  const body=JSON.parse(repo.getById(qid)!.body);
+  db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(JSON.stringify({...body,reason:'forged-reason'}),qid);
+  expect(svc.noticeOutcomeContained('xv',wake)).toBe(false);
+ });
+
  it('a pre-plan rollout item is recorded through the registered Operator observer path',async()=>{
   // No plan and no holder: rollout items exist precisely when a rig has neither.
   expect(svc.plan('xv')).toBeNull();

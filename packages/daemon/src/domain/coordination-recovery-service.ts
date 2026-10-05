@@ -275,7 +275,7 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
  }
  /** System administrative actions whose pointed-to task may carry an
   *  outcome-only receipt. Nothing here can grant product authority. */
- private static readonly SYSTEM_WAKE_ACTIONS=['materialize-standard-resilience','resolve-exact-coordination-task-hold'] as readonly string[];
+ private static readonly SYSTEM_COORDINATOR_RECOVERY_ACTIONS=['recover-unavailable-coordinator','recover-expired-idle-transfer','restore-current-held-history-binding','reconcile-current-coordinator-lease'] as readonly string[];
  private static readonly SYSTEM_WAKE_ROLLOUT='materialize-standard-resilience';
  private static readonly SYSTEM_WAKE_HOLD='resolve-exact-coordination-task-hold';
  /** The exact pointer-wake template. A wake carrying instructions is never eligible. */
@@ -305,7 +305,15 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
    if('qitem-resilience-rollout-'+digest(rolloutKey+':'+(body.previousQueueId??'initial')).slice(0,24)!==qid)return null;
   }else if(action===CoordinationRecoveryService.SYSTEM_WAKE_HOLD){
    if(!this.validAccountableIntake(body.rigId,qid,q)&&!(typeof body.rootQueueId==='string'&&this.validAccountableIntakeChainItem(body.rigId,q,body.rootQueueId)))return null;
-  }else if(!CoordinationRecoveryService.SYSTEM_WAKE_ACTIONS.includes(action))return null;
+  }else if(CoordinationRecoveryService.SYSTEM_COORDINATOR_RECOVERY_ACTIONS.includes(action)){
+   // Recompute the producer's key and chain id. Native custody contains only the
+   // pointer wake; it does not resolve the recovery or confer holder authority.
+   if(!Number.isInteger(body.epoch)||body.epoch<1||typeof body.reason!=='string'||!body.reason||typeof body.recoveryKey!=='string')return null;
+   if(body.previousQueueId!==null&&typeof body.previousQueueId!=='string')return null;
+   const recoveryKey=digest((body.heldHistoryAdmission?JSON.stringify(body.heldHistoryAdmission):'')+body.rigId+':'+body.epoch+':'+body.recipientGeneration+':'+action+':'+body.reason);
+   if(recoveryKey!==body.recoveryKey||'qitem-coordination-recovery-'+digest(recoveryKey+':'+(body.previousQueueId??'initial')).slice(0,24)!==qid)return null;
+   if(body.returnPath?.queueId!==qid||body.returnPath?.actor!==recipient)return null;
+  }else return null;
   return {rigId:body.rigId,action,body,bodyHash:digest(q.body)};
  }
  /** Genuine native custody is the outcome: the exact recipient, its current
