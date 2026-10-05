@@ -391,6 +391,27 @@ export class CoordinatorAuthorityService {
    const out=this.get(r!.rig_id)!;this.log(r!.rig_id,input.operationId,"reconciliation-recover",out,request);return out;
   }).immediate();
  }
+ /** Operator opens a new finite reconciliation window for the exact expired
+  * active holder. No custody moves, acknowledgment or product admission. */
+ recoverExpiredActive(actor:string,generation:string,input:{token:CoordinatorToken;expectedLeaseUntil:number;operationId:string;obligationsDigest:string;windowMs:number}):Authority {
+  return this.db.transaction(()=>{
+   this.operator(actor,generation);
+   if(typeof input.operationId!=="string"||!input.operationId.trim()||input.operationId.length>160)reject("coordinator_invalid_operation","Bounded recovery operation ID required");
+   const request={actor,generation,input};const replay=this.replay(input.token.rigId,input.operationId,"active-expiry-recover",request);if(replay)return replay as Authority;
+   const r=this.get(input.token.rigId);
+   if(!r||r.state!=="active"||r.epoch!==input.token.epoch||r.owner_generation!==input.token.generation||this.generation(r.owner_session)!==r.owner_generation||r.lease_until!==input.expectedLeaseUntil)reject("coordinator_active_recovery_mismatch","Exact expired active holder, generation, epoch and lease required");
+   if(r!.lease_until>this.now())reject("coordinator_lease_live","Recovery cannot replace a live lease");
+   const e=this.runtimeEvidence.get(r!.owner_session);
+   if(!e||e.state!=="present"||e.session!==r!.owner_session||!e.fingerprint||e.generation!==r!.owner_generation||e.observedAt>this.now()||this.now()-e.observedAt>1000)reject("coordinator_live_holder_unproven","Fresh generation-bound native presence required");
+   if(!Number.isSafeInteger(input.windowMs)||input.windowMs<10000||input.windowMs>900000)reject("coordinator_invalid_ack_window","Recovery window must be10seconds to15minutes");
+   if(input.obligationsDigest!==this.reconciliationDigest(r!.rig_id))reject("coordinator_reconciliation_changed","Exact current custody digest required");
+   const baton=this.db.prepare("SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?").get(r!.baton_id) as any;
+   if(!baton||baton.destination_session!==r!.owner_session||baton.state!=="in-progress"||baton.claimed_by_generation_uuid!==r!.owner_generation)reject("coordinator_baton_mismatch","Exact original holder baton custody required");
+   this.assertRecipientDispatchScope(r!.rig_id,r!.owner_session);
+   this.db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=?,operation_id=? WHERE rig_id=?").run(this.now()+input.windowMs,input.operationId,r!.rig_id);
+   const out=this.get(r!.rig_id)!;this.log(r!.rig_id,input.operationId,"active-expiry-recover",out,request);return out;
+  }).immediate();
+ }
  acknowledge(actor:string, token:CoordinatorToken, evidence:{obligationsDigest:string;operationId:string}): Authority {
    return this.db.transaction(() => {
      const r=this.assertOwner(actor,token,true);
@@ -414,6 +435,8 @@ export class CoordinatorAuthorityService {
      if (old!.owner_session!==input.oldOwner||old!.epoch!==input.expected.epoch||old!.owner_generation!==input.expected.generation) reject("coordinator_cas_lost","Expected predecessor changed; no transfer effects");
      if (actor===old!.owner_session) {
        if(callerGeneration!==old!.owner_generation) reject("coordinator_retired","Predecessor generation does not match");
+       this.assertOwner(actor,input.expected);
+       if(input.recipient===input.oldOwner)reject("coordinator_self_transfer_refused","Use explicit expiry recovery, not self-transfer");
      } else {
        this.operator(actor,callerGeneration);
        // Only an attributed, terminal operational recovery obligation permits unavailable-owner transfer.

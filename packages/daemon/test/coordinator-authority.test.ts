@@ -31,6 +31,37 @@ describe("coordinator exclusion and custody",()=>{
   svc.setRuntimeObserver(async session=>({session,generation:generation??svc.generation(session)!,state,observedAt:clock-age,fingerprint:"test-native-observation"}));
   await svc.refreshRuntimeAvailability("xv");
  }
+ it("expired active recovery is bounded native Operator administration and preserves custody",async()=>{
+  db.prepare('UPDATE coordinator_authority SET lease_until=1').run();await absent('present');
+  const before=db.prepare('SELECT * FROM queue_items').all(),effects=db.prepare('SELECT * FROM outbox_entries').all();
+  const input={token,expectedLeaseUntil:1,operationId:'expired-active-r1',obligationsDigest:svc.reconciliationDigest('xv'),windowMs:10000};
+  expect(()=>svc.renew('lead@xv',token,10000,'invalid-renew')).toThrow('Lease expiry');
+  const recovered=svc.recoverExpiredActive('operator-agent@kernel','operator-agent-g1',input);
+  expect(recovered).toMatchObject({state:'reconciling',epoch:1,owner_session:'lead@xv',owner_generation:'lead-g1'});
+  expect(db.prepare('SELECT * FROM queue_items').all()).toEqual(before);expect(db.prepare('SELECT * FROM outbox_entries').all()).toEqual(effects);
+  expect(svc.recoverExpiredActive('operator-agent@kernel','operator-agent-g1',input)).toEqual(recovered);
+  expect(()=>svc.recoverExpiredActive('operator-agent@kernel','operator-agent-g1',{...input,operationId:'chain'})).toThrow('Exact expired active');
+  svc.acknowledge('lead@xv',token,{operationId:'recovery-ack',obligationsDigest:svc.reconciliationDigest('xv')});expect(svc.get('xv')?.state).toBe('active');
+ });
+ it.each(['absent','unknown','stale','retired-generation','changed-digest','changed-lease','wrong-baton','wrong-actor','live-lease'] as const)("active expiry recovery refuses %s without changing authority",async(reason)=>{
+  db.prepare('UPDATE coordinator_authority SET lease_until=1').run();await absent('present');
+  const input={token,expectedLeaseUntil:1,operationId:'refused-'+reason,obligationsDigest:svc.reconciliationDigest('xv'),windowMs:10000};
+  if(reason==='absent'||reason==='unknown')await absent(reason);
+  if(reason==='stale')clock+=1001;
+  if(reason==='retired-generation')await absent('present',0,'retired');
+  if(reason==='changed-digest')input.obligationsDigest='changed';
+  if(reason==='changed-lease')input.expectedLeaseUntil=2;
+  if(reason==='wrong-baton'){db.prepare("UPDATE queue_items SET claimed_by_generation_uuid='wrong' WHERE qitem_id='baton'").run();input.obligationsDigest=svc.reconciliationDigest('xv');}
+  if(reason==='live-lease'){db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+10000);input.expectedLeaseUntil=clock+10000;}
+  const before=svc.get('xv');
+  expect(()=>svc.recoverExpiredActive(reason==='wrong-actor'?'lead@xv':'operator-agent@kernel',reason==='wrong-actor'?'lead-g1':'operator-agent-g1',input)).toThrow();
+  expect(svc.get('xv')).toEqual(before);
+ });
+ it("expired owner cannot manufacture authority through self-transfer",()=>{
+  db.prepare('UPDATE coordinator_authority SET lease_until=1').run();
+  expect(()=>svc.transfer('lead@xv','lead-g1',{expected:token,oldOwner:'lead@xv',recipient:'lead@xv',recipientGeneration:'lead-g1',operationId:'loophole',leaseMs:10000})).toThrow('Lease expiry');
+  expect(svc.get('xv')?.epoch).toBe(1);
+ });
  it("samples independent coordinators concurrently without weakening freshness",async()=>{
   db.prepare("UPDATE coordinator_authority SET lease_until=1").run();
   let release:()=>void=()=>{};const wait=new Promise<void>(resolve=>release=resolve);let calls=0;
