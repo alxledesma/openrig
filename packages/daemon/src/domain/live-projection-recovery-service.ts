@@ -26,6 +26,7 @@ import type { EventBus } from "./event-bus.js";
 import type { PiNativeProof } from "./coordinator-runtime-availability.js";
 import { verifyCodexPaneProcess, verifyClaudePaneProcess, type NativeProcessLister } from "./native-process-lineage.js";
 import { classifyPaneRuntimeMatch } from "./seat-identity-reconciler.js";
+import { findNativeCodexDescendant, proveCodexInitialLaunch, defaultDeps as defaultCodexSessionFileProofDeps, type CodexSessionFileProofDeps, type CodexSessionFileProofResult } from "./codex-session-file-proof.js";
 const digest = (value: unknown): string => createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value)).digest("hex");
 
 /** Shared Pi proof lives in coordinator-runtime-availability.makePiNativeProver;
@@ -64,6 +65,9 @@ export interface LiveProjectionRecoveryDeps {
   events: EventBus;
   piProve?: (session: string) => Promise<PiNativeProof | null>;
   listProcesses?: NativeProcessLister;
+  /** Optional injection for the Codex initial-launch session-file proof, used
+   *  only by tests. Omitted in production, where the real default deps apply. */
+  codexSessionFileProof?: CodexSessionFileProofDeps;
   now?: () => number;
 }
 
@@ -86,12 +90,17 @@ export class LiveProjectionRecoveryService {
   private readonly events: EventBus;
   private readonly piProve?: (session: string) => Promise<PiNativeProof | null>;
   private readonly listProcesses?: NativeProcessLister;
+  private readonly codexSessionFileProof: CodexSessionFileProofDeps;
   private readonly now: () => number;
 
   constructor(deps: LiveProjectionRecoveryDeps) {
     this.db = deps.db; this.tmux = deps.tmux; this.authority = deps.authority;
     this.events = deps.events; this.piProve = deps.piProve;
-    this.listProcesses = deps.listProcesses; this.now = deps.now ?? Date.now;
+    this.listProcesses = deps.listProcesses;
+    // B1: the real kernel/filesystem dependencies are the DEFAULT, so a deployed
+    // daemon never silently runs with the initial-launch witness unconfigured.
+    this.codexSessionFileProof = deps.codexSessionFileProof ?? defaultCodexSessionFileProofDeps;
+    this.now = deps.now ?? Date.now;
   }
 
   async recover(actor: string, generation: string, input: LiveProjectionRecoveryInput): Promise<LiveProjectionRecoveryOutcome> {
@@ -121,7 +130,7 @@ export class LiveProjectionRecoveryService {
     } catch { return { ok: false, code: "recovery_infrastructure_error", message: "Custody schema precondition failed; nothing was written." }; }
 
     // Fresh native probe AFTER static checks, BEFORE any transaction.
-    const probe = await this.probe(pre.row, pre.runtime, pre.pane, pre.nativeBoot);
+    const probe = await this.probe(pre.row, pre.runtime, pre.pane, pre.nativeBoot, input.expectedGeneration);
     if ("outcome" in probe) return probe.outcome;
 
     const at = new Date(this.now()).toISOString();
@@ -208,7 +217,34 @@ export class LiveProjectionRecoveryService {
     return { row, tenureId: tenure.id, runtime: node.runtime ?? null, rigId: node.rig_id, pane: binding?.tmux_pane ?? null, nativeBoot: tenure.native_session_id_at_boot, unknownEffects: this.unknownEffects(row.session_name) };
   }
 
-  private async probe(row: SessionRow, runtime: string | null, pane: string | null, nativeBoot: string | null): Promise<{ evidence: Record<string, unknown> } | { outcome: LiveProjectionRecoveryOutcome }> {
+  /** A pane whose own process is a plain supported shell (not an agent runtime) is the
+   *  normal shape for a launched seat: the native agent runs below it. A pane running a
+   *  DIFFERENT agent binary is still a contradiction and keeps refusing. */
+  private supportedOuterShell(command: string | null): boolean {
+    if (!command) return false;
+    const base=command.trim().toLowerCase().split("/").pop() ?? "";
+    if(!base) return false;
+    return ["zsh","bash","sh","fish","dash","tmux","login"].includes(base)&&!/(claude|codex|pi)/.test(command.toLowerCase());
+  }
+
+  /**
+   * Codex INITIAL LAUNCH alternative witness. Reached only after the strict
+   * resume-token proof declines, and only for a pane-root descendant carrying one
+   * open read/write rollout file whose own session_meta.id is the stored token.
+   * Never consults filename, cwd, profile or model as identity, and returns a
+   * refusal that writes nothing when any condition is ambiguous, absent or moved.
+   */
+  private async proveInitialLaunch(pane: string, pid: number, token: string, expectedGeneration: string): Promise<CodexSessionFileProofResult> {
+    // The registered pane PID is the pane ROOT (its own shell). The native agent is
+    // its descendant, and exactly one native codex binary must hang off that root.
+    const paneRootPid = await this.tmux.getPanePid(pane);
+    if (paneRootPid === null) return { state: "refused", code: "pane_root_missing" };
+    const nativePid = await findNativeCodexDescendant(paneRootPid, this.codexSessionFileProof);
+    if (nativePid === null) return { state: "refused", code: "lineage_broken" };
+    return proveCodexInitialLaunch({ paneRootPid, pid: nativePid, expectedToken: token, expectedGeneration }, this.codexSessionFileProof);
+  }
+
+  private async probe(row: SessionRow, runtime: string | null, pane: string | null, nativeBoot: string | null, expectedGeneration: string): Promise<{ evidence: Record<string, unknown> } | { outcome: LiveProjectionRecoveryOutcome }> {
     if (runtime !== "codex" && runtime !== "claude-code" && runtime !== "pi")
       return { outcome: { ok: false, code: "unsupported_runtime_proof", message: `No positive same-native identity proof exists for runtime '${runtime ?? "unknown"}'; refusing instead of inferring.` } };
 
@@ -220,14 +256,25 @@ export class LiveProjectionRecoveryService {
     const pid = await this.tmux.getPanePid(pane);
     if (pid === null) return { outcome: { ok: false, code: "pane_missing", message: "Registered pane PID no longer resolves." } };
     const command = await this.tmux.getPaneCommand(pane);
-    if (classifyPaneRuntimeMatch(command, runtime) === "mismatch") return { outcome: { ok: false, code: "identity_mismatch", message: "Pane process contradicts the managed runtime." } };
+    // A supported OUTER shell (the pane's own launcher) is not a contradiction: the
+    // native agent is its descendant and the descendant proof decides identity. Only a
+    // different AGENT runtime actually occupying the pane is a mismatch.
+    const paneMatch=classifyPaneRuntimeMatch(command,runtime);
+    if(paneMatch==="mismatch"&&!this.supportedOuterShell(command))return { outcome: { ok: false, code: "identity_mismatch", message: "Pane process contradicts the managed runtime." } };
 
     if (!row.resume_token) return { outcome: { ok: false, code: "native_proof_unavailable", message: "Stored resume token is missing; same native history cannot be proven." } };
 
     if (runtime === "codex") {
+      // Strict resume-token path stays authoritative and is consulted first and
+      // unchanged. It is simply not satisfiable for a seat launched without a
+      // resume argv, which is a different fact from the session being unproven.
       const proof = await verifyCodexPaneProcess({ target: pane, tmux: this.tmux, expectedToken: row.resume_token, requireResume: true, ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}) });
-      if (!proof) return { outcome: { ok: false, code: "native_proof_failed", message: "Token-bound Codex process-lineage double observation did not confirm the same live resume." } };
-      return { evidence: { axis: "codex_process_lineage", pane, pid, command, fingerprint: proof.fingerprint, nativeSessionIdAtBoot: nativeBoot, resumeTokenHash: digest(row.resume_token) } };
+      if (proof) return { evidence: { axis: "codex_process_lineage", pane, pid, command, fingerprint: proof.fingerprint, nativeSessionIdAtBoot: nativeBoot, resumeTokenHash: digest(row.resume_token) } };
+      const initialLaunch = await this.proveInitialLaunch(pane, pid, row.resume_token, expectedGeneration);
+      if (initialLaunch.state === "proven")
+        return { evidence: { axis: "codex_initial_launch_session_file", pane, pid, command, fingerprint: initialLaunch.fingerprint, sessionIdHash: digest(initialLaunch.sessionId!), fd: initialLaunch.fd, inode: initialLaunch.inode, generation: initialLaunch.generation, nativeSessionIdAtBoot: nativeBoot, resumeTokenHash: digest(row.resume_token) } };
+      // Refusal is total: nothing is written, and no weaker identity is inferred.
+      return { outcome: { ok: false, code: "native_proof_failed", message: `Token-bound Codex proof declined and the initial-launch session-file proof did not establish the same native conversation (${initialLaunch.code ?? initialLaunch.state}).` } };
     }
     if (runtime === "claude-code") {
       const proof = await verifyClaudePaneProcess({ target: pane, tmux: this.tmux, expectedToken: row.resume_token, ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}) });

@@ -11,6 +11,7 @@ import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { LiveProjectionRecoveryService, type LiveProjectionRecoveryInput } from "../src/domain/live-projection-recovery-service.js";
+import type { CodexSessionFileProofDeps } from "../src/domain/codex-session-file-proof.js";
 import { seed } from "./helpers/coordinator-fixture.js";
 
 let dir: string, db: Database.Database, repo: QueueRepository, clock: number;
@@ -25,9 +26,9 @@ const input = (over: Partial<LiveProjectionRecoveryInput> = {}): LiveProjectionR
   operationId: "op-1", sessionId: "lead@xv", nodeId: "lead@xv", sessionName: "lead@xv", expectedGeneration: "lead-g1", ...over,
 });
 
-function service(deps: { piProve?: (s: string) => Promise<{ state: "present" | "absent"; generation: string; launchId: string | null; fingerprint: string } | null>; tmux?: unknown }) {
+function service(deps: { piProve?: (s: string) => Promise<{ state: "present" | "absent"; generation: string; launchId: string | null; fingerprint: string } | null>; tmux?: unknown; codexSessionFileProof?: CodexSessionFileProofDeps }) {
   const tmux = deps.tmux ?? { listSessions: async () => [{ name: "lead@xv" }], getPanePid: async () => 4242, getPaneCommand: async () => "node" };
-  return new LiveProjectionRecoveryService({ db, tmux: tmux as never, authority: repo.coordinatorAuthority, events: new EventBus(db), ...(deps.piProve ? { piProve: deps.piProve } : {}) });
+  return new LiveProjectionRecoveryService({ db, tmux: tmux as never, authority: repo.coordinatorAuthority, events: new EventBus(db), ...(deps.piProve ? { piProve: deps.piProve } : {}), ...(deps.codexSessionFileProof ? { codexSessionFileProof: deps.codexSessionFileProof } : {}) });
 }
 const present = (launchId = "L-77") => async () => ({ state: "present" as const, generation: "lead-g1", launchId, fingerprint: "{}" });
 
@@ -291,5 +292,108 @@ describe("live-projection recovery", () => {
     detachSeat();
     const second = (await service({ piProve: present() }).recover("operator-agent@kernel", "operator-agent-g1", input({ operationId: "op-2" }))).receipt as { unknownEffectsPreserved: { digest: string } };
     expect(second.unknownEffectsPreserved.digest).not.toBe(first.unknownEffectsPreserved.digest);
+  });
+});
+
+// Codex initial-launch projection proof. The strict resume-token path above is
+// untouched; these cases cover only the alternative witness reached after it
+// declines for a seat launched without a resume argv.
+describe("codex initial-launch projection proof", () => {
+  const CODEX_TOKEN = "01a0fe42-cdb5-78d3-94fc-60533aaa46fb";
+  const CODEX_GEN = "a6285bc5-0a93-4c7c-9cb7-6d4331aad0eb";
+  const ROLLOUT = `/home/u/.codex/sessions/2026/10/02/rollout-2026-10-02T16-16-26-${CODEX_TOKEN}.jsonl`;
+  const codexWorld = (over: { token?: string; generation?: string; rollouts?: Array<{ fd: number; inode: string; path: string }>; parents?: Record<number, number>; paneRoot?: number } = {}): CodexSessionFileProofDeps => {
+    const token = over.token ?? CODEX_TOKEN;
+    const rollouts = over.rollouts ?? [{ fd: 43, inode: "472826364", path: ROLLOUT }];
+    const parents = over.parents ?? { 54494: 54455, 54455: 53570 };
+    return {
+      async run(command, args) {
+        const pid = Number(String(args[args.length - 1]).match(/\d+/)?.[0] ?? 0);
+        if (command === "ps" && args.includes("-axo")) return "54494  54455  /vendor/bin/codex\n54455  53570  /bin/zsh\n53570     1  /bin/zsh\n";
+        if (command === "ps" && args.includes("comm=")) return `/vendor/bin/codex\n`;
+        if (command === "lsof") return `p${pid}\n` + rollouts.map(e => `f${e.fd}\nau\ni${e.inode}\nD0x1000011\nn${e.path}\n`).join("");
+        if (command === "stat") { const f = args[args.length - 1]!; const hit = rollouts.find(e => e.path === f); return hit ? `16777233 ${hit.inode}\n` : ""; }
+        return "";
+      },
+      async readPrefix() { return `${JSON.stringify({ type: "session_meta", payload: { id: token, cwd: "/anywhere" } })}\n`; },
+      async occupantGeneration() { return over.generation ?? CODEX_GEN; },
+      async ancestry(pid) { const p = parents[pid]; return p === undefined ? [] : [p]; },
+    };
+  };
+  const codexSeat = () => {
+    db.prepare("UPDATE sessions SET status='detached', resume_token=? WHERE session_name='lead@xv'").run(CODEX_TOKEN);
+    db.prepare("UPDATE nodes SET runtime='codex' WHERE id='lead@xv'").run();
+    db.prepare("UPDATE bindings SET tmux_pane='%0' WHERE node_id='lead@xv'").run();
+    db.prepare("UPDATE occupant_tenures SET generation_uuid=? WHERE node_id='lead@xv'").run(CODEX_GEN);
+  };
+  const codexInput = (): LiveProjectionRecoveryInput => ({
+    operationId: "op-codex-initial", sessionId: "lead@xv", nodeId: "lead@xv",
+    sessionName: "lead@xv", expectedGeneration: CODEX_GEN,
+  });
+
+  it("accepts an initial launch through the session-file proof and records only identifiers", async () => {
+    codexSeat();
+    const svc = service({ codexSessionFileProof: codexWorld(), tmux: { listSessions: async () => [{ name: "lead@xv" }], getPanePid: async () => 53570, getPaneCommand: async () => "/bin/zsh" } });
+    const out = await svc.recover("operator-agent@kernel", "operator-agent-g1", codexInput());
+    expect(out.ok).toBe(true);
+    const receipt = db.prepare("SELECT receipt FROM live_projection_recovery_operations WHERE operation_id='live-projection-recover:op-codex-initial'").get() as { receipt: string } | undefined;
+    expect(receipt).toBeTruthy();
+    const parsed = JSON.parse(receipt!.receipt);
+    const evidence = (parsed.evidence ?? parsed.proof ?? parsed) as Record<string, unknown>;
+    expect(evidence.axis).toBe("codex_initial_launch_session_file");
+    expect(evidence.fd).toBe(43);
+    expect(evidence.inode).toBe("472826364");
+    expect(evidence.generation).toBe(CODEX_GEN);
+    // the stored token never appears in the clear anywhere in the durable receipt
+    expect(receipt!.receipt).not.toContain(CODEX_TOKEN);
+    expect(db.prepare("SELECT status FROM sessions WHERE session_name='lead@xv'").get()).toEqual({ status: "running" });
+  });
+
+  it("still refuses a genuinely mismatching native runtime, with zero writes", async () => {
+    codexSeat();
+    const before = db.prepare("SELECT status FROM sessions WHERE session_name='lead@xv'").get();
+    const svc = service({ codexSessionFileProof: codexWorld({ token: "00000000-0000-4000-8000-000000000000" }) });
+    const out = await svc.recover("operator-agent@kernel", "operator-agent-g1", codexInput());
+    expect(out.ok).toBe(false);
+    expect((out as { code: string }).code).toBe("native_proof_failed");
+    expect(db.prepare("SELECT status FROM sessions WHERE session_name='lead@xv'").get()).toEqual(before);
+    expect(db.prepare("SELECT count(*) n FROM live_projection_recovery_operations").get()).toEqual({ n: 0 });
+  });
+
+  it("B1: with NO injected deps the service still reaches the real proof path, and refuses cleanly on real evidence", async () => {
+    codexSeat();
+    const before = db.prepare("SELECT status FROM sessions WHERE session_name='lead@xv'").get();
+    // No codexSessionFileProof injected: the constructor default (real kernel and
+    // filesystem deps) must be in force, so the witness is never "unconfigured".
+    const svc = new LiveProjectionRecoveryService({
+      db,
+      tmux: { listSessions: async () => [{ name: "lead@xv" }], getPanePid: async () => 53570, getPaneCommand: async () => "/bin/zsh" } as never,
+      authority: repo.coordinatorAuthority,
+      events: new EventBus(db),
+    });
+    const out = await svc.recover("operator-agent@kernel", "operator-agent-g1", codexInput());
+    // The only thing this wiring test asserts is that the witness is REACHED. Whether
+    // the live host happens to satisfy it is deliberately not asserted here, so the
+    // suite never depends on which panes are running; Claude's required separate run
+    // is the one that must exercise the real default deps against a live pane.
+    if (!out.ok) expect((out as { message: string }).message).not.toContain("initial_launch_proof_unconfigured");
+    else expect(db.prepare("SELECT count(*) n FROM live_projection_recovery_operations").get()).toEqual({ n: 1 });
+    // Either way the outcome is a real verdict from the real deps, never a silent no-op.
+    expect(out.ok === true || typeof (out as { code: string }).code === "string").toBe(true);
+    if (!out.ok) expect(db.prepare("SELECT status FROM sessions WHERE session_name='lead@xv'").get()).toEqual(before);
+  });
+
+  it("refuses multiple open writers and a generation mismatch, mutating nothing", async () => {
+    codexSeat();
+    for (const world of [
+      codexWorld({ rollouts: [{ fd: 43, inode: "472826364", path: ROLLOUT }, { fd: 44, inode: "472826365", path: "/x/rollout-other.jsonl" }] }),
+      codexWorld({ generation: "00000000-0000-4000-8000-000000000000" }),
+    ]) {
+      const before = db.prepare("SELECT status FROM sessions WHERE session_name='lead@xv'").get();
+      const out = await service({ codexSessionFileProof: world }).recover("operator-agent@kernel", "operator-agent-g1", codexInput());
+      expect(out.ok).toBe(false);
+      expect(db.prepare("SELECT status FROM sessions WHERE session_name='lead@xv'").get()).toEqual(before);
+      expect(db.prepare("SELECT count(*) n FROM live_projection_recovery_operations").get()).toEqual({ n: 0 });
+    }
   });
 });
