@@ -354,9 +354,10 @@ function stageRefusalRecovery(deps: StuckSweepDeps, c: Candidate, code: string, 
       return { qitemId: previous.qitem_id, action: "refreshed" as const };
     }
     const queueId = "qitem-stuck-sweep-control-" + digest(recoveryKey + ":" + (previous?.qitem_id ?? "initial")).slice(0, 24);
+    const originalRig=deps.db.prepare("SELECT rig_id FROM coordinator_assignments WHERE queue_id=? UNION ALL SELECT rig_id FROM coordinator_stage_assignments WHERE queue_id=?").get(current.qitemId,current.qitemId) as {rig_id:string}|undefined;
     deps.queueRepo.createWithinTransaction({
       qitemId: queueId, sourceSession: "watchdog@system", destinationSession: OPERATOR,
-      body: JSON.stringify({ action: "reconcile-refused-stuck-finding", stuckSweepRecoveryKey: recoveryKey,
+      body: JSON.stringify({ action: "reconcile-refused-stuck-finding", ...(originalRig?{rigId:originalRig.rig_id}:{}), stuckSweepRecoveryKey: recoveryKey,
         previousQueueId: previous?.qitem_id ?? null, reason: code, kind: c.kind,
         original: { qitemId: current.qitemId, sourceSession: current.sourceSession,
           destinationSession: current.destinationSession, bodyHash: digest(current.body),
@@ -370,6 +371,7 @@ function stageRefusalRecovery(deps: StuckSweepDeps, c: Candidate, code: string, 
       evidenceRef: `rig queue show ${current.qitemId}`, tags: [STUCK_SWEEP_FINDING_TAG, ACCOUNTABILITY_TAG],
       identityProvenance: "system:operator-authorized-coordination", nudge: true,
     });
+    if(originalRig){const q=deps.queueRepo.getById(queueId)!;const receipt={queueId,bodyHash:digest(q.body),generation,recoveryKey,sourceFacts:sourceFacts(current)};deps.db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(originalRig.rig_id,'diagnostic-wake-producer:'+queueId,'diagnostic-wake-producer',JSON.stringify(receipt),digest(JSON.stringify(receipt)));}
     deps.queueRepo.stageWakeIntent(queueId, "watchdog@system", OPERATOR,
       "system:operator-authorized-coordination", true, generation);
     return { qitemId: queueId, action: "created" as const };

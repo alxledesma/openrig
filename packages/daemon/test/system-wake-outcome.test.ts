@@ -66,6 +66,38 @@ describe('system-origin administrative wake outcome convergence',()=>{
  }
 
 
+ async function stageDiagnostic(legacy=false){
+  configureAdminOnly();const body='original diagnostic target';
+  repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv','diagnostic-target',{inputDigest:digest('original'),destination:'builder@xv',bodyHash:digest(body),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+  await repo.create({qitemId:'diagnostic-target',sourceSession:'lead@xv',destinationSession:'builder@xv',body,dispatch:{token,packageKey:'diagnostic-target'},nudge:false});
+  repo.recordNudgeAttempt('diagnostic-target','failed:transport unavailable');
+  const {runStuckSweep}=await import('../src/domain/queue-stuck-sweep.js');
+  await runStuckSweep({db,queueRepo:repo,now:new Date(clock),log:()=>{},resolveOrchestrator:()=>null});
+  const row=db.prepare("SELECT qitem_id,body FROM queue_items WHERE qitem_id LIKE 'qitem-stuck-sweep-control-%' LIMIT 1").get() as any;
+  expect(row).toBeTruthy();const qid=row.qitem_id;
+  if(legacy){db.prepare("DELETE FROM coordinator_operations WHERE operation_id=?").run('diagnostic-wake-producer:'+qid);const b=JSON.parse(row.body);delete b.rigId;db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(JSON.stringify(b),qid);}
+  db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+qid);
+  return qid;
+ }
+ it('contains real producer-bound completed diagnostic wakes without changing UNKNOWN delivery',async()=>{
+  const qid=await stageDiagnostic();claimOperator(qid);
+  const notice=()=>db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid);
+  const before=notice();reconcile();expect(svc.noticeOutcomeContained('xv',notice())).toBe(false);
+  repo.update({qitemId:qid,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+  reconcile();expect(svc.noticeOutcomeContained('xv',notice())).toBe(true);expect(notice()).toEqual(before);
+  db.prepare("DELETE FROM coordinator_operations WHERE operation_id=?").run('diagnostic-wake-producer:'+qid);expect(svc.noticeOutcomeContained('xv',notice())).toBe(false);
+ });
+ it('requires explicit native exact-snapshot disposition for older diagnostic wakes and rejects drift',async()=>{
+  const qid=await stageDiagnostic(true),notice=()=>db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid) as any;
+  claimOperator(qid);repo.update({qitemId:qid,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+  const before=notice();reconcile();expect(svc.noticeOutcomeContained('xv',notice())).toBe(false);
+  const input={rigId:'xv',outboxId:'wake-intent-'+qid,noticeSnapshotHash:digest(JSON.stringify(before)),taskBodyHash:digest(repo.getById(qid)!.body),evidenceRef:'native-diagnostic-terminal.json'};
+  expect(()=>svc.disposeDiagnosticWake('lead@xv','lead-g1',input)).toThrow();
+  expect(()=>svc.disposeDiagnosticWake('operator-agent@kernel','operator-agent-g1',{...input,noticeSnapshotHash:'drift'})).toThrow();
+  svc.disposeDiagnosticWake('operator-agent@kernel','operator-agent-g1',input);expect(svc.noticeOutcomeContained('xv',notice())).toBe(true);expect(notice()).toEqual(before);
+  expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='diagnostic-wake-producer'").get()).toBeUndefined();
+  db.prepare("UPDATE queue_items SET body=body||' ' WHERE qitem_id=?").run(qid);expect(svc.noticeOutcomeContained('xv',notice())).toBe(false);
+ });
  it('reproduces the deadlock: a genuinely finished system-origin item still blocks the Operator frontier duty forever',async()=>{
   configureAdminOnly();
   const qitemId=stageSystemAdministrativeEffect();

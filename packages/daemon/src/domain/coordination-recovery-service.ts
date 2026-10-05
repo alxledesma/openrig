@@ -278,6 +278,37 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
  private static readonly SYSTEM_COORDINATOR_RECOVERY_ACTIONS=['recover-unavailable-coordinator','recover-expired-idle-transfer','restore-current-held-history-binding','reconcile-current-coordinator-lease'] as readonly string[];
  private static readonly SYSTEM_WAKE_ROLLOUT='materialize-standard-resilience';
  private static readonly SYSTEM_WAKE_HOLD='resolve-exact-coordination-task-hold';
+ /** A completed detector notice is not original-work completion or delivery. */
+ private diagnosticWakeProof(rigId:string,row:any,producerRequired:boolean):{queueId:string;bodyHash:string;generation:string;terminalId:number}|null {
+  const id=String(row?.outbox_id??''),qid=id.slice('wake-intent-'.length),recipient='operator-agent@kernel';
+  if(!id.startsWith('wake-intent-')||row.delivery_state!=='indeterminate'||!this.systemPointerNotice(row,qid,recipient))return null;
+  const q=this.repo.getById(qid);let body:any;try{body=JSON.parse(q?.body??'');}catch{return null;}
+  const generation=this.authority.generation(recipient),first=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1').get(qid) as any,last=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(qid) as any;
+  if(!q||q.sourceSession!=='watchdog@system'||q.destinationSession!==recipient||q.state!=='done'||!generation||body.recipientGeneration!==generation||first?.actor_session!=='watchdog@system'||first.identity_provenance!=='system:operator-authorized-coordination'||last?.state!=='done'||last.actor_session!==recipient||last.identity_provenance!=='transport:v1'||!this.systemNativeCustody(qid,recipient,generation))return null;
+  if(body.action!=='reconcile-refused-stuck-finding'||typeof body.stuckSweepRecoveryKey!=='string'||body.returnPath?.queueId!==qid||body.returnPath?.actor!==recipient||body.returnPath?.generation!==generation||'qitem-stuck-sweep-control-'+digest(body.stuckSweepRecoveryKey+':'+(body.previousQueueId??'initial')).slice(0,24)!==qid)return null;
+  const original=this.db.prepare('SELECT a.rig_id,q.body,q.source_session,q.destination_session FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.queue_id=? UNION ALL SELECT a.rig_id,q.body,q.source_session,q.destination_session FROM coordinator_stage_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.queue_id=?').get(body.original?.qitemId,body.original?.qitemId) as any;
+  if(!original||original.rig_id!==rigId||digest(original.body)!==body.original.bodyHash||original.source_session!==body.original.sourceSession||original.destination_session!==body.original.destinationSession)return null;
+  if(producerRequired){const op=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='diagnostic-wake-producer'").get(rigId,'diagnostic-wake-producer:'+qid) as any;let r:any;try{r=JSON.parse(op?.receipt??'');}catch{return null;}
+   if(r.queueId!==qid||r.bodyHash!==digest(q.body)||r.generation!==generation||r.recoveryKey!==body.stuckSweepRecoveryKey||digest(r.sourceFacts)!==body.original.factsHash||digest(JSON.stringify([r.sourceFacts,body.kind,body.original.evidenceAt,body.reason,generation]))!==r.recoveryKey)return null;
+  }
+  return {queueId:qid,bodyHash:digest(q.body),generation,terminalId:last.transition_id};
+ }
+ disposeDiagnosticWake(actor:string,generation:string,input:{rigId:string;outboxId:string;noticeSnapshotHash:string;taskBodyHash:string;evidenceRef:string}):void {
+  this.db.transaction(()=>{
+   this.authority.assertCurrentOperator(actor,generation);
+   if(this.plan(input.rigId)?.operatorGeneration!==generation||typeof input.evidenceRef!=='string'||!input.evidenceRef.trim())fail('diagnostic_wake_evidence_required','Current genuine Operator, current plan and actual terminal evidence required');
+   const row=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(input.outboxId) as any,proof=row?this.diagnosticWakeProof(input.rigId,row,false):null;
+   if(!proof||input.noticeSnapshotHash!==digest(JSON.stringify(row))||input.taskBodyHash!==proof.bodyHash)fail('diagnostic_wake_evidence_required','Exact completed native diagnostic and unchanged UNKNOWN notice required; no historical producer evidence is invented');
+   const receipt={...proof,outboxId:input.outboxId,noticeSnapshotHash:input.noticeSnapshotHash,actor,generation,evidenceRef:input.evidenceRef,deliveryConclusion:'unknown',outcomeOnly:true,grantsAuthority:false,originalMutations:0};
+   const id='diagnostic-wake-disposition:'+input.outboxId,prior=this.db.prepare('SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(input.rigId,id) as any;
+   if(prior){if(prior.receipt!==JSON.stringify(receipt))fail('diagnostic_wake_conflict','Existing disposition is immutable');return;}
+   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,id,'diagnostic-wake-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+  }).immediate();
+ }
+ private diagnosticWakeContained(row:any):boolean {
+  const records=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE operation_id=? AND kind='diagnostic-wake-disposition'").all('diagnostic-wake-disposition:'+row.outbox_id) as any[];
+  return records.some(op=>{let r:any;try{r=JSON.parse(op.receipt);}catch{return false;}const p=this.diagnosticWakeProof(op.rig_id,row,false);return !!p&&r.actor==='operator-agent@kernel'&&r.generation===p.generation&&r.queueId===p.queueId&&r.bodyHash===p.bodyHash&&r.terminalId===p.terminalId&&r.noticeSnapshotHash===digest(JSON.stringify(row))&&r.deliveryConclusion==='unknown'&&r.outcomeOnly===true&&r.grantsAuthority===false&&r.originalMutations===0;});
+ }
  /** The exact pointer-wake template. A wake carrying instructions is never eligible. */
  private systemPointerNotice(row:any,qid:string,recipient:string):boolean {
   if(row.outbox_id!=='wake-intent-'+qid||row.sender_session!=='watchdog@system'||row.destination_session!==recipient||row.audit_pointer!==qid)return false;
@@ -305,6 +336,8 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
    if('qitem-resilience-rollout-'+digest(rolloutKey+':'+(body.previousQueueId??'initial')).slice(0,24)!==qid)return null;
   }else if(action===CoordinationRecoveryService.SYSTEM_WAKE_HOLD){
    if(!this.validAccountableIntake(body.rigId,qid,q)&&!(typeof body.rootQueueId==='string'&&this.validAccountableIntakeChainItem(body.rigId,q,body.rootQueueId)))return null;
+  }else if(action==='reconcile-refused-stuck-finding'){
+   if(!this.diagnosticWakeProof(body.rigId,this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid),true))return null;
   }else if(action==='reconcile-transferred-baton'){
    if(!Number.isInteger(body.epoch)||body.epoch<1||typeof body.batonId!=='string'||!body.batonId)return null;
    if('qitem-coordination-peer-'+digest(body.rigId+':'+body.epoch).slice(0,24)!==qid)return null;
@@ -404,7 +437,7 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
  }
  /** The one consumption predicate both debt gates call. */
  noticeOutcomeContained(rigId:string,row:any):boolean {
-  return this.heldHistoryNoticeOutcomeContained(rigId,row)||this.systemWakeOutcomeContained(rigId,row);
+  return this.heldHistoryNoticeOutcomeContained(rigId,row)||this.systemWakeOutcomeContained(rigId,row)||this.diagnosticWakeContained(row);
  }
  private recordHeldHistoryNoticeOutcome(rigId:string,parent:any):void {
   const row=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+parent.queueId) as any;if(!row||!this.heldHistoryNoticeOutcomeProof(rigId,row))return;
