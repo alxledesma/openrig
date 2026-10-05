@@ -1597,7 +1597,20 @@ export class QueueRepository {
   }
   private async stageRecipientAckDuties(rigId:string,jobId:string):Promise<void> {
     if(!this.outbox||!this.transport?.deliveryGuard)return;const guard=this.transport.deliveryGuard,a=this.coordinatorAuthority.get(rigId),plan=this.coordinatorAuthority.coordinationRecovery?.plan(rigId);if(!a||!plan)return;
-    const candidates=this.db.prepare("SELECT outbox_id,sender_session,destination_session FROM outbox_entries WHERE delivery_state IN ('pending','indeterminate') ORDER BY ts_dispatched,rowid LIMIT 2000").all() as Array<{outbox_id:string;sender_session:string;destination_session:string}>;
+    // One origin-history read, then exact rig/non-executable eligibility BEFORE the
+    // finite bound. Old audit/wake history cannot starve current real direct reports.
+    // Selection is not authority: all exact evidence/protection checks remain fresh.
+    const candidates=this.db.prepare(`WITH origins AS MATERIALIZED (
+      SELECT DISTINCT json_extract(payload,'$.outboxId') AS outbox_id
+      FROM events WHERE type='outbox.direct_attempt'
+    ) SELECT e.outbox_id,e.sender_session,e.destination_session
+      FROM origins o JOIN outbox_entries e ON e.outbox_id=o.outbox_id
+      WHERE e.delivery_state IN ('pending','indeterminate')
+        AND substr(e.outbox_id,1,12)!='wake-intent-' AND e.guard_binding IS NULL
+        AND NOT EXISTS (SELECT 1 FROM outbox_historical_quarantines h WHERE h.outbox_id=e.outbox_id)
+        AND EXISTS (SELECT 1 FROM nodes n JOIN sessions s ON s.node_id=n.id
+          WHERE n.rig_id=? AND s.session_name IN (e.sender_session,e.destination_session))
+      ORDER BY e.ts_dispatched,e.rowid LIMIT 2000`).all(rigId) as Array<{outbox_id:string;sender_session:string;destination_session:string}>;
     for(const e of candidates){const touches=this.db.prepare('SELECT 1 FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE n.rig_id=? AND s.session_name IN (?,?)').get(rigId,e.sender_session,e.destination_session);if(!touches)continue;const generation=this.coordinatorAuthority.generation(e.destination_session),senderGeneration=this.coordinatorAuthority.generation(e.sender_session);if(!generation||!senderGeneration)continue;
       const queueId='qitem-outbox-recipient-duty-'+createHash('sha256').update(JSON.stringify([e.outbox_id,e.destination_session,generation])).digest('hex').slice(0,32);if(this.getById(queueId)||this.recipientAckDuty(queueId))continue;
       if(this.db.prepare("SELECT 1 FROM queue_items q JOIN coordinator_operations o ON o.operation_id=q.qitem_id AND o.kind='outbox-recipient-duty' WHERE q.destination_session=? AND q.state IN ('pending','in-progress','blocked')").get(e.destination_session))continue;

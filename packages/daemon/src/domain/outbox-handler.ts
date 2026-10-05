@@ -327,6 +327,8 @@ export class OutboxHandler {
   /** Read-only current recipient evidence; displaying bytes is not testimony or execution. */
   recipientAcknowledgmentContract(actor:string,generation:string,outboxId:string):{body:string;contract:{outboxId:string;bodySha256:string;effectSnapshotSha256:string;expectedState:"pending"|"indeterminate";acknowledged:true;reason:string}} {
     const entry=this.getById(outboxId),hash=(v:string)=>createHash('sha256').update(v).digest('hex');
+    // Reject executable and contained history before any origin-history lookup.
+    if(!entry||!generation||entry.destinationSession!==actor||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||entry.guardBinding||this.isHistoricalQuarantined(outboxId)||!['pending','indeterminate'].includes(entry.deliveryState))throw new OutboxHandlerError('outbox_ack_evidence_required','Current exact recipient and unresolved real non-executable unquarantined direct attempt required');
     const node=this.db.prepare('SELECT node_id FROM sessions WHERE session_name=? ORDER BY id DESC LIMIT 1').get(actor) as {node_id:string}|undefined;
     const current=node?this.db.prepare('SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1').get(node.node_id) as {generation_uuid:string}|undefined:undefined;
     const attempt=this.db.prepare("SELECT payload FROM events WHERE type='outbox.direct_attempt' AND json_extract(payload,'$.outboxId')=? ORDER BY seq LIMIT 1").get(outboxId) as {payload:string}|undefined;let origin:any;try{origin=attempt?JSON.parse(attempt.payload):null;}catch{}
