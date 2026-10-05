@@ -32,11 +32,14 @@ describe("shared Pi native prover", () => {
   const census = (child = childLine) => `100 1 /bin/zsh -l\n${runnerLine}\n${child}`;
   const env = (gen = "lead-g1") => `101 node pi-runner SECRET=never-logged OPENRIG_OCCUPANT_GENERATION=${gen}\n102 node cli.js OTHER=x OPENRIG_OCCUPANT_GENERATION=${gen}`;
   const sidecar = (over: Record<string, unknown> = {}) => JSON.stringify({ ready: true, launchId: "L-77", sessionFile: row.resume_token, updatedAt: "2026-01-01T00:00:00.000Z", ...over });
-  function prover(opts: { rows?: unknown[]; exec?: () => Promise<string>; argvCensus?: () => Promise<string>; envProbe?: (p: number[]) => Promise<string>; sidecar?: string } = {}) {
+  function prover(opts: { rows?: unknown[]; exec?: () => Promise<string>; argvCensus?: () => Promise<string>; envProbe?: (p: number[]) => Promise<string>; sidecar?: string; procArgs?: (p: number[]) => Promise<Map<number, string | null>> } = {}) {
     const rows = opts.rows ?? [row];
     const db = { prepare: () => ({ all: () => rows }) } as never;
     return makePiNativeProver(db, opts.exec ?? (async () => "%4|100|0"), {
       fs: { readFile: () => opts.sidecar ?? sidecar() }, piStateRoot: "/state/pi",
+      // Hermetic default: behave like a non-Darwin host (kernel evidence
+      // unavailable) so injected envProbe text decides, unless a case overrides.
+      procArgs: opts.procArgs ?? (async () => new Map()),
       argvCensus: opts.argvCensus ?? (async () => census()), envProbe: opts.envProbe ?? (async () => env()), now: () => Date.parse("2026-10-05T12:00:00Z"),
     });
   }
@@ -63,6 +66,17 @@ describe("shared Pi native prover", () => {
   });
   it("a dead retained pane positively proves absence", async () => {
     expect(await prover({ exec: async () => "%4|100|1", argvCensus: async () => "100 1 /bin/cat something" })("lead@xv")).toMatchObject({ state: "absent" });
+  });
+  it("kernel process-args evidence proves seats whose ps env view was erased by title rewriting", async () => {
+    const gens = new Map<number, string | null>([[101, "lead-g1"], [102, "lead-g1"]]);
+    expect(await prover({ procArgs: async () => gens, envProbe: async () => { throw new Error("ps eww renders no env after setproctitle"); } })("lead@xv")).toMatchObject({ state: "present" });
+  });
+  it("kernel-confirmed absence is never contradicted by a stale ps token", async () => {
+    const gens = new Map<number, string | null>([[101, "lead-g1"], [102, null]]);
+    expect(await prover({ procArgs: async () => gens, envProbe: async () => env() })("lead@xv")).toBeNull();
+  });
+  it("unavailable kernel probe falls back to the legacy ps evidence", async () => {
+    expect(await prover({ procArgs: async () => new Map() })("lead@xv")).toMatchObject({ state: "present" });
   });
   it("observer delegates Pi seats to the shared prover and stays unknown without one", async () => {
     const db = { prepare: () => ({ all: () => [{ id: "n", runtime: "pi", tmux_pane: "%4", tmux_session: null, generation_uuid: "lead-g1" }] }) } as never;

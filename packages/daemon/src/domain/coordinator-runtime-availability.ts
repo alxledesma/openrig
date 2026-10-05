@@ -7,18 +7,45 @@ const run = promisify(execFile);
 export interface RuntimeAvailability { session: string; generation: string; state: "present" | "absent" | "unknown"; observedAt: number; fingerprint: string }
 /** Proof that the SAME managed Pi occupant is live: runner argv binds
  * --session-name/--launch-id, the runner's typed sidecar binds launchId and
- * the exact native session-file token with a current heartbeat, and the
+ * the exact native session-file token via the per-launch launch-id instance binding, and the
  * target-process environment carries the genuine OPENRIG_OCCUPANT_GENERATION
  * equal to the node's latest occupant tenure. Environment text never leaves
  * this module except the single extracted generation token; fingerprints carry
  * only identifiers. */
 export interface PiNativeProof { state: "present" | "absent"; generation: string; launchId: string | null; fingerprint: string }
-export interface PiNativeProverOptions { fs: { readFile(path: string): string }; piStateRoot: string; argvCensus?: () => Promise<string>; envProbe?: (pids: number[]) => Promise<string> }
+export interface PiNativeProverOptions { fs: { readFile(path: string): string }; piStateRoot: string; argvCensus?: () => Promise<string>; envProbe?: (pids: number[]) => Promise<string>; procArgs?: (pids: number[]) => Promise<Map<number, string | null>> }
+// Reads the kernel's stored process args+env (sysctl KERN_PROCARGS2, mib
+// {CTL_KERN=1, KERN_PROCARGS2=49, pid}) and prints ONLY `<pid>\t<token>` for
+// the allowlisted OPENRIG_OCCUPANT_GENERATION when exactly one sanitized
+// occurrence exists, else `<pid>\t`. No other byte is ever emitted.
+const PROC_ARGS_PY = [
+  "import ctypes,sys,re",
+  "libc=ctypes.CDLL(None)",
+  "def tok(pid):",
+  "    mib=(ctypes.c_int*3)(1,49,pid); n=ctypes.c_size_t(0)",
+  "    if libc.sysctl(mib,3,None,ctypes.byref(n),None,0)!=0: return ''",
+  "    b=ctypes.create_string_buffer(n.value)",
+  "    if libc.sysctl(mib,3,b,ctypes.byref(n),None,0)!=0: return ''",
+  "    t=[s.decode('utf-8','ignore').split('=',1)[1] for s in b.raw[:n.value].split(b'\\0') if s.startswith(b'OPENRIG_OCCUPANT_GENERATION=')]",
+  "    return t[0] if len(t)==1 and re.fullmatch(r'[A-Za-z0-9._:-]{1,128}',t[0]) else ''",
+  "print(''.join(f'{i}\\t{tok(i)}\\n' for i in map(int,sys.argv[1:])))",
+].join("\n");
 export function makePiNativeProver(db: Database.Database, exec: (command: string) => Promise<string>, opts: PiNativeProverOptions) {
   const quote = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
   const argvCensus = opts.argvCensus ?? (async () => (await run("ps", ["-axo", "pid=,ppid=,command="], { timeout: 2000, maxBuffer: 8 * 1024 * 1024 })).stdout);
   const envProbe = opts.envProbe ?? (async (pids: number[]) => (await run("/bin/ps", ["eww", "-p", pids.join(",")], { timeout: 2000, maxBuffer: 8 * 1024 * 1024 })).stdout);
   const GENERATION_ENV = "OPENRIG_OCCUPANT_GENERATION=";
+  // Darwin: the kernel copy is authoritative because a Pi child rewrites its
+  // process title, wiping the env region `ps eww` renders. Elsewhere (or on any
+  // probe failure) the map stays empty and callers fall back to ps evidence.
+  const procArgs = opts.procArgs ?? (process.platform !== "darwin" ? async () => new Map<number, string | null>() : async (pids: number[]) => {
+    const map = new Map<number, string | null>();
+    try {
+      const { stdout } = await run("python3", ["-c", PROC_ARGS_PY, ...pids.map(String)], { timeout: 2000, maxBuffer: 64 * 1024 });
+      for (const line of stdout.split("\n")) { const m = line.match(/^(\d+)\t(.*)$/); if (m) map.set(Number(m[1]), m[2] === "" ? null : m[2]!); }
+    } catch { /* unavailable: ps fallback below decides */ }
+    return map;
+  });
   return async (session: string): Promise<PiNativeProof | null> => {
     const read = () => {
       const rows = db.prepare(`SELECT n.id AS nodeId,n.runtime,b.tmux_pane,b.tmux_session,t.generation_uuid,s.resume_token FROM sessions s JOIN nodes n ON n.id=s.node_id LEFT JOIN bindings b ON b.node_id=n.id JOIN occupant_tenures t ON t.node_id=n.id WHERE s.session_name=? AND n.runtime='pi' AND s.id=(SELECT MAX(s2.id) FROM sessions s2 WHERE s2.node_id=n.id) AND t.generation_ordinal=(SELECT MAX(x.generation_ordinal) FROM occupant_tenures x WHERE x.node_id=n.id)`).all(session) as Array<{ nodeId: string; runtime: string; tmux_pane: string | null; tmux_session: string | null; generation_uuid: string; resume_token: string | null }>;
@@ -80,17 +107,21 @@ export function makePiNativeProver(db: Database.Database, exec: (command: string
         // occupant-generation token is extracted; every other byte is dropped.
         // Both the runner AND its Pi child must independently carry exactly one
         // generation equal to the node's latest tenure (allowlist confirmed at
-        // adapters/pi-runner-protocol.ts PI_ENV_OPENRIG_VARS).
-        const envText = await envProbe([runner.pid, piProc.pid]);
-        const genFor = (pid: number): string | null => {
-          const line = envText.split("\n").find(l => l.trim().startsWith(String(pid) + " "));
-          if (!line) return null;
-          const found = [...line.matchAll(new RegExp(GENERATION_ENV + "(\\S+)", "g"))].map(m => m[1]!);
-          return found.length === 1 ? found[0]! : null;
+        // adapters/pi-runner-protocol.ts PI_ENV_OPENRIG_VARS). Source order:
+        // kernel KERN_PROCARGS2 (survives process-title rewriting), then the
+        // legacy `ps eww` view. A kernel-confirmed absence is never contradicted
+        // by ps; nothing is synthesized from parentage.
+        const kernelGens = await procArgs([runner.pid, piProc.pid]);
+        let psText: string | null = null;
+        const genFor = async (pid: number): Promise<{ value: string | null; source: "kernel" | "ps" }> => {
+          if (kernelGens.has(pid)) return { value: kernelGens.get(pid)!, source: "kernel" };
+          if (psText === null) psText = await envProbe([runner.pid, piProc.pid]);
+          const found = [...(psText.split("\n").find(l => l.trim().startsWith(pid + " ")) ?? "").matchAll(new RegExp(GENERATION_ENV + "(\\S+)", "g"))].map(m => m[1]!);
+          return { value: found.length === 1 ? found[0]! : null, source: "ps" };
         };
-        const runnerGen = genFor(runner.pid), piGen = genFor(piProc.pid);
-        if (runnerGen !== binding.generation_uuid || piGen !== binding.generation_uuid) return null;
-        return { state: "present", generation: binding.generation_uuid, launchId: launchFlag, fingerprint: JSON.stringify({ pane: match[1], runner: [runner.pid, runner.ppid], pi: [piProc.pid, piProc.ppid], launchId: launchFlag, sidecarUpdatedAt: state.updatedAt }) };
+        const runnerEv = await genFor(runner.pid), piEv = await genFor(piProc.pid);
+        if (runnerEv.value !== binding.generation_uuid || piEv.value !== binding.generation_uuid) return null;
+        return { state: "present", generation: binding.generation_uuid, launchId: launchFlag, fingerprint: JSON.stringify({ pane: match[1], runner: [runner.pid, runner.ppid], pi: [piProc.pid, piProc.ppid], launchId: launchFlag, sidecarUpdatedAt: state.updatedAt, genSources: [runnerEv.source, piEv.source] }) };
       };
       const first = await sample(), second = await sample();
       if (!first || !second || first.fingerprint !== second.fingerprint || JSON.stringify(read()) !== JSON.stringify(binding)) return null;
