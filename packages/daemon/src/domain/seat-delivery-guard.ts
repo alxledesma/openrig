@@ -14,6 +14,9 @@ interface Lease {
   active: boolean;
   origin: "automatic" | "human";
   lifecycle?: boolean;
+  /** Set only by the dedicated same-generation runner-rehost lease. Distinguishes rehost
+   * authority from ordinary input/lifecycle/human authority, which never confer it. */
+  rehost?: boolean;
   reservationId?: string;
 }
 
@@ -41,6 +44,9 @@ export class SeatDeliveryGuard {
   private readonly tails = new Map<string, Promise<void>>();
   private readonly scope = new AsyncLocalStorage<Map<string, Lease>>();
   private readonly humanLeases = new Set<Lease>();
+  /** Tracked per node, independent of the tail, so a human lease cannot START after the
+   * rehost already holds the tail and still interleave with the stop/resume window. */
+  private readonly rehostLeases = new Set<Lease>();
 
   constructor(
     readonly db: Database.Database,
@@ -119,6 +125,15 @@ export class SeatDeliveryGuard {
     const bound = this.target(name);
     const inherited = this.scope.getStore()?.get(bound.nodeId);
     if (inherited?.active && inherited.target.nodeId === bound.nodeId) {
+      // G1: an ordinary operation or lifecycle call must never inherit a REHOST lease.
+      // Before this, lifecycle() reached an in-scope rehost lease through this generic
+      // branch, then set lease.lifecycle = true on it and silently upgraded rehost
+      // authority into general lifecycle authority. The rehost lease is a narrow,
+      // guard-ON-scoped permission for exactly one operation; it is not a licence for
+      // lifecycle preflight, rebinding or any other ordinary writing path.
+      // input() is untouched and keeps its own active-lease fast path, so the required
+      // resume typing still works under the rehost lease.
+      if (inherited.rehost === true) throw new DeliveryGuardError("rehost_lease_not_upgradable", "A same-generation runner rehost lease cannot be upgraded to ordinary operation or lifecycle authority; this writing path did not inherit it.");
       this.assertCurrent(name, inherited);
       return fn();
     }
@@ -139,6 +154,66 @@ export class SeatDeliveryGuard {
       try { return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [lease.target.nodeId, lease]]), fn); }
       finally { lease.active = false; }
     });
+  }
+
+  /** Dedicated SAME-GENERATION runner-rehost lease.
+   *
+   * This is the one writing path that requires typing protection to be ON, and it requires
+   * it strictly: desired AND effective, with no pending activation. The operator's
+   * quiescence guarantee is exactly what makes replacing a runner on its own session file
+   * safe, and the replacement must be typed while that quiescence still holds.
+   *
+   * It deliberately keeps every other protection:
+   *   - it serializes on the SAME per-node tail as input and lifecycle, so it waits for and
+   *     blocks any other input/lifecycle tail rather than racing them;
+   *   - it captures the binding before waiting and re-proves node/session/occupant/pane
+   *     unchanged, so a new occupant or a recycled pane can never be adopted;
+   *   - a durable dispatch reservation always excludes it, and it takes no reservation of
+   *     its own and creates no human lease;
+   *   - it grants no preference, disables nothing and bypasses nothing.
+   *
+   * There is no global permissive flag: `operation`, `input`, `reconcileBinding` and every
+   * other path keep refusing a writing operation while the guard is on, exactly as before. */
+  async runnerRehost<T>(name: string, fn: () => Promise<T>): Promise<T> {
+    const bound = this.target(name);
+    const inherited = this.scope.getStore()?.get(bound.nodeId);
+    // Only a REHOST lease may be inherited, and only after the guard-ON requirement is
+    // proven again here. An ordinary input, lifecycle or human lease carries no rehost
+    // authority at all: it is never inherited and never launders this operation through
+    // a scope whose protections were proven for a different purpose.
+    if (inherited?.active && inherited.target.nodeId === bound.nodeId) {
+      if (inherited.rehost !== true) {
+        // Refuse here, BEFORE serial(). An ordinary operation holds this node's own tail
+        // while it runs, so re-entering serial() from inside it would wait on a tail that
+        // only this call can release. That self-wait must never be allowed to hang; it is a
+        // composition error, not a transient contention to retry.
+        throw new DeliveryGuardError("rehost_not_nestable", "A same-generation runner rehost cannot run inside an ordinary input, lifecycle or human lease for this seat. Run it as its own top-level operation.");
+      }
+      this.assertCurrent(name, inherited);
+      this.assertRehostGuard(bound.nodeId);
+      return fn();
+    }
+    return this.serial(bound.nodeId, async () => {
+      const current = this.target(name);
+      if (!this.same(bound, current)) throw new DeliveryGuardError("guard_target_changed", "Input target changed while waiting; no input written.");
+      // A human lease is an intentional binding path that deliberately does not take this
+      // tail, so the tail alone cannot exclude it. Rehost never interleaves with it.
+      if ([...this.humanLeases].some(lease => lease.active && lease.target.nodeId === bound.nodeId)) throw new DeliveryGuardError("guard_operation_in_progress", "Human input is in progress for this seat; a same-generation runner rehost did not interleave with it. Retry after it finishes.");
+      if (this.activeReservation(bound.nodeId)) throw new DeliveryGuardError("seat_dispatch_reserved", "Seat has a durable cutover reservation; a same-generation runner rehost is excluded from it.");
+      this.assertRehostGuard(bound.nodeId);
+      // Deliberately NOT marked lifecycle: a rehost lease must never satisfy ownsLifecycle
+      // or rebindLifecycle, so it cannot be reused as general lifecycle authority.
+      const lease: Lease = { target: bound, active: true, origin: "automatic", rehost: true };
+      this.rehostLeases.add(lease);
+      try { return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [lease.target.nodeId, lease]]), fn); }
+      finally { lease.active = false; this.rehostLeases.delete(lease); }
+    });
+  }
+
+  /** Narrow requirement, one direction only: typing protection must be ON. Never a waiver. */
+  private assertRehostGuard(nodeId: string): void {
+    const pref = this.preference(nodeId);
+    if (pref.desired !== true || pref.effective !== true || pref.pending) throw new DeliveryGuardError("typing_guard_required_for_rehost", "A same-generation runner rehost requires this seat's typing guard desired AND effective ON. Rehost never disables, relaxes or bypasses typing protection.");
   }
 
   /** Read-only protection inspection under the exact delivery serialization domain.
@@ -239,6 +314,13 @@ export class SeatDeliveryGuard {
   /** Internal broker path only; never an option accepted by the send HTTP route. */
   async humanInput<T>(name: string, fn: () => Promise<T>): Promise<T> {
     const target = this.target(name);
+    // Symmetric fence with the human-lease check inside runnerRehost. That one stops a
+    // rehost from starting while human input runs; this one stops human input from starting
+    // once a rehost already holds the window. The rehost set is checked by node, so ordinary
+    // human input on every other seat, and with no rehost active, is unchanged.
+    if ([...this.rehostLeases].some(lease => lease.active && lease.target.nodeId === target.nodeId)) {
+      throw new DeliveryGuardError("rehost_in_progress", "A same-generation runner rehost is in progress for this seat; human input did not interleave with its stop/resume window. Retry after it finishes.");
+    }
     const lease: Lease = { target, active: true, origin: "human" };
     this.humanLeases.add(lease);
     try { return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [lease.target.nodeId, lease]]), fn); }

@@ -1481,7 +1481,12 @@ export class SeatLifecycleService {
     if (!sessionName)
       return { ok: false, code: "rehost_process_identity_unproven", message: "Seat has no canonical session name to rehost." };
 
-    const outcome = await guard.lifecycle<RehostRunnerResult>([resolved.nodeId], async (): Promise<RehostRunnerResult> => {
+    // R5 behaviour reused unchanged, but under the DEDICATED runner-rehost lease: it
+    // requires the typing guard desired AND effective ON (the operator's quiescence is what
+    // makes a same-file replacement safe) instead of refusing because the guard is on.
+    // It still serializes on the same tail, re-proves the binding, excludes reservations,
+    // and takes no human lease. Ordinary lifecycle/input/reconcile paths are untouched.
+    const outcome = await guard.runnerRehost<RehostRunnerResult>(resolved.nodeId, async (): Promise<RehostRunnerResult> => {
       // S0: EVERY precondition is re-proven inside the exclusive guard lease. A throw
       // here happens BEFORE any signal, so it is a typed refusal that signals nothing and
       // is never an UNKNOWN: no runner has been touched.

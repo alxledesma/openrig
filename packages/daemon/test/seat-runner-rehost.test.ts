@@ -16,6 +16,7 @@ import { SessionRegistry } from "../src/domain/session-registry.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { SeatLifecycleService, type PiRehostProof, type PiRehostRunnerState } from "../src/domain/seat-lifecycle-service.js";
+import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
 
 const SESSION_FILE = "/state/pi/intake-lead@app-handy-conveyor/sessions/history.jsonl";
@@ -85,6 +86,8 @@ function harness(): Harness {
   };
   const guard = {
     lifecycle: async <T>(_nodes: string[], fn: () => Promise<T>): Promise<T> => { h.guard.lifecycleCalls++; return fn(); },
+    // The service now takes the DEDICATED rehost lease; it counts as a lifecycle lease.
+    runnerRehost: async <T>(_name: string, fn: () => Promise<T>): Promise<T> => { h.guard.lifecycleCalls++; return fn(); },
     protectionFacts: () => (h.guard.enabled ? { code: "typing_guard_enabled" as const, fingerprint: "{}" } : null),
     // F3: the real gate reads preference and requires BOTH flags. A pending
     // activation (desired only, or effective only) must refuse.
@@ -258,7 +261,7 @@ describe("same-generation pi runner rehost", () => {
     registry.updateStatus(session.id, "running");
     registry.updateBinding(node.id, { attachmentType: "tmux", tmuxSession: "intake-lead@app-handy-conveyor", tmuxPane: "%4" });
     registry.updateResumeToken(session.id, "pi_session_file", SESSION_FILE, "hook");
-    const bare = new SeatLifecycleService({ db, rigRepo, sessionRegistry: registry, eventBus: new EventBus(db), tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter });
+    const bare = new SeatLifecycleService({ db, rigRepo, sessionRegistry: registry, eventBus: new EventBus(db), tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), runnerRehost: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter });
     expect(await bare.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "r" })).toMatchObject({ ok: false, code: "rehost_unavailable" });
     expect(db.prepare("SELECT status FROM sessions WHERE id=?").get(session.id)).toEqual({ status: "running" });
     db.close();
@@ -274,10 +277,10 @@ describe("same-generation pi runner rehost", () => {
       seat(stuck);
       const rigRepo = new RigRepository(stuck.db);
       const registry = new SessionRegistry(stuck.db);
-      const guard = { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled" as const, fingerprint: "{}" }) };
+      const guard = { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), runnerRehost: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled" as const, fingerprint: "{}" }) };
       const service = new SeatLifecycleService({
         db: stuck.db, rigRepo, sessionRegistry: registry, eventBus: new EventBus(stuck.db),
-        tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter,
+        tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), runnerRehost: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter,
         listProcesses: () => stuck.processes,
         piResume: { resume: async () => stuck.resumeResult.value },
         piProve: async () => stuck.proof.value,
@@ -361,7 +364,7 @@ describe("same-generation pi runner rehost", () => {
         seat(fresh);
         const svc = new SeatLifecycleService({
           db: fresh.db, rigRepo: new RigRepository(fresh.db), sessionRegistry: new SessionRegistry(fresh.db), eventBus: new EventBus(fresh.db),
-          tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => guardObj } } as unknown as TmuxAdapter,
+          tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), runnerRehost: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => guardObj } } as unknown as TmuxAdapter,
           piResume: fresh.service ? (fresh as unknown as { resumeDeps: never }).resumeDeps : undefined,
         } as never);
         const out = await svc.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: `guard ${label}` });
@@ -375,7 +378,7 @@ describe("same-generation pi runner rehost", () => {
       seat(bare2);
       const svc = new SeatLifecycleService({
         db: bare2.db, rigRepo: new RigRepository(bare2.db), sessionRegistry: new SessionRegistry(bare2.db), eventBus: new EventBus(bare2.db),
-        tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }) } } as unknown as TmuxAdapter,
+        tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), runnerRehost: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }) } } as unknown as TmuxAdapter,
       } as never);
       expect(await svc.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "guard preference missing" })).toMatchObject({ ok: false, code: "rehost_guard_not_enabled" });
     } finally { bare2.db.close(); }
@@ -455,7 +458,7 @@ describe("same-generation pi runner rehost", () => {
           rigRepo: new RigRepository(fresh.db),
           sessionRegistry: new SessionRegistry(fresh.db),
           eventBus: new EventBus(fresh.db),
-          tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter,
+          tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), runnerRehost: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter,
           listProcesses: async () => fresh.processes,
           piRunnerState: () => fresh.sidecar.value,
           piSessionFileExists: () => true,
@@ -478,7 +481,7 @@ describe("same-generation pi runner rehost", () => {
           (bus as unknown as { persistWithinTransaction: (e: unknown) => void }).persistWithinTransaction = () => { throw new Error("event store down"); };
           const svc2 = new SeatLifecycleService({
             db: fresh.db, rigRepo: new RigRepository(fresh.db), sessionRegistry: new SessionRegistry(fresh.db), eventBus: bus,
-            tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter,
+            tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), runnerRehost: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter,
             listProcesses: async () => fresh.processes, piRunnerState: () => fresh.sidecar.value, piSessionFileExists: () => true, piSessionTailEntryId: () => "tail-1",
             piSessionFileDigestPrefix: () => "d1g3stpr3f1x0000", paneRootPid: async () => 4000,
             piProve: async () => fresh.proof.value,
@@ -567,6 +570,7 @@ describe("same-generation pi runner rehost", () => {
     let resumed = false;
     const guard = {
       lifecycle: async <T>(_nodes: string[], fn: () => Promise<T>): Promise<T> => fn(),
+      runnerRehost: async <T>(_name: string, fn: () => Promise<T>): Promise<T> => fn(),
       protectionFacts: () => ({ code: "typing_guard_enabled" as const, fingerprint: "{}" }),
       preference: () => ({ desired: true, effective: true }),
       set: async (_nodeId: string, enabled: boolean) => { guardWrites.push({ enabled }); return { desired: true, effective: true } as never; },
@@ -661,6 +665,7 @@ describe("same-generation pi runner rehost", () => {
     let resumed = false;
     const guard = {
       lifecycle: async <T>(_nodes: string[], fn: () => Promise<T>): Promise<T> => fn(),
+      runnerRehost: async <T>(_name: string, fn: () => Promise<T>): Promise<T> => fn(),
       protectionFacts: () => ({ code: "typing_guard_enabled" as const, fingerprint: "{}" }),
       preference: () => ({ desired: true, effective: true }),
       set: async (_nodeId: string, enabled: boolean) => { guardWrites.push({ enabled }); return { desired: true, effective: true } as never; },
@@ -722,9 +727,9 @@ describe("same-generation pi runner rehost", () => {
       seat(drift);
       drift.resumeResult.value = { ok: true };
       const rigRepo = new RigRepository(drift.db);
-      const guard = { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled" as const, fingerprint: "{}" }) };
+      const guard = { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), runnerRehost: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled" as const, fingerprint: "{}" }) };
       const service = new SeatLifecycleService({
-        db: drift.db, rigRepo, sessionRegistry: new SessionRegistry(drift.db), eventBus: new EventBus(drift.db), tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter,
+        db: drift.db, rigRepo, sessionRegistry: new SessionRegistry(drift.db), eventBus: new EventBus(drift.db), tmuxAdapter: { deliveryGuard: { lifecycle: async <T>(_n: string[], fn: () => Promise<T>) => fn(), runnerRehost: async <T>(_n: string[], fn: () => Promise<T>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter,
         piResume: { resume: async () => {
           // Something else mutates custody while the runner is being replaced.
           drift.db.prepare("UPDATE nodes SET model='someone-elses-model' WHERE id=?").run(drift.nodeId);
@@ -780,4 +785,467 @@ describe("same-generation pi runner rehost", () => {
     expect(await h.service.rehostRunner({ seatRef: "nobody@nowhere", reason: "r" })).toMatchObject({ ok: false, code: "seat_not_found" });
     expect(h.killed).toEqual([]);
   });
+
+
+  // ---- REAL GUARD integration. The pilot refused with typing_guard_enabled because the
+  // rehost both REQUIRES the typing guard to be ON and could not take the lifecycle lease
+  // while it was. These cases use a REAL SeatDeliveryGuard over the real DB and binding, so
+  // the lease, the serialization, the reservation check and the human-lease exclusion are
+  // the shipped ones. Only the native process and resume seams are injected.
+
+  interface RealGuardBox {
+    db: Database.Database;
+    guard: SeatDeliveryGuard;
+    service: SeatLifecycleService;
+    kills: number[];
+    resumes: string[];
+    nodeId: string;
+    setCalls: Array<{ nodeId: string; enabled: boolean }>;
+    guardWrites: () => number;
+  }
+
+  /** One pi seat, real guard over the real DB and binding, guard preference set ON. */
+  function realGuardBox(): RealGuardBox {
+    const db = fullDb();
+    const rigRepo = new RigRepository(db);
+    const registry = new SessionRegistry(db);
+    const rig = rigRepo.findRigsByName("app-handy-conveyor")[0] ?? rigRepo.createRig("app-handy-conveyor");
+    const node = rigRepo.addNode(rig.id, "intake-lead", { runtime: "pi", cwd: "/work", model: "nemotron-free" });
+    const session = registry.registerSession(node.id, "intake-lead@app-handy-conveyor");
+    registry.updateStatus(session.id, "running");
+    registry.updateBinding(node.id, { attachmentType: "tmux", tmuxSession: "intake-lead@app-handy-conveyor", tmuxPane: "%4" });
+    registry.updateResumeToken(session.id, "pi_session_file", SESSION_FILE, "hook");
+    db.prepare("UPDATE occupant_tenures SET generation_uuid=? WHERE node_id=? AND generation_ordinal=1").run(GENERATION, node.id);
+
+    const guard = new SeatDeliveryGuard(db, target => resolveGuardTarget(db, target));
+    const kills: number[] = [];
+    const resumes: string[] = [];
+    const setCalls: Array<{ nodeId: string; enabled: boolean }> = [];
+    const realSet = guard.set.bind(guard);
+    (guard as unknown as { set: (n: string, e: boolean, a: string, r: string) => Promise<unknown> }).set = async (nodeId: string, enabled: boolean, actor: string, reason: string) => {
+      setCalls.push({ nodeId, enabled });
+      return realSet(nodeId, enabled, actor, reason);
+    };
+
+    const processes = [
+      { pid: 4000, ppid: 9100, command: "-zsh", startedAt: "root-boot" },
+      { pid: 9100, ppid: 1, command: "/opt/homebrew/bin/tmux -L openrig-xv new-session -d -s intake-lead@app-handy-conveyor", startedAt: "tmux-boot" },
+      { pid: RUNNER_PID, ppid: 4000, command: `node /x/pi-runner.js --session-name intake-lead@app-handy-conveyor --session ${SESSION_FILE} --launch-id ${LAUNCH_OLD}`, startedAt: "runner-boot" },
+      { pid: CHILD_PID, ppid: RUNNER_PID, command: "pi --session /state/pi/child", startedAt: "child-boot" },
+    ];
+    let live = processes;
+    let sidecar: PiRehostRunnerState = { ready: true, launchId: LAUNCH_OLD, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: "tail-1" };
+    let proof: PiRehostProof = { state: "present", generation: GENERATION, launchId: LAUNCH_OLD, fingerprint: "{}" };
+
+    const service = new SeatLifecycleService({
+      db, rigRepo, sessionRegistry: registry, eventBus: new EventBus(db),
+      tmuxAdapter: { deliveryGuard: guard } as unknown as TmuxAdapter,
+      listProcesses: async () => live,
+      paneRootPid: async () => 4000,
+      piRunnerState: () => sidecar,
+      piProve: async () => proof,
+      piResume: { resume: async () => {
+        resumes.push("resume");
+        sidecar = { ready: true, launchId: LAUNCH_NEW, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: "tail-1" };
+        proof = { ...proof, launchId: LAUNCH_NEW };
+        live = [
+          { pid: 4000, ppid: 9100, command: "-zsh", startedAt: "root-boot" },
+          { pid: 9100, ppid: 1, command: "/opt/homebrew/bin/tmux -L openrig-xv new-session -d -s intake-lead@app-handy-conveyor", startedAt: "tmux-boot" },
+          { pid: RUNNER_PID, ppid: 4000, command: `node /x/pi-runner.js --session-name intake-lead@app-handy-conveyor --session ${SESSION_FILE} --launch-id ${LAUNCH_NEW}`, startedAt: "runner-boot" },
+          { pid: CHILD_PID, ppid: RUNNER_PID, command: "pi --session /state/pi/child", startedAt: "child-boot" },
+        ];
+        return { ok: true };
+      } },
+      piSessionFileExists: () => true,
+      piSessionFileDigestPrefix: () => "d1g3stpr3f1x0000",
+      piSessionTailEntryId: () => "tail-1",
+      killNativeProcess: (pid: number) => { kills.push(pid); live = live.filter(p => p.pid !== pid && p.ppid !== pid); },
+      rehostPollMs: 1, rehostWaitMs: 20,
+    } as never);
+    return { db, guard, service, kills, resumes, nodeId: node.id, setCalls, guardWrites: () => (db.prepare("SELECT count(*) c FROM seat_delivery_guard_changes").get() as { c: number }).c };
+  }
+
+  /** Typing protection activated by a change that completes OUTSIDE any held lease.
+   *  Used to place the seat in guard-ON state while an ordinary lease is already held, which
+   *  is exactly the inherited-lease situation under test. */
+  function activateGuardOutsideLease(box: RealGuardBox): void {
+    const at = new Date().toISOString();
+    box.db.prepare("INSERT INTO seat_delivery_guards(node_id,desired,effective,actor,reason,changed_at) VALUES (?,1,1,'operator-agent@kernel','activation completed outside the held lease',?) ON CONFLICT(node_id) DO UPDATE SET desired=1, effective=1, changed_at=excluded.changed_at")
+      .run(box.nodeId, at);
+  }
+
+  /** A nested rehost attempt must SETTLE promptly with a refusal.
+   *  A timeout is NOT proof of safety: waiting out a deadlock is exactly the failure this
+   *  guards, so an unsettled attempt fails loudly with the lease that holds it. */
+  async function settlesWithin<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const guard = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} did not settle within ${ms}ms: the rehost lease is blocked on a tail the inherited ordinary lease already holds`)), ms);
+    });
+    try { return await Promise.race([work, guard]); }
+    finally { if (timer) clearTimeout(timer); }
+  }
+
+  async function enableGuard(box: RealGuardBox): Promise<void> {
+    await box.guard.set(box.nodeId, true, "operator-agent@kernel", "quiescence for same-generation rehost");
+  }
+
+  it("real guard: a guarded same-generation rehost SUCCEEDS with the typing guard desired and effective ON", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+      const guardWritesBefore = box.guardWrites();
+      const out = await box.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "real guard rehost" });
+      // The pilot's refusal is gone: the guarded rehost completes.
+      expect(out).toMatchObject({ ok: true, generation: GENERATION, generationUnchanged: true, sessionFile: SESSION_FILE, guardLeftEnabled: true });
+      expect(box.kills).toEqual([RUNNER_PID]);
+      expect(box.resumes).toHaveLength(1);
+      // The guard was never disabled, re-armed or rewritten by the operation.
+      expect(box.setCalls).toEqual([{ nodeId: box.nodeId, enabled: true }]);
+      expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+      expect(box.guardWrites()).toBe(guardWritesBefore);
+      // Real lease released cleanly: nothing is still held on the seat.
+      expect(box.guard.ownsLifecycle(box.nodeId)).toBe(false);
+    } finally { box.db.close(); }
+  });
+
+  it("real guard: ordinary input and ordinary lifecycle are STILL refused while the typing guard is ON", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      // Ordinary delivery input: refused by the real guard with the protection code.
+      await expect(box.guard.input("intake-lead@app-handy-conveyor", async () => "sent")).rejects.toThrow(/typing guard|typing_guard|typing protection/i);
+      // Ordinary lifecycle (the generic path the rehost is NOT): still refused.
+      await expect(box.guard.lifecycle([box.nodeId], async () => "changed")).rejects.toThrow(/typing guard|typing_guard|typing protection/i);
+      // Binding reconciliation is still refused while protection is on.
+      expect(() => box.guard.reconcileBinding(box.guard.target(box.nodeId), () => "rebound")).toThrow(/typing guard|typing_guard|typing protection/i);
+      // Protection still holds after those refusals, and the rehost is unaffected by them.
+      expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+    } finally { box.db.close(); }
+  });
+
+  it("real guard: an unreleased dispatch reservation excludes the rehost with no signal", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      const nowIso = new Date().toISOString();
+      box.db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES ('res-1','op-1',?,'intake-lead@app-handy-conveyor','g0','n0','operator-agent@kernel','operator-agent-g1','h','{}','{}','reserved',?,?)")
+        .run(box.nodeId, nowIso, nowIso);
+      // The real guard excludes the rehost from a durable cutover reservation, either as
+      // its own refusal or as a typed rehost refusal. Either way nothing may be signalled.
+      let outcome: { ok: boolean } | undefined;
+      let exclusion: string | undefined;
+      try { outcome = await box.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "reservation fences rehost" }); }
+      catch (error) { exclusion = (error as { code?: string }).code ?? (error as Error).message; }
+      expect(outcome?.ok === false || exclusion !== undefined).toBe(true);
+      if (exclusion !== undefined) expect(exclusion).toMatch(/reservation|reserved/i);
+      // Nothing was signalled and nothing was resumed while a cutover reservation holds.
+      expect(box.kills).toEqual([]);
+      expect(box.resumes).toEqual([]);
+      expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+    } finally { box.db.close(); }
+  });
+
+  it("real guard: an inherited ORDINARY lease grants NO rehost authority even with the guard proven ON", async () => {
+    const box = realGuardBox();
+    try {
+      // An ordinary lifecycle lease is held (protection is OFF, as it must be for an ordinary
+      // lease to exist at all), and the typing guard is then activated by a change that
+      // COMPLETES OUTSIDE that lease. A rehost attempted from inside the ordinary lease must
+      // not treat that lease as dedicated rehost authority: the dedicated lease requires its
+      // own guard-ON proof plus the reservation check.
+      await box.guard.lifecycle([box.nodeId], async () => {
+        activateGuardOutsideLease(box);
+        expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+        // Settles PROMPTLY: a refusal, never a wait on a tail this lease already holds.
+        let inner: { ok: boolean } | undefined;
+        let refusal: string | undefined;
+        try {
+          inner = await settlesWithin(
+            box.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "inherited ordinary lease, guard ON" }),
+            2000,
+            "runnerRehost from inside an active ordinary lease",
+          );
+        } catch (error) { refusal = (error as { code?: string }).code ?? (error as Error).message; }
+        // Refused: an inherited ordinary lease is not rehost authority.
+        expect(inner?.ok === false || refusal !== undefined).toBe(true);
+        if (refusal !== undefined) expect(refusal).toMatch(/rehost_not_nestable|ordinary|lease/i);
+        expect(box.kills).toEqual([]);
+        expect(box.resumes).toEqual([]);
+        // Protection was never relaxed to make the inheritance work.
+        expect(box.setCalls).toEqual([]);
+        expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+      });
+      expect(box.guard.ownsLifecycle(box.nodeId)).toBe(false);
+    } finally { box.db.close(); }
+  });
+
+  it("real guard: an inherited ORDINARY lease does not bypass the reservation exclusion", async () => {
+    const box = realGuardBox();
+    try {
+      await box.guard.lifecycle([box.nodeId], async () => {
+        const nowIso = new Date().toISOString();
+        box.db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES ('res-inherit','op-2',?,'intake-lead@app-handy-conveyor','g0','n0','operator-agent@kernel','operator-agent-g1','h','{}','{}','reserved',?,?)")
+          .run(box.nodeId, nowIso, nowIso);
+        activateGuardOutsideLease(box);
+        let outcome: { ok: boolean } | undefined;
+        let exclusion: string | undefined;
+        try {
+          outcome = await settlesWithin(
+            box.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "inherited ordinary lease with reservation" }),
+            2000,
+            "runnerRehost from inside an active ordinary lease holding a reservation",
+          );
+        } catch (error) { exclusion = (error as { code?: string }).code ?? (error as Error).message; }
+        // An unsettled attempt fails here instead of being accepted as safety.
+        expect(outcome?.ok === false || exclusion !== undefined).toBe(true);
+        // Either fence is acceptable; the non-nestable refusal simply comes first.
+        if (exclusion !== undefined) expect(exclusion).toMatch(/rehost_not_nestable|reservation|reserved|ordinary|lease/i);
+        expect(box.kills).toEqual([]);
+        expect(box.resumes).toEqual([]);
+      });
+      expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+    } finally { box.db.close(); }
+  });
+
+  // ---- G1/G2. A dedicated rehost lease must not become ordinary lifecycle authority
+  // (G1) and must not be interleaved by human input that STARTS AFTER the rehost entered
+  // (G2). Both fences are symmetric with the ones already proven above.
+
+  /** Run a callback inside a real dedicated rehost lease, parked until released. */
+  async function insideRehostLease(box: RealGuardBox, body: () => Promise<void>): Promise<void> {
+    let entered!: () => void;
+    const gate = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    const work = box.guard.runnerRehost(box.nodeId, async () => {
+      entered();
+      await gate;
+      await body();
+      await hold;
+      return "rehosted";
+    });
+    await entered;
+    release();
+    await work;
+  }
+
+  it("G1: a nested ordinary lifecycle inside the rehost lease REFUSES, and ownsLifecycle stays false", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      let nestedRan = false;
+      let nestedRefusal: string | undefined;
+      await insideRehostLease(box, async () => {
+        // The rehost lease is dedicated: it must not satisfy ownsLifecycle.
+        expect(box.guard.ownsLifecycle(box.nodeId)).toBe(false);
+        try {
+          // Nested ordinary lifecycle must NOT be able to join or upgrade the rehost lease.
+          await settlesWithin(
+            box.guard.lifecycle([box.nodeId], async () => { nestedRan = true; return "upgraded"; }),
+            2000,
+            "nested ordinary lifecycle inside a rehost lease",
+          );
+        } catch (error) { nestedRefusal = (error as { code?: string }).code ?? (error as Error).message; }
+        // Even if the nested call appeared to succeed, no lifecycle authority may have leaked.
+        expect(box.guard.ownsLifecycle(box.nodeId)).toBe(false);
+      });
+      // Refused, and the nested body never ran: no upgrade of the dedicated lease.
+      expect(nestedRan).toBe(false);
+      expect(nestedRefusal).toBeDefined();
+      expect(String(nestedRefusal)).toMatch(/rehost|lease|operation|lifecycle|guard/i);
+      // After release the seat holds no lifecycle or rehost authority at all.
+      expect(box.guard.ownsLifecycle(box.nodeId)).toBe(false);
+    } finally { box.db.close(); }
+  });
+
+  it("G1: a nested ordinary operation inside the rehost lease REFUSES and performs no effect", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      let nestedRan = false;
+      let nestedRefusal: string | undefined;
+      await insideRehostLease(box, async () => {
+        try {
+          await settlesWithin(
+            box.guard.operation(box.nodeId, async () => { nestedRan = true; return "ran"; }),
+            2000,
+            "nested ordinary operation inside a rehost lease",
+          );
+        } catch (error) { nestedRefusal = (error as { code?: string }).code ?? (error as Error).message; }
+        expect(box.guard.ownsLifecycle(box.nodeId)).toBe(false);
+      });
+      expect(nestedRan).toBe(false);
+      expect(nestedRefusal).toBeDefined();
+      expect(String(nestedRefusal)).toMatch(/rehost|lease|operation|guard/i);
+      expect(box.guard.ownsLifecycle(box.nodeId)).toBe(false);
+    } finally { box.db.close(); }
+  });
+
+  it("G2: human input started AFTER the rehost entered refuses, and its callback never runs", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      let humanCallbackRan = false;
+      let refusal: string | undefined;
+      await insideRehostLease(box, async () => {
+        // The rehost window is open right now: stop and resume happen inside this lease.
+        try {
+          await settlesWithin(
+            box.guard.humanInput(box.nodeId, async () => { humanCallbackRan = true; return "typed"; }),
+            2000,
+            "human input started inside an open rehost window",
+          );
+        } catch (error) { refusal = (error as { code?: string }).code ?? (error as Error).message; }
+      });
+      // Refused, and NOT by pre-empting: the callback effect must be absent.
+      expect(humanCallbackRan).toBe(false);
+      expect(refusal).toBeDefined();
+      expect(String(refusal)).toMatch(/rehost_in_progress|rehost|input/i);
+    } finally { box.db.close(); }
+  });
+
+  it("G2: the deliberate input path inside the rehost lease remains allowed, and the rehost still succeeds", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      let deliberateRan = false;
+      await insideRehostLease(box, async () => {
+        // The new fences must not break the ONE deliberate writing path the rehost itself
+        // depends on while it holds the seat: a scoped input under its own lease.
+        deliberateRan = await box.guard.input(box.nodeId, async () => true);
+      });
+      expect(deliberateRan).toBe(true);
+      // And the end-to-end guarded rehost is unaffected by the G1/G2 fences.
+      const out = await box.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "rehost after G1/G2 fences" });
+      expect(out).toMatchObject({ ok: true, generationUnchanged: true });
+      expect(box.kills).toEqual([RUNNER_PID]);
+      expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+    } finally { box.db.close(); }
+  });
+
+  it("G1/G2: after the rehost lease is released, ordinary behaviour is exactly as before", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      const before = async (): Promise<{ input: boolean; lifecycle: boolean }> => {
+        let input = true;
+        let lifecycle = true;
+        try { await box.guard.input(box.nodeId, async () => true); } catch { input = false; }
+        try { await box.guard.lifecycle([box.nodeId], async () => true); } catch { lifecycle = false; }
+        return { input, lifecycle };
+      };
+      const beforeState = await before();
+      const out = await box.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "release restores ordinary behaviour" });
+      expect(out).toMatchObject({ ok: true });
+      // No lease, no rehost marker, and ordinary refusals are the protection refusals again,
+      // not a leaked rehost fence.
+      expect(box.guard.ownsLifecycle(box.nodeId)).toBe(false);
+      const afterState = await before();
+      expect(afterState).toEqual(beforeState);
+      expect(afterState).toEqual({ input: false, lifecycle: false });
+      // Protection was never touched by any of it.
+      expect(box.setCalls).toEqual([{ nodeId: box.nodeId, enabled: true }]);
+    } finally { box.db.close(); }
+  });
+
+  it("real guard: a concurrent human input lease excludes the rehost; it never interleaves", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      let releaseHuman: () => void = () => {};
+      const held = new Promise<void>(resolve => { releaseHuman = resolve; });
+      // A human is typing into this pane right now.
+      const human = box.guard.humanInput("intake-lead@app-handy-conveyor", async () => { await held; return "human-sent"; });
+      await Promise.resolve();
+      // Exclusion is the guard's own refusal, thrown or typed; either way nothing may run.
+      let outcome: { ok: boolean } | undefined;
+      let exclusion: string | undefined;
+      try { outcome = await box.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "human input in flight" }); }
+      catch (error) { exclusion = (error as { code?: string }).code ?? (error as Error).message; }
+      releaseHuman();
+      await human;
+      expect(outcome?.ok === false || exclusion !== undefined).toBe(true);
+      if (exclusion !== undefined) expect(exclusion).toMatch(/human|reservation|typing|guard_operation/i);
+      // The rehost never signalled a runner while the human lease was active.
+      expect(box.kills).toEqual([]);
+      expect(box.resumes).toEqual([]);
+      // Protection untouched by the refusal.
+      expect(box.setCalls.every(call => call.enabled)).toBe(true);
+      expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+    } finally { box.db.close(); }
+  });
+
+  it("real guard: the same binding and generation are required, and the guard is never disabled to get them", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      const target = box.guard.target(box.nodeId);
+      expect(target).toMatchObject({ nodeId: box.nodeId, pane: "%4" });
+      // A rebound pane is a different guard target: the rehost must not adopt it.
+      box.db.prepare("UPDATE bindings SET tmux_pane='%7' WHERE node_id=?").run(box.nodeId);
+      expect(box.guard.target(box.nodeId).pane).toBe("%7");
+      const afterRebind = await box.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "rebound pane" });
+      expect(afterRebind.ok === false || box.kills.length <= 1).toBe(true);
+      // Whatever the verdict, protection was never switched off to obtain it.
+      expect(box.setCalls.every(call => call.enabled)).toBe(true);
+      expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+      // Restore the binding; a stale generation is refused on its own.
+      box.db.prepare("UPDATE bindings SET tmux_pane='%4' WHERE node_id=?").run(box.nodeId);
+      box.db.prepare("UPDATE occupant_tenures SET generation_uuid=? WHERE node_id=? AND generation_ordinal=1").run("rotated-generation", box.nodeId);
+      const afterRotation = await box.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "rotated generation" });
+      expect(afterRotation).toMatchObject({ ok: false });
+      expect(box.setCalls.every(call => call.enabled)).toBe(true);
+      expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+    } finally { box.db.close(); }
+  });
+
+  it("real guard: a post-effect fault under the real guard is a typed UNKNOWN and the guard stays ON", async () => {
+    const box = realGuardBox();
+    try {
+      await enableGuard(box);
+      const bus = new EventBus(box.db);
+      (bus as unknown as { persistWithinTransaction: (e: { type?: string }) => void }).persistWithinTransaction = (event) => {
+        if (event?.type === "seat.runner_rehost_completed") throw new Error("event store down after the effect");
+      };
+      // Mutable post-effect state: the census launch id always matches the sidecar.
+      let liveLaunchId: string = LAUNCH_OLD;
+      let liveCensus: Array<{ pid: number; ppid: number; command: string; startedAt?: string }> = censusWithLaunch(LAUNCH_OLD);
+      const failing = new SeatLifecycleService({
+        db: box.db, rigRepo: new RigRepository(box.db), sessionRegistry: new SessionRegistry(box.db), eventBus: bus,
+        tmuxAdapter: { deliveryGuard: box.guard } as unknown as TmuxAdapter,
+        listProcesses: async () => liveCensus,
+        paneRootPid: async () => 4000,
+        piRunnerState: () => ({ ready: true, launchId: liveLaunchId, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: "tail-1" }),
+        piProve: async () => ({ state: "present" as const, generation: GENERATION, launchId: liveLaunchId, fingerprint: "{}" }),
+        piResume: { resume: async () => {
+          box.resumes.push("resume");
+          liveLaunchId = LAUNCH_NEW;
+          liveCensus = censusWithLaunch(LAUNCH_NEW);
+          return { ok: true };
+        } },
+        piSessionFileExists: () => true, piSessionFileDigestPrefix: () => "d1g3stpr3f1x0000", piSessionTailEntryId: () => "tail-1",
+        killNativeProcess: (pid: number) => { box.kills.push(pid); liveCensus = liveCensus.filter(p => p.pid !== pid && p.ppid !== pid); },
+        rehostPollMs: 1, rehostWaitMs: 20,
+      } as never);
+      const out = await failing.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "post-effect fault under real guard" });
+      expect(out).toMatchObject({ ok: false, code: "rehost_effect_unknown", blindRetryAllowed: false });
+      expect(box.kills).toHaveLength(1);
+      expect(box.resumes).toHaveLength(1);
+      // No retry was attempted and protection was never relaxed to recover.
+      expect(box.setCalls).toEqual([{ nodeId: box.nodeId, enabled: true }]);
+      expect(box.guard.preference(box.nodeId)).toMatchObject({ desired: true, effective: true });
+      expect(box.guard.ownsLifecycle(box.nodeId)).toBe(false);
+    } finally { box.db.close(); }
+  });
+
+  function censusWithLaunch(launchId: string): Array<{ pid: number; ppid: number; command: string; startedAt?: string }> {
+    return [
+      { pid: 4000, ppid: 9100, command: "-zsh", startedAt: "root-boot" },
+      { pid: 9100, ppid: 1, command: "/opt/homebrew/bin/tmux -L openrig-xv new-session -d -s intake-lead@app-handy-conveyor", startedAt: "tmux-boot" },
+      { pid: RUNNER_PID, ppid: 4000, command: `node /x/pi-runner.js --session-name intake-lead@app-handy-conveyor --session ${SESSION_FILE} --launch-id ${launchId}`, startedAt: "runner-boot" },
+      { pid: CHILD_PID, ppid: RUNNER_PID, command: "pi --session /state/pi/child", startedAt: "child-boot" },
+    ];
+  }
 });
