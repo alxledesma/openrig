@@ -14,7 +14,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
  app.get("/:rigId",c=>{
    const svc=(c.get("queueRepo" as never) as QueueRepository).coordinatorAuthority;
    const rigId=c.req.param("rigId"), authority=svc.get(rigId);
-   return authority?c.json({authority,coordinationPlan:svc.coordinationRecovery?.plan(rigId)??null,obligations:svc.obligations(rigId),obligationsDigest:svc.reconciliationDigest(rigId)}):c.json({error:"coordinator_not_enabled"},404);
+   return authority?c.json({authority,coordinationPlan:svc.coordinationRecovery?.plan(rigId)??null,frontier:svc.coordinationRecovery?.frontierProjection(rigId)??null,obligations:svc.obligations(rigId),obligationsDigest:svc.reconciliationDigest(rigId)}):c.json({error:"coordinator_not_enabled"},404);
  });
  app.post("/:operation",async c=>{
    // No active token means controls are unavailable rather than silently unauthenticated.
@@ -35,6 +35,10 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
      if(operation==="coordination-reconcile"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');const result=svc.coordinationRecovery.reconcile(actor,generation,b.rigId);await svc.coordinationRecovery.deliverCommitted();return c.json(result);}
      if(operation==="coordination-worker-probe"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");return c.json(await svc.coordinationRecovery.probeWorker(actor,generation,await c.req.json()));}
      if(operation==="coordination-lifecycle-recovery"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");svc.coordinationRecovery.recordLifecycleRecovery(actor,generation,await c.req.json());return c.json({ok:true});}
+    if(operation==="coordination-frontier-plan"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");return c.json(svc.coordinationRecovery.recordFrontierPlan(actor,generation,await c.req.json()));}
+    if(operation==="coordination-frontier-admit"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");return c.json(svc.coordinationRecovery.admitFrontierProposal(actor,generation,await c.req.json()));}
+    if(operation==="coordination-frontier-confirm"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");return c.json(svc.coordinationRecovery.recordFrontierConfirmation(actor,generation,await c.req.json()));}
+    if(operation==="coordination-frontier-boundary"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");return c.json(svc.coordinationRecovery.recordFrontierReopen(actor,generation,await c.req.json()));}
      if(operation==="coordination-return-intake-refresh"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");return c.json(svc.coordinationRecovery.refreshTerminalReturnIntake(actor,generation,await c.req.json()));}
      if(operation==="coordination-return-retire"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");const result=svc.coordinationRecovery.retireExpiredTerminalReturn(actor,generation,await c.req.json());await svc.coordinationRecovery.deliverCommitted();return c.json(result);}
      if(operation==="coordination-return-continue"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");const result=svc.coordinationRecovery.continueTerminalReturn(actor,generation,await c.req.json());await svc.coordinationRecovery.deliverCommitted();return c.json(result);}

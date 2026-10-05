@@ -2,7 +2,18 @@ import { rotationLocalAddresses } from "./rotation-local-custody.js";
 import type { QueueRepository } from "./queue-repository.js";
 import { CoordinatorFenceError, digest, type CoordinatorToken } from "./coordinator-authority-service.js";
 import type { ActivityEvidence, ArbitratedSeatState } from "./activity-taxonomy.js";
+import { ADMISSION_DUTY_KIND, CONFIRMATION_DUTY_KIND, FrontierPlanning, PLANNING_DUTY_KIND, type FrontierAdmissionReceipt, type FrontierConfirmationReceipt, type FrontierPlanReceipt, type FrontierReopenReceipt, type FrontierSnapshot, type ScopeSource } from "./frontier-planning.js";
 
+/** The frontier kinds are next-work planning obligations, not administrative refresh:
+ *  admission and confirmation deliberately keep the strict effect-debt gate because
+ *  the administrative allowlist stays explicitly qualification-refresh only. */
+type DutyKind='held-history-authoring'|'held-history-pickup'|'held-history-retirement'|'acceptance'|'recovery'|'materialization'|'outcome-qualification-refresh'|'lifecycle-retirement'|'frontier-planning'|'frontier-admission'|'frontier-confirmation';
+const dutyKinds:Record<DutyKind,{binding:'currentHolder'|'currentOperator'|'recipientOnly';effectClass:'state-changing'|'report-only'}>={
+ 'held-history-authoring':{binding:'currentHolder',effectClass:'state-changing'},'held-history-pickup':{binding:'currentOperator',effectClass:'state-changing'},'held-history-retirement':{binding:'recipientOnly',effectClass:'report-only'},
+ acceptance:{binding:'currentHolder',effectClass:'state-changing'},recovery:{binding:'currentHolder',effectClass:'state-changing'},materialization:{binding:'currentOperator',effectClass:'state-changing'},'outcome-qualification-refresh':{binding:'currentOperator',effectClass:'state-changing'},'lifecycle-retirement':{binding:'recipientOnly',effectClass:'report-only'},
+ 'frontier-planning':{binding:'currentHolder',effectClass:'state-changing'},'frontier-admission':{binding:'currentOperator',effectClass:'state-changing'},'frontier-confirmation':{binding:'currentOperator',effectClass:'state-changing'}
+};
+export interface DutyFacts {claim:boolean;send:boolean;act:boolean;complete:boolean;close:boolean;retired:boolean;failedByRecipient:boolean;superseded:boolean;expired:boolean;queueId:string;reason?:string}
 export interface CoordinationActivity { generation:string; identityVerified:boolean; identityObservedAt?:string|null; state:ArbitratedSeatState; witness:ActivityEvidence|null }
 export interface CoordinationTask {
  key:string; packageKey:string; owner:string; action:string; deadline:number; body:string; recoveryFor?:string;
@@ -11,10 +22,19 @@ export interface CoordinationTask {
  /** Owner boundary affects this slice only. Recovery work is a separate admitted task. */
  boundary?:"owner-access"|"owner-credential"|"owner-material"|"owner-irreversible";
 }
-export interface CoordinationPlan { rigId:string; revision:string; operatorGeneration:string; stallMs:number; allowIdlePeerTransfer:boolean; allowUnavailablePeerTransfer?:boolean; acknowledgmentWindowMs?:number; refreshDispatchIdentity?:boolean; dispatchRestrictions?:Array<{session:string;generation:string;packageKeys:string[];validUntil:number;evidenceRef:string;checkpointDisposition?:'release-listed-packages'}>; tasks:CoordinationTask[] }
-export interface CoordinationResult { key:string; state:string; queueId?:string; reason?:string; deadline:number; activityEvidence?:Record<string,unknown> }
+export interface CoordinationPlan { rigId:string; revision:string; operatorGeneration:string; stallMs:number; allowIdlePeerTransfer:boolean; allowUnavailablePeerTransfer?:boolean; acknowledgmentWindowMs?:number; refreshDispatchIdentity?:boolean; dispatchRestrictions?:Array<{session:string;generation:string;packageKeys:string[];validUntil:number;evidenceRef:string;checkpointDisposition?:'release-listed-packages'}>; tasks:CoordinationTask[]; /** Goal-defining artifacts the genuine current Operator binds. Refs and digests only: the runtime never reads or interprets their contents, and prepared snapshots are not permission. */
+ scopeSources?:ScopeSource[];
+ /** Bounded stabilization configuration for the next-work planning obligation. Not a retry budget. */
+ frontierPlanning?:{stabilizationObservations?:number;stabilizationMs?:number} }
+export interface CoordinationResult { key:string; state:string; queueId?:string; reason?:string; deadline:number; activityEvidence?:Record<string,unknown>; /** Exact accountable intake subject when a hold has no duty row: the reserved package key, its native owner and the frozen obligation identity. */
+ subject?:{packageKey:string;owner:string;identity:string} }
 const successfulReturn=(state:string,disposition:string|null):boolean=>!!disposition&&['done','handed-off'].includes(state);
 /** Only the exact migration091 refusal is normalized, never arbitrary SQL failures. */
+/** Held outcomes that must keep an accountable Operator intake, whether it is first
+   * staged or renewed. Any other hold stays a bare observation. */
+export const FRONTIER_INTAKE_ROUTED_REASONS=['frontier-planning-duty-exhausted','frontier-boundary-blocked','frontier-boundary-declined','frontier-operator-absent'] as readonly string[];
+export const LIFECYCLE_INTAKE_RENEWAL_REASONS=['lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
+export const INTAKE_ROUTED_REASONS=['current-admission-required','uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict','terminal-return-incarnation-changed','terminal-return-contract-drift','terminal-return-duty-exhausted','terminal-return-seat_dispatch_reserved','terminal-return-coordinator_resource_conflict','lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
 function heldDispatchCode(error:unknown):string|undefined {
  const e=error as {code?:string;message?:string};
  if(e.code==='SQLITE_CONSTRAINT_TRIGGER'&&e.message==='seat_dispatch_reserved')return 'seat_dispatch_reserved';
@@ -111,24 +131,98 @@ export class CoordinationRecoveryService {
   const id='qitem-coordination-'+digest(rigId+':'+t.packageKey).slice(0,24);
   return !this.db.prepare('SELECT 1 FROM coordinator_assignments WHERE rig_id=? AND package_key=?').get(rigId,t.packageKey)&&!this.db.prepare('SELECT 1 FROM coordinator_stage_assignments WHERE rig_id=? AND package_key=?').get(rigId,t.packageKey)&&!this.db.prepare('SELECT 1 FROM coordinator_resources WHERE rig_id=? AND package_key=?').get(rigId,t.packageKey)&&!this.db.prepare("SELECT 1 FROM queue_items WHERE qitem_id=? AND state IN ('pending','in-progress','blocked')").get(id);
  }
- private lifecycleRecipientReady(rigId:string,recipient:string,packageKey:string,excludeEffect?:string):boolean {
-  const plan=this.plan(rigId),scope=plan?.dispatchRestrictions?.find(r=>r.session===recipient);
-  return !!plan&&(!scope||(scope.generation===this.authority.generation(recipient)&&scope.validUntil>this.now()&&scope.packageKeys.includes(packageKey)))&&!this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(recipient,recipient)&&!this.workerEffectDebt(recipient,excludeEffect);
+/** Explicit administrative allowlist for the acknowledgment-contract debt boundary:
+   * only the Operator's own qualification refresh (F3) uses it. The pre-existing
+   * materialization duty keeps its strict zero-debt gate, and no future kind inherits
+   * this relaxation by default. Held-history kinds already used that gate before. */
+  private administrativeDuty(kind:string):boolean {return kind==='outcome-qualification-refresh';}
+  /** This control plane's own accountable intake is its recovery traffic, not an unknown
+   * external effect: a genuine wake to the Operator seat for a retained hold never blocks
+   * the administrative duty it announces. Provenance is exact (watchdog sender, audit
+   * pointer, creation identity, recorded notice hash) and only an already-unresolved
+   * delivery state is exempt; a pending or sending intake wake still counts as debt. */
+  private administrativeIntakeNotices(rigId:string,recipient:string):string[] {
+   const rows=this.db.prepare("SELECT qitem_id FROM queue_items WHERE destination_session=? AND state IN ('pending','in-progress','blocked') AND json_valid(body) AND json_extract(body,'$.action') IN ('resolve-exact-coordination-task-hold','coordination-task-hold-lineage')").all(recipient) as Array<{qitem_id:string}>,excluded:string[]=[];
+   for(const {qitem_id} of rows){
+    const q=this.repo.getById(qitem_id);if(!q)continue;
+    let h:any;try{h=JSON.parse(q.body);}catch{continue;}
+    if(h.rigId!==rigId||h.grantsAuthority!==false||h.recipientGeneration===undefined)continue;
+    // Either the deterministic root for this hold, or a successor proven to follow a
+    // validated root of the same chain by its recorded, hash-bound chain receipt.
+    const chainItem=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordination-intake-chain' AND operation_id=?").get('coordination-intake-chain:'+qitem_id) as {receipt:string}|undefined,recorded=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordination-task-hold-lineage' AND operation_id=?").get(qitem_id) as {receipt:string}|undefined;
+    let expectedBodyHash:string|undefined;
+    if(this.validAccountableIntake(rigId,qitem_id,q)){expectedBodyHash=(chainItem?JSON.parse(chainItem.receipt):recorded?JSON.parse(recorded.receipt):undefined)?.noticeBodyHash;}
+    else if(chainItem){const r=JSON.parse(chainItem.receipt);if(r.rootQueueId===qitem_id)continue;if(!this.validAccountableIntakeChainItem(rigId,q,r.rootQueueId))continue;expectedBodyHash=r.noticeBodyHash;}
+    else if(recorded)expectedBodyHash=JSON.parse(recorded.receipt).noticeBodyHash;
+    if(typeof expectedBodyHash!=='string')continue;
+    const notice=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qitem_id) as any;
+    if(!notice||notice.sender_session!=='watchdog@system'||notice.destination_session!==recipient||notice.audit_pointer!==qitem_id||!['indeterminate','failed'].includes(notice.delivery_state))continue;
+    if(expectedBodyHash!==digest(notice.body))continue;
+    excluded.push('wake-intent-'+qitem_id);
+   }
+   return excluded;
+  }
+  private lifecycleRecipientReady(rigId:string,recipient:string,packageKey:string,excludeEffect?:string|string[],administrative=false):boolean {
+   const plan=this.plan(rigId),scope=plan?.dispatchRestrictions?.find(r=>r.session===recipient),excluded=administrative?[...(Array.isArray(excludeEffect)?excludeEffect:excludeEffect?[excludeEffect]:[]),...this.administrativeIntakeNotices(rigId,recipient)]:excludeEffect;
+   return !!plan&&(!scope||(scope.generation===this.authority.generation(recipient)&&scope.validUntil>this.now()&&scope.packageKeys.includes(packageKey)))&&!this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(recipient,recipient)&&(administrative?this.repo.heldHistoryAuthoringDebtReady(rigId,recipient,excluded):!this.workerEffectDebt(recipient,excludeEffect));
+  }
+ private stageDutyRetirement(rigId:string,parent:any,targetQueueId=parent.queueId):string|undefined {
+  const target=this.repo.getById(targetQueueId);if(!target||!target.expiresAt||Date.parse(target.expiresAt)>this.now()||!['pending','in-progress','blocked'].includes(target.state))return;
+  const targetControl=this.lifecycleControl(targetQueueId)?.receipt;
+  if(!targetControl&&!(parent.recordQueueId===targetQueueId&&this.heldHistoryRecord(parent)))return;
+  const generation=targetControl?.recipientGeneration??parent.operatorGeneration;if(this.authority.generation(target.destinationSession)!==generation)return;
+  const prior=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.targetQueueId')=? AND json_extract(receipt,'$.kind') IN ('held-history-retirement','lifecycle-retirement') ORDER BY rowid DESC LIMIT 1").get(rigId,targetQueueId) as any;
+let previousQueueId:string|undefined;if(prior){const r=JSON.parse(prior.receipt);this.observeDuty(r.queueId);this.recordHeldHistoryNoticeOutcome(rigId,r);const facts=this.dutyFacts(r.queueId);if(facts.complete||(!facts.expired&&!facts.failedByRecipient))return r.queueId;if(!facts.retired){return this.stageDutyRetirement(rigId,r,r.queueId);}previousQueueId=r.queueId;}
+   const queueId='qitem-coordination-lifecycle-'+digest(rigId+':retire:'+targetQueueId+':'+(previousQueueId??'initial')).slice(0,24);if(this.repo.getById(queueId))return queueId;
+   const chainIds=[...new Set([parent.queueId,targetQueueId,parent.authoringQueueId,parent.recordQueueId,parent.previousQueueId,...(parent.chainIds??[]),previousQueueId].filter(Boolean))],held=parent.kind.startsWith('held-history-'),plan=this.plan(rigId),owner=this.authority.get(rigId);
+   // Issue provenance is always current: a freshly staged duty whose plan revision is
+   // stale can never satisfy the send facet, which would leave the recipient's own
+   // failure report as the only way the chain could ever advance. The held-history chain
+   // keeps its authoring holder, epoch and operator generation, whose gates are read
+   // against the authoring receipt rather than this one.
+   const r={...parent,kind:held?'held-history-retirement':'lifecycle-retirement',queueId,authoringQueueId:parent.authoringQueueId??parent.queueId,targetQueueId,targetBodyHash:digest(target.body),recipient:target.destinationSession,recipientGeneration:generation,deadline:this.now()+1200000,previousQueueId,chainIds,issuedAt:this.now(),planRevision:plan?.revision??parent.planRevision,...(held?{}:{holder:owner?.owner_session??parent.holder,holderGeneration:owner?.owner_generation??parent.holderGeneration,epoch:owner?.epoch??parent.epoch,operatorGeneration:plan?.operatorGeneration??parent.operatorGeneration})};
+  if(!this.dutyBinding(rigId,r)||!this.dutyProtection(rigId,r))return;
+  const body=JSON.stringify({action:'report-own-expired-administrative-duty-outcome',rigId,queueId,claimCommand:'rig queue claim '+queueId,targetQueueId,targetBodyHash:r.targetBodyHash,originalDeadline:Date.parse(target.expiresAt),recipientGeneration:generation,deadline:r.deadline,grantsAuthority:false,required:'Read the exact frozen expired target and its retained evidence. Genuinely claim this fresh failure-only duty under your own native identity. Report the actual target failed/canceled through rig queue update '+targetQueueId+' --state failed --note <actual-own-expiry-disposition>. Do not claim or execute expired work, renew its authority, infer delivery, retry an uncertain mutation, accept, bind, dispatch, release resources or alter the original notice. The old target stays unclaimed if it was unclaimed. If the genuine target terminal receipt already exists, claim and close this report referencing it; do not repeat the target mutation.'});
+  this.db.transaction(()=>{if(!this.dutyBinding(rigId,r)||!this.dutyProtection(rigId,r)||this.repo.getById(queueId))return;this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:r.recipient,body,expiresAt:new Date(r.deadline).toISOString(),identityProvenance:'system:operator-authorized-coordination',nudge:false});const id=this.repo.stageHeldHistoryAuthoringWake(queueId,r.recipient,generation),notice=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(id) as any;this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,queueId,'coordinator-lifecycle-control',JSON.stringify({...r,bodyHash:digest(body),noticeBodyHash:digest(notice.body)}),digest(body));})();return this.repo.getById(queueId)?queueId:undefined;
  }
- private lifecycleDuty(rigId:string,kind:'acceptance'|'recovery'|'materialization',packageKey:string,recipient:string,recipientGeneration:string,semanticKey:string,details:Record<string,unknown>):CoordinationResult {
-  const a=this.authority.get(rigId)!,plan=this.plan(rigId)!;
-  const queueId='qitem-coordination-lifecycle-'+digest(rigId+':'+kind+':'+semanticKey+':'+recipientGeneration+':'+a.epoch+':'+plan.revision).slice(0,24),existing=this.repo.getById(queueId);
-  const deadline=existing?.expiresAt?Date.parse(existing.expiresAt):this.now()+1200000;
-  if(existing&&this.lifecycleControlCompleted(queueId))return {key:kind+':'+packageKey,state:kind==='materialization'?'materialized':'owned-recovery',queueId,deadline};
-  if(existing){return {key:kind+':'+packageKey,state:['pending','in-progress','blocked'].includes(existing.state)&&deadline>this.now()?'pending-native-'+kind:'held',queueId,...(!['pending','in-progress','blocked'].includes(existing.state)||deadline<=this.now()?{reason:'lifecycle-duty-exhausted'}:{}),deadline};}
-  if(!this.lifecycleRecipientReady(rigId,recipient,packageKey))return {key:kind+':'+packageKey,state:'held',reason:'lifecycle-recipient-protected',deadline};
-  let body=JSON.stringify({action:kind==='acceptance'?'accept-exact-return-or-own-recovery':kind==='recovery'?'own-exact-failed-return-recovery':'materialize-exact-admitted-frontier',rigId,packageKey,recipientGeneration,deadline,grantsAuthority:false,...details,required:kind==='acceptance'?'Claim this finite duty under current holder identity. Inspect the exact typed disposed return and required technical evidence. Use supported coordination-accept only when all classifier, qualification and independent review gates actually pass. An incomplete or unverified outcome requires distinct admitted, configured and genuinely picked-up recovery; record its exact active custody through coordination-lifecycle-recovery. Prose is not acceptance or owned recovery. Original acceptance alone releases the existing authorized frontier; never invent work or waive a gate.':'Claim this finite Operator intake. Inspect the immutable admitted contract, retained accepted predecessor references and current plan. Materialize this exact package into the existing plan with actual current qualification, capacity, effort, native generation/configuration and recovery evidence through coordination-plan. Preserve unchanged accepted history and dormant backup bytes. If scope or a protected gate prevents this, park the concrete boundary; this notice grants no admission, qualification, dispatch or acceptance.'});
+ private lifecycleDuty(rigId:string,kind:'acceptance'|'recovery'|'materialization'|'outcome-qualification-refresh'|'frontier-planning'|'frontier-admission'|'frontier-confirmation',packageKey:string,recipient:string,recipientGeneration:string,semanticKey:string,details:Record<string,unknown>):CoordinationResult {
+  const a=this.authority.get(rigId)!,plan=this.plan(rigId)!,rootId='qitem-coordination-lifecycle-'+digest(rigId+':'+kind+':'+semanticKey).slice(0,24);
+  const rows=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')=? AND json_extract(receipt,'$.packageKey')=? ORDER BY rowid DESC").all(rigId,kind,packageKey) as any[];
+  const prior=rows.map(v=>JSON.parse(v.receipt)).find(r=>r.semanticKey===semanticKey||(r.semanticKey===undefined&&(kind==='materialization'?r.contractHash===details.contractHash:r.originalQueueId===details.originalQueueId&&r.dispositionId===details.dispositionId)));
+let queueId=rootId,previousQueueId:string|undefined,expiredUnclaimed=false;
+   if(prior){this.observeDuty(prior.queueId);this.recordDutyChainNoticeOutcomes(rigId,prior);const facts=this.dutyFacts(prior.queueId),q=this.repo.getById(prior.queueId)!;
+    if(facts.complete)return {key:kind+':'+packageKey,state:kind==='materialization'?'materialized':'owned-recovery',queueId:prior.queueId,deadline:prior.deadline};
+    if(!facts.superseded&&['pending','in-progress','blocked'].includes(q.state)&&!facts.expired)return {key:kind+':'+packageKey,state:'pending-native-'+kind,queueId:prior.queueId,deadline:prior.deadline};
+    expiredUnclaimed=!facts.complete&&!facts.superseded&&facts.expired&&!q.claimedAt&&['pending','in-progress','blocked'].includes(q.state);
+    // An expired unclaimed link keeps a supported retirement and containment route for its
+    // own unresolved wake, and an accountable intake instead of a silent dead end.
+    if(!facts.superseded&&(!facts.retired||(expiredUnclaimed&&!this.dutyNoticeContained(rigId,prior)))){const retirementQueueId=this.stageDutyRetirement(rigId,prior);return {key:kind+':'+packageKey,state:'held',queueId:prior.queueId,reason:facts.retired?'lifecycle-recipient-protected':'lifecycle-duty-exhausted',deadline:prior.deadline,...(retirementQueueId?{activityEvidence:{retirementQueueId}}:{})};}
+    if(!this.dutySubjectReady(rigId,prior))return {key:kind+':'+packageKey,state:'held',queueId:prior.queueId,reason:'lifecycle-return-contract-drift',deadline:prior.deadline};
+    previousQueueId=prior.queueId;const bindingVersion=kind==='materialization'||kind==='outcome-qualification-refresh'?recipientGeneration:recipientGeneration+':'+a.epoch;queueId='qitem-coordination-lifecycle-'+digest(rootId+':successor:'+prior.queueId+':'+bindingVersion).slice(0,24);
+   }
+   const existing=this.repo.getById(queueId),deadline=existing?.expiresAt?Date.parse(existing.expiresAt):this.now()+1200000;if(existing)return {key:kind+':'+packageKey,state:'pending-native-'+kind,queueId,deadline};
+   if(!this.lifecycleRecipientReady(rigId,recipient,packageKey,undefined,this.administrativeDuty(kind)))return {key:kind+':'+packageKey,state:'held',queueId:prior?.queueId,reason:'lifecycle-recipient-protected',deadline};
+  let bodyValue:any={action:kind==='acceptance'?'accept-exact-return-or-own-recovery':kind==='recovery'?'own-exact-failed-return-recovery':kind==='outcome-qualification-refresh'?'refresh-exact-expired-outcome-qualification':'materialize-exact-admitted-frontier',rigId,queueId,packageKey,recipientGeneration,deadline,grantsAuthority:false,...details,required:kind==='acceptance'?'Claim this finite duty under current holder identity. Inspect the exact typed disposed return and required technical evidence. Use supported coordination-accept only when all classifier, qualification and independent review gates actually pass. An incomplete or unverified outcome requires distinct admitted, configured and genuinely picked-up recovery; record its exact active custody through coordination-lifecycle-recovery. Prose is not acceptance or owned recovery. Original acceptance alone releases the existing authorized frontier; never invent work or waive a gate.':kind==='recovery'?'Claim this finite recovery-only duty under the current native holder identity. Preserve the exact failed/denied/canceled original and its genuine typed disposition. Technical acceptance is forbidden for this original failure. Coordinate with the genuine current Operator to materialize a distinct admitted current recovery in the existing plan if absent; do not invent or reopen work. After actual worker pickup, record its exact active custody and evidence through coordination-lifecycle-recovery. Successful duty closure requires that verified distinct owned recovery; prose, a pending ticket and a failed-return acceptance attempt are not completion. Unknown effects, quiescence, current admission and qualifications remain protected.':kind==='outcome-qualification-refresh'?'Claim this finite current-Operator duty under your exact native identity. Revalidate the unchanged policy, provider configuration, existing private-input permission and credential availability without logging credentials. Submit a fresh dated qualification through rig coordinator outcome-qualification-refresh using the exact dutyQueueId in qualificationRefreshContract. Preserve the logical policy revision, provider/privacy/paid/calibration/negative-advice settings, prior decisions, unresolved assessment/recovery/acceptance references, and unknown effects. No provider test, provider retry, automatic renewal, policy rewrite, positive authority or acceptance waiver is authorized.': 'Claim this finite Operator intake. Inspect the immutable admitted contract, retained accepted predecessor references and current plan. Materialize this exact package into the existing plan with actual current qualification, capacity, effort, native generation/configuration and recovery evidence through coordination-plan. Preserve unchanged accepted history and dormant backup bytes. If scope or a protected gate prevents this, park the concrete boundary; this notice grants no admission, qualification, dispatch or acceptance.'};
+  if(kind==='outcome-qualification-refresh')bodyValue.qualificationRefreshContract={rigId,dutyQueueId:queueId,operationId:'<new-exact-operation-id>',policyRevision:details.policyRevision,policyDigest:details.policyDigest,qualifiedAt:'<actual-fresh-proof-time>',qualification:{ref:'<actual-new-proof-reference>',providerConfigDigest:details.providerConfigDigest,validUntil:'<actual-finite-proof-deadline>'}};
+  let body=JSON.stringify(bodyValue);
   if(kind==='recovery'){const b=JSON.parse(body);b.required='Claim this finite recovery-only duty under the current native holder identity. Preserve the exact failed/denied/canceled original and its genuine typed disposition. Technical acceptance is forbidden for this original failure. Coordinate with the genuine current Operator to materialize a distinct admitted current recovery in the existing plan if absent; do not invent or reopen work. After actual worker pickup, record its exact active custody and evidence through coordination-lifecycle-recovery. Successful duty closure requires that verified distinct owned recovery; prose, a pending ticket and a failed-return acceptance attempt are not completion. Unknown effects, quiescence, current admission and qualifications remain protected.';body=JSON.stringify(b);}
-  this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:recipient,expiresAt:new Date(deadline).toISOString(),body,identityProvenance:'system:operator-authorized-coordination',nudge:true});
-   const receipt={kind,queueId,packageKey,recipient,recipientGeneration,bodyHash:digest(body),deadline,holder:a.owner_session,holderGeneration:a.owner_generation,epoch:a.epoch,operatorGeneration:plan.operatorGeneration,planRevision:plan.revision,...details};
-   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,queueId,'coordinator-lifecycle-control',JSON.stringify(receipt),digest(body));this.repo.stageCoordinatorLifecycleWake(queueId,recipient,recipientGeneration);
-  })();
-  return {key:kind+':'+packageKey,state:'pending-native-'+kind,queueId,deadline};
+  if(kind===PLANNING_DUTY_KIND||kind===ADMISSION_DUTY_KIND||kind===CONFIRMATION_DUTY_KIND){const b=JSON.parse(body);b.action=kind===PLANNING_DUTY_KIND?'plan-exact-next-product-frontier':kind===ADMISSION_DUTY_KIND?'admit-or-refuse-exact-scope-cited-frontier-proposal':'confirm-exact-scope-mapped-frontier-completion';b.required=kind===PLANNING_DUTY_KIND?'Claim this finite duty under the current native Lead identity. This project has no remaining authorized product work and silence is not completion. Read the frozen scopeSources snapshot; the runtime never reads or interprets their contents. Record exactly one typed disposition with rig coordinator coordination-frontier-plan carrying this duty frontierDigest. plan-proposal: candidate packages that each cite a frozen scope ref with its matching digest, plus their resources and return contract. frontier-complete: every frozen scope item mapped to an accepted scope-bound product package or an explicit owner-attributed deferral carrying its authorization reference. frontier-blocked: a named accountable boundary and its unblock condition. With no configured scope sources, frontier-complete is refused and scope-source-missing is the only accountable boundary. Prose and an empty frontier are not completion. This grants no package creation, admission, qualification, dispatch or acceptance.':kind===ADMISSION_DUTY_KIND?'Claim this finite duty under the current native Operator identity. You are the independent reviewer: the proposer is the current Lead and you are not the implementing worker. Read the exact frozen scope-cited proposal. Register every cited candidate through the existing supported package admission, or refuse the whole proposal once with an attributed reason; partial admission, a non-product work class and any divergence from the frozen proposal resources or return contract are refused. Registration only hands the work to the existing materialization and qualified dispatch path. This grants no judgement of product correctness, no acceptance, no qualification and no delivery.':'Claim this finite duty under the current native Operator identity. The Lead recorded a frontier-complete mapping every frozen scope item to an accepted scope-bound product package or an authorized deferral on this exact planning duty. Read the exact frozen mapping and its cited scope digests and record your own attributed confirmation with rig coordinator coordination-frontier-confirm. You are the independent reviewer and are not the proposer. Confirm only what the mapping actually shows; otherwise record the reopen disposition that returns this frontier to accountable planning. A confirmation never carries across a reopen. Prose is not confirmation. This grants no acceptance, qualification, dispatch or delivery.';body=JSON.stringify(b);}
+this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:recipient,expiresAt:new Date(deadline).toISOString(),body,identityProvenance:'system:operator-authorized-coordination',nudge:false});
+    const receipt={kind,queueId,rootId,semanticKey,previousQueueId,chainIds:[queueId,...(prior?.chainIds??[]),...(previousQueueId?[previousQueueId]:[])],packageKey,recipient,recipientGeneration,bodyHash:digest(body),deadline,issuedAt:this.now(),holder:a.owner_session,holderGeneration:a.owner_generation,epoch:a.epoch,operatorGeneration:plan.operatorGeneration,planRevision:plan.revision,...details};
+    const id=this.repo.stageHeldHistoryAuthoringWake(queueId,recipient,recipientGeneration),notice=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(id) as any;this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,queueId,'coordinator-lifecycle-control',JSON.stringify({...receipt,noticeBodyHash:digest(notice.body)}),digest(body));
+   })();
+   // One deduplicated accountable intake per expired-unclaimed link: finite per link,
+   // with no invented numerical maximum on the lineage.
+   if(expiredUnclaimed)return {key:kind+':'+packageKey,state:'held',queueId:prior!.queueId,reason:'lifecycle-duty-expired-unclaimed',deadline:prior!.deadline,activityEvidence:{successorQueueId:queueId}};
+   return {key:kind+':'+packageKey,state:'pending-native-'+kind,queueId,deadline};
+  }
+ stageOutcomeQualificationDuty(rigId:string,details:{policyRevision:string;policyDigest:string;providerConfigDigest:string;qualificationRef:string;qualificationValidUntil:number}):string|null {
+  const assessment=this.authority.runtimeOutcomeAssessment,plan=this.plan(rigId),generation=this.authority.generation('operator-agent@kernel');
+  if(!assessment?.qualificationBoundaryMatches(rigId,details)||!plan||!generation||plan.operatorGeneration!==generation)return null;
+  const semanticKey=digest(JSON.stringify(details)),result=this.lifecycleDuty(rigId,'outcome-qualification-refresh','outcome-qualification:'+details.policyRevision,'operator-agent@kernel',generation,semanticKey,details);
+  // A blocked administrative duty is accountable to the Operator, never a silent null.
+  if(result.state==='held'){const owner=this.authority.get(rigId);if(owner)this.stageTaskHoldIntake(rigId,owner,plan,result,[]);}
+  return result.queueId??null;
  }
  heldHistoryAuthoringControl(queueId:string):any|null {const op=this.lifecycleControl(queueId);return ['held-history-authoring','held-history-pickup','held-history-retirement'].includes(op?.receipt.kind)?op!.receipt:null;}
  private heldHistoryAuthoringReady(rigId:string,r:any,excludeEffect?:string|string[]):boolean {
@@ -144,7 +238,7 @@ export class CoordinationRecoveryService {
   const a=this.authority.get(rigId),plan=this.plan(rigId),intake=this.repo.getById(operatorIntakeId);if(!a||!plan||!intake)return;
   let effects;try{effects=this.authority.heldHistoryAuthoringSnapshot(rigId);}catch(error){if(!(error instanceof CoordinatorFenceError))throw error;return;}
   let queueId='qitem-coordination-lifecycle-'+digest(rigId+':held-history-authoring:'+operatorIntakeId+':'+a.epoch+':'+a.owner_generation+':'+digest(JSON.stringify(effects))).slice(0,24);const previous=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='held-history-authoring' AND json_extract(receipt,'$.operatorIntakeId')=? ORDER BY rowid DESC LIMIT 1").get(rigId,operatorIntakeId) as any;
-  let predecessor:string|undefined;if(previous){const prior=JSON.parse(previous.receipt);if(prior.deadline>this.now()){this.stageHeldHistoryPickup(rigId,prior);return;}this.stageHeldHistoryRetirement(rigId,prior);this.recordHeldHistoryNoticeOutcome(rigId,prior);if(this.heldHistoryRecord(prior))this.stageHeldHistoryRetirement(rigId,prior,prior.recordQueueId);const pickup=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='held-history-pickup' AND json_extract(receipt,'$.authoringQueueId')=?").get(prior.queueId) as any;if(pickup){const p=JSON.parse(pickup.receipt);this.stageHeldHistoryRetirement(rigId,prior,p.queueId);this.recordHeldHistoryNoticeOutcome(rigId,p);const q=this.repo.getById(p.queueId),notice=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+p.queueId) as any;if(!q||digest(q.body)!==p.bodyHash||!this.heldNativeTerminal(p.queueId,p.recipient,p.recipientGeneration)||!notice||(!['delivered','failed'].includes(notice.delivery_state)&&!this.heldHistoryNoticeOutcomeContained(rigId,notice))||digest(notice.body)!==p.noticeBodyHash)return;}const retirements=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='held-history-retirement' AND json_extract(receipt,'$.authoringQueueId')=?").all(prior.queueId) as any[];for(const retirement of retirements){const t=JSON.parse(retirement.receipt),q=this.repo.getById(t.queueId);this.recordHeldHistoryNoticeOutcome(rigId,t);if(!q||q.state!=='done'||!q.claimedAt||!this.lifecycleControlCompleted(t.queueId))return;}const record=this.heldHistoryRecord(prior);if(this.repo.getById(prior.recordQueueId)&&!record)return;if(!this.heldNativeTerminal(prior.queueId,prior.recipient,prior.recipientGeneration)||record&&!this.heldNativeTerminal(prior.recordQueueId,'operator-agent@kernel',prior.operatorGeneration))return;const notice=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+prior.queueId) as any;if(!notice||(!['delivered','failed'].includes(notice.delivery_state)&&!this.heldHistoryNoticeOutcomeContained(rigId,notice)))return;predecessor=prior.queueId;}
+  let predecessor:string|undefined;if(previous){const prior=JSON.parse(previous.receipt);if(prior.deadline>this.now()){this.stageHeldHistoryPickup(rigId,prior);return;}this.stageHeldHistoryRetirement(rigId,prior);this.recordHeldHistoryNoticeOutcome(rigId,prior);if(this.heldHistoryRecord(prior))this.stageHeldHistoryRetirement(rigId,prior,prior.recordQueueId);const pickup=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='held-history-pickup' AND json_extract(receipt,'$.authoringQueueId')=?").get(prior.queueId) as any;if(pickup){const p=JSON.parse(pickup.receipt);this.stageHeldHistoryRetirement(rigId,prior,p.queueId);this.recordHeldHistoryNoticeOutcome(rigId,p);const q=this.repo.getById(p.queueId),notice=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+p.queueId) as any;this.observeDuty(p.queueId);if(!q||digest(q.body)!==p.bodyHash||!this.dutyFacts(p.queueId).retired||!notice||(!['delivered','failed'].includes(notice.delivery_state)&&!this.heldHistoryNoticeOutcomeContained(rigId,notice))||digest(notice.body)!==p.noticeBodyHash)return;}const retirements=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='held-history-retirement' AND json_extract(receipt,'$.authoringQueueId')=?").all(prior.queueId) as any[];for(const retirement of retirements){const t=JSON.parse(retirement.receipt),q=this.repo.getById(t.queueId);this.recordHeldHistoryNoticeOutcome(rigId,t);this.observeDuty(t.queueId);if(!q||!this.dutyFacts(t.queueId).retired)return;}const record=this.heldHistoryRecord(prior);if(this.repo.getById(prior.recordQueueId)&&!record)return;if(!this.heldNativeTerminal(prior.queueId,prior.recipient,prior.recipientGeneration)||record&&!this.heldNativeTerminal(prior.recordQueueId,'operator-agent@kernel',prior.operatorGeneration))return;const notice=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+prior.queueId) as any;if(!notice||(!['delivered','failed'].includes(notice.delivery_state)&&!this.heldHistoryNoticeOutcomeContained(rigId,notice)))return;predecessor=prior.queueId;}
   if(predecessor)queueId='qitem-coordination-lifecycle-'+digest(queueId+':successor:'+predecessor).slice(0,24);if(this.repo.getById(queueId))return;
   const deadline=this.now()+1200000,recordQueueId='qitem-held-history-record-'+digest(queueId).slice(0,24),bindingOperationId='held-authoring:'+queueId;
   const r={kind:'held-history-authoring',queueId,previousQueueId:predecessor,packageKey:'held-history-authoring',recipient:a.owner_session,recipientGeneration:a.owner_generation,holder:a.owner_session,holderGeneration:a.owner_generation,epoch:a.epoch,operatorGeneration:plan.operatorGeneration,planRevision:plan.revision,deadline,operatorIntakeId,operatorIntakeBodyHash:digest(intake.body),operatorClaimedAt:intake.claimedAt,effects,recordQueueId,bindingOperationId};
@@ -167,22 +261,16 @@ export class CoordinationRecoveryService {
  }
  heldHistoryRetirementAllows(queueId:string,actor:string,generation:string|null|undefined,provenance:string|null|undefined):boolean {
   if(!generation||provenance!=='transport:v1'||this.authority.generation(actor)!==generation)return false;
-  const rows=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='held-history-retirement' AND json_extract(receipt,'$.targetQueueId')=?").all(queueId) as any[];
-  return rows.some(row=>{const r=JSON.parse(row.receipt),q=this.repo.getById(r.queueId),claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(r.queueId) as any;return r.recipient===actor&&r.recipientGeneration===generation&&!!q?.claimedAt&&['in-progress','blocked'].includes(q.state)&&claim?.claimed_by_generation_uuid===generation&&this.heldRetirementReady(row.rig_id,r,'wake-intent-'+r.queueId);});
+  const rows=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.targetQueueId')=? AND json_extract(receipt,'$.kind') IN ('held-history-retirement','lifecycle-retirement')").all(queueId) as any[];
+  return rows.some(row=>{const r=JSON.parse(row.receipt),q=this.repo.getById(r.queueId),claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(r.queueId) as any;return r.recipient===actor&&r.recipientGeneration===generation&&!!q?.claimedAt&&['in-progress','blocked'].includes(q.state)&&claim?.claimed_by_generation_uuid===generation&&this.dutyFacts(r.queueId).act;});
  }
- private stageHeldHistoryRetirement(rigId:string,parent:any,targetQueueId=parent.queueId):void {
-  const target=this.repo.getById(targetQueueId);if(!target||!['pending','in-progress','blocked'].includes(target.state))return;
-  const queueId='qitem-coordination-lifecycle-'+digest(parent.queueId+':failure-only:'+targetQueueId).slice(0,24);if(this.repo.getById(queueId))return;
-  const r={...parent,kind:'held-history-retirement',queueId,authoringQueueId:parent.queueId,targetQueueId,targetBodyHash:digest(target.body),recipient:target.destinationSession,recipientGeneration:target.destinationSession===parent.holder?parent.holderGeneration:parent.operatorGeneration,deadline:this.now()+1200000};if(!this.heldRetirementReady(rigId,r))return;
-  const body=JSON.stringify({action:'report-own-expired-held-history-control-failure',rigId,queueId,claimCommand:'rig queue claim '+queueId,targetQueueId,recordQueueId:parent.recordQueueId,originalDeadline:parent.deadline,deadline:r.deadline,recipientGeneration:r.recipientGeneration,grantsAuthority:false,required:'Read the exact expired administrative target. Genuinely claim this failure-only duty under your own current native identity. Report your own target failed or canceled using rig queue update '+targetQueueId+' --state failed --note <actual-expiry-disposition>. This grants only truthful administrative outcome reporting, never authorization renewal, binding, product work, UNKNOWN delivery inference, replay or lock release. Pending original targets remain unclaimed: no synthetic claim is recorded. The genuine Operator must separately report its expired record failed/canceled. Then close this duty only after the actual native target terminal receipt.'});
-  this.db.transaction(()=>{if(!this.heldRetirementReady(rigId,r)||this.repo.getById(queueId))return;this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:r.recipient,expiresAt:new Date(r.deadline).toISOString(),body,identityProvenance:'system:operator-authorized-coordination',nudge:false});const id=this.repo.stageHeldHistoryAuthoringWake(queueId,r.recipient,r.recipientGeneration),notice=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(id) as any;this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,queueId,'coordinator-lifecycle-control',JSON.stringify({...r,bodyHash:digest(body),noticeBodyHash:digest(notice.body)}),digest(body));})();
- }
+ private stageHeldHistoryRetirement(rigId:string,parent:any,targetQueueId=parent.queueId):void {this.stageDutyRetirement(rigId,parent,targetQueueId);}
  private heldHistoryNoticeOutcomeProof(rigId:string,row:any):boolean {
   const id=String(row.outbox_id??'');if(!id.startsWith('wake-intent-')||row.delivery_state!=='indeterminate')return false;
-  const qid=id.slice('wake-intent-'.length),op=this.lifecycleControl(qid);if(!op||op.rigId!==rigId||!['held-history-authoring','held-history-pickup','held-history-retirement'].includes(op.receipt.kind))return false;const r=op.receipt,q=this.repo.getById(qid);
-  if(!q||digest(q.body)!==r.bodyHash||row.sender_session!=='watchdog@system'||row.destination_session!==r.recipient||row.audit_pointer!==qid||digest(String(row.body))!==r.noticeBodyHash||!((this.heldNativeTerminal(qid,r.recipient,r.recipientGeneration))||(r.kind==='held-history-retirement'&&q.state==='done'&&this.heldNativeTerminal(r.targetQueueId,r.recipient,r.recipientGeneration)&&digest(this.repo.getById(r.targetQueueId)?.body??'')===r.targetBodyHash)))return false;
+  const qid=id.slice('wake-intent-'.length),op=this.lifecycleControl(qid);if(!op||op.rigId!==rigId||!dutyKinds[op.receipt.kind as DutyKind])return false;const r=op.receipt,q=this.repo.getById(qid);
+  if(!q||digest(q.body)!==r.bodyHash||row.sender_session!=='watchdog@system'||row.destination_session!==r.recipient||row.audit_pointer!==qid||digest(String(row.body))!==r.noticeBodyHash||!((this.heldNativeTerminal(qid,r.recipient,r.recipientGeneration))||(dutyKinds[r.kind as DutyKind]?.effectClass==='report-only'&&q.state==='done'&&this.heldNativeTerminal(r.targetQueueId,r.recipient,r.recipientGeneration)&&digest(this.repo.getById(r.targetQueueId)?.body??'')===r.targetBodyHash)))return false;
   if(q.claimedAt){const claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(qid) as any,last=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(qid) as any;return claim?.claimed_by_generation_uuid===r.recipientGeneration&&last?.actor_session===r.recipient&&last?.identity_provenance==='transport:v1';}
-  const proof=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='held-history-retirement' AND json_extract(receipt,'$.targetQueueId')=?").get(qid) as any;if(!proof)return false;
+  const proof=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind') IN ('held-history-retirement','lifecycle-retirement') AND json_extract(receipt,'$.targetQueueId')=? ORDER BY rowid DESC LIMIT 1").get(rigId,qid) as any;if(!proof)return false;
   const t=JSON.parse(proof.receipt),d=this.repo.getById(t.queueId),claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(t.queueId) as any;return !!d?.claimedAt&&claim?.claimed_by_generation_uuid===r.recipientGeneration;
  }
  heldHistoryNoticeOutcomeContained(rigId:string,row:any):boolean {
@@ -195,6 +283,20 @@ export class CoordinationRecoveryService {
   const terminal=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(parent.queueId) as any;
   const receipt={outboxId:row.outbox_id,noticeSnapshotHash:digest(JSON.stringify(row)),queueId:parent.queueId,queueBodyHash:parent.bodyHash,recipient:parent.recipient,recipientGeneration:parent.recipientGeneration,terminalTransitionId:terminal.transition_id,terminalState:terminal.state,deliveryConclusion:'unknown',originalMutations:0,outcomeOnly:true,nonExecutable:true};
   this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'held-control-outcome:'+row.outbox_id,'held-history-control-outcome',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+ }
+ /** A chain link's own UNKNOWN wake stops counting only through its own recorded
+   * receipt, and only for the exact owning chain and its retirements. */
+ private recordDutyChainNoticeOutcomes(rigId:string,r:any):void {
+  for(const c of this.dutyChain(r))this.recordHeldHistoryNoticeOutcome(rigId,c);
+  for(const row of this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.targetQueueId')=? AND json_extract(receipt,'$.kind') IN ('held-history-retirement','lifecycle-retirement')").all(rigId,r.queueId) as any[])this.recordHeldHistoryNoticeOutcome(rigId,JSON.parse(row.receipt));
+ }
+ /** A duty's own wake is not debt only when its delivery is resolved or provably
+   * contained; an UNKNOWN notice stays unresolved and therefore blocking. */
+ private dutyNoticeContained(rigId:string,r:any):boolean {
+  const notice=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+r.queueId) as any;
+  if(!notice||!this.dutyNoticeMatches(r,notice))return true;
+  if(['delivered','failed','retired'].includes(notice.delivery_state))return true;
+  return this.heldHistoryNoticeOutcomeContained(rigId,notice);
  }
  private heldHistoryRecord(r:any):any|null {
   const q=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(r.recordQueueId) as any;
@@ -233,20 +335,94 @@ export class CoordinationRecoveryService {
   for(const row of unplanned){if(plan.tasks.some(t=>t.packageKey===row.package_key))continue;
    result.push(this.lifecycleDuty(rigId,'materialization',row.package_key,'operator-agent@kernel',plan.operatorGeneration,row.package_key+':'+row.contract_hash,{contractHash:row.contract_hash,contract:JSON.parse(row.contract),acceptedPredecessors}));
   }
+  result.push(...this.frontierPlanning().pass(rigId));
   return result;
  }
  private lifecycleControl(queueId:string):{rigId:string;receipt:any}|null {const row=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE operation_id=? AND kind='coordinator-lifecycle-control'").get(queueId) as {rig_id:string;receipt:string}|undefined;return row?{rigId:row.rig_id,receipt:JSON.parse(row.receipt)}:null;}
+ lifecycleControlReceipt(queueId:string):any|null {return this.lifecycleControl(queueId)?.receipt??null;}
  isLifecycleControl(queueId:string):boolean {return this.lifecycleControl(queueId)!==null;}
- lifecycleControlCompleted(queueId:string):boolean {
-  const op=this.lifecycleControl(queueId);if(!op)return false;const r=op.receipt;
-  if(r.kind==='held-history-retirement'){const p=this.lifecycleControl(r.authoringQueueId)?.receipt;return !!p&&r.deadline>this.now()&&this.heldHistoryAuthoringReady(op.rigId,{...p,deadline:r.deadline},['wake-intent-'+p.queueId,'wake-intent-'+queueId])&&this.heldNativeTerminal(r.targetQueueId,r.recipient,r.recipientGeneration);}
-  if(r.kind==='held-history-pickup'){const parent=this.lifecycleControl(r.authoringQueueId)?.receipt,author=parent?this.repo.getById(parent.queueId):null,own=this.repo.getById(queueId),last=parent?this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(parent.queueId) as any:null,claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(queueId) as any;const completedParent=!!parent&&author?.state==='done'&&!!author.claimedAt&&digest(author.body)===parent.bodyHash&&last?.actor_session===parent.recipient&&last?.identity_provenance==='transport:v1'&&last?.state==='done'&&this.heldHistoryAuthoringReady(op.rigId,parent,'wake-intent-'+parent.queueId);return !!own?.claimedAt&&claim?.claimed_by_generation_uuid===r.recipientGeneration&&digest(own.body)===r.bodyHash&&r.deadline>this.now()&&(this.heldHistoryPickupReady(op.rigId,r,'wake-intent-'+queueId)||completedParent)&&this.authority.heldHistoryAuthoringBindingComplete(op.rigId,r.bindingOperationId,r.effects,r.recordQueueId,r.holder,r.holderGeneration,r.operatorGeneration);}
-  if(r.kind==='held-history-authoring'){const q=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(queueId) as any;return !!q&&q.claimed_by_generation_uuid===r.recipientGeneration&&!!q.claimed_at&&digest(q.body)===r.bodyHash&&q.expires_at===new Date(r.deadline).toISOString()&&this.heldHistoryAuthoringReady(op.rigId,r,'wake-intent-'+queueId)&&this.authority.heldHistoryAuthoringBindingComplete(op.rigId,r.bindingOperationId,r.effects,r.recordQueueId,r.recipient,r.recipientGeneration,r.operatorGeneration);}
-  if(r.kind==='materialization'){const plan=this.plan(op.rigId),pkg=this.db.prepare('SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(op.rigId,r.packageKey) as any;return !!plan&&plan.operatorGeneration===this.authority.generation('operator-agent@kernel')&&pkg?.contract_hash===r.contractHash&&plan.tasks.some(t=>t.packageKey===r.packageKey&&this.admittedNow(t));}
-  if(r.kind==='acceptance'&&this.exactAccepted(op.rigId,r.originalQueueId,r.dispositionId))return true;
-  const recovery=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='coordinator-lifecycle-recovery'").get(op.rigId,'lifecycle-recovery:'+queueId) as {receipt:string}|undefined;
-  return !!recovery&&this.validOwnedLifecycleRecovery(op.rigId,r,JSON.parse(recovery.receipt));
+ private dutyPostcondition(rigId:string,r:any):boolean {
+  if(dutyKinds[r.kind as DutyKind]?.effectClass==='report-only')return digest(this.repo.getById(r.targetQueueId)?.body??'')===r.targetBodyHash&&this.heldNativeTerminal(r.targetQueueId,r.recipient,r.recipientGeneration);
+  if(r.kind==='held-history-authoring'||r.kind==='held-history-pickup'){
+   const parent=r.kind==='held-history-pickup'?this.lifecycleControl(r.authoringQueueId)?.receipt:r;if(!parent)return false;
+   const record=this.heldHistoryRecord(parent),op=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='held-history-recovery-binding'").get(rigId,parent.bindingOperationId) as any;
+   if(!record||!op)return false;try{const b=JSON.parse(op.receipt);return b.kind==='coordinator-held-history-recovery-binding.v1'&&b.actor==='operator-agent@kernel'&&b.generation===parent.operatorGeneration&&b.originalMutations===0&&JSON.stringify(b.effects)===JSON.stringify(parent.effects.map((e:any)=>e.outboxId))&&b.binding?.queueId===parent.recordQueueId&&b.binding.bodyHash===digest(record.body)&&b.binding.lead===parent.holder&&b.binding.leadGeneration===parent.holderGeneration&&record.claimed_by_generation_uuid===parent.operatorGeneration;}catch{return false;}
+  }
+  if(r.kind==='outcome-qualification-refresh')return this.authority.runtimeOutcomeAssessment?.qualificationRefreshCompleted(rigId,r)===true;
+  if(r.kind==='materialization'){const plan=this.plan(rigId),pkg=this.db.prepare('SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(rigId,r.packageKey) as any;return !!plan&&pkg?.contract_hash===r.contractHash&&plan.tasks.some(t=>t.packageKey===r.packageKey&&this.admittedNow(t));}
+  if(r.kind===PLANNING_DUTY_KIND)return this.frontierPlanning().planPostcondition(rigId,r);
+  if(r.kind===ADMISSION_DUTY_KIND)return this.frontierPlanning().admissionPostcondition(rigId,r);
+  if(r.kind===CONFIRMATION_DUTY_KIND)return this.frontierPlanning().confirmationPostcondition(rigId,r);
+  if(r.kind==='acceptance'&&this.exactAccepted(rigId,r.originalQueueId,r.dispositionId))return true;
+  const op=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='coordinator-lifecycle-recovery'").get(rigId,'lifecycle-recovery:'+r.queueId) as any;return !!op&&this.validOwnedLifecycleRecovery(rigId,r,JSON.parse(op.receipt));
  }
+ private dutyNoticeMatches(r:any,notice:any):boolean {
+  if(!notice||notice.outbox_id!=='wake-intent-'+r.queueId||notice.sender_session!=='watchdog@system'||notice.destination_session!==r.recipient||notice.audit_pointer!==r.queueId||this.db.prepare('SELECT 1 FROM outbox_historical_quarantines WHERE outbox_id=?').get(notice.outbox_id))return false;
+  if(r.noticeBodyHash)return digest(notice.body)===r.noticeBodyHash;
+  // Compatibility for pre-facet central controls whose issued receipt predates
+  // noticeBodyHash: only the exact original fixed envelope is recognized.
+  if(!['acceptance','recovery','materialization'].includes(r.kind))return false;
+  const parts=String(notice.body).split('\n---\n');return parts.length===3&&parts[0]?.startsWith('From: watchdog@system\nTo: '+r.recipient+'\nSent: ')===true&&parts[1]==='Read and genuinely claim exact lifecycle duty '+r.queueId+'; retain all existing acceptance, qualification and scope gates.'&&parts[2]==='↩ Reply: rig send watchdog@system "..."';
+ }
+ private dutyChain(r:any):any[] {
+  const seen=new Set<string>(),todo=[r.queueId,...(r.chainIds??[]),r.previousQueueId,r.authoringQueueId,r.targetQueueId,r.recordQueueId].filter(Boolean),controls:any[]=[];
+  while(todo.length){const id=todo.pop()!;if(seen.has(id))continue;seen.add(id);const op=this.lifecycleControl(id);if(!op)continue;controls.push(op.receipt);todo.push(...[...(op.receipt.chainIds??[]),op.receipt.previousQueueId,op.receipt.authoringQueueId,op.receipt.targetQueueId,op.receipt.recordQueueId].filter(Boolean));}
+  return controls;
+ }
+ private dutyExcludedNotices(r:any):string[] {
+  const ids=['wake-intent-'+r.queueId];if(dutyKinds[r.kind as DutyKind]?.effectClass!=='report-only')return ids;
+  for(const c of this.dutyChain(r)){const n=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+c.queueId) as any;if(this.dutyNoticeMatches(c,n)&&['pending','sending','delivered','indeterminate','failed'].includes(n.delivery_state))ids.push(n.outbox_id);}return [...new Set(ids)];
+ }
+ private dutyBinding(rigId:string,r:any):boolean {
+  const k=dutyKinds[r.kind as DutyKind],a=this.authority.get(rigId),plan=this.plan(rigId);if(!k||this.authority.generation(r.recipient)!==r.recipientGeneration)return false;
+  if(k.binding==='recipientOnly')return true;
+  if(k.binding==='currentOperator')return r.recipient==='operator-agent@kernel'&&r.operatorGeneration===r.recipientGeneration&&this.authority.generation('operator-agent@kernel')===r.operatorGeneration;
+  return !!a&&a.state==='active'&&a.lease_until>this.now()&&a.epoch===r.epoch&&a.owner_session===r.holder&&a.owner_generation===r.holderGeneration&&r.recipient===r.holder&&this.authority.generation(r.holder)===r.holderGeneration&&!!plan&&plan.operatorGeneration===r.operatorGeneration&&this.authority.generation('operator-agent@kernel')===r.operatorGeneration;
+ }
+private dutyProtection(rigId:string,r:any):boolean {
+   const plan=this.plan(rigId),administrative=this.administrativeDuty(r.kind),excluded=[...this.dutyExcludedNotices(r),...(administrative?this.administrativeIntakeNotices(rigId,r.recipient):[])];if(!plan)return false;
+  const sessions=r.kind.startsWith('held-history-')?[r.recipient,r.holder,'operator-agent@kernel']:[r.recipient];
+  for(const session of new Set(sessions)){const restriction=plan.dispatchRestrictions?.find(t=>t.session===session);if(restriction&&(restriction.generation!==this.authority.generation(session)||restriction.validUntil<=this.now()||!restriction.packageKeys.includes(r.packageKey)))return false;if(this.db.prepare('SELECT 1 FROM seat_delivery_guards WHERE (desired=1 OR effective=1) AND node_id IN (SELECT node_id FROM sessions WHERE session_name=?)').get(session)||this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(session,session))return false;}
+  return r.kind.startsWith('held-history-')||this.administrativeDuty(r.kind)?this.repo.heldHistoryAuthoringDebtReady(rigId,r.recipient,excluded):!this.workerEffectDebt(r.recipient,excluded);
+ }
+ private dutySubjectReady(rigId:string,r:any):boolean {
+  if(dutyKinds[r.kind as DutyKind]?.effectClass==='report-only'){const q=this.repo.getById(r.targetQueueId);return !!q&&q.destinationSession===r.recipient&&digest(q.body)===r.targetBodyHash&&!!q.expiresAt&&Date.parse(q.expiresAt)<=this.now()&&['pending','in-progress','blocked'].includes(q.state);}
+  if(r.kind==='held-history-authoring')return this.heldHistoryAuthoringReady(rigId,{...r,planRevision:this.plan(rigId)?.revision},this.dutyExcludedNotices(r));
+  if(r.kind==='held-history-pickup'){const p=this.lifecycleControl(r.authoringQueueId)?.receipt;return !!p&&this.heldHistoryRecord(p)!==null&&this.heldHistoryAuthoringReady(rigId,{...p,planRevision:this.plan(rigId)?.revision},['wake-intent-'+p.queueId,...this.dutyExcludedNotices(r)]);}
+  if(r.kind==='outcome-qualification-refresh')return this.authority.runtimeOutcomeAssessment?.qualificationBoundaryMatches(rigId,r)===true;
+  if(r.kind==='materialization'){const plan=this.plan(rigId),pkg=this.db.prepare('SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(rigId,r.packageKey) as any;return pkg?.contract_hash===r.contractHash&&!plan?.tasks.some(t=>t.packageKey===r.packageKey)&&r.acceptedPredecessors.every((v:any)=>this.exactAccepted(rigId,v.queueId,v.dispositionId));}
+  if(r.kind===PLANNING_DUTY_KIND)return this.frontierPlanning().planActAllowed(rigId,r);
+  if(r.kind===ADMISSION_DUTY_KIND)return this.frontierPlanning().admissionActAllowed(rigId,r);
+  if(r.kind===CONFIRMATION_DUTY_KIND)return this.frontierPlanning().confirmationActAllowed(rigId,r);
+  const original=this.db.prepare('SELECT a.*,q.body,q.state,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.queue_id=? AND a.package_key=?').get(rigId,r.originalQueueId,r.packageKey) as any,returned=this.repo.getById(r.dispositionId);
+  return !!original&&(r.kind==='recovery'?['failed','denied','canceled'].includes(original.state)&&original.state===r.terminalState:successfulReturn(original.state,original.disposition_id))&&original.disposition_id===r.dispositionId&&original.body_hash===r.assignmentBodyHash&&digest(original.body)===r.assignmentBodyHash&&digest(original.contract)===r.contractHash&&!!returned&&digest(returned.body)===r.returnBodyHash&&this.validContinuationReturn(r.dispositionId,original.destination,original.claimed_by_generation_uuid,r.packageKey,JSON.parse(original.contract));
+ }
+ /** Pure facets never infer transport delivery or perform a duty's mutation. */
+ dutyFacts(queueId:string):DutyFacts {
+  const op=this.lifecycleControl(queueId),none={queueId,claim:false,send:false,act:false,complete:false,close:false,retired:false,failedByRecipient:false,superseded:false,expired:true};if(!op||!dutyKinds[op.receipt.kind as DutyKind])return none;
+  const r=op.receipt,q=this.repo.getById(queueId),notice=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+queueId) as any,creation=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1').get(queueId) as any;
+  const frozen=!!q&&q.sourceSession==='watchdog@system'&&q.destinationSession===r.recipient&&digest(q.body)===r.bodyHash&&q.expiresAt===new Date(r.deadline).toISOString()&&creation?.actor_session==='watchdog@system'&&creation?.identity_provenance==='system:operator-authorized-coordination'&&this.dutyNoticeMatches(r,notice);
+  const complete=frozen&&this.dutyPostcondition(op.rigId,r),expired=r.deadline<=this.now(),binding=this.dutyBinding(op.rigId,r),protection=frozen&&binding&&this.dutyProtection(op.rigId,r);
+  const observation=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='duty-completion-observation'").get(op.rigId,'duty-completion:'+queueId) as any;
+  let completedAt:number|undefined;try{const o=observation?JSON.parse(observation.receipt):null;if(o?.bodyHash===r.bodyHash&&o.at<=r.deadline)completedAt=o.at;}catch{}
+  const expiryObservation=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='duty-expiry-observation'").get(op.rigId,'duty-expiry-observation:'+queueId) as any;
+  let expiredUnclaimedObserved=false;try{const o=expiryObservation?JSON.parse(expiryObservation.receipt):null;expiredUnclaimedObserved=!!o&&o.queueId===queueId&&o.bodyHash===r.bodyHash&&o.at>=r.deadline&&o.claimedAt===null&&o.grantsAuthority===false&&!q?.claimedAt;}catch{}
+  const close=complete&&(!expired||completedAt!==undefined),failedByRecipient=frozen&&this.heldNativeTerminal(queueId,r.recipient,r.recipientGeneration),superseded=frozen&&dutyKinds[r.kind as DutyKind].binding!=='recipientOnly'&&!binding;
+  const live=!!q&&['pending','in-progress','blocked'].includes(q.state),claim=frozen&&!expired&&protection&&live;
+  const claimedBy=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(queueId) as {claimed_by_generation_uuid:string|null}|undefined;
+  const nativeClaim=!!q?.claimedAt&&['in-progress','blocked'].includes(q.state)&&claimedBy?.claimed_by_generation_uuid===r.recipientGeneration&&!!this.db.prepare("SELECT 1 FROM queue_transitions WHERE qitem_id=? AND state='in-progress' AND transition_note='claimed' AND actor_session=? AND identity_provenance='transport:v1'").get(queueId,r.recipient);
+  const subjectReady=this.dutySubjectReady(op.rigId,r),act=claim&&nativeClaim&&!complete&&subjectReady,send=claim&&!complete&&subjectReady&&r.planRevision===this.plan(op.rigId)?.revision&&q?.state==='pending'&&!q.claimedAt&&['pending','sending'].includes(notice?.delivery_state);
+  const retired=frozen&&(failedByRecipient||(complete&&(!q?.claimedAt||close))||expiredUnclaimedObserved);
+  return {queueId,claim,send,act,complete,close,retired,failedByRecipient,superseded,expired,...(!frozen?{reason:'duty-immutable-proof-drift'}:!binding?{reason:'duty-binding-superseded'}:!protection?{reason:'duty-recipient-protected'}:{})};
+ }
+ private observeDuty(queueId:string):void {
+  const op=this.lifecycleControl(queueId);if(!op)return;const f=this.dutyFacts(queueId),q=this.repo.getById(queueId),notice=this.db.prepare('SELECT delivery_state FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+queueId) as any;
+  if(f.complete&&!f.expired){const r={queueId,bodyHash:op.receipt.bodyHash,at:this.now(),outcomeOnly:true};this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(op.rigId,'duty-completion:'+queueId,'duty-completion-observation',JSON.stringify(r),digest(JSON.stringify(r)));}
+  if(f.expired&&!q?.claimedAt){const r={queueId,bodyHash:op.receipt.bodyHash,subjectComplete:f.complete,noticeState:notice?.delivery_state??null,claimedAt:null,at:this.now(),grantsAuthority:false};this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(op.rigId,'duty-expiry-observation:'+queueId,'duty-expiry-observation',JSON.stringify(r),digest(JSON.stringify(r)));}
+ }
+ lifecycleControlCompleted(queueId:string):boolean {return this.dutyFacts(queueId).close;}
+ lifecycleControlClaimAllowed(queueId:string,actor:string,generation:string|null|undefined,provenance:string|null|undefined):boolean {const op=this.lifecycleControl(queueId);return !!op&&actor===op.receipt.recipient&&generation===op.receipt.recipientGeneration&&this.authority.generation(actor)===generation&&provenance==='transport:v1'&&this.dutyFacts(queueId).claim;}
+ lifecycleControlActAllowed(queueId:string,actor:string,generation:string|null|undefined,provenance:string|null|undefined):boolean {const op=this.lifecycleControl(queueId),q=this.repo.getById(queueId),claimed=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(queueId) as {claimed_by_generation_uuid:string|null}|undefined;return !!op&&actor===op.receipt.recipient&&generation===op.receipt.recipientGeneration&&this.authority.generation(actor)===generation&&provenance==='transport:v1'&&!!q?.claimedAt&&['in-progress','blocked'].includes(q.state)&&claimed?.claimed_by_generation_uuid===generation&&this.dutyFacts(queueId).act;}
  private validOwnedLifecycleRecovery(rigId:string,duty:any,recovery:any):boolean {
   const plan=this.plan(rigId),target=plan?.tasks.find(t=>t.packageKey===duty.packageKey),task=plan?.tasks.find(t=>t.packageKey===recovery.recoveryPackageKey),a=this.authority.get(rigId);
   const row=this.db.prepare('SELECT a.destination,a.body_hash,q.body,q.state,q.claimed_by_generation_uuid FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=? AND a.queue_id=?').get(rigId,recovery.recoveryPackageKey,recovery.recoveryQueueId) as any;
@@ -257,7 +433,7 @@ export class CoordinationRecoveryService {
    const op=this.lifecycleControl(input.dutyQueueId),q=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(input.dutyQueueId) as any;
    const row=this.db.prepare('SELECT q.claimed_by_generation_uuid FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=? AND a.queue_id=?').get(input.rigId,input.recoveryPackageKey,input.recoveryQueueId) as any;
    const receipt={actor,generation,epoch:this.authority.get(input.rigId)?.epoch,recoveryPackageKey:input.recoveryPackageKey,recoveryQueueId:input.recoveryQueueId,workerGeneration:row?.claimed_by_generation_uuid,evidenceRef:input.evidenceRef};
-   if(!op||op.rigId!==input.rigId||!['acceptance','recovery'].includes(op.receipt.kind)||!this.validLifecycleControlWake('watchdog@system',actor,input.dutyQueueId)||!q||digest(q.body)!==op.receipt.bodyHash||q.destination_session!==actor||q.claimed_by_generation_uuid!==generation||!['in-progress','blocked'].includes(q.state)||Date.parse(q.expires_at)<=this.now()||typeof input.evidenceRef!=='string'||!input.evidenceRef.trim()||!this.validOwnedLifecycleRecovery(input.rigId,op.receipt,receipt))fail('coordination_lifecycle_recovery_required','Exact current holder claim and distinct admitted genuinely active recovery required; prose cannot close acceptance duty');
+   if(!op||op.rigId!==input.rigId||!['acceptance','recovery'].includes(op.receipt.kind)||!this.dutyFacts(input.dutyQueueId).act||!q||digest(q.body)!==op.receipt.bodyHash||q.destination_session!==actor||q.claimed_by_generation_uuid!==generation||!['in-progress','blocked'].includes(q.state)||Date.parse(q.expires_at)<=this.now()||typeof input.evidenceRef!=='string'||!input.evidenceRef.trim()||!this.validOwnedLifecycleRecovery(input.rigId,op.receipt,receipt))fail('coordination_lifecycle_recovery_required','Exact current holder claim and distinct admitted genuinely active recovery required; prose cannot close acceptance duty');
    const id='lifecycle-recovery:'+input.dutyQueueId,prior=this.db.prepare('SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(input.rigId,id) as {receipt:string}|undefined;
    if(prior){if(prior.receipt!==JSON.stringify(receipt))fail('coordination_lifecycle_recovery_conflict','Frozen recovery disposition differs');return;}
    this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,id,'coordinator-lifecycle-recovery',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
@@ -265,18 +441,8 @@ export class CoordinationRecoveryService {
  }
  /** A genuine recipient claim is its own native reading action, not proof of
   * transport delivery. Only that exact claimant may consume its UNKNOWN notice. */
- heldHistoryAuthoringClaimAllowed(queueId:string,actor:string,generation:string|null|undefined,provenance:string|null|undefined):boolean {
-  const r=this.heldHistoryAuthoringControl(queueId);return !!r&&actor===r.recipient&&generation===r.recipientGeneration&&this.authority.generation(actor)===generation&&provenance==='transport:v1'&&this.validLifecycleControlFrame('watchdog@system',actor,queueId,true);
- }
- validLifecycleControlWake(source:string|undefined,destination:string,queueId:string):boolean {return this.validLifecycleControlFrame(source,destination,queueId);}
- private validLifecycleControlFrame(source:string|undefined,destination:string,queueId:string,nativeAuthoringClaim=false):boolean {
-  if(source!=='watchdog@system')return false;const op=this.lifecycleControl(queueId);if(!op)return false;const r=op.receipt,a=this.authority.get(op.rigId),plan=this.plan(op.rigId),q=this.repo.getById(queueId);
-  if(!q||q.sourceSession!==source||q.destinationSession!==destination||r.recipient!==destination||r.recipientGeneration!==this.authority.generation(destination)||!['pending','in-progress','blocked'].includes(q.state)||q.expiresAt===null||Date.parse(q.expiresAt)!==r.deadline||r.deadline<=this.now()||digest(q.body)!==r.bodyHash||!a||a.state!=='active'||a.lease_until<=this.now()||a.epoch!==r.epoch||a.owner_session!==r.holder||a.owner_generation!==r.holderGeneration||this.authority.generation(r.holder)!==r.holderGeneration||!plan||plan.revision!==r.planRevision||plan.operatorGeneration!==r.operatorGeneration||this.authority.generation('operator-agent@kernel')!==r.operatorGeneration||!(r.kind==='held-history-authoring'?this.heldHistoryAuthoringReady(op.rigId,r,'wake-intent-'+queueId):r.kind==='held-history-pickup'?this.heldHistoryPickupReady(op.rigId,r,'wake-intent-'+queueId):r.kind==='held-history-retirement'?this.heldRetirementReady(op.rigId,r,'wake-intent-'+queueId):this.lifecycleRecipientReady(op.rigId,destination,r.packageKey,'wake-intent-'+queueId))||this.lifecycleControlCompleted(queueId))return false;
-  if(['held-history-authoring','held-history-pickup','held-history-retirement'].includes(r.kind)){const notice=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+queueId) as any;return !!notice&&(['pending','sending','delivered'].includes(notice.delivery_state)||(nativeAuthoringClaim&&r.kind==='held-history-authoring'&&notice.delivery_state==='indeterminate'))&&!this.db.prepare('SELECT 1 FROM outbox_historical_quarantines WHERE outbox_id=?').get(notice.outbox_id)&&notice.sender_session===source&&notice.destination_session===destination&&notice.audit_pointer===queueId&&digest(notice.body)===r.noticeBodyHash;}
-  if(r.kind==='materialization'){const pkg=this.db.prepare('SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(op.rigId,r.packageKey) as any;return pkg?.contract_hash===r.contractHash&&(!plan.tasks.some(t=>t.packageKey===r.packageKey))&&r.acceptedPredecessors.every((ref:any)=>this.exactAccepted(op.rigId,ref.queueId,ref.dispositionId));}
-  const original=this.db.prepare('SELECT a.*,q.body,q.state,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.queue_id=? AND a.package_key=?').get(op.rigId,r.originalQueueId,r.packageKey) as any;
-  const returned=this.repo.getById(r.dispositionId);return !!original&&(r.kind==='recovery'?['failed','denied','canceled'].includes(original.state)&&original.state===r.terminalState:successfulReturn(original.state,original.disposition_id))&&original.disposition_id===r.dispositionId&&original.body_hash===r.assignmentBodyHash&&digest(original.body)===r.assignmentBodyHash&&digest(original.contract)===r.contractHash&&!!returned&&digest(returned.body)===r.returnBodyHash&&this.validContinuationReturn(r.dispositionId,original.destination,original.claimed_by_generation_uuid,r.packageKey,JSON.parse(original.contract));
- }
+ heldHistoryAuthoringClaimAllowed(queueId:string,actor:string,generation:string|null|undefined,provenance:string|null|undefined):boolean {return this.lifecycleControlClaimAllowed(queueId,actor,generation,provenance);}
+ validLifecycleControlWake(source:string|undefined,destination:string,queueId:string):boolean {const op=this.lifecycleControl(queueId);return source==='watchdog@system'&&!!op&&destination===op.receipt.recipient&&this.dutyFacts(queueId).send;}
  private currentReturnObserver(jobId:string,operatorGeneration:string):boolean {
   return !!this.db.prepare("SELECT 1 FROM watchdog_jobs WHERE job_id=? AND policy='coordinator-continuity' AND state='active' AND target_session='operator-agent@kernel' AND registered_by_session='operator-agent@kernel' AND registered_by_generation_uuid=?").get(jobId,operatorGeneration);
  }
@@ -314,7 +480,12 @@ export class CoordinationRecoveryService {
  private advanceTaskHoldIntakes(rigId:string,jobId:string,result:CoordinationResult[]):void {
   const a=this.authority.get(rigId),plan=this.plan(rigId);if(!a||!plan||!this.currentReturnObserver(jobId,plan.operatorGeneration))return;
   for(const held of result){if(held.state!=='held')continue;
-   const rootQueueId='qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:plan.revision,operatorGeneration:plan.operatorGeneration,packageKey:held.key.startsWith('terminal-return:')?held.key.slice(16):plan.tasks.find(t=>t.key===held.key)?.packageKey,reason:held.reason,queueId:held.queueId??null})).slice(0,24);
+   // Registered-observer lineage is the mechanism for terminal-return exhaustion only;
+   // lifecycle and administrative holds are renewed exclusively by the intake chain, so a
+   // clean Operator seat can never end up with two live accountable items for one hold.
+   if(LIFECYCLE_INTAKE_RENEWAL_REASONS.includes(held.reason??''))continue;
+   const subject=this.intakeHoldSubject(rigId,held,this.missingAttributedReturns(rigId),true);if(!subject)continue;
+   const rootQueueId='qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:plan.revision,operatorGeneration:plan.operatorGeneration,packageKey:subject.packageKey,reason:held.reason,queueId:held.queueId??null})).slice(0,24);
    const root=this.repo.getById(rootQueueId);if(!root)continue;const h=JSON.parse(root.body),creation=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1').get(rootQueueId) as any;
    if(root.sourceSession!=='watchdog@system'||root.destinationSession!=='operator-agent@kernel'||creation?.state!=='pending'||creation.actor_session!=='watchdog@system'||creation.identity_provenance!=='system:operator-authorized-coordination'||h.grantsAuthority!==false||h.recipientGeneration!==plan.operatorGeneration||h.rigId!==rigId)continue;
    const explicit=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='native-terminal-return-intake-authorization' AND json_extract(receipt,'$.previousIntakeQueueId')=? ORDER BY rowid DESC LIMIT 1").get(rigId,rootQueueId) as {receipt:string}|undefined;if(explicit){const q=this.repo.getById(JSON.parse(explicit.receipt).queueId);if(q&&['pending','in-progress','blocked'].includes(q.state)&&q.expiresAt&&Date.parse(q.expiresAt)>this.now())continue;}
@@ -326,6 +497,98 @@ export class CoordinationRecoveryService {
    this.db.transaction(()=>{if(!this.intakeLineageReady(r)||this.repo.getById(queueId))return;this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:new Date(r.deadline).toISOString(),body,identityProvenance:'system:operator-authorized-coordination',nudge:false});const noticeId=this.repo.stageTaskHoldLineageWake(queueId,plan.operatorGeneration);const notice=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(noticeId) as {body:string};this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,queueId,'coordination-task-hold-lineage',JSON.stringify({...r,bodyHash:digest(body),noticeBodyHash:digest(notice.body)}),digest(JSON.stringify(r)));})();
   }
  }
+ /** Assignments completed without an attributed typed disposition still need a return. */
+ private missingAttributedReturns(rigId:string):Array<{package_key:string;queue_id:string;destination:string;body_hash:string;body:string;ts_updated:string;claimed_by_generation_uuid:string|null;contract:string}> {
+  return this.db.prepare("SELECT a.package_key,a.queue_id,a.destination,a.body_hash,q.body,q.ts_updated,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.disposition_id IS NULL AND q.state IN ('done','failed','denied','canceled','handed-off')").all(rigId) as Array<{package_key:string;queue_id:string;destination:string;body_hash:string;body:string;ts_updated:string;claimed_by_generation_uuid:string|null;contract:string}>;
+ }
+ /** The next bounded intake id in one chain, always derived from the item it follows, so
+   * every renewal is a distinct finite item and no earlier id is ever reused or extended. */
+ private nextIntakeChainId(rootQueueId:string,previousQueueId:string):string {return 'qitem-coordination-task-hold-'+digest('intake-chain:'+rootQueueId+':'+previousQueueId).slice(0,24);}
+ /** Liveness of an accountable item: a live or genuinely claimed intake still owns the
+   * hold. Only an expired, unclaimed item may be followed by a fresh one. */
+ private intakeStillAccounted(item:any):boolean {return ['pending','in-progress','blocked'].includes(item.state)&&(!item.expiresAt||Date.parse(item.expiresAt)>this.now()||!!item.claimedAt);}
+ /** One resolver for the whole chain of a held reason: validates the deterministic root,
+   * then follows the actual prior items to the latest one. Null means the recorded root is
+   * not a genuine accountable intake for this hold, so nothing may be derived from it. */
+ private intakeChainTail(rigId:string,plan:CoordinationPlan,held:CoordinationResult,task:{packageKey:string;owner:string}):{rootQueueId:string;tail:any}|null {
+  const rootQueueId='qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:plan.revision,operatorGeneration:plan.operatorGeneration,packageKey:task.packageKey,reason:held.reason,queueId:held.queueId??null})).slice(0,24),root=this.repo.getById(rootQueueId);
+  if(!root)return {rootQueueId,tail:null};
+  if(!this.validAccountableIntake(rigId,rootQueueId,root))return null;
+  let tail=root;
+  for(;;){const next=this.repo.getById(this.nextIntakeChainId(rootQueueId,tail.qitemId));if(!next||!this.validAccountableIntakeChainItem(rigId,next,rootQueueId))break;tail=next;}
+  return {rootQueueId,tail};
+ }
+ /** An accountable intake must be this control plane's own exact item for this rig, with
+   * no authority and no identity claims beyond the current Operator generation. */
+ private validAccountableIntake(rigId:string,qitemId:string,q:any):boolean {
+  if(q.sourceSession!=='watchdog@system'||q.destinationSession!=='operator-agent@kernel')return false;
+  const creation=this.db.prepare('SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1').get(qitemId) as any;
+  if(creation?.actor_session!=='watchdog@system'||creation?.identity_provenance!=='system:operator-authorized-coordination')return false;
+  let h:any;try{h=JSON.parse(q.body);}catch{return false;}
+  if(h.rigId!==rigId||h.grantsAuthority!==false||typeof h.reason!=='string'||typeof h.packageKey!=='string')return false;
+  return qitemId==='qitem-coordination-task-hold-'+digest(JSON.stringify({rigId:h.rigId,revision:h.planRevision,operatorGeneration:h.recipientGeneration,packageKey:h.packageKey,reason:h.reason,queueId:h.retainedQueueId??null})).slice(0,24);
+ }
+ /** A chain successor is valid only when it follows a genuine member of the same chain
+   * and its id is exactly the derived next id, so a spoofed item cannot extend a chain. */
+ private validAccountableIntakeChainItem(rigId:string,q:any,rootQueueId:string):boolean {
+  const qitemId=q.qitemId;
+  if(!qitemId||q.sourceSession!=='watchdog@system'||q.destinationSession!=='operator-agent@kernel')return false;
+  const creation=this.db.prepare('SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1').get(qitemId) as any;
+  if(creation?.actor_session!=='watchdog@system'||creation?.identity_provenance!=='system:operator-authorized-coordination')return false;
+  let h:any;try{h=JSON.parse(q.body);}catch{return false;}
+  if(h.rigId!==rigId||h.grantsAuthority!==false||h.rootQueueId!==rootQueueId||h.renewsIntakeQueueId!==rootQueueId||typeof h.previousIntakeQueueId!=='string'||!this.repo.getById(h.previousIntakeQueueId))return false;
+  const recorded=this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind='coordination-intake-chain' AND operation_id=?").get(rigId,'coordination-intake-chain:'+qitemId);
+  return !!recorded&&qitemId===this.nextIntakeChainId(rootQueueId,h.previousIntakeQueueId);
+ }
+ /** The accountable subject of a held result, resolved identically for the first intake
+   * and for renewal: a plan task, a missing attributed return, the retained lifecycle
+   * control receipt, or the administrative boundary key. Renewal therefore never goes
+   * silent just because a lifecycle or administrative key has no plan task. */
+ private intakeHoldSubject(rigId:string,held:CoordinationResult,missingReturns:ReadonlyArray<{package_key:string;destination:string}>=[],forRenewal=false):{packageKey:string;owner:string}|null {
+  if(held.state!=='held'||!INTAKE_ROUTED_REASONS.includes(held.reason??''))return null;
+  // A frontier hold can precede any duty row; its own subject is authoritative.
+  if(held.subject)return {packageKey:held.subject.packageKey,owner:held.subject.owner};
+  const plan=this.plan(rigId);if(!plan)return null;
+  const missing=missingReturns.find(m=>'terminal-return:'+m.package_key===held.key);
+  const control=held.queueId?this.lifecycleControl(held.queueId)?.receipt:null,administrative=held.key.startsWith('outcome-qualification-refresh:')?{packageKey:held.key.slice('outcome-qualification-refresh:'.length),owner:'operator-agent@kernel'}:null;
+  // Renewal keeps the original package key resolution for a terminal return whose
+  // control row is already consumed; first staging still needs a real subject.
+  const terminal=forRenewal&&held.key.startsWith('terminal-return:')?{packageKey:held.key.slice('terminal-return:'.length),owner:control?.recipient??'operator-agent@kernel'}:null;
+  return plan.tasks.find(t=>t.key===held.key)??(missing?{packageKey:missing.package_key,owner:missing.destination}:control?{packageKey:control.packageKey,owner:control.recipient}:terminal??administrative);
+ }
+ /** One deterministic accountable intake per held reason and prior link; it is a fresh
+   * finite recovery item, never renewed authority for any predecessor. */
+ private stageTaskHoldIntake(rigId:string,a:any,plan:CoordinationPlan,held:CoordinationResult,missingReturns:ReadonlyArray<{package_key:string;destination:string}>):void {
+  const task=this.intakeHoldSubject(rigId,held,missingReturns);if(!task)return;
+  const rootId='qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:plan.revision,operatorGeneration:plan.operatorGeneration,packageKey:task.packageKey,reason:held.reason,queueId:held.queueId??null,...(held.subject?{subjectIdentity:held.subject.identity}:{})})).slice(0,24);
+  // One mechanism answers each routed reason exactly once. Every reason gets a single
+  // deterministic first intake at the root id. Only lifecycle and administrative holds,
+  // whose accountability must outlive any one intake window, renew through the chain;
+  // terminal-return exhaustion keeps its registered-observer lineage succession, and every
+  // other routed reason keeps its original single deterministic intake, untouched.
+  let renewed=false,queueId=rootId,chainRoot=rootId,priorItem:any=null;
+  if(LIFECYCLE_INTAKE_RENEWAL_REASONS.includes(held.reason??'')){
+   const chain=this.intakeChainTail(rigId,plan,held,task);
+   if(!chain)return;
+   chainRoot=chain.rootQueueId;priorItem=chain.tail;
+   if(priorItem&&this.intakeStillAccounted(priorItem))return;
+   renewed=!!priorItem;queueId=renewed?this.nextIntakeChainId(chainRoot,priorItem.qitemId):chainRoot;
+  }else if(this.repo.getById(rootId))return;
+   try {this.db.transaction(()=>{if(!this.repo.getById(queueId)){
+    const deadline=this.now()+1200000;
+    this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:new Date(deadline).toISOString(),body:JSON.stringify({action:'resolve-exact-coordination-task-hold',rigId,planRevision:plan.revision,packageKey:task.packageKey,taskOwner:task.owner,reason:held.reason,retainedQueueId:held.queueId??null,recipientGeneration:plan.operatorGeneration,deadline,grantsAuthority:false,returnPath:a.owner_session,...(renewed?{rootQueueId:chainRoot,previousIntakeQueueId:priorItem.qitemId,renewsIntakeQueueId:chainRoot,renewalNote:'The previous finite intake for this same held reason reached its deadline while the hold persisted. This is a new finite accountable intake, not renewed authority; prior claims, effects and notices stand, and no prior deadline is extended.'}:{}),...(held.reason==='terminal-return-duty-exhausted'?{nextAction:'For an expired still-claimed control: claim this intake genuinely; the registered Operator observer can stage finite failure-only retirement when native idle and effects are proven. The original worker records failed/canceled; then use coordination-return-successor. Never extend expiry or cancel on the worker behalf.'}:{}),required:'Claim this bounded recovery and inspect the exact current task, native identity and custody. Repair an expired admission only from current qualified evidence. Reconcile uncertain effects through supported disposition without assuming delivery or retrying unknown effects. For a retained pre-ledger row, preserve it and have the current Lead define a distinct admitted follow-up contract when needed; never forge an assignment or reopen terminal history. Return supported resolution evidence or a named protected boundary. Reconcile eligible independent product frontier afterward; this control item grants no acceptance, product qualification, checkpoint release or dispatch authority.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
+    this.repo.stageWakeIntent(queueId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,plan.operatorGeneration);
+    const notice=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+queueId) as any;if(!notice?.body)throw new Error('accountable intake wake intent missing');
+    // The chain is durable and hash-bound, so any later reader can prove this exact
+    // notice belongs to this exact accountable item.
+    const chainReceipt={rigId,rootQueueId:chainRoot,queueId,previousIntakeQueueId:renewed?priorItem.qitemId:null,packageKey:task.packageKey,reason:held.reason,retainedQueueId:held.queueId??null,operatorGeneration:plan.operatorGeneration,planRevision:plan.revision,grantsAuthority:false,noticeBodyHash:digest(notice.body)};
+    this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'coordination-intake-chain:'+queueId,'coordination-intake-chain',JSON.stringify(chainReceipt),digest(JSON.stringify(chainReceipt)));
+   }})();}catch(error){
+    const code=heldDispatchCode(error);if(!code)throw error;
+    const receipt={rigId,packageKey:task.packageKey,reason:code,owner:'operator-agent@kernel',action:'Resolve native Operator reservation before exact recovery intake',grantsAuthority:false};
+    this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'coordination-intake-hold:'+digest(queueId+':'+code),'coordination-intake-hold',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   }
+  }
  private exhaustionIntakeProvenance(rigId:string,queueId:string,controlQueueId:string,packageKey:string):boolean {
   const q=this.repo.getById(queueId),h=q?JSON.parse(q.body):null,creation=this.db.prepare('SELECT state,actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1').get(queueId) as any;
   const expected=h?'qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:h.planRevision,operatorGeneration:h.recipientGeneration,packageKey,reason:'terminal-return-duty-exhausted',queueId:controlQueueId})).slice(0,24):null;
@@ -439,6 +702,8 @@ export class CoordinationRecoveryService {
      if(!r.session||r.generation!==this.authority.generation(r.session)||!Array.isArray(r.packageKeys)||!r.packageKeys.length||new Set(r.packageKeys).size!==r.packageKeys.length||r.packageKeys.some(key=>!plan.tasks.some(t=>t.owner===r.session&&t.packageKey===key))||!Number.isFinite(r.validUntil)||r.validUntil<=this.now()||typeof r.evidenceRef!=='string'||!r.evidenceRef.trim())fail('coordination_invalid_dispatch_scope','Exact current owner, admitted packages, future expiry and evidence required');
     }
    }
+  if(plan.scopeSources!==undefined&&(!Array.isArray(plan.scopeSources)||new Set(plan.scopeSources.map(s=>s?.ref)).size!==plan.scopeSources.length||plan.scopeSources.some(s=>!s||typeof s.ref!=='string'||!s.ref.trim()||typeof s.digest!=='string'||!/^[0-9a-f]{64}$/.test(s.digest))))fail('coordination_invalid_scope_sources','Unique scope refs with exact sha256 digests required');
+  if(plan.frontierPlanning!==undefined&&(plan.frontierPlanning===null||typeof plan.frontierPlanning!=='object'||(plan.frontierPlanning.stabilizationObservations!==undefined&&(!Number.isSafeInteger(plan.frontierPlanning.stabilizationObservations)||plan.frontierPlanning.stabilizationObservations<1||plan.frontierPlanning.stabilizationObservations>64))||(plan.frontierPlanning.stabilizationMs!==undefined&&(!Number.isSafeInteger(plan.frontierPlanning.stabilizationMs)||plan.frontierPlanning.stabilizationMs<0||plan.frontierPlanning.stabilizationMs>3600000))))fail('coordination_invalid_frontier_planning','Bounded explicit stabilization configuration required');
    const prior=this.plan(plan.rigId);
    const stable=(t:CoordinationTask)=>JSON.stringify({...t,admission:undefined,deadline:undefined});
    const keys=new Set(plan.tasks.map(t=>t.key));
@@ -479,6 +744,7 @@ export class CoordinationRecoveryService {
      this.repo.stageWakeIntent(queueId,actor,r.session,'system:operator-authorized-coordination',true,r.generation);
     }
    }
+   for(const row of this.db.prepare("SELECT operation_id FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control'").all(plan.rigId) as Array<{operation_id:string}>)this.observeDuty(row.operation_id);
    this.recordProgress(plan.rigId);
    return plan;
   }).immediate();
@@ -487,6 +753,28 @@ export class CoordinationRecoveryService {
   const rows=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordination-plan' ORDER BY rowid DESC LIMIT 1").get(rigId) as {receipt:string}|undefined;
   return rows?JSON.parse(rows.receipt):null;
  }
+ /** The whole frontier integration surface. Every frontier decision lives in
+  * `frontier-planning.ts`; this adapter only binds it to the shared facets. */
+ private frontierPlanner?:FrontierPlanning;
+ frontierPlanning():FrontierPlanning {
+  if(!this.frontierPlanner)this.frontierPlanner=new FrontierPlanning({db:this.db,now:()=>this.now(),generation:s=>this.authority.generation(s),authorityRecord:rigId=>this.authority.get(rigId)??null,plan:rigId=>this.plan(rigId),lifecycleControlCompleted:queueId=>this.lifecycleControlCompleted(queueId),actAllowed:(queueId,actor,generation)=>this.frontierDutyActAllowed(queueId,actor,generation),issueLifecycleDuty:input=>this.lifecycleDuty(input.rigId,input.kind,input.packageKey,input.recipient,input.recipientGeneration,input.semanticKey,input.details),admittedNow:t=>this.admittedNow(t),dispatchScopeHold:(plan,t)=>this.dispatchScopeHold(plan,t),effectDebt:session=>this.workerEffectDebt(session),requiresRecovery:(rigId,packageKey)=>this.authority.runtimeOutcomeAssessment?.requiresRecovery(rigId,packageKey)??false,admitPackage:(actor,generation,rigId,packageKey,contract)=>this.authority.admit(actor,generation,rigId,packageKey,contract)});
+  return this.frontierPlanner;
+ }
+ /** The shared Act facet itself: exact recipient identity and generation, a genuine
+  *  transport:v1 claim, and dutyFacts().act. Never the send predicate. */
+ private frontierDutyActAllowed(queueId:string,actor:string,generation:string):boolean {
+  return this.lifecycleControlActAllowed(queueId,actor,generation,'transport:v1')&&this.dutyFacts(queueId).act;
+ }
+ /** Genuine current Lead records its one typed planning disposition. */
+ recordFrontierPlan(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;frontierDigest:string;disposition:string;proposal?:unknown;mapping?:unknown;boundary?:unknown;unblockCondition?:unknown}):FrontierPlanReceipt {return this.frontierPlanning().recordFrontierPlan(actor,generation,input);}
+ /** Genuine current Operator registers the cited proposal or refuses it once. */
+ admitFrontierProposal(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;proposalDigest:string;admitted?:unknown;declined?:unknown}):FrontierAdmissionReceipt {return this.frontierPlanning().admitFrontierProposal(actor,generation,input);}
+ /** Genuine current Operator independently confirms the Lead's recorded completion. */
+ recordFrontierConfirmation(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;completionDigest:string;evidenceRef:string}):FrontierConfirmationReceipt {return this.frontierPlanning().recordFrontierConfirmation(actor,generation,input);}
+ /** Genuine current Operator records that a recorded blocked or declined disposition is discharged. */
+ recordFrontierReopen(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;dispositionDigest:string;evidenceRef:string}):FrontierReopenReceipt {return this.frontierPlanning().recordFrontierReopen(actor,generation,input);}
+ /** Read-only frontier census for the current Operator. Never a finding of completeness. */
+ frontierProjection(rigId:string):FrontierSnapshot|null {return this.frontierPlanning().frontier(rigId);}
  reconcile(actor:string,generation:string,rigId:string):CoordinationResult[] {
   return this.db.transaction(()=>{
    const a=this.authority.get(rigId),plan=this.plan(rigId);
@@ -552,7 +840,7 @@ export class CoordinationRecoveryService {
    }
    // A terminal UI state is not an attributed return. Detect retained scope even
    // when that completed assignment is absent from the latest dispatch plan.
-   const missingReturns=this.db.prepare("SELECT a.package_key,a.queue_id,a.destination,a.body_hash,q.body,q.ts_updated,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.disposition_id IS NULL AND q.state IN ('done','failed','denied','canceled','handed-off')").all(rigId) as Array<{package_key:string;queue_id:string;destination:string;body_hash:string;body:string;ts_updated:string;claimed_by_generation_uuid:string|null;contract:string}>;
+   const missingReturns=this.missingAttributedReturns(rigId);
    for(const missing of missingReturns){
     const current=this.authority.generation(missing.destination),contract=JSON.parse(missing.contract);
     const restriction=plan!.dispatchRestrictions?.find(r=>r.session===missing.destination);
@@ -573,22 +861,9 @@ export class CoordinationRecoveryService {
    }
    // Configuration/effect holds need real recovery custody, not only a diagnostic
    // string. Control intake grants no dispatch, acceptance or history authority.
-   for(const held of result){
-    if(held.state!=='held'||!['current-admission-required','uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict','terminal-return-incarnation-changed','terminal-return-contract-drift','terminal-return-duty-exhausted','terminal-return-seat_dispatch_reserved','terminal-return-coordinator_resource_conflict'].includes(held.reason??''))continue;
-    const missing=missingReturns.find(m=>'terminal-return:'+m.package_key===held.key);
-    const task=plan!.tasks.find(t=>t.key===held.key)??(missing?{packageKey:missing.package_key,owner:missing.destination}:undefined);if(!task)continue;
-    const queueId='qitem-coordination-task-hold-'+digest(JSON.stringify({rigId,revision:plan!.revision,operatorGeneration:plan!.operatorGeneration,packageKey:task.packageKey,reason:held.reason,queueId:held.queueId??null})).slice(0,24);
-    try {this.db.transaction(()=>{if(!this.repo.getById(queueId)){
-     const deadline=this.now()+1200000;
-     this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:new Date(deadline).toISOString(),body:JSON.stringify({action:'resolve-exact-coordination-task-hold',rigId,planRevision:plan!.revision,packageKey:task.packageKey,taskOwner:task.owner,reason:held.reason,retainedQueueId:held.queueId??null,recipientGeneration:plan!.operatorGeneration,deadline,grantsAuthority:false,returnPath:a!.owner_session,...(held.reason==='terminal-return-duty-exhausted'?{nextAction:'For an expired still-claimed control: claim this intake genuinely; the registered Operator observer can stage finite failure-only retirement when native idle and effects are proven. The original worker records failed/canceled; then use coordination-return-successor. Never extend expiry or cancel on the worker behalf.'}:{}),required:'Claim this bounded recovery and inspect the exact current task, native identity and custody. Repair an expired admission only from current qualified evidence. Reconcile uncertain effects through supported disposition without assuming delivery or retrying unknown effects. For a retained pre-ledger row, preserve it and have the current Lead define a distinct admitted follow-up contract when needed; never forge an assignment or reopen terminal history. Return supported resolution evidence or a named protected boundary. Reconcile eligible independent product frontier afterward; this control item grants no acceptance, product qualification, checkpoint release or dispatch authority.'}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
-     this.repo.stageWakeIntent(queueId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,plan!.operatorGeneration);
-    }})();}catch(error){
-     const code=heldDispatchCode(error);if(!code)throw error;
-     const receipt={rigId,packageKey:task.packageKey,reason:code,owner:'operator-agent@kernel',action:'Resolve native Operator reservation before exact recovery intake',grantsAuthority:false};
-     this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'coordination-intake-hold:'+digest(queueId+':'+code),'coordination-intake-hold',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
-    }
-   }
-   result.push(...lifecycle,...this.repo.observeOutboxAbandonNotifications(rigId,plan!.operatorGeneration));
+   result.push(...lifecycle);
+   for(const held of result)this.stageTaskHoldIntake(rigId,a!,plan!,held,missingReturns);
+   result.push(...this.repo.observeOutboxAbandonNotifications(rigId,plan!.operatorGeneration));
    // Observation ages are diagnostics, not new work or a new reconciliation state.
    const stableResult=result.map(({activityEvidence,...state})=>state);
    const operationId=`coordination-reconcile:${digest(JSON.stringify({revision:plan!.revision,epoch:a!.epoch,result:stableResult}))}`;
@@ -607,12 +882,17 @@ export class CoordinationRecoveryService {
   if(r.validUntil<=this.now())return 'dispatch-scope-expired';
   return r.packageKeys.includes(t.packageKey)?null:'checkpoint-quiescence';
  }
- private workerEffectDebt(session:string,excludeEffect?:string):boolean {
+ private workerEffectDebt(session:string,excludeEffect?:string|string[]):boolean {
   const addresses=rotationLocalAddresses(this.db,session);
   const rig=this.db.prepare('SELECT n.rig_id FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(session) as {rig_id:string}|undefined;
   const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session IN (?,?) OR destination_session IN (?,?))").all(...addresses,...addresses) as Record<string,unknown>[];
-  return effects.some(row=>row.outbox_id!==excludeEffect&&(!rig||!this.authority.isAdoptedHistoryContained(rig.rig_id,row)));
- }
+  return effects.some(row=>{
+   if(Array.isArray(excludeEffect)?excludeEffect.includes(String(row.outbox_id)):row.outbox_id===excludeEffect)return false;
+   const outboxId=String(row.outbox_id??''),control=outboxId.startsWith('wake-intent-')?this.lifecycleControl(outboxId.slice('wake-intent-'.length)):null,effectRig=control?.rigId??rig?.rig_id;
+if(!effectRig)return true;
+    return !this.authority.isAdoptedHistoryContained(effectRig,row)&&!this.heldHistoryNoticeOutcomeContained(effectRig,row);
+   });
+  }
  private admittedNow(t:CoordinationTask):boolean {
   return t.admission.validUntil>this.now()&&t.admission.generation===this.authority.generation(t.owner)&&t.admission.configurationDigest===this.configurationDigest(t.owner);
  }
