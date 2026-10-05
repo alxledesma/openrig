@@ -1618,10 +1618,10 @@ export class QueueRepository {
   }
   /** Administrative authoring alone may coexist with an exact terminal receipt
    * notice. UNKNOWN transport stays terminal and is never selected or replayed. */
-  heldHistoryAuthoringDebtReady(rigId:string,recipient:string,excludeEffect?:string):boolean {
+  heldHistoryAuthoringDebtReady(rigId:string,recipient:string,excludeEffect?:string|string[]):boolean {
     if(!this.outbox)return false;
     const rows=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session=? OR destination_session=?)").all(recipient,recipient) as Array<Record<string,unknown>&{outbox_id:string}>;
-    for(const row of rows){if(row.outbox_id===excludeEffect||this.coordinatorAuthority.isAdoptedHistoryContained(rigId,row))continue;
+    for(const row of rows){if((Array.isArray(excludeEffect)?excludeEffect.includes(row.outbox_id):row.outbox_id===excludeEffect)||this.coordinatorAuthority.isAdoptedHistoryContained(rigId,row)||this.coordinatorAuthority.coordinationRecovery?.heldHistoryNoticeOutcomeContained(rigId,row))continue;
       if(row.delivery_state!=='indeterminate')return false;
       if(!row.outbox_id.startsWith(WAKE_INTENT_PREFIX)){if(row.guard_binding)return false;try{const effect=this.outbox.getById(row.outbox_id)!;const generation=this.coordinatorAuthority.generation(effect.destinationSession);if(!generation)return false;this.outbox.recipientAcknowledgmentContract(effect.destinationSession,generation,effect.outboxId);continue;}catch{return false;}}
       const id=row.outbox_id.slice(WAKE_INTENT_PREFIX.length),r=this.recipientAckDuty(id),q=this.getById(id),last=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(id) as any,claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(id) as any;
@@ -2704,7 +2704,7 @@ export class QueueRepository {
         `qitem ${input.qitemId} not found`
       );
     }
-    if(input.state!==undefined)this.assertAdministrativeClaimant(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance);
+    if(input.state!==undefined&&!(['failed','canceled'].includes(input.state)&&this.coordinatorAuthority.coordinationRecovery?.heldHistoryRetirementAllows(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance)))this.assertAdministrativeClaimant(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance);
     if(this.abandonmentAuthorization(input.qitemId)&&input.state!==undefined&&((qitem.claimedAt&&input.state==='pending')||(isTerminalState(qitem.state)&&input.state!==qitem.state)))throw new QueueRepositoryError('outbox_authorization_custody_required','Preserve administrative history; exact current claimant must report own failed/canceled expiry, never unclaim or reopen it');
     if(input.state==='done'||input.state==='handed-off')this.assertNativeTerminalReturnCompleted(input.qitemId);
     const hasNote = typeof input.transitionNote === "string" && input.transitionNote.trim().length > 0;
