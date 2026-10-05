@@ -325,7 +325,16 @@ export class RunnerCore {
       this.io.mirrorLine(`you (steer) ▸ ${block}`);
       return;
     }
-    this.io.sendRpc({ type: "prompt", message: block });
+    // Pi stays "processing" from agent_start until agent_settled — retries,
+    // overflow recovery, automatic compaction and before-settle continuations
+    // all run AFTER `agent_end` while isStreaming is still true (docs/rpc.md:
+    // "agent_end marks the end of one low-level agent run… wait for
+    // agent_settled"). A bare prompt in that window is rejected with
+    // "Agent is already processing", losing the message. Declaring followUp
+    // keeps both cases correct on one RPC: idle → ignored, starts normally;
+    // busy-but-not-mirrored-streaming → queued and delivered when the agent
+    // stops. No retry, no duplicate replay.
+    this.io.sendRpc({ type: "prompt", message: block, streamingBehavior: "followUp" });
     this.io.mirrorLine(`you ▸ ${block}`);
   }
 

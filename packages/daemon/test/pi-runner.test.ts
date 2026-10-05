@@ -114,7 +114,8 @@ describe("runner input", () => {
       core.handlePiLine(JSON.stringify({ type: "agent_start" }));
       t.input.write(start + "second" + end + "\r/followup later\r/abort\r");
       expect(rpc.filter(x => ["prompt", "steer", "follow_up", "abort"].includes(String(x.type)))).toEqual([
-        { type: "prompt", message: "first" }, { type: "steer", message: "second" },
+        { type: "prompt", message: "first", streamingBehavior: "followUp" },
+        { type: "steer", message: "second" },
         { type: "follow_up", message: "later" }, { type: "abort" },
       ]);
     } finally { t.editor.close(); }
@@ -202,7 +203,7 @@ describe("RunnerCore.handleUserBlock", () => {
   it("idle → RPC prompt", () => {
     const { core, rpc } = readyCore();
     core.handleUserBlock("hello pi");
-    expect(rpc.at(-1)).toEqual({ type: "prompt", message: "hello pi" });
+    expect(rpc.at(-1)).toEqual({ type: "prompt", message: "hello pi", streamingBehavior: "followUp" });
   });
 
   it("streaming → RPC steer (Pi's documented mid-stream delivery)", () => {
@@ -217,7 +218,36 @@ describe("RunnerCore.handleUserBlock", () => {
     core.handlePiLine(JSON.stringify({ type: "agent_start" }));
     core.handlePiLine(JSON.stringify({ type: "agent_end" }));
     core.handleUserBlock("next task");
-    expect(rpc.at(-1)).toEqual({ type: "prompt", message: "next task" });
+    // agent_end stops the low-level run, but Pi keeps isStreaming=true until
+    // agent_settled; the followUp declaration makes this same RPC correct in
+    // both cases (idle: ignored, started; still-processing: queued).
+    expect(rpc.at(-1)).toEqual({ type: "prompt", message: "next task", streamingBehavior: "followUp" });
+  });
+
+  it("busy window after agent_end (compaction while mirrored idle) → prompt queues via followUp, never a bare rejected prompt", () => {
+    // Live symptom reproduction: agent_end flips the runner's streaming mirror
+    // to false, then automatic compaction runs while Pi's isStreaming is
+    // still true. A bare prompt there got "ERROR rpc: Agent is already
+    // processing…" and the message was lost.
+    const { core, rpc } = readyCore();
+    core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    core.handlePiLine(JSON.stringify({ type: "compaction_start" }));
+    core.handleUserBlock("queued during compaction");
+    expect(rpc.at(-1)).toEqual({ type: "prompt", message: "queued during compaction", streamingBehavior: "followUp" });
+    // Exactly one RPC for the message: no steer/prompt pair, no replay.
+    expect(rpc.filter((c) => c.message === "queued during compaction")).toHaveLength(1);
+  });
+
+  it("compaction events alone never flip the streaming mirror or bypass steer mid-stream", () => {
+    const { core, rpc } = readyCore();
+    core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    core.handlePiLine(JSON.stringify({ type: "compaction_start" }));
+    core.handleUserBlock("still steering mid-stream");
+    expect(rpc.at(-1)).toEqual({ type: "steer", message: "still steering mid-stream" });
+    core.handlePiLine(JSON.stringify({ type: "compaction_end" }));
+    core.handleUserBlock("still steering after compaction_end");
+    expect(rpc.at(-1)).toEqual({ type: "steer", message: "still steering after compaction_end" });
   });
 
   it("/abort → RPC abort; /followup → RPC follow_up", () => {
