@@ -56,6 +56,21 @@ describe('runtime outcome enforcement',()=>{
   const originalDeadline=Date.parse(q.expiresAt!);clock=originalDeadline+1;vi.setSystemTime(clock);expect(r.stagePolicyBoundary('xv')).toBe(id);const retirement=JSON.parse((db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='lifecycle-retirement' AND json_extract(receipt,'$.targetQueueId')=?").get(id) as {receipt:string}).receipt);expect(retirement.deadline).toBeLessThanOrEqual(clock+1200000);expect(repo.getById(id)?.claimedAt).toBeTruthy();repo.update({qitemId:id,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'failed',transitionNote:'actual native expired-duty failure'});expect(svc.dutyFacts(id)).toMatchObject({failedByRecipient:true,retired:true});expect(r.stagePolicyBoundary('xv')).not.toBe(id);await svc.deliverCommitted();const successor=r.stagePolicyBoundary('xv')!;expect(successor).not.toBe(id);const successorReceipt=svc.lifecycleControlReceipt(successor);expect(successorReceipt).toMatchObject({kind:'outcome-qualification-refresh',previousQueueId:id,qualificationRef:policy.qualification.ref,deadline:expect.any(Number)});expect(successorReceipt.deadline).toBeLessThanOrEqual(clock+1200000);expect(repo.getById(id)?.expiresAt).toBe(q.expiresAt);expect(repo.getById(successor)?.expiresAt).not.toBe(q.expiresAt);
   db.prepare("UPDATE occupant_tenures SET generation_uuid='operator-agent-g2' WHERE node_id='operator-agent@kernel'").run();expect(r.stagePolicyBoundary('xv')).toBeNull();
  });
+ it('successive refresh binds latest expired overlay while retaining immutable logical policy digest',()=>{
+  configure(normal());const r=outcome(reply());const original=storedPolicy();
+  clock=original.qualification.validUntil+1;vi.setSystemTime(clock);db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+3600000);
+  const first=r.stagePolicyBoundary('xv')!;repo.claim({qitemId:first,destinationSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1'});
+  const one=qualificationRefresh(original,first);r.refreshQualification('operator-agent@kernel','operator-agent-g1',one);
+  repo.update({qitemId:first,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+  clock=one.qualification.validUntil+1;vi.setSystemTime(clock);
+  const second=r.stagePolicyBoundary('xv')!;expect(second).toBeTruthy();expect(second).not.toBe(first);
+  expect(svc.lifecycleControlReceipt(second)).toMatchObject({qualificationRef:one.qualification.ref,policyDigest:digest(JSON.stringify(original))});
+  repo.claim({qitemId:second,destinationSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1'});
+  const two={...qualificationRefresh(original,second),operationId:'second-proof',qualification:{...one.qualification,ref:'actual-second-dated-proof',validUntil:clock+60000}};
+  r.refreshQualification('operator-agent@kernel','operator-agent-g1',two);
+  expect(storedPolicy()).toEqual(original);expect(r.policy('xv')?.qualification).toEqual(two.qualification);
+  expect(svc.dutyFacts(second)).toMatchObject({complete:true});
+ });
  it('qualification refresh is authorized only by the exact claimed expired-qualification duty, never another claimed Operator duty',()=>{
    configure(normal());const r=outcome(reply());const p=r.policy('xv')!;
    repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv','unplanned',{inputDigest:digest('unplanned'),destination:'builder@xv',bodyHash:digest('unplanned'),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
