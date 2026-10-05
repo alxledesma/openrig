@@ -273,10 +273,114 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
   const proof=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind') IN ('held-history-retirement','lifecycle-retirement') AND json_extract(receipt,'$.targetQueueId')=? ORDER BY rowid DESC LIMIT 1").get(rigId,qid) as any;if(!proof)return false;
   const t=JSON.parse(proof.receipt),d=this.repo.getById(t.queueId),claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(t.queueId) as any;return !!d?.claimedAt&&claim?.claimed_by_generation_uuid===r.recipientGeneration;
  }
+ /** System administrative actions whose pointed-to task may carry an
+  *  outcome-only receipt. Nothing here can grant product authority. */
+ private static readonly SYSTEM_WAKE_ACTIONS=['materialize-standard-resilience','resolve-exact-coordination-task-hold'] as readonly string[];
+ private static readonly SYSTEM_WAKE_ROLLOUT='materialize-standard-resilience';
+ private static readonly SYSTEM_WAKE_HOLD='resolve-exact-coordination-task-hold';
+ /** The exact pointer-wake template. A wake carrying instructions is never eligible. */
+ private systemPointerNotice(row:any,qid:string,recipient:string):boolean {
+  if(row.outbox_id!=='wake-intent-'+qid||row.sender_session!=='watchdog@system'||row.destination_session!==recipient||row.audit_pointer!==qid)return false;
+  if(this.db.prepare('SELECT 1 FROM outbox_historical_quarantines WHERE outbox_id=?').get(row.outbox_id))return false;
+  const parts=String(row.body??'').split('\n---\n');
+  if(parts.length!==3)return false;
+  if(parts[0]?.startsWith('From: watchdog@system\nTo: '+recipient+'\nSent: ')!==true)return false;
+  return parts[1]==='Queue handoff: '+qid+' - check your queue.'&&parts[2]==='↩ Reply: rig send watchdog@system "..."';
+ }
+ /** Validated origin of the pointed-to task. Rollout items must recompute their
+  *  deterministic id from the persisted rolloutKey, rig, Operator generation and
+  *  reasons, so a body action alone never qualifies. */
+ private systemTaskProof(qid:string,recipient:string):{rigId:string;action:string;body:any;bodyHash:string}|null {
+  const q=this.repo.getById(qid);if(!q||q.sourceSession!=='watchdog@system'||q.destinationSession!==recipient)return null;
+  const first=this.db.prepare('SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1').get(qid) as any;
+  if(first?.actor_session!=='watchdog@system'||first?.identity_provenance!=='system:operator-authorized-coordination')return null;
+  let body:any;try{body=JSON.parse(q.body);}catch{return null;}
+  if(!body||typeof body.rigId!=='string'||!body.rigId||typeof body.recipientGeneration!=='string'||!body.recipientGeneration)return null;
+  if(body.grantsAuthority!==undefined&&body.grantsAuthority!==false)return null;
+  const action=String(body.action??'');
+  if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
+   if(!Array.isArray(body.reasons)||!body.reasons.length||typeof body.rolloutKey!=='string'||!body.rolloutKey)return null;
+   const rolloutKey=digest(body.rigId+':'+body.recipientGeneration+':'+body.reasons.join('|'));
+   if(rolloutKey!==body.rolloutKey)return null;
+   if('qitem-resilience-rollout-'+digest(rolloutKey+':'+(body.previousQueueId??'initial')).slice(0,24)!==qid)return null;
+  }else if(action===CoordinationRecoveryService.SYSTEM_WAKE_HOLD){
+   if(!this.validAccountableIntake(body.rigId,qid,q)&&!(typeof body.rootQueueId==='string'&&this.validAccountableIntakeChainItem(body.rigId,q,body.rootQueueId)))return null;
+  }else if(!CoordinationRecoveryService.SYSTEM_WAKE_ACTIONS.includes(action))return null;
+  return {rigId:body.rigId,action,body,bodyHash:digest(q.body)};
+ }
+ /** Genuine native custody is the outcome: the exact recipient, its current
+  *  generation, a transport:v1 claim, and a non-pending state. */
+ private systemNativeCustody(qid:string,recipient:string,expectedGeneration:string):boolean {
+  const q=this.repo.getById(qid);if(!q||!['in-progress','blocked','done','failed','canceled'].includes(q.state))return false;
+  const claim=this.db.prepare("SELECT * FROM queue_transitions WHERE qitem_id=? AND state='in-progress' AND transition_note='claimed' AND actor_session=? AND identity_provenance='transport:v1' ORDER BY transition_id LIMIT 1").get(qid,recipient) as any;
+  if(!claim)return false;
+  const row=this.db.prepare('SELECT claimed_by_generation_uuid,claimed_at FROM queue_items WHERE qitem_id=?').get(qid) as any;
+  const generation=this.authority.generation(recipient);
+  return row?.claimed_by_generation_uuid===generation&&generation===expectedGeneration;
+ }
+ /** A holder is deliberately not required: rollout items exist precisely when a
+  *  rig has none. Without a plan only a genuine current Operator plus recomputed
+  *  rollout provenance qualifies, so a pre-plan task is never orphaned. */
+ private systemWakeAuthority(rigId:string,recipient:string,generation:string,action:string):boolean {
+  const plan=this.plan(rigId);
+  if(plan)return plan.operatorGeneration===generation;
+  return action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT&&recipient==='operator-agent@kernel'&&this.authority.generation(recipient)===generation;
+ }
+ private systemWakeOutcomeProof(rigId:string,row:any):{task:any;generation:string}|null {
+  const id=String(row.outbox_id??'');
+  if(!id.startsWith('wake-intent-')||row.delivery_state!=='indeterminate')return null;
+  const task=this.systemTaskProof(id.slice('wake-intent-'.length),String(row.destination_session??''));if(!task||task.rigId!==rigId)return null;
+  if(!this.systemPointerNotice(row,id.slice('wake-intent-'.length),String(row.destination_session??'')))return null;
+  if(task.body.recipientGeneration!==this.systemTaskGeneration(task))return null;
+  const generation=this.authority.generation(String(row.destination_session??''));
+  if(!generation||!this.systemNativeCustody(id.slice('wake-intent-'.length),String(row.destination_session??''),task.body.recipientGeneration))return null;
+  if(!this.systemWakeAuthority(rigId,String(row.destination_session??''),generation,task.action))return null;
+  return {task,generation};
+ }
+ private systemTaskGeneration(task:any):string {return String(task.body.recipientGeneration??'');}
+ /** The rig of a wake row, resolved through its validated system task rather
+  *  than the endpoints' node membership. This is what kernel seats need. */
+ private systemTaskRig(row:any):string|null {
+  const id=String(row.outbox_id??'');if(!id.startsWith('wake-intent-'))return null;
+  return this.systemTaskProof(id.slice('wake-intent-'.length),String(row.destination_session??''))?.rigId??null;
+ }
+ /** Outcome-only containment. The notice row is never written, relabelled or
+  *  acknowledged: `deliveryConclusion` stays unknown for ever. */
+ private systemWakeOutcomeContained(rigId:string,row:any):boolean {
+  const taskRig=this.systemTaskRig(row);if(!taskRig||!this.systemWakeOutcomeProof(taskRig,row))return false;
+  const proof=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='system-wake-outcome' AND operation_id=?").get(taskRig,'system-wake-outcome:'+row.outbox_id) as any;
+  if(!proof)return false;
+  try{const p=JSON.parse(proof.receipt);return p.outboxId===row.outbox_id&&p.noticeSnapshotHash===digest(JSON.stringify(row))&&p.taskBodyHash===digest(this.repo.getById(p.taskQueueId)?.body??'')&&p.deliveryConclusion==='unknown'&&p.originalMutations===0&&p.outcomeOnly===true&&p.grantsAuthority===false;}catch{return false;}
+ }
+ /** One bounded scan per pass, written by the registered observer path only. */
+ private recordSystemWakeOutcomes(rigId:string):void {
+  // Paged, and the rig is resolved per row before anything is written, so a busy
+  // project can never starve another project's older notice.
+  let from=0,scanned=0;
+  while(scanned<2000){
+   const rows=this.db.prepare("SELECT o.rowid AS scan_rowid,o.* FROM outbox_entries o JOIN queue_items q ON q.qitem_id=o.audit_pointer WHERE o.rowid>? AND o.delivery_state='indeterminate' AND o.outbox_id='wake-intent-'||q.qitem_id AND q.source_session='watchdog@system' AND q.state IN ('in-progress','blocked','done','failed','canceled') AND json_valid(q.body) AND json_extract(q.body,'$.rigId')=? AND NOT EXISTS (SELECT 1 FROM coordinator_operations c WHERE c.rig_id=? AND c.kind='system-wake-outcome' AND c.operation_id='system-wake-outcome:'||o.outbox_id) ORDER BY o.rowid ASC LIMIT 200").all(from,rigId,rigId) as any[];
+   if(!rows.length)break;
+   for(const scannedRow of rows){
+   const {scan_rowid:_,...row}=scannedRow;
+   const proof=this.systemWakeOutcomeProof(rigId,row);if(!proof)continue;
+   const qid=String(proof.task.rigId===rigId?row.outbox_id.slice('wake-intent-'.length):'');
+   const terminal=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(qid) as any;
+   const plan=this.plan(rigId);
+   const receipt={outboxId:row.outbox_id,noticeSnapshotHash:digest(JSON.stringify(row)),taskQueueId:qid,taskBodyHash:proof.task.bodyHash,action:proof.task.action,rigId,recipient:row.destination_session,recipientGeneration:proof.generation,claimTransitionId:(this.db.prepare("SELECT transition_id FROM queue_transitions WHERE qitem_id=? AND transition_note='claimed' AND actor_session=? AND identity_provenance='transport:v1' ORDER BY transition_id LIMIT 1").get(qid,row.destination_session) as any)?.transition_id??null,taskStateAtRecord:this.repo.getById(qid)!.state,...(terminal&&['done','failed','canceled'].includes(terminal.state)?{terminal:{transitionId:terminal.transition_id,state:terminal.state}}:{}),authorityBasis:{operatorGeneration:proof.generation,planRevision:plan?.revision??null},deliveryConclusion:'unknown',originalMutations:0,outcomeOnly:true,nonExecutable:true,grantsAuthority:false};
+   this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'system-wake-outcome:'+row.outbox_id,'system-wake-outcome',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+  }
+   scanned+=rows.length;from=Number((rows[rows.length-1] as any).scan_rowid);
+   if(rows.length<200)break;
+  }
+ }
  heldHistoryNoticeOutcomeContained(rigId:string,row:any):boolean {
   if(!this.heldHistoryNoticeOutcomeProof(rigId,row))return false;
   const proof=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='held-history-control-outcome'").get(rigId,'held-control-outcome:'+row.outbox_id) as any;
   if(!proof)return false;try{const p=JSON.parse(proof.receipt);return p.outboxId===row.outbox_id&&p.noticeSnapshotHash===digest(JSON.stringify(row))&&p.deliveryConclusion==='unknown'&&p.originalMutations===0&&p.outcomeOnly===true;}catch{return false;}
+ }
+ /** The one consumption predicate both debt gates call. */
+ noticeOutcomeContained(rigId:string,row:any):boolean {
+  return this.heldHistoryNoticeOutcomeContained(rigId,row)||this.systemWakeOutcomeContained(rigId,row);
  }
  private recordHeldHistoryNoticeOutcome(rigId:string,parent:any):void {
   const row=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+parent.queueId) as any;if(!row||!this.heldHistoryNoticeOutcomeProof(rigId,row))return;
@@ -296,7 +400,7 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
   const notice=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+r.queueId) as any;
   if(!notice||!this.dutyNoticeMatches(r,notice))return true;
   if(['delivered','failed','retired'].includes(notice.delivery_state))return true;
-  return this.heldHistoryNoticeOutcomeContained(rigId,notice);
+  return this.noticeOutcomeContained(rigId,notice);
  }
  private heldHistoryRecord(r:any):any|null {
   const q=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(r.recordQueueId) as any;
@@ -782,6 +886,7 @@ private dutyProtection(rigId:string,r:any):boolean {
    if(this.authority.generation("operator-agent@kernel")!==plan!.operatorGeneration)fail("coordination_operator_retired","Reauthorize plan after Operator generation change");
    if(actor!==a!.owner_session||generation!==a!.owner_generation||this.authority.generation(actor)!==generation||a!.state!=="active"||a!.lease_until<=this.now())fail("coordinator_retired","Only reconciled current holder may dispatch");
    const token:CoordinatorToken={rigId,epoch:a!.epoch,generation};
+   this.recordSystemWakeOutcomes(rigId);
    const lifecycle=this.centralLifecyclePass(rigId),result:CoordinationResult[]=[];
    this.recordProgress(rigId);
    for(const t of plan!.tasks){
@@ -888,9 +993,9 @@ private dutyProtection(rigId:string,r:any):boolean {
   const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session IN (?,?) OR destination_session IN (?,?))").all(...addresses,...addresses) as Record<string,unknown>[];
   return effects.some(row=>{
    if(Array.isArray(excludeEffect)?excludeEffect.includes(String(row.outbox_id)):row.outbox_id===excludeEffect)return false;
-   const outboxId=String(row.outbox_id??''),control=outboxId.startsWith('wake-intent-')?this.lifecycleControl(outboxId.slice('wake-intent-'.length)):null,effectRig=control?.rigId??rig?.rig_id;
+   const outboxId=String(row.outbox_id??''),control=outboxId.startsWith('wake-intent-')?this.lifecycleControl(outboxId.slice('wake-intent-'.length)):null,effectRig=control?.rigId??this.systemTaskRig(row)??rig?.rig_id;
 if(!effectRig)return true;
-    return !this.authority.isAdoptedHistoryContained(effectRig,row)&&!this.heldHistoryNoticeOutcomeContained(effectRig,row);
+    return !this.authority.isAdoptedHistoryContained(effectRig,row)&&!this.noticeOutcomeContained(effectRig,row);
    });
   }
  private admittedNow(t:CoordinationTask):boolean {
@@ -975,6 +1080,9 @@ if(!effectRig)return true;
   * It creates real queue intents through the same path, never acknowledgment. */
  supervise(rigId:string,jobId:string):CoordinationResult[]|null {
   return this.db.transaction(()=>{
+   // The registered Operator observer records outcome-only receipts without any
+   // plan or holder, which is the only path a pre-plan rollout rig has.
+   if(this.db.prepare("SELECT 1 FROM watchdog_jobs WHERE job_id=? AND policy='coordinator-continuity' AND state='active' AND target_session='operator-agent@kernel' AND registered_by_session='operator-agent@kernel' AND registered_by_generation_uuid=?").get(jobId,this.authority.generation('operator-agent@kernel')??''))this.recordSystemWakeOutcomes(rigId);
    const job=this.db.prepare('SELECT * FROM watchdog_jobs WHERE job_id=?').get(jobId) as {policy:string;state:string;registered_by_session:string;registered_by_generation_uuid:string;target_session:string}|undefined;
    const plan=this.plan(rigId),a=this.authority.get(rigId);
    if(!plan||!a)return null;
