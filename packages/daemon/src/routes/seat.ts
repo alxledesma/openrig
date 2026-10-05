@@ -16,13 +16,23 @@ import { SeatSwitchClientService } from "../domain/seat-switch-client-service.js
 import { SeatLifecycleService, type SeatRefusal } from "../domain/seat-lifecycle-service.js";
 import { makePredecessorRecapResolver } from "../domain/predecessor-recap-resolver.js";
 import type { ContextUsageStore } from "../domain/context-usage-store.js";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { resolveAuthoredRecapPointer } from "../domain/context-packs/seat-recap-store.js";
 import { buildRebuildPrimingChain } from "../domain/rebuild-priming-chain.js";
 import { OPENRIG_HOME } from "../openrig-compat.js";
 import { SettingsStore } from "../domain/user-settings/settings-store.js";
 import { transportSenderSession } from "./require-sender-identity.js";
+import { PiResumeAdapter } from "../adapters/pi-resume.js";
+import { piSeatPaths, parsePiRunnerState } from "../adapters/pi-runner-protocol.js";
+/** Bounded positional tail window for the idle witness; matches the native 64 KiB evidence. */
+const PI_SESSION_TAIL_WINDOW_BYTES = 65536;
+
+import { makePiNativeProver } from "../domain/coordinator-runtime-availability.js";
+import { execCommand } from "../adapters/tmux-exec.js";
+import { listNativeProcesses } from "../domain/native-process-lineage.js";
+import { resolve as resolvePath } from "node:path";
 
 export const seatRoutes = new Hono();
 
@@ -255,6 +265,89 @@ export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifec
     activityOracle: (c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined) ?? undefined,
   });
 }
+
+// Same-generation Pi runner rehost. The shipped resume primitive, the shipped pi
+// native prover and the shipped runner-state parser are constructed here
+// unchanged; startup does not expose them on the request context. Paths derive
+// from the same OPENRIG_HOME the launch path uses, so the session file identity
+// is the RECORDED one and never a reconstructed guess.
+seatRoutes.post("/rehost-runner/:seatRef", async c => {
+  const body = await c.req.json<Record<string, unknown>>();
+  if (typeof body.reason !== "string" || !body.reason.trim()) return c.json({ error: "reason required" }, 400);
+  if (body.operator !== undefined && typeof body.operator !== "string") return c.json({ error: "operator must be a string when present" }, 400);
+  const rigRepo = c.get("rigRepo" as never) as RigRepository;
+  const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter;
+  const stateRoot = join(OPENRIG_HOME, "state", "pi");
+  const runnerEntryPath = resolvePath(import.meta.dirname, "../adapters/pi-runner.js");
+  const fsOps = {
+    readFile: (p: string) => readFileSync(p, "utf-8"),
+    writeFile: (p: string, content: string) => writeFileSync(p, content, "utf-8"),
+    exists: (p: string) => existsSync(p),
+    mkdirp: (p: string) => mkdirSync(p, { recursive: true }),
+  };
+  const lifecycle = new SeatLifecycleService({
+    db: rigRepo.db,
+    rigRepo,
+    sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
+    eventBus: c.get("eventBus" as never) as EventBus,
+    tmuxAdapter,
+    nodeLauncher: c.get("nodeLauncher" as never) as import("../domain/node-launcher.js").NodeLauncher,
+    startupOrchestrator: (c.get("startupOrchestrator" as never) as import("../domain/startup-orchestrator.js").StartupOrchestrator | undefined) ?? undefined,
+    runtimeAdapters: (c.get("runtimeAdapters" as never) as Record<string, import("../domain/runtime-adapter.js").RuntimeAdapter> | undefined) ?? undefined,
+    occupantInvalidator: (c.get("occupantInvalidator" as never) as import("../domain/occupant-invalidator.js").OccupantInvalidator | undefined) ?? undefined,
+    activityOracle: (c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined) ?? undefined,
+    listProcesses: () => listNativeProcesses(),
+    piResume: new PiResumeAdapter(tmuxAdapter, fsOps, { stateRoot, runnerEntryPath }),
+    piProve: makePiNativeProver(rigRepo.db, execCommand, { fs: { readFile: (p: string) => readFileSync(p, "utf-8") }, piStateRoot: stateRoot }),
+    piRunnerState: (sessionName: string) => {
+      const p = piSeatPaths(stateRoot, sessionName).runnerStatePath;
+      return existsSync(p) ? parsePiRunnerState(readFileSync(p, "utf-8")) : null;
+    },
+    piSessionFileExists: (p: string) => existsSync(p),
+    // Bounded 64 KiB POSITIONAL tail: read only the last window, never the whole file.
+    // An entry larger than the window, or a final line without its terminating newline
+    // (a partial/in-progress append), returns null so rehost refuses instead of
+    // parsing an optimistic value. No transcript content is ever returned.
+    // R3-B3: the identity digest is BOUNDED too. The whole session file may be very
+    // large, so only a bounded positional window is hashed and the receipt states which.
+    piSessionFileDigestPrefix: (p: string) => {
+      try {
+        const size = statSync(p).size;
+        const window = Math.min(size, PI_SESSION_TAIL_WINDOW_BYTES);
+        const buffer = Buffer.alloc(window);
+        const fd = openSync(p, "r");
+        try { readSync(fd, buffer, 0, window, size - window); } finally { closeSync(fd); }
+        return `w${window}:${createHash("sha256").update(buffer).digest("hex").slice(0, 16)}`;
+      } catch { return null; }
+    },
+    piSessionTailEntryId: (p: string) => {
+      try {
+        const size = statSync(p).size;
+        const window = Math.min(size, PI_SESSION_TAIL_WINDOW_BYTES);
+        const start = size - window;
+        const buffer = Buffer.alloc(window);
+        const fd = openSync(p, "r");
+        try { readSync(fd, buffer, 0, window, start); } finally { closeSync(fd); }
+        const text = buffer.toString("utf-8");
+        const lines = text.split("\n").filter(line => line.trim().length > 0);
+        const tail = lines[lines.length - 1];
+        if (!tail) return null;
+        // A single entry larger than the window means we did not see its start.
+        if (start > 0 && lines.length === 1) return null;
+        // Refuse a truncated final entry: the tail must end at a record boundary.
+        if (start > 0 && !text.endsWith("\n")) return null;
+        const parsed = JSON.parse(tail) as { id?: unknown };
+        return typeof parsed.id === "string" && /^[0-9a-f]{8}$/i.test(parsed.id) ? parsed.id : null;
+      } catch { return null; }
+    },
+  });
+  const result = await lifecycle.rehostRunner({
+    seatRef: decodeURIComponent(c.req.param("seatRef")),
+    reason: body.reason,
+    operator: (body.operator as string | undefined) ?? null,
+  });
+  return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
+});
 
 function seatLifecycleStatus(code: SeatRefusal["code"]): 400 | 404 | 409 | 500 | 502 {
   if (code === "seat_ref_required" || code === "missing_model" || code === "missing_reason" || code === "missing_actor" || code === "fresh_required" || code === "invalid_cwd" || code === "invalid_codex_profile" || code === "profile_not_installed") return 400;

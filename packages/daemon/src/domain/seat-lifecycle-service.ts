@@ -62,7 +62,69 @@ export interface SeatLifecycleDeps {
   codexProfileHome?: string;
   /** Test seam; production asks Codex's own loader to accept the named profile. */
   codexProfileProbe?: (profile: string) => Promise<unknown>;
+  /** Same-generation Pi runner rehost. Every seam is REQUIRED for the operation
+   *  and its absence is a refusal, never a degraded path: the shipped resume
+   *  primitive, the shipped pi native prover, the shipped runner-state parser,
+   *  the shipped session-file existence check, and the session-file tail reader
+   *  used for the idle witness. */
+  piResume?: PiRehostResume;
+  piProve?: (session: string) => Promise<PiRehostProof | null>;
+  piRunnerState?: (sessionName: string) => PiRehostRunnerState | null;
+  piSessionFileExists?: (path: string) => boolean;
+  /** Bounded identity digest of the session file the runner will resume. Optional so a
+   *  caller may supply its own reader; the default hashes the real bytes. Rehost
+   *  refuses rather than fabricating a prefix it could not read. */
+  piSessionFileDigestPrefix?: (sessionFile: string) => string | null;
+  /** Authoritative pane ROOT pid for a node, resolved from its registered tmux pane.
+   *  Optional seam; the default reads the binding and asks the tmux adapter. */
+  paneRootPid?: (nodeId: string) => Promise<number | null>;
+  piSessionTailEntryId?: (path: string) => string | null;
+  /** SIGTERM delivery to ONE verified runner pid. Never a terminal keystroke. */
+  killNativeProcess?: (pid: number) => void;
+  rehostPollMs?: number;
+  rehostWaitMs?: number;
 }
+
+/** Structural view of the shipped PiResumeAdapter: only `resume` is used, and
+ *  only with the exact session file. --resume/--fork are never emitted here. */
+export interface PiRehostResume {
+  resume(tmuxSessionName: string, resumeType: string | null, resumeToken: string | null, cwd: string, model?: string | null, resolvedPosture?: "floor" | "full_bypass"): Promise<{ ok: boolean; code?: string; message?: string }>;
+}
+export interface PiRehostProof { state: "present" | "absent"; generation: string; launchId: string | null; fingerprint: string }
+export interface PiRehostRunnerState { ready: boolean; launchId?: string; sessionFile?: string; sessionId?: string; lastEntryId?: string }
+
+export interface RehostAuthorityFact { state: string; leaseUntil: number; epoch: number; ownerGeneration: string; generationMatchesOwner: boolean; expired: boolean; readOnly?: boolean; repairedByThisOperation?: boolean }
+/** Shell basenames that may legitimately own a managed pane. tmux is deliberately
+ *  absent: it is the shared SERVER, never a pane shell. */
+const SHELL_BASENAMES = new Set(["zsh", "bash", "sh", "fish", "dash"]);
+/** Shell identity derived exactly as the shipped Pi prover does (see
+ *  coordinator-runtime-availability.ts): first token, basename, then the login-shell
+ *  leading dash stripped, because ps lists a tmux pane's login shell as `-zsh`. */
+function paneShellBasename(command: string | null | undefined): string | null {
+  const first = (command ?? "").trim().split(/\s+/)[0] ?? "";
+  if (!first) return null;
+  return (first.split("/").pop() ?? "").replace(/^-/, "").toLowerCase();
+}
+
+export interface RehostPlan {
+  generation: string; sessionFile: string; launchId: string; lastEntryId: string | null;
+  runnerPid: number; runnerChildPid: number | null; sessionFileSha256Prefix: string;
+  model: string | null; cwd: string; posture: "floor" | "full_bypass";
+  authority: RehostAuthorityFact | null; sessionId: string | null;
+}
+export interface RehostCustodySnapshot {
+  tenantHash: string; resumeTokenHash: string; authorityHash: string; claimHash: string;
+  unknownEffects: { count: number; digest: string }; sessionFile: string;
+}
+export type RehostRunnerResult =
+  | {
+      ok: true; seat: SeatDescriptor; generation: string; generationUnchanged: true; sessionFile: string;
+      launchIdBefore: string; launchIdAfter: string | null; durableModel: string | null;
+      unknownEffectsPreserved: { count: number; digest: string };
+      authority: (RehostAuthorityFact & { readOnly: true; repairedByThisOperation: false }) | null;
+      guardLeftEnabled: true; events: string[];
+    }
+  | SeatRefusal;
 
 interface ResolvedSeat {
   entry: NodeInventoryEntry;
@@ -106,9 +168,32 @@ export interface SeatRefusal {
     | "launch_failed"
     | "startup_failed"
     | "attention_required"
-    | "runtime_identity_unverified";
+    | "runtime_identity_unverified"
+    // Same-generation Pi runner rehost. Absence of a required seam, or any
+    // unverifiable pre-stop fact, refuses. There is no degraded path.
+    | "rehost_requires_pi_runtime"
+    | "rehost_unavailable"
+    | "rehost_guard_not_enabled"
+    | "rehost_precondition_failed"
+    | "rehost_receipt_unwritable"
+    | "rehost_pane_root_unresolved"
+    | "rehost_reservation_active"
+    | "rehost_outbox_sending"
+    | "rehost_generation_mismatch"
+    | "rehost_sidecar_unverified"
+    | "rehost_session_file_missing"
+    | "rehost_process_identity_unproven"
+    | "rehost_runner_pid_unresolved"
+    | "rehost_not_idle"
+    | "rehost_stop_unverified"
+    | "rehost_resume_failed"
+    | "rehost_custody_drift"
+    | "rehost_post_proof_failed" | "rehost_effect_unknown";
   message: string;
   guidance?: string;
+  /** Present on an outcome whose EFFECT already happened: never true, never retryable. */
+  blindRetryAllowed?: false;
+  observed?: Record<string, unknown>;
   matches?: Array<{ rig_name: string; logical_id: string; current_occupant: string | null }>;
 }
 
@@ -232,6 +317,16 @@ export class SeatLifecycleService {
   private readonly activityOracle: SeatLifecycleDeps["activityOracle"] | null;
   private readonly codexProfileHome: string;
   private readonly codexProfileProbe: (profile: string) => Promise<unknown>;
+  private readonly piResume?: PiRehostResume;
+  private readonly piProve?: (session: string) => Promise<PiRehostProof | null>;
+  private readonly piRunnerState?: (sessionName: string) => PiRehostRunnerState | null;
+  private readonly piSessionFileExists?: (path: string) => boolean;
+  private readonly piSessionFileDigestPrefix?: (sessionFile: string) => string | null;
+  private readonly paneRootPid?: (nodeId: string) => Promise<number | null>;
+  private readonly piSessionTailEntryId?: (path: string) => string | null;
+  private readonly killNativeProcess?: (pid: number) => void;
+  private readonly rehostPollMs: number;
+  private readonly rehostWaitMs: number;
 
   constructor(deps: SeatLifecycleDeps) {
     if (deps.db !== deps.rigRepo.db) throw new Error("SeatLifecycleService: rigRepo must share the same db handle");
@@ -253,6 +348,16 @@ export class SeatLifecycleService {
       // argv is fixed and the name is allowlisted; no shell or model turn.
       await runCodex("codex", ["-p", profile, "mcp", "list"], { timeout: 10_000, maxBuffer: 1024 * 1024 });
     });
+    this.piResume = deps.piResume;
+    this.piProve = deps.piProve;
+    this.piRunnerState = deps.piRunnerState;
+    this.piSessionFileExists = deps.piSessionFileExists;
+    this.piSessionFileDigestPrefix = deps.piSessionFileDigestPrefix;
+    this.paneRootPid = deps.paneRootPid;
+    this.piSessionTailEntryId = deps.piSessionTailEntryId;
+    this.killNativeProcess = deps.killNativeProcess ?? ((pid) => { process.kill(pid, "SIGTERM"); });
+    this.rehostPollMs = deps.rehostPollMs ?? 250;
+    this.rehostWaitMs = deps.rehostWaitMs ?? 20_000;
   }
 
   /** Audited future-launch directory selection; never sends input or restarts a seat. */
@@ -1331,6 +1436,417 @@ export class SeatLifecycleService {
       ),
     );
   }
+
+  /**
+   * SAME-GENERATION Pi runner rehost (OPR.0.4.6.PI1 continuation class).
+   *
+   * Only the native process incarnation changes: the SAME pane, the SAME
+   * persisted session file (opened with --session, never --resume/--fork) and
+   * the SAME occupant generation, which travels in the pane environment set at
+   * seat creation. It therefore mints no generation, no tenure and no authority,
+   * rotates nothing, and calls no invalidator, so tenure, baton, claims,
+   * resources, assignments, outbox rows and UNKNOWN effects stay byte-identical.
+   * There is no fresh, handover, fork or blank-occupant fallback: any
+   * unverifiable fact refuses, and a failed stop or resume writes a failed
+   * event and stops, so a blind retry cannot happen.
+   */
+  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null }): Promise<RehostRunnerResult> {
+    const required = this.requireReason(input.reason);
+    if (required) return required;
+    const resolved = this.resolveSeat(input.seatRef);
+    if ("code" in resolved) return resolved;
+    const seat = this.describe(resolved);
+    if (resolved.entry.runtime !== "pi")
+      return { ok: false, code: "rehost_requires_pi_runtime", message: `Same-generation runner rehost is defined for pi seats only; this seat runtime is '${resolved.entry.runtime ?? "unknown"}'. No other runtime has a shipped same-session-file resume primitive here.` };
+    // The guard gate runs BEFORE the seam gate: a disarmed guard is a refusal on its own
+    // merits and must not be masked by a missing-seam refusal. Nothing is signalled either
+    // way, because both refusals precede every effect.
+    const guard = this.tmuxAdapter.deliveryGuard;
+    const guardPreference = (guard as unknown as { preference?: (id: string) => { desired?: boolean; effective?: boolean } } | undefined)?.preference?.(resolved.nodeId);
+    if (!guard)
+      return { ok: false, code: "rehost_unavailable", message: "Seat delivery guard unavailable; rehost runs under the guard lifecycle lease and refuses without it." };
+    // F3, fail closed: the guard MUST expose its raw preference and BOTH flags must be on.
+    // A missing preference is a refusal, never a fallback to the OR semantics of
+    // protectionFacts, because a pending activation would otherwise pass.
+    if (!guardPreference || guardPreference.desired !== true || guardPreference.effective !== true)
+      return { ok: false, code: "rehost_guard_not_enabled", message: "Rehost requires the seat typing guard desired and effective ON (operator-visible quiescence). Enable it first with rig seat set-typing-guard." };
+    if (!this.piResume || !this.piProve || !this.piRunnerState || !this.piSessionFileExists || !this.piSessionTailEntryId || !this.listProcesses)
+      return { ok: false, code: "rehost_unavailable", message: "Rehost seams are not configured on this daemon; refusing instead of degrading. No runner was touched." };
+    // Non-optional after the seam gate above, so the nested callbacks keep the narrowing.
+    const piResume = this.piResume!, piProve = this.piProve!, piRunnerState = this.piRunnerState!;
+    // `??` binds tighter than `?:`, so the original expression parsed as
+    // `(canonicalSessionName ?? logicalId) ? logicalId@rigName : null` and DISCARDED the
+    // canonical name, producing a derived name the runner's --session-name never matches.
+    const sessionName = resolved.entry.canonicalSessionName ?? (resolved.entry.logicalId ? `${resolved.entry.logicalId}@${resolved.entry.rigName}` : null);
+    if (!sessionName)
+      return { ok: false, code: "rehost_process_identity_unproven", message: "Seat has no canonical session name to rehost." };
+
+    const outcome = await guard.lifecycle<RehostRunnerResult>([resolved.nodeId], async (): Promise<RehostRunnerResult> => {
+      // S0: EVERY precondition is re-proven inside the exclusive guard lease. A throw
+      // here happens BEFORE any signal, so it is a typed refusal that signals nothing and
+      // is never an UNKNOWN: no runner has been touched.
+      let plan: RehostPlan | SeatRefusal;
+      try {
+        plan = await this.rehostPlan(resolved, sessionName);
+      } catch (error) {
+        return { ok: false, code: "rehost_precondition_failed", message: `A precondition could not be evaluated (${(error as Error).message}); no runner was signalled and nothing was touched.`, guidance: "Read the seat state and retry only after the underlying condition is understood." };
+      }
+      if ("code" in plan) return plan;
+      const before = this.rehostCustodySnapshot(resolved.nodeId, plan.sessionFile);
+
+      // S1: preserved before-record, appended before anything is stopped.
+      // Pre-effect receipt. If it cannot be written, nothing has been signalled, so this
+      // is a typed refusal that signals nothing rather than an UNKNOWN.
+      try {
+      this.appendRehostEvent("seat.runner_rehost_began", seat, input, {
+        generation: plan.generation,
+        sessionFile: plan.sessionFile,
+        sessionFileSha256Prefix: plan.sessionFileSha256Prefix,
+        lastEntryId: plan.lastEntryId,
+        launchIdBefore: plan.launchId,
+        runnerPid: plan.runnerPid,
+        runnerChildPid: plan.runnerChildPid,
+        durableModel: plan.model,
+        cwd: plan.cwd,
+        guardProtection: guard.protectionFacts(resolved.nodeId)?.code ?? null,
+        authority: plan.authority,
+        unknownEffects: before.unknownEffects,
+        deliveryOrQualificationCredit: false,
+        continuityCredit: false,
+        leaseRepairedByThisOperation: false,
+      });
+      } catch (error) {
+        return { ok: false, code: "rehost_receipt_unwritable", message: `The pre-effect receipt could not be written (${(error as Error).message}); no runner was signalled and nothing was touched.`, guidance: "Repair the receipt store, then re-read the seat before any rehost." };
+      }
+
+      // Stage and plan facts are declared OUTSIDE the guarded region so its catch can read
+      // them, and so no nested try is needed.
+      const planFacts = { generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId };
+      let stage = "stop";
+      let stopVerified = false;
+      // R3-B2: ONE guarded region covering everything AFTER the began receipt, so the
+      // runner may already be gone. Any throw from here - a failed event write at any
+      // stage, a throwing resume, a failing post-proof, proof or custody snapshot - is a
+      // typed UNKNOWN with blindRetryAllowed false. It never escapes as an HTTP 500 and is
+      // never retried. Everything above this line is a pre-effect refusal.
+      try {
+      // S2: SIGTERM ONLY the verified runner pid. Never a terminal keystroke: C-c
+      // into the pane is input and could abort or steer an in-flight turn.
+      try {
+        // Capture the pre-stop identity of BOTH processes so pid reuse cannot be
+        // mistaken for survival, and so the pane root can be re-proven quiescent.
+        const preStopRows = await this.listProcesses!();
+        const preStopRunner = preStopRows.find(r => r.pid === plan.runnerPid);
+        const preStopChild = plan.runnerChildPid === null ? undefined : preStopRows.find(r => r.pid === plan.runnerChildPid);
+        // R3-B1: the pane ROOT is the AUTHORITATIVE pane pid, never derived by climbing
+        // the census. Climbing reaches the shared tmux SERVER (ppid 1), whose command is
+        // not a shell, so quiescence could never pass on a real pane and every rehost
+        // would end as a destructive stop-unverified.
+        // R3-B1: the pane ROOT is the AUTHORITATIVE pane pid only. No census climb and no
+        // assumed shell parent: climbing reaches the shared tmux SERVER (ppid 1), whose
+        // command is not a shell, so quiescence could never pass on a real pane. The
+        // runner must provably sit under exactly that root before anything is signalled.
+        const rootPid = await this.paneRootPidFor(resolved.nodeId);
+        // The root's SHELL shape is proven BEFORE the signal. Without this the whole
+        // kill-then-cannot-verify class returns: a real pane whose login shell ps lists
+        // as `-zsh` would be signalled and then never recognised as quiescent.
+        const rootRow = rootPid === null ? undefined : preStopRows.find(r => r.pid === rootPid);
+        const rootIsShell = !!rootRow && SHELL_BASENAMES.has(paneShellBasename(rootRow.command) ?? "");
+        if (rootPid === null || !this.ancestryReaches(preStopRows, plan.runnerPid, rootPid) || !rootIsShell)
+          return { ok: false, code: "rehost_pane_root_unresolved", message: "The authoritative tmux pane pid for this seat could not be resolved, the verified runner does not sit under exactly that pane root, or that root is not a recognisable shell. No runner was signalled and nothing was touched; no substitute root is assumed.", guidance: "Resolve the real pane root, confirm the runner ancestry, and re-read the seat before any rehost." };
+        this.killNativeProcess?.(plan.runnerPid);
+        stopVerified = await this.rehostRunnerExited(rootPid, plan.runnerPid, plan.runnerChildPid, { runnerStartedAt: preStopRunner?.startedAt, childStartedAt: preStopChild?.startedAt });
+      } catch (error) {
+        this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
+          stage: "stop", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId,
+          observed: { runnerPid: plan.runnerPid, error: (error as Error).message, runnerGone: false },
+          blindRetryAllowed: false, fallbackTaken: "none",
+          note: "SIGTERM delivery to the verified runner pid did not complete; the pane may still hold the old runner. A human must read the pane before any further rehost.",
+        });
+        return { ok: false, code: "rehost_stop_unverified", message: "Runner stop could not be verified; the old runner may still be live. No resume was attempted, no fallback taken, and a blind retry is not permitted." };
+      }
+      if (!stopVerified) {
+        this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
+          stage: "stop", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId,
+          observed: { runnerPid: plan.runnerPid, runnerChildPid: plan.runnerChildPid, runnerGone: false, runnerStillListed: true },
+          blindRetryAllowed: false, fallbackTaken: "none",
+          note: "The runner process was still listed after the bounded wait; stop effect is UNKNOWN. Do not rehost again until the pane is read.",
+        });
+        return { ok: false, code: "rehost_stop_unverified", message: "Runner exit was not observed within the bounded wait; the stop effect is UNKNOWN. No resume attempted, no fallback taken, no blind retry." };
+      }
+
+      stage = "resume";
+      // S3: reopen the SAME file through the shipped resume primitive.
+      const resumed = await piResume.resume(sessionName, "pi_session_file", plan.sessionFile, plan.cwd, plan.model, plan.posture);
+      if (!resumed.ok) {
+        this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
+          stage: "resume", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId,
+          observed: { code: resumed.code ?? null, message: resumed.message ?? null, runnerGone: true },
+          blindRetryAllowed: resumed.code === "resume_failed" ? false : false,
+          fallbackTaken: "none",
+          note: resumed.code === "retry_fresh"
+            ? "Session file missing: stop-and-ask. This operation never falls back to fresh, handover or fork."
+            : "Resume did not complete. The guard stays ON and held messages stay held; no retry from this invocation.",
+        });
+        return { ok: false, code: "rehost_resume_failed", message: `Same-file resume did not complete (${resumed.code ?? "unknown"}). The typing guard stays ON, nothing was flushed or retried, and no fresh, handover or fork fallback was taken.` };
+      }
+
+      // S4: post-proof. Process identity, launch scope, file equality, generation,
+      // and a READ-ONLY custody comparison against the S1 snapshot.
+      const post = piRunnerState(sessionName);
+      const proof = await piProve(sessionName);
+      const launchIdAfter = post?.launchId ?? null;
+      const postProof =
+        !!post && post.ready && post.sessionFile === plan.sessionFile && !!launchIdAfter && launchIdAfter !== plan.launchId &&
+        proof?.state === "present" && proof.generation === plan.generation && proof.launchId === launchIdAfter;
+      const after = this.rehostCustodySnapshot(resolved.nodeId, plan.sessionFile);
+      const custodyUnchanged =
+        after.tenantHash === before.tenantHash && after.resumeTokenHash === before.resumeTokenHash &&
+        after.authorityHash === before.authorityHash && after.claimHash === before.claimHash &&
+        after.unknownEffects.digest === before.unknownEffects.digest && after.unknownEffects.count === before.unknownEffects.count;
+      if (!postProof || !custodyUnchanged) {
+        this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
+          stage: "post_proof", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId, launchIdAfter,
+          observed: { postProof, custodyUnchanged, proofState: proof?.state ?? null, proofGeneration: proof?.generation ?? null, proofLaunchId: proof?.launchId ?? null, sidecarReady: post?.ready ?? null, sidecarSessionFile: post?.sessionFile ?? null },
+          blindRetryAllowed: false, fallbackTaken: "none",
+          note: "Post-rehost proof or custody comparison failed; reported, never repaired by this operation.",
+        });
+        return {
+          ok: false,
+          code: postProof ? "rehost_custody_drift" : "rehost_post_proof_failed",
+          message: postProof
+            ? "Custody, generation or UNKNOWN-effect comparison failed after resume; reported only, never repaired."
+            : "Post-resume process proof failed (launch scope, session-file equality or same-generation proof). Reported only, never repaired.",
+        };
+      }
+
+      // S5: completed receipt. The guard deliberately stays ON. It sits inside the single
+      // guarded post-effect region opened at S3, so a failed write here is an UNKNOWN too.
+      this.appendRehostEvent("seat.runner_rehost_completed", seat, input, {
+        generation: plan.generation,
+        generationUnchanged: true,
+        sessionFile: plan.sessionFile,
+        sessionFileUnchanged: true,
+        launchIdBefore: plan.launchId,
+        launchIdAfter,
+        durableModel: plan.model,
+        guardLeftEnabled: true,
+        authority: plan.authority,
+        authorityReadOnly: true,
+        leaseRepairedByThisOperation: false,
+        unknownEffects: after.unknownEffects,
+        deliveryOrQualificationCredit: false,
+        continuityCredit: false,
+        nextActorIsGenuineHolder: "acknowledge then renew; for an EXPIRED reconciling lease use the single per-epoch reconciliation-recover window, which this operation never touches",
+      });
+      return {
+        ok: true,
+        seat,
+        generation: plan.generation,
+        generationUnchanged: true,
+        sessionFile: plan.sessionFile,
+        launchIdBefore: plan.launchId,
+        launchIdAfter,
+        durableModel: plan.model,
+        unknownEffectsPreserved: after.unknownEffects,
+        authority: plan.authority ? { ...plan.authority, readOnly: true, repairedByThisOperation: false } : null,
+        guardLeftEnabled: true,
+        events: ["seat.runner_rehost_began", "seat.runner_rehost_completed"],
+      };
+      } catch (error) {
+        return {
+          ok: false,
+          code: "rehost_effect_unknown",
+          message: "An effect was already applied for this seat (runner signalled or replaced) and a later step failed, so the rehost outcome is UNKNOWN. Do not retry: read the pane and the runner launch id before any further rehost.",
+          blindRetryAllowed: false,
+          guidance: "Read the pane and the runner launch id before any further rehost.",
+          observed: { stage, effectApplied: true, generation: planFacts.generation, sessionFile: planFacts.sessionFile, launchIdBefore: planFacts.launchIdBefore, guardLeftEnabled: true, fallbackTaken: "none", error: (error as Error).message },
+        };
+      }
+    });
+    return outcome;
+  }
+
+  /** Every rehost precondition, proven fresh. No partial acceptance. */
+  private async rehostPlan(resolved: ResolvedSeat, sessionName: string): Promise<RehostPlan | SeatRefusal> {
+    const { nodeId } = resolved;
+    if (this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE node_id=? AND state <> 'released' LIMIT 1").get(nodeId))
+      return { ok: false, code: "rehost_reservation_active", message: "An unreleased dispatch reservation fences rehost; its cutover disposition must be settled first." };
+    const guard = this.tmuxAdapter.deliveryGuard;
+    // F3: the architecture gate is desired AND effective ON. protectionFacts reports
+    // typing_guard_enabled for either alone, so a pending activation would pass it;
+    // Re-proven inside the exclusive guard lease (S0), still fail closed on both flags.
+    const recheckPreference = (guard as unknown as { preference?: (id: string) => { desired?: boolean; effective?: boolean } } | undefined)?.preference?.(nodeId);
+    if (!recheckPreference || recheckPreference.desired !== true || recheckPreference.effective !== true)
+      return { ok: false, code: "rehost_guard_not_enabled", message: "Rehost requires the seat typing guard desired and effective ON (operator-visible quiescence). Enable it first with rig seat set-typing-guard." };
+    if (this.db.prepare("SELECT 1 FROM outbox_entries WHERE destination_session=? AND delivery_state='sending' LIMIT 1").get(sessionName))
+      return { ok: false, code: "rehost_outbox_sending", message: "An effect is in flight (sending) to this seat; rehost refuses until it resolves. Indeterminate/UNKNOWN rows are allowed and are only read." };
+
+    const tenure = this.db.prepare("SELECT id, generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1").get(nodeId) as { id: string; generation_uuid: string } | undefined;
+    if (!tenure)
+      return { ok: false, code: "rehost_generation_mismatch", message: "No occupant tenure exists for this node; rehost never mints one." };
+    const generation = tenure.generation_uuid;
+
+    const session = this.db.prepare("SELECT id, status, resume_token, resume_type FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1").get(nodeId) as { id: string; status: string; resume_token: string | null; resume_type: string | null } | undefined;
+    if (!session || !session.resume_token?.trim())
+      return { ok: false, code: "rehost_sidecar_unverified", message: "Latest session carries no resume token; same-history rehost cannot proceed and never invents one." };
+    if ((session.resume_type ?? "") !== "pi_session_file")
+      return { ok: false, code: "rehost_sidecar_unverified", message: `Resume token type '${session.resume_type ?? "unknown"}' is not pi_session_file; rehost never converts a token type.` };
+    const sessionFile = session.resume_token.trim();
+
+    const authorityRow = this.db.prepare("SELECT state, lease_until, epoch, owner_session, owner_generation FROM coordinator_authority WHERE owner_session=?").get(sessionName) as { state: string; lease_until: number; epoch: number; owner_session: string; owner_generation: string } | undefined;
+    const authority = authorityRow
+      ? { state: authorityRow.state, leaseUntil: authorityRow.lease_until, epoch: authorityRow.epoch, ownerGeneration: authorityRow.owner_generation, generationMatchesOwner: authorityRow.owner_generation === generation, expired: authorityRow.lease_until <= Date.now() }
+      : null;
+    if (authorityRow && authorityRow.owner_generation !== generation)
+      return { ok: false, code: "rehost_generation_mismatch", message: "Coordinator authority names a different owner generation than the node's latest tenure; rehost refuses rather than acting under drifted authority." };
+
+    const sidecar = this.piRunnerState!(sessionName);
+    if (!sidecar || !sidecar.ready || !sidecar.launchId || sidecar.sessionFile !== sessionFile)
+      return { ok: false, code: "rehost_sidecar_unverified", message: "Runner sidecar is missing, not ready, or does not name the stored resume token exactly; rehost refuses instead of guessing the live session file." };
+    const launchId = sidecar.launchId;
+    if (!this.piSessionFileExists!(sessionFile))
+      return { ok: false, code: "rehost_session_file_missing", message: "The persisted session file no longer exists; stop-and-ask. Rehost never falls back to a fresh, forked or blank occupant." };
+
+    const proof = await this.piProve!(sessionName);
+    if (!proof || proof.state !== "present" || proof.generation !== generation || proof.launchId !== launchId)
+      return { ok: false, code: "rehost_process_identity_unproven", message: "Live pi process identity is not proven for this exact launch id and generation; rehost refuses before touching any process." };
+
+    // F4/F5: read the sidecar cursor TWICE and require it stable, then read a BOUNDED
+    // positional tail. The shared prover double-samples identity but exposes lastEntryId
+    // only indirectly, so the cursor is proven stable here. A tail that is overlong or
+    // ends in a partial line is refused rather than parsed optimistically.
+    const cursorFirst = this.piRunnerState!(sessionName)?.lastEntryId ?? null;
+    const tail = this.piSessionTailEntryId!(sessionFile);
+    const cursorSecond = this.piRunnerState!(sessionName)?.lastEntryId ?? null;
+    if (!cursorFirst || cursorFirst !== cursorSecond || !tail || tail !== cursorFirst)
+      return { ok: false, code: "rehost_not_idle", message: "Idle witness missing or unstable: the runner's last projected entry could not be confirmed twice-stable against the bounded session-file tail, so a turn may be in flight. Refuse rather than abort-then-proceed." };
+
+    const rows = await this.listProcesses!();
+    const escaped = sessionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const runners = rows.filter(r => r.command.includes("pi-runner.js") && new RegExp(`--session-name\\s+'?${escaped}'?(\\s|$)`).test(r.command) && new RegExp(`--launch-id\\s+'?${launchId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'?(\\s|$)`).test(r.command));
+    if (runners.length !== 1)
+      return { ok: false, code: "rehost_runner_pid_unresolved", message: `Expected exactly one live runner process for this launch id, found ${runners.length}; rehost refuses rather than signalling an ambiguous pid.` };
+    const runner = runners[0]!;
+    // The runner's pi child is the census row whose parent is the runner pid.
+    const childPid = rows.find(r => r.ppid === runner.pid && r.pid !== runner.pid)?.pid ?? null;
+    const digestPrefix = this.piSessionFileDigestPrefix
+      ? this.piSessionFileDigestPrefix(sessionFile)
+      : (() => { try { return createHash("sha256").update(readFileSync(sessionFile)).digest("hex").slice(0, 16); } catch { return null; } })();
+    if (!digestPrefix)
+      return { ok: false, code: "rehost_session_file_missing", message: "The persisted session file could not be read to bind its identity; rehost refuses instead of resuming an unbound file." };
+    // S1 returns the PROVEN plan. Everything below only reads it.
+    return {
+      generation, sessionFile, launchId, lastEntryId: cursorFirst,
+      runnerPid: runner.pid, runnerChildPid: childPid, sessionFileSha256Prefix: digestPrefix,
+      model: resolved.entry.model ?? null, cwd: resolved.entry.cwd ?? "",
+      // NodeInventoryEntry carries no posture; the launch posture comes from the
+      // existing policy provenance, exactly as the managed start path derives it.
+      posture: (this.rigRepo.getNodePolicyProvenance(nodeId)?.launchPosture ?? this.rigRepo.getRigPolicyProvenance(resolved.entry.rigName)?.launchPosture ?? "floor") as "floor" | "full_bypass",
+      authority, sessionId: session.id ?? null,
+    };
+  }
+  /** Bounded poll: is the verified runner (and its pi child) gone from the census? */
+  /** Every descendant of the pane root, by stable identity. */
+ private rehostDescendants(paneRootPid: number, rows: Array<{ pid: number; ppid: number; command: string }>): Array<{ pid: number; command: string }> {
+   const children = new Map<number, number[]>();
+   for (const r of rows) { if (!children.has(r.ppid)) children.set(r.ppid, []); children.get(r.ppid)!.push(r.pid); }
+   const seen = new Set<number>(); const out: Array<{ pid: number; command: string }> = []; const queue = [...(children.get(paneRootPid) ?? [])];
+   while (queue.length) {
+     const pid = queue.shift()!;
+     if (pid === paneRootPid || seen.has(pid)) continue;
+     seen.add(pid);
+     const row = rows.find(r => r.pid === pid);
+     if (row) out.push({ pid, command: row.command });
+     queue.push(...(children.get(pid) ?? []));
+   }
+   return out;
+ }
+ /** True when the runner's own parent chain in this census reaches exactly paneRootPid.
+  *  Nothing is assumed: unproven ancestry is a refusal, never a silent substitute root. */
+ private ancestryReaches(rows: Array<{ pid: number; ppid: number }>, startPid: number, paneRootPid: number): boolean {
+   const seen = new Set<number>(); let cursor = startPid;
+   for (let hop = 0; hop < 32; hop += 1) {
+     if (cursor === paneRootPid) return true;
+     if (seen.has(cursor)) return false;
+     seen.add(cursor);
+     const parent = rows.find(r => r.pid === cursor)?.ppid;
+     if (!parent || parent <= 1) return false;
+     cursor = parent;
+   }
+   return false;
+ }
+ /** Resolve the pane ROOT pid for a node. Never climbs to the shared tmux server. */
+ private async paneRootPidFor(nodeId: string): Promise<number | null> {
+   if (this.paneRootPid) return this.paneRootPid(nodeId);
+   const binding = this.db.prepare("SELECT tmux_pane FROM bindings WHERE node_id=?").get(nodeId) as { tmux_pane: string | null } | undefined;
+   if (!binding?.tmux_pane) return null;
+   if (typeof this.tmuxAdapter.getPanePid !== "function") return null;
+   return (await this.tmuxAdapter.getPanePid(binding.tmux_pane).catch(() => null)) ?? null;
+ }
+ /** A pane is quiescent only when its root is alive as a shell and NOTHING else hangs
+  *  off it. Any surviving process means the typed resume could reach a second writer. */
+ private async rehostPaneQuiesced(paneRootPid: number, rows: Array<{ pid: number; ppid: number; command: string; startedAt?: string }>): Promise<{ quiesced: boolean; present: Array<{ pid: number; command: string }> }> {
+   const root = rows.find(r => r.pid === paneRootPid);
+   if (!root) return { quiesced: false, present: [] };
+   const base = paneShellBasename(root.command);
+   if (!base || !SHELL_BASENAMES.has(base)) return { quiesced: false, present: this.rehostDescendants(paneRootPid, rows) };
+   const present = this.rehostDescendants(paneRootPid, rows);
+   return { quiesced: present.length === 0, present };
+ }
+ /**
+  * Bounded poll for the verified stop. Identity is by pid PLUS startedAt, never by the
+  * runner argv regex: the pi child's argv carries neither `pi-runner.js` nor
+  * `--session-name`, so a regex match could never see it, and pid reuse is defeated by
+  * the pre-stop startedAt. An orphan child alive BLOCKS: no resume may be typed.
+  */
+ private async rehostRunnerExited(
+   paneRootPid: number,
+   runnerPid: number,
+   childPid: number | null,
+   preStop: { runnerStartedAt?: string; childStartedAt?: string },
+ ): Promise<boolean> {
+   const deadline = Date.now() + this.rehostWaitMs;
+   const sameProcess = (r: { pid: number; startedAt?: string }, was: string | undefined) => r.startedAt !== undefined && was !== undefined && r.startedAt === was;
+   for (;;) {
+     const rows = await this.listProcesses!();
+     const runnerAlive = rows.some(r => r.pid === runnerPid && sameProcess(r, preStop.runnerStartedAt));
+     const childAlive = childPid !== null && rows.some(r => r.pid === childPid && sameProcess(r, preStop.childStartedAt));
+     const quiesced = await this.rehostPaneQuiesced(paneRootPid, rows);
+     // Every one of these must hold; any survivor keeps the stop UNKNOWN.
+     if (!runnerAlive && !childAlive && quiesced.quiesced) return true;
+     if (Date.now() >= deadline) return false;
+     await new Promise<void>(resolve => setTimeout(resolve, this.rehostPollMs));
+   }
+ }
+  /** READ-ONLY preservation facts. Compared before and after; never written. */
+  private rehostCustodySnapshot(nodeId: string, sessionFile: string): RehostCustodySnapshot {
+    const latestSessionName: string = (this.db.prepare("SELECT session_name FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1").get(nodeId) as { session_name: string } | undefined)?.session_name ?? "";
+    const tenures = this.db.prepare("SELECT * FROM occupant_tenures WHERE node_id=? ORDER BY id").all(nodeId);
+    // Scoped to claims addressed to this seat, or held by its own generation.
+    const claims = this.db.prepare("SELECT qitem_id, claimed_by_generation_uuid, state FROM queue_items WHERE claimed_by_generation_uuid IS NOT NULL AND (destination_session=? OR claimed_by_generation_uuid=?) ORDER BY qitem_id").all(latestSessionName, latestSessionName);
+    // Scoped to THIS seat: another rig renewing its lease is not drift here.
+    const authority = this.db.prepare("SELECT * FROM coordinator_authority WHERE owner_session=? ORDER BY rig_id").all(latestSessionName);
+    const token = (this.db.prepare("SELECT resume_token FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1").get(nodeId) as { resume_token: string | null } | undefined)?.resume_token ?? null;
+    const unknown = this.db.prepare("SELECT outbox_id, delivery_state, body FROM outbox_entries WHERE destination_session=? AND delivery_state='indeterminate' ORDER BY outbox_id").all(latestSessionName) as Array<{ outbox_id: string; delivery_state: string; body: string }>;
+    const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+    return {
+      tenantHash: hash(tenures),
+      resumeTokenHash: hash(token),
+      authorityHash: hash(authority),
+      claimHash: hash(claims),
+      unknownEffects: { count: unknown.length, digest: hash(unknown.map((r: { outbox_id: string; delivery_state: string; body: string }) => [r.outbox_id, r.delivery_state, createHash("sha256").update(r.body).digest("hex")])) },
+      sessionFile,
+    };
+  }
+
+  private appendRehostEvent(type: string, seat: SeatDescriptor, input: { reason: string; operator?: string | null }, payload: Record<string, unknown>): void {
+    const at = new Date().toISOString();
+    const tx = this.db.transaction(() => {
+      this.eventBus.persistWithinTransaction({ type, rigId: seat.rigId, nodeId: seat.nodeId, logicalId: seat.logicalId, reason: input.reason.trim(), operator: input.operator ?? null, at, ...payload } as never);
+    });
+    tx();
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1359,4 +1875,5 @@ function isOptionalOneOf<T extends string>(value: unknown, allowed: readonly T[]
 
 function isStringArrayOf<T extends string>(value: unknown, allowed: readonly T[]): value is T[] {
   return Array.isArray(value) && value.every((entry) => isOneOf(entry, allowed));
+
 }

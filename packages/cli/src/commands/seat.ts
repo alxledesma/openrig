@@ -468,7 +468,7 @@ Examples:
   // Thin CLI over the daemon's SeatLifecycleService; refusals print message +
   // guidance + match list exactly as the daemon named them.
   const runLifecycleVerb = async (
-    path: "set-cwd" | "set-model" | "set-codex-profile" | "set-permissions" | "launch" | "stop" | "clean",
+    path: "set-cwd" | "set-model" | "set-codex-profile" | "set-permissions" | "launch" | "stop" | "clean" | "rehost-runner",
     seat: string,
     body: Record<string, unknown>,
     opts: { json?: boolean },
@@ -479,7 +479,7 @@ Examples:
     if (!daemonStatusGuard(daemon)) return;
     const client = deps.clientFactory(getDaemonUrl(daemon));
     const endpoint = `/api/seat/${path}/${encodeURIComponent(seat)}`;
-    const res = (path === "set-codex-profile" || path === "set-cwd")
+    const res = (path === "set-codex-profile" || path === "set-cwd" || path === "rehost-runner")
       ? await client.post<Record<string, unknown>>(endpoint, body, { headers: terminalAuthHeaders() })
       : await client.post<Record<string, unknown>>(endpoint, body);
     if (opts.json) {
@@ -603,6 +603,42 @@ Examples:
         console.log(`Generation: ${String(data["generation"])}; model: ${String(data["model"] ?? "none")}.`);
         console.log(`Startup policy: ${String(data["startupPolicyHash"])}; superseded sessions: ${superseded?.length ?? 0}.`);
         console.log("No continuity source was used; siblings and durable work were preserved.");
+      });
+    });
+
+  cmd
+    .command("rehost-runner")
+    .argument("<seat>", "Canonical session name or logical seat ref")
+    .requiredOption("--reason <text>", "Audit reason recorded on the seat.runner_rehost_* events")
+    .option("--operator <address>", "Operator recorded on the audit events")
+    .option("--json", "JSON output for agents")
+    .description("Rehost a live pi seat's runner onto the SAME session file at the SAME generation")
+    .addHelpText("after", `
+Same-generation process rehost. The same pane, the same persisted session file
+(opened with --session; --resume and --fork are never emitted) and the same
+occupant generation are preserved. It mints no generation, no tenure and no
+authority, rotates nothing, and changes no claim, baton, resource or outbox row.
+Refuses unless the typing guard is ON, no unreleased reservation exists, no
+effect is in flight (sending), the live runner's launch id and generation are
+proven, and the runner's last entry is the session-file tail.
+The seat typing guard stays ENABLED on return: rehost never flushes held
+messages and never retries, releases or relabels an UNKNOWN effect. Any failed
+step writes a failed event and stops; there is no fresh, handover or fork
+fallback and no blind retry.
+Examples:
+  rig seat rehost-runner intake-lead@app-handy-conveyor --reason "runner qualification upgrade" --json
+  rig seat rehost-runner dev.impl --reason "upgrade runner" --operator orch-lead@my-rig`)
+    .action(async (seat: string, opts: { reason: string; operator?: string; json?: boolean }) => {
+      await runLifecycleVerb("rehost-runner", seat, { reason: opts.reason, operator: opts.operator }, opts, (data) => {
+        if (!data["ok"]) {
+          console.error(`Rehost refused: ${String(data["code"] ?? "unknown")} - ${String(data["message"] ?? "")}`);
+          return;
+        }
+        const descriptor = data["seat"] as { logicalId?: string; rigName?: string } | undefined;
+        console.log(`Rehosted ${String(descriptor?.logicalId)}@${String(descriptor?.rigName)} at the same generation ${String(data["generation"])}.`);
+        console.log(`Session file unchanged: ${String(data["sessionFile"])}; launch ${String(data["launchIdBefore"])} -> ${String(data["launchIdAfter"])}; durable model: ${String(data["durableModel"] ?? "none")}.`);
+        console.log(`UNKNOWN effects preserved: ${String((data["unknownEffectsPreserved"] as { count?: number } | undefined)?.count ?? 0)} row(s), byte-identical.`);
+        console.log("Typing guard left ENABLED; no authority, claim or lease was written. The genuine holder acts next.");
       });
     });
 
