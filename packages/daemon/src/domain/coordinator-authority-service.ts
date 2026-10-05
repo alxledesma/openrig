@@ -452,7 +452,7 @@ export class CoordinatorAuthorityService {
    const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired')").all() as Record<string,unknown>[];
    const rigName=(this.db.prepare('SELECT name FROM rigs WHERE id=?').get(input.rigId) as {name:string}).name;
    const touches=(session:string)=>this.local(session)?.rig_id===input.rigId||session.split('@')[1]===rigName;
-   if(effects.some(e=>(touches(String(e.sender_session))||touches(String(e.destination_session)))&&!this.adoptedHistoryContained(input.rigId,e)))reject('coordinator_uncertain_effects','Reconcile uncertain effects before stalled-live takeover');
+   if(effects.some(e=>(touches(String(e.sender_session))||touches(String(e.destination_session)))&&!this.adoptedHistoryContained(input.rigId,e)&&!this.coordinationRecovery?.noticeOutcomeContained(input.rigId,e)))reject('coordinator_uncertain_effects','Reconcile uncertain effects before stalled-live takeover');
    const baton=this.db.prepare('SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(r!.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string}|undefined;
    if(!baton||baton.destination_session!==r!.owner_session||baton.state!=='in-progress'||baton.claimed_by_generation_uuid!==r!.owner_generation)reject('coordinator_baton_mismatch','Actual old holder claim required');
    const epoch=r!.epoch+1,ts=new Date(this.now()).toISOString();
@@ -481,7 +481,7 @@ export class CoordinatorAuthorityService {
    const rigName=(this.db.prepare('SELECT name FROM rigs WHERE id=?').get(input.rigId) as {name:string}).name;
    const touches=(session:string)=>this.local(session)?.rig_id===input.rigId||session.split('@')[1]===rigName;
    const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired')").all() as Record<string,unknown>[];
-   if(effects.some(e=>(touches(String(e.sender_session))||touches(String(e.destination_session)))&&!this.adoptedHistoryContained(input.rigId,e)))reject('coordinator_uncertain_effects','Uncertain effects require exact recovery before takeover');
+   if(effects.some(e=>(touches(String(e.sender_session))||touches(String(e.destination_session)))&&!this.adoptedHistoryContained(input.rigId,e)&&!this.coordinationRecovery?.noticeOutcomeContained(input.rigId,e)))reject('coordinator_uncertain_effects','Uncertain effects require exact recovery before takeover');
    const baton=this.db.prepare('SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(a!.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string}|undefined;
    if(!baton||baton.destination_session!==a!.owner_session||baton.state!=='in-progress'||baton.claimed_by_generation_uuid!==a!.owner_generation)reject('coordinator_baton_mismatch','Exact predecessor claimed canonical baton required');
    const epoch=a!.epoch+1,ts=new Date(this.now()).toISOString(),operationId='unavailable-owner:'+epoch;

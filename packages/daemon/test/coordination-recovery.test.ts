@@ -628,4 +628,26 @@ describe('durable coordination recovery',()=>{
 
  it('closing an expired-holder recovery notice without restoring authority does not erase the recovery obligation',async()=>{unavailableSetup();observer('present');await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');const first=svc.supervise('xv','j')![0];repo.claim({qitemId:first.queueId!,destinationSession:'operator-agent@kernel'});repo.update({qitemId:first.queueId!,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});const next=svc.supervise('xv','j')![0];expect(next.queueId).not.toBe(first.queueId);expect(JSON.parse(repo.getById(next.queueId!)!.body).previousQueueId).toBe(first.queueId);expect(repo.getById(first.queueId!)?.state).toBe('done');expect(repo.coordinatorAuthority.get('xv')?.epoch).toBe(1);});
 
+ it.each(['indeterminate','pending','sending','postcondition-drift','unclaimed','retired-recipient'] as const)('expired idle holder takeover preserves %s lifecycle notice evidence',async(state)=>{
+  configure(normal());const original=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;
+  await finishTyped('product','builder@xv',original,'takeover-return');
+  const duty=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='acceptance:product')!;
+  repo.claim({qitemId:duty.queueId!,destinationSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1'});
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  svc.accept('lead@xv','lead-g1','xv','product','takeover-return','actual/takeover-acceptance.md');
+  repo.update({qitemId:duty.queueId!,actorSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+  db.prepare("UPDATE outbox_entries SET delivery_state=? WHERE outbox_id=?").run(['pending','sending'].includes(state)?state:'indeterminate','wake-intent-'+duty.queueId);
+  svc.reconcile('lead@xv','lead-g1','xv');
+  if(state==='postcondition-drift')db.prepare("DELETE FROM coordinator_operations WHERE kind='coordination-accept'").run();
+  if(state==='unclaimed')db.prepare("UPDATE queue_items SET claimed_at=NULL,claimed_by_generation_uuid=NULL WHERE qitem_id=?").run(duty.queueId);
+  if(state==='retired-recipient')db.prepare("UPDATE occupant_tenures SET generation_uuid='retired-lead' WHERE generation_uuid='lead-g1'").run();
+  const notice=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+duty.queueId) as any;
+  expect(svc.noticeOutcomeContained('xv',notice)).toBe(state==='indeterminate');
+  job();clock+=60001;vi.setSystemTime(clock);refresh();
+  const result=svc.supervise('xv','j');
+  if(state==='indeterminate')expect(repo.coordinatorAuthority.get('xv')).toMatchObject({epoch:2,owner_session:'peer@xv',state:'reconciling'});
+  else {if(['pending','sending','unclaimed'].includes(state))expect(result?.find(r=>r.key==='coordinator')?.reason).toBe('coordinator_uncertain_effects');expect(repo.coordinatorAuthority.get('xv')?.epoch).toBe(1);}
+  expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(notice.outbox_id)).toEqual(notice);
+ });
+
 });

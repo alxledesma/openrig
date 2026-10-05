@@ -268,7 +268,7 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
  private heldHistoryNoticeOutcomeProof(rigId:string,row:any):boolean {
   const id=String(row.outbox_id??'');if(!id.startsWith('wake-intent-')||row.delivery_state!=='indeterminate')return false;
   const qid=id.slice('wake-intent-'.length),op=this.lifecycleControl(qid);if(!op||op.rigId!==rigId||!dutyKinds[op.receipt.kind as DutyKind])return false;const r=op.receipt,q=this.repo.getById(qid);
-  if(!q||digest(q.body)!==r.bodyHash||row.sender_session!=='watchdog@system'||row.destination_session!==r.recipient||row.audit_pointer!==qid||digest(String(row.body))!==r.noticeBodyHash||!((this.heldNativeTerminal(qid,r.recipient,r.recipientGeneration))||(dutyKinds[r.kind as DutyKind]?.effectClass==='report-only'&&q.state==='done'&&this.heldNativeTerminal(r.targetQueueId,r.recipient,r.recipientGeneration)&&digest(this.repo.getById(r.targetQueueId)?.body??'')===r.targetBodyHash)))return false;
+  if(!q||digest(q.body)!==r.bodyHash||row.sender_session!=='watchdog@system'||row.destination_session!==r.recipient||row.audit_pointer!==qid||digest(String(row.body))!==r.noticeBodyHash||!((this.heldNativeTerminal(qid,r.recipient,r.recipientGeneration))||(q.state==='done'&&!!q.claimedAt&&this.authority.generation(r.recipient)===r.recipientGeneration&&this.dutyPostcondition(rigId,r))||(dutyKinds[r.kind as DutyKind]?.effectClass==='report-only'&&q.state==='done'&&this.heldNativeTerminal(r.targetQueueId,r.recipient,r.recipientGeneration)&&digest(this.repo.getById(r.targetQueueId)?.body??'')===r.targetBodyHash)))return false;
   if(q.claimedAt){const claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(qid) as any,last=this.db.prepare('SELECT * FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(qid) as any;return claim?.claimed_by_generation_uuid===r.recipientGeneration&&last?.actor_session===r.recipient&&last?.identity_provenance==='transport:v1';}
   const proof=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind') IN ('held-history-retirement','lifecycle-retirement') AND json_extract(receipt,'$.targetQueueId')=? ORDER BY rowid DESC LIMIT 1").get(rigId,qid) as any;if(!proof)return false;
   const t=JSON.parse(proof.receipt),d=this.repo.getById(t.queueId),claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(t.queueId) as any;return !!d?.claimedAt&&claim?.claimed_by_generation_uuid===r.recipientGeneration;
@@ -354,6 +354,10 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
  }
  /** One bounded scan per pass, written by the registered observer path only. */
  private recordSystemWakeOutcomes(rigId:string):void {
+  // Completed scope may no longer be traversed by task reconciliation. Record only
+  // exact terminal lifecycle pointer outcomes; never infer transport delivery.
+  const completed=this.db.prepare("SELECT c.receipt FROM coordinator_operations c JOIN queue_items q ON q.qitem_id=json_extract(c.receipt,'$.queueId') JOIN outbox_entries o ON o.outbox_id='wake-intent-'||q.qitem_id WHERE c.rig_id=? AND c.kind='coordinator-lifecycle-control' AND q.state IN ('done','failed','denied','canceled','handed-off') AND o.delivery_state='indeterminate' AND NOT EXISTS (SELECT 1 FROM coordinator_operations p WHERE p.rig_id=c.rig_id AND p.kind='held-history-control-outcome' AND p.operation_id='held-control-outcome:'||o.outbox_id) ORDER BY c.rowid LIMIT 200").all(rigId) as Array<{receipt:string}>;
+  for(const row of completed)this.recordHeldHistoryNoticeOutcome(rigId,JSON.parse(row.receipt));
   // Paged, and the rig is resolved per row before anything is written, so a busy
   // project can never starve another project's older notice.
   let from=0,scanned=0;
