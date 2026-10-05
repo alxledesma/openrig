@@ -204,6 +204,35 @@ export class CoordinatorAuthorityService {
      const result=this.get(input.rigId)!;this.log(input.rigId,input.operationId,"legacy-enrollment",result,operationRequest);return result;
    }).immediate();
  }
+ /** Current-epoch adoption appends containment only; never imports custody or resets authority. */
+ adoptHeldHistory(actor:string,generation:string,input:{rigId:string;operationId:string;expected:CoordinatorToken;effects:HeldHistoryRef[];recovery:{queueId:string;rowHash:string}}):unknown {
+   return this.db.transaction(()=>{
+     this.operator(actor,generation);
+     if(!input||Object.keys(input).sort().join(',')!=='effects,expected,operationId,recovery,rigId'||typeof input.rigId!=='string'||typeof input.operationId!=='string'||!input.operationId.trim()||!input.expected||Object.keys(input.expected).sort().join(',')!=='epoch,generation,rigId'||input.expected.rigId!==input.rigId||!Number.isSafeInteger(input.expected.epoch)||typeof input.expected.generation!=='string'||!Array.isArray(input.effects)||input.effects.length<1||input.effects.length>2000||new Set(input.effects.map(h=>h?.outboxId)).size!==input.effects.length)reject('coordinator_held_history_contract','Exact bounded current-epoch containment contract required');
+     const request={actor,generation,input};const prior=this.replay(input.rigId,input.operationId,'held-history-adoption',request);if(prior)return prior;
+     const current=this.get(input.rigId);if(!current)reject('coordinator_not_enabled','Current enabled authority required');
+     const a=this.assertOwner(current!.owner_session,input.expected);
+     if(!this.coordinatorMembersValid(input.rigId,a.owner_session,this.coordinatorMembers(a)))reject('coordinator_invalid_members','Current registered coordinator occupants required');
+     const rows=input.effects.map(ref=>{
+       if(!ref||Object.keys(ref).sort().join(',')!=='custodyHash,operationHash,outboxId,quarantineHash,rowHash'||Object.values(ref).some(v=>typeof v!=='string'||!v.trim()))reject('coordinator_held_history_contract','Exact immutable row, quarantine, operation and custody references required');
+       const row=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(ref.outboxId) as Record<string,unknown>|undefined;
+       const held=row?this.containedHistory(row):null;
+       const quarantine=this.db.prepare('SELECT rig_id FROM outbox_historical_quarantines WHERE outbox_id=?').get(ref.outboxId) as {rig_id:string}|undefined;
+       if(!row||!held||quarantine?.rig_id!==input.rigId||canonical(held)!==canonical(ref))reject('coordinator_held_history_contract','Immutable same-rig contained row or custody changed; reconcile before adoption');
+       if(this.db.prepare('SELECT 1 FROM coordinator_held_history WHERE rig_id=? AND outbox_id=?').get(input.rigId,ref.outboxId))reject('coordinator_held_history_conflict','Already adopted history requires existing recovery binding, not a second adoption');
+       return {row:row!,held:held!};
+     });
+     const recoveryBinding=this.validateHeldRecovery(actor,generation,{rigId:input.rigId,operationId:input.operationId,owner:a.owner_session,ownerGeneration:a.owner_generation,heldHistoryRecovery:input.recovery} as LegacyEnrollment,input.effects);
+     for(const queueId of [a.baton_id,input.recovery.queueId]){
+       const claim=this.db.prepare("SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? AND state='in-progress' AND transition_note='claimed' ORDER BY transition_id DESC LIMIT 1").get(queueId) as {actor_session:string;identity_provenance:string}|undefined;
+       if(!claim||claim.actor_session!==(queueId===a.baton_id?a.owner_session:actor)||claim.identity_provenance!=='transport:v1')reject('coordinator_held_history_contract','Actual current native holder and Operator recovery claims required');
+     }
+     for(const {row,held:h} of rows){const custody=this.historyCustody(row);
+       this.db.prepare('INSERT INTO coordinator_held_history VALUES (?,?,?,?,?,?,?,?,?,?)').run(input.rigId,h.outboxId,input.operationId,h.rowHash,h.quarantineHash,h.operationHash,h.custodyHash,h.custodyHash,input.recovery.queueId,JSON.stringify({kind:'coordinator-held-history-adoption.v1',actor,generation,owner:a.owner_session,ownerGeneration:a.owner_generation,epoch:a.epoch,pre:h,postCustody:custody,recovery:input.recovery,recoveryBinding,deliveryConclusion:'unknown',originalMutations:0}));
+     }
+     const receipt={kind:'coordinator-current-held-history-adoption.v1',actor,generation,expected:input.expected,effects:input.effects,recoveryBinding,deliveryConclusion:'unknown',originalMutations:0};this.log(input.rigId,input.operationId,'held-history-adoption',receipt,request);return receipt;
+   }).immediate();
+ }
  /** Complete pre-import custody; never overwrite the historical quarantine receipt. */
  private historyCustody(row:Record<string,unknown>):unknown {
    const q=row.audit_pointer?this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(row.audit_pointer):null;
