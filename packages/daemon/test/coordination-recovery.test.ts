@@ -657,7 +657,148 @@ describe('durable coordination recovery',()=>{
   const result=svc.supervise('xv','j');
   if(state==='indeterminate')expect(repo.coordinatorAuthority.get('xv')).toMatchObject({epoch:2,owner_session:'peer@xv',state:'reconciling'});
   else {if(['pending','sending','unclaimed'].includes(state))expect(result?.find(r=>r.key==='coordinator')?.reason).toBe('coordinator_uncertain_effects');expect(repo.coordinatorAuthority.get('xv')?.epoch).toBe(1);}
-  expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(notice.outbox_id)).toEqual(notice);
- });
+expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(notice.outbox_id)).toEqual(notice);
+  });
+
+  function expiredPresentSetup(){configure(normal());job();samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});svc.supervise('xv','j');repo.coordinatorAuthority.renew('lead@xv',token,10000,'short-lease');clock+=10001;vi.setSystemTime(clock);refresh();samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});return {expectedLeaseUntil:repo.coordinatorAuthority.get('xv')!.lease_until};}
+  const expiryDuties=()=>db.prepare("SELECT qitem_id,body FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_valid(body) AND json_extract(body,'$.action')='active-expiry-recover' ORDER BY rowid").all() as Array<{qitem_id:string;body:string}>;
+  const intentActions=()=>db.prepare("SELECT json_extract(body,'$.action') a,count(*) n FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_valid(body) GROUP BY a").all() as Array<{a:string|null;n:number}>;
+
+  it('expired active present creates one operator intake with exact frozen lease',()=>{
+   expiredPresentSetup();
+   const result=svc.supervise('xv','j')!;
+   expect(result).toHaveLength(1);
+   expect(result[0]).toMatchObject({key:'coordinator',state:'recovery-required',reason:'expired-active-native-present-holder'});
+   const q=repo.getById(result[0].queueId!)!;
+   expect(q).toMatchObject({sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',state:'pending'});
+   expect(db.prepare("SELECT claimed_at,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?").get(result[0].queueId)).toEqual({claimed_at:null,claimed_by_generation_uuid:null});
+   const body=JSON.parse(q.body);
+   expect(body).toMatchObject({action:'active-expiry-recover',reason:'expired-active-native-present-holder',previousQueueId:null,rigId:'xv',epoch:1,recipientGeneration:'operator-agent-g1'});
+   expect(body.activeExpiry).toEqual({owner:'lead@xv',ownerGeneration:'lead-g1',expectedLeaseUntil:repo.coordinatorAuthority.get('xv')!.lease_until,custodyDigest:repo.coordinatorAuthority.reconciliationDigest('xv'),recoveryWindowMs:300000});
+   expect(body.nextAction).toContain('active-expiry-recover');
+   expect(body.nextAction).toContain('genuinely acknowledge custody first');
+   expect(body.nextAction).toContain('only after that acknowledgment renew');
+   expect('grantsAuthority' in body).toBe(false);
+   expect(q.expiresAt).toBe(new Date(result[0].deadline!).toISOString());
+   // Precedence is proven, not assumed: the idle-transfer fallback cannot also stage its hold.
+   expect(expiryDuties()).toHaveLength(1);
+   expect(intentActions().filter(r=>r.a==='recover-expired-idle-transfer')).toEqual([]);
+   expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='idle-stall-transfer'").get()).toEqual({n:0});
+   expect(repo.coordinatorAuthority.get('xv')).toMatchObject({epoch:1,owner_session:'lead@xv',state:'active'});
+  });
+
+  it('repeated tick no duplicate',()=>{
+   expiredPresentSetup();
+   const first=svc.supervise('xv','j')!,qid=first[0].queueId!,item=repo.getById(qid)!;
+   const emitted=db.prepare("SELECT outbox_id FROM outbox_entries").all().map((r:any)=>r.outbox_id as string);
+   expect(emitted).toContain('wake-intent-'+qid);
+   const wake=db.prepare("SELECT * FROM outbox_entries WHERE outbox_id=?").get('wake-intent-'+qid);
+   expect(wake).toMatchObject({delivery_state:'pending',tags:JSON.stringify(['queue:recipient-generation:operator-agent-g1'])});
+   svc.supervise('xv','j');svc.supervise('xv','j');
+   expect(expiryDuties()).toHaveLength(1);
+   expect(repo.getById(qid)).toEqual(item);
+   expect(db.prepare("SELECT count(*) n FROM outbox_entries WHERE outbox_id=?").get('wake-intent-'+qid)).toEqual({n:1});
+   // An UNKNOWN wake stays exactly as emitted; it is never relabelled, retried or exempted.
+   db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+qid);
+   const unknown=db.prepare("SELECT * FROM outbox_entries WHERE outbox_id=?").get('wake-intent-'+qid);
+   svc.supervise('xv','j');
+   expect(expiryDuties()).toHaveLength(1);
+   expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id=?").get('wake-intent-'+qid)).toEqual(unknown);
+   expect(String((unknown as any).tags)).not.toContain('system-wake');
+   // Plain administrative intake: claimed through the ordinary queue path with effects still unresolved.
+   repo.claim({qitemId:qid,destinationSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1'});
+   expect(repo.getById(qid)?.state).toBe('in-progress');
+   expect(db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(qid)).toEqual({claimed_by_generation_uuid:'operator-agent-g1'});
+   svc.supervise('xv','j');
+   expect(expiryDuties()).toHaveLength(1);
+   expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind IN ('coordination-task-hold-lineage','native-terminal-return-retirement')").get()).toBeUndefined();
+   expect(repo.coordinatorAuthority.get('xv')).toMatchObject({epoch:1,state:'active'});
+  });
+
+  it('new later lease distinct episode',async()=>{
+   const {expectedLeaseUntil}=expiredPresentSetup();
+   const first=svc.supervise('xv','j')!,firstId=first[0].queueId!,before=repo.getById(firstId)!;
+   // Supported native sequence: Operator opens the window, the same holder acknowledges, then renews.
+   observer('present');await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');
+   const frozen=JSON.parse(before.body).activeExpiry;
+   expect(()=>repo.coordinatorAuthority.renew('lead@xv',token,60000,'premature-renew')).toThrow('Lease expiry');
+   expect(repo.coordinatorAuthority.recoverExpiredActive('operator-agent@kernel','operator-agent-g1',{token,expectedLeaseUntil:frozen.expectedLeaseUntil,operationId:'expiry-duty-r1',obligationsDigest:frozen.custodyDigest,windowMs:frozen.recoveryWindowMs})).toMatchObject({state:'reconciling',owner_session:'lead@xv',epoch:1});
+   expect(()=>repo.coordinatorAuthority.renew('lead@xv',token,60000,'renew-before-ack')).toThrow('not reconciled');
+   repo.coordinatorAuthority.acknowledge('lead@xv',token,{operationId:'expiry-ack',obligationsDigest:repo.coordinatorAuthority.reconciliationDigest('xv')});
+   expect(()=>repo.coordinatorAuthority.renew('lead@xv','retired',60000,'retired-renew')).toThrow();
+   repo.coordinatorAuthority.renew('lead@xv',token,10000,'post-ack-renew');
+   expect(repo.coordinatorAuthority.get('xv')).toMatchObject({state:'active',lease_until:clock+10000});
+   expect(repo.getById(firstId)).toEqual(before);
+   // The acknowledged lease lapses again: a distinct episode that never rewrites the earlier duty.
+   clock=clock+10001;vi.setSystemTime(clock);refresh();samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});
+   const second=svc.supervise('xv','j')!;
+   expect(second[0].reason).toBe('expired-active-native-present-holder');
+   expect(second[0].queueId).not.toBe(firstId);
+   expect(expiryDuties()).toHaveLength(2);
+   expect(repo.getById(firstId)).toEqual(before);
+   const later=JSON.parse(repo.getById(second[0].queueId!)!.body);
+   expect(later.activeExpiry.expectedLeaseUntil).toBe(clock-1);
+   expect(later.activeExpiry.expectedLeaseUntil).not.toBe(expectedLeaseUntil);
+   expect(later.previousQueueId).toBeNull();
+   expect(later.recoveryKey).not.toBe(JSON.parse(before.body).recoveryKey);
+  });
+
+  it('no authority/custody mutation',()=>{
+   expiredPresentSetup();
+   const authority=db.prepare('SELECT * FROM coordinator_authority').all(),assignments=db.prepare('SELECT * FROM coordinator_assignments').all(),stages=db.prepare('SELECT * FROM coordinator_stage_assignments').all(),resources=db.prepare('SELECT * FROM coordinator_resources').all(),operations=db.prepare('SELECT * FROM coordinator_operations').all(),outbox=db.prepare('SELECT count(*) n FROM outbox_entries').get(),baton=repo.getById('baton')!;
+   const result=svc.supervise('xv','j')!;
+   expect(db.prepare('SELECT * FROM coordinator_authority').all()).toEqual(authority);
+   expect(db.prepare('SELECT * FROM coordinator_assignments').all()).toEqual(assignments);
+   expect(db.prepare('SELECT * FROM coordinator_stage_assignments').all()).toEqual(stages);
+   expect(db.prepare('SELECT * FROM coordinator_resources').all()).toEqual(resources);
+   expect(db.prepare('SELECT * FROM coordinator_operations').all()).toEqual(operations);
+   expect(db.prepare('SELECT count(*) n FROM outbox_entries').get()).toEqual({n:(outbox as any).n+1});
+   expect(repo.getById('baton')).toEqual(baton);
+   const body=JSON.parse(repo.getById(result[0].queueId!)!.body);
+   expect(body.grantsAuthority).toBeUndefined();
+   expect(intentActions()).toEqual([{a:'active-expiry-recover',n:1}]);
+   expect(db.prepare("SELECT count(*) n FROM queue_items WHERE destination_session='operator-agent@kernel' AND claimed_by_generation_uuid IS NOT NULL").get()).toEqual({n:0});
+  });
+
+  it.each(['absent','unknown-identity','stale-identity','unverified-identity','retired-holder','live-lease','reconciling','no-plan'] as const)('absent/unknown state follows existing safe fences (%s)',async(kind)=>{
+   const {expectedLeaseUntil}=expiredPresentSetup();
+   if(kind==='absent'){observer('absent');await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');expect(repo.coordinatorAuthority.hasFreshUnavailableOwner('xv')).toBe(true);}
+   if(kind==='unknown-identity')samples.delete('lead@xv');
+   if(kind==='stale-identity')samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock-3001).toISOString()});
+   if(kind==='unverified-identity')samples.set('lead@xv',{...sample('lead@xv'),identityVerified:false,identityObservedAt:new Date(clock).toISOString()});
+   if(kind==='retired-holder')db.prepare("UPDATE occupant_tenures SET generation_uuid='retired-lead' WHERE node_id='lead@xv'").run();
+   if(kind==='live-lease')db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+60000);
+   if(kind==='reconciling'){observer('present');await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');repo.coordinatorAuthority.recoverExpiredActive('operator-agent@kernel','operator-agent-g1',{token,expectedLeaseUntil,operationId:'fence-reconciling',obligationsDigest:repo.coordinatorAuthority.reconciliationDigest('xv'),windowMs:60000});clock=repo.coordinatorAuthority.get('xv')!.lease_until+1;vi.setSystemTime(clock);refresh();samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});}
+   if(kind==='no-plan')db.prepare("DELETE FROM coordinator_operations WHERE kind='coordination-plan'").run();
+   const before=db.prepare('SELECT count(*) n FROM queue_items').get(),authority=db.prepare('SELECT * FROM coordinator_authority').all();
+   let error:Error|undefined,result:ReturnType<typeof svc.supervise>=null;
+   try{result=svc.supervise('xv','j');}catch(e){error=e as Error;}
+   // The actionable expiry duty is never staged on any absent, unknown or stale condition.
+   expect(expiryDuties()).toEqual([]);
+   if(kind==='retired-holder'){expect(error?.message).toContain('Caller generation is missing, retired, or unknown');expect(db.prepare('SELECT * FROM coordinator_authority').all()).toEqual(authority);return;}
+   expect(error).toBeUndefined();
+   expect(db.prepare('SELECT * FROM coordinator_authority').all()).toEqual(authority);
+   if(kind==='no-plan'){expect(result).toBeNull();expect(db.prepare('SELECT count(*) n FROM queue_items').get()).toEqual(before);return;}
+   if(kind==='live-lease'){expect(result?.find(r=>r.key==='product')?.state).toBe('pending-pickup');expect(intentActions().map(r=>r.a)).not.toContain('active-expiry-recover');return;}
+   if(kind==='reconciling'){expect(result?.[0]).toMatchObject({key:'coordinator',state:'pending-reconciliation-recovery'});expect(intentActions().map(r=>r.a)).toContain('recover-expired-reconciliation');return;}
+   if(kind==='absent'||kind==='unknown-identity'||kind==='unverified-identity'){expect(result?.[0]).toMatchObject({key:'coordinator',state:'recovery-required'});expect(intentActions().map(r=>r.a)).toContain('reconcile-current-coordinator-lease');return;}
+   // A present-but-unverified holder keeps whatever pre-existing fence its own path already applies.
+   expect(result?.find(r=>r.key==='coordinator')?.reason).not.toBe('expired-active-native-present-holder');
+   expect(intentActions().map(r=>r.a)).toContain('recover-expired-idle-transfer');
+  });
+
+  it('supported active-expiry-recover still refuses unproven presence and drift without staging another duty',async()=>{
+   expiredPresentSetup();
+   const first=svc.supervise('xv','j')!,frozen=JSON.parse(repo.getById(first[0].queueId!)!.body).activeExpiry;
+   observer('unknown');await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');
+   const authority=db.prepare('SELECT * FROM coordinator_authority').all();
+   expect(()=>repo.coordinatorAuthority.recoverExpiredActive('operator-agent@kernel','operator-agent-g1',{token,expectedLeaseUntil:frozen.expectedLeaseUntil,operationId:'unknown-presence',obligationsDigest:frozen.custodyDigest,windowMs:frozen.recoveryWindowMs})).toThrow('Fresh generation-bound native presence required');
+   expect(()=>repo.coordinatorAuthority.recoverExpiredActive('lead@xv','lead-g1',{token,expectedLeaseUntil:frozen.expectedLeaseUntil,operationId:'non-operator',obligationsDigest:frozen.custodyDigest,windowMs:frozen.recoveryWindowMs})).toThrow('Kernel Operator owns admission');
+   observer('present');await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');
+   expect(()=>repo.coordinatorAuthority.recoverExpiredActive('operator-agent@kernel','operator-agent-g1',{token,expectedLeaseUntil:frozen.expectedLeaseUntil+1,operationId:'stale-lease',obligationsDigest:frozen.custodyDigest,windowMs:frozen.recoveryWindowMs})).toThrow('Exact expired active');
+   expect(()=>repo.coordinatorAuthority.recoverExpiredActive('operator-agent@kernel','operator-agent-g1',{token,expectedLeaseUntil:frozen.expectedLeaseUntil,operationId:'drifted-digest',obligationsDigest:'stale-digest',windowMs:frozen.recoveryWindowMs})).toThrow('Exact current custody digest required');
+   expect(db.prepare('SELECT * FROM coordinator_authority').all()).toEqual(authority);
+   expect(expiryDuties()).toHaveLength(1);
+  });
 
 });

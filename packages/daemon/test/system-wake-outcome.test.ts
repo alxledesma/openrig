@@ -52,21 +52,32 @@ describe('system-origin administrative wake outcome convergence',()=>{
 
  /** A genuine system-origin administrative item with a typed rig origin, and the
   *  guarded wake the runtime staged for it that then went indeterminate. */
- function stageSystemAdministrativeEffect(reasons=['rig-plan-absent'],rigId='xv'){
-  // A genuine runtime rollout item: its id and rolloutKey are recomputable, so the
-  // provenance is verified rather than trusted from the body action alone.
-  const recipientGeneration='operator-agent-g1';
-  const rolloutKey=digest(rigId+':'+recipientGeneration+':'+reasons.join('|'));
-  const previousQueueId=null;
-  const qitemId='qitem-resilience-rollout-'+digest(rolloutKey+':'+(previousQueueId??'initial')).slice(0,24);
-  db.transaction(()=>repo.createWithinTransaction({qitemId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:new Date(clock+1200000).toISOString(),body:JSON.stringify({action:'materialize-standard-resilience',rolloutKey,previousQueueId,rigId,rigName:rigId,policyRef:'resilience-rollout',reasons,recipientGeneration,deadline:clock+1200000,grantsAuthority:false,required:'Genuine native custody only.'}),identityProvenance:'system:operator-authorized-coordination',nudge:false}))();
-  repo.stageWakeIntent(qitemId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,recipientGeneration);
-  db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+qitemId);
-  return qitemId;
- }
+function stageSystemAdministrativeEffect(reasons=['rig-plan-absent'],rigId='xv',expiryRecoveryContract?:Record<string,unknown>){
+   // A genuine runtime rollout item: its id and rolloutKey are recomputable, so the
+   // provenance is verified rather than trusted from the body action alone. When the
+   // lease has lapsed the producer also binds the lease tuple into that same key.
+   const recipientGeneration='operator-agent-g1';
+   const suffix=expiryRecoveryContract?':'+digest(`${(expiryRecoveryContract.token as any).epoch}:${(expiryRecoveryContract.token as any).generation}:${expiryRecoveryContract.expectedLeaseUntil}`):'';
+   const rolloutKey=digest(rigId+':'+recipientGeneration+':'+reasons.join('|')+suffix);
+   const previousQueueId=null;
+   const qitemId='qitem-resilience-rollout-'+digest(rolloutKey+':'+(previousQueueId??'initial')).slice(0,24);
+   db.transaction(()=>repo.createWithinTransaction({qitemId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:new Date(clock+1200000).toISOString(),body:JSON.stringify({action:'materialize-standard-resilience',rolloutKey,previousQueueId,rigId,rigName:rigId,policyRef:'resilience-rollout',reasons,...(expiryRecoveryContract?{expiryRecoveryContract}:{}),recipientGeneration,deadline:clock+1200000,grantsAuthority:false,required:'Genuine native custody only.'}),identityProvenance:'system:operator-authorized-coordination',nudge:false}))();
+   repo.stageWakeIntent(qitemId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,recipientGeneration);
+   db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+qitemId);
+   return qitemId;
+  }
 
 
- async function stageDiagnostic(legacy=false){
+ /** The same item a real rollout stages while the active lease has lapsed: the key
+   *  carries the lease-tuple suffix, so the proof must recompute exactly this. */
+  function stageExpiryContractRollout(reasons=['rig-plan-absent'],rigId='xv'){
+   const recipientGeneration='operator-agent-g1';
+   const a=repo.coordinatorAuthority.get(rigId)!;
+   const contract={schema:'expiry-recovery-contract.v1',supportedOperation:'active-expiry-recover',guardSequence:['refreshRuntimeAvailability','active-expiry-recover with recomputed current custody digest'],token:{rigId:a.rig_id,epoch:a.epoch,generation:a.owner_generation},expectedLeaseUntil:a.lease_until,windowMs:{min:10000,max:900000},obligationsDigest:'recompute reconciliationDigest(rigId) at execution; never reuse this snapshot as proof',observedObligationsDigest:repo.coordinatorAuthority.reconciliationDigest(rigId),executionOrder:'Operator executes supported active-expiry-recover within the finite window; the genuine holder may then acknowledge and renew through the guarded reconciling paths; staging itself changes no authority'};
+   return stageSystemAdministrativeEffect(reasons,rigId,contract);
+  }
+
+  async function stageDiagnostic(legacy=false){
   configureAdminOnly();const body='original diagnostic target';
   repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv','diagnostic-target',{inputDigest:digest('original'),destination:'builder@xv',bodyHash:digest(body),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
   await repo.create({qitemId:'diagnostic-target',sourceSession:'lead@xv',destinationSession:'builder@xv',body,dispatch:{token,packageKey:'diagnostic-target'},nudge:false});
@@ -193,6 +204,145 @@ describe('system-origin administrative wake outcome convergence',()=>{
   // The rollout notice is still contained from the earlier pass, and unchanged.
   expect(svc.noticeOutcomeContained('xv',db.prepare("SELECT * FROM outbox_entries WHERE outbox_id=?").get('wake-intent-'+qitemId))).toBe(true);
  });
+
+ it('contains a genuine claimed expiry-contract rollout wake without changing UNKNOWN delivery',()=>{
+   configureAdminOnly();
+   const qitemId=stageExpiryContractRollout();
+   expect(JSON.parse(repo.getById(qitemId)!.body).expiryRecoveryContract.token.rigId).toBe('xv');
+   claimOperator(qitemId);
+   repo.update({qitemId,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+   reconcile();
+   const wake=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qitemId) as any;
+   // D1: the tuple-bound key is recomputed with the contract suffix, so the receipt
+   // is produced and this wake stops being uncontained Operator-seat debt.
+   expect(svc.noticeOutcomeContained('xv',wake)).toBe(true);
+   const receipt=JSON.parse((db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='system-wake-outcome' AND operation_id=?").get('system-wake-outcome:wake-intent-'+qitemId) as {receipt:string}).receipt);
+   expect(receipt).toMatchObject({action:'materialize-standard-resilience',rigId:'xv',recipientGeneration:'operator-agent-g1',taskStateAtRecord:'done',deliveryConclusion:'unknown',originalMutations:0,outcomeOnly:true,grantsAuthority:false});
+   // UNKNOWN delivery is never relabelled or retried, and staging changed no authority.
+   expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id=?").get('wake-intent-'+qitemId)).toEqual({delivery_state:'indeterminate'});
+   expect(wake.delivery_state).toBe('indeterminate');
+   expect((svc as any).workerEffectDebt('operator-agent@kernel')).toBe(false);
+  });
+
+ it.each(['epoch','generation','lease','schema','rig','missing','null'])('refuses a tampered expiry-contract rollout wake (%s)',kind=>{
+   configureAdminOnly();
+   const qitemId=stageExpiryContractRollout();
+   claimOperator(qitemId);
+   repo.update({qitemId,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+   reconcile();
+   const wake=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qitemId) as any;
+   expect(svc.noticeOutcomeContained('xv',wake)).toBe(true);
+   const original=repo.getById(qitemId)!.body;
+   const body=JSON.parse(original);
+   if(kind==='epoch')body.expiryRecoveryContract.token.epoch=body.expiryRecoveryContract.token.epoch+1;
+   if(kind==='generation')body.expiryRecoveryContract.token.generation='forged-generation';
+   if(kind==='lease')body.expiryRecoveryContract.expectedLeaseUntil=body.expiryRecoveryContract.expectedLeaseUntil+1;
+   if(kind==='schema')body.expiryRecoveryContract.schema='expiry-recovery-contract.v2';
+   if(kind==='rig')body.expiryRecoveryContract.token.rigId='other-rig';
+   if(kind==='missing')delete body.expiryRecoveryContract;
+   if(kind==='null')body.expiryRecoveryContract=null;
+   db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(JSON.stringify(body),qitemId);
+   expect((svc as any).systemTaskProof(qitemId,'operator-agent@kernel')).toBeNull();
+   expect(svc.noticeOutcomeContained('xv',wake)).toBe(false);
+   expect((svc as any).workerEffectDebt('operator-agent@kernel')).toBe(true);
+   db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(original,qitemId);
+   expect(svc.noticeOutcomeContained('xv',wake)).toBe(true);
+  });
+
+ it.each(['claimed','terminal'])('contains a genuine %s active-expiry recovery intake through the existing outcome-only contract',state=>{
+   configureAdminOnly();
+   // The producer's own staging path, so the key, id and frozen tuple are authentic.
+   const a=repo.coordinatorAuthority.get('xv')!;
+   const lease={owner:a.owner_session,ownerGeneration:a.owner_generation,expectedLeaseUntil:a.lease_until,custodyDigest:repo.coordinatorAuthority.reconciliationDigest('xv'),recoveryWindowMs:60000};
+   const qid=(svc as any).stageCoordinatorRecovery('xv',1,'operator-agent-g1','active-expiry-recover','expired-active-native-present-holder',clock+60000,undefined,lease);
+   expect(JSON.parse(repo.getById(qid)!.body).activeExpiry).toEqual(lease);
+   db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+qid);
+   const before=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid);
+   const authorityBefore=db.prepare('SELECT * FROM coordinator_authority').all();
+   reconcile();
+   // Nothing is contained before genuine native custody exists.
+   expect(svc.noticeOutcomeContained('xv',before)).toBe(false);
+   expect((svc as any).workerEffectDebt('operator-agent@kernel')).toBe(true);
+   claimOperator(qid);
+   if(state==='terminal')repo.update({qitemId:qid,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+   reconcile();
+   const wake=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid) as any;
+   // L1 closed: the real native outcome now has an exit, through the existing contract only.
+   expect(svc.noticeOutcomeContained('xv',wake)).toBe(true);
+   expect((svc as any).workerEffectDebt('operator-agent@kernel')).toBe(false);
+   const receipt=JSON.parse((db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='system-wake-outcome' AND operation_id=?").get('system-wake-outcome:wake-intent-'+qid) as {receipt:string}).receipt);
+   expect(receipt).toMatchObject({action:'active-expiry-recover',rigId:'xv',recipient:'operator-agent@kernel',recipientGeneration:'operator-agent-g1',taskStateAtRecord:state==='terminal'?'done':'in-progress',deliveryConclusion:'unknown',originalMutations:0,outcomeOnly:true,nonExecutable:true,grantsAuthority:false});
+   // UNKNOWN delivery is preserved byte-for-byte and no authority moved.
+   expect(wake).toEqual(before);
+   expect(wake.delivery_state).toBe('indeterminate');
+   expect(db.prepare('SELECT * FROM coordinator_authority').all()).toEqual(authorityBefore);
+  });
+
+ it.each(['epoch','generation','lease','owner','missing','null','empty-owner','empty-generation','non-finite-lease'])('refuses a tampered active-expiry recovery intake (%s)',kind=>{
+   configureAdminOnly();
+   const a=repo.coordinatorAuthority.get('xv')!;
+   const lease={owner:a.owner_session,ownerGeneration:a.owner_generation,expectedLeaseUntil:a.lease_until,custodyDigest:repo.coordinatorAuthority.reconciliationDigest('xv'),recoveryWindowMs:60000};
+   const qid=(svc as any).stageCoordinatorRecovery('xv',1,'operator-agent-g1','active-expiry-recover','expired-active-native-present-holder',clock+60000,undefined,lease);
+   db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+qid);
+   const original=repo.getById(qid)!.body;
+   const wake=()=>db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid) as any;
+   const tamper=(fn:(body:any)=>void)=>{const body=JSON.parse(original);fn(body);db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(JSON.stringify(body),qid);};
+   if(kind==='epoch')tamper(b=>{b.epoch=2;});
+   if(kind==='generation')tamper(b=>{b.activeExpiry.ownerGeneration='forged';});
+   if(kind==='lease')tamper(b=>{b.activeExpiry.expectedLeaseUntil=b.activeExpiry.expectedLeaseUntil+1;});
+   if(kind==='owner')tamper(b=>{b.activeExpiry.owner='attacker@xv';});
+   if(kind==='missing')tamper(b=>{delete b.activeExpiry;});
+   if(kind==='null')tamper(b=>{b.activeExpiry=null;});
+   if(kind==='empty-owner')tamper(b=>{b.activeExpiry.owner='';});
+   if(kind==='empty-generation')tamper(b=>{b.activeExpiry.ownerGeneration='';});
+   if(kind==='non-finite-lease')tamper(b=>{b.activeExpiry.expectedLeaseUntil='soon';});
+   expect((svc as any).systemTaskProof(qid,'operator-agent@kernel')).toBeNull();
+   // Even with genuine native custody the tampered row stays unresolved debt.
+   claimOperator(qid);
+   repo.update({qitemId:qid,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+   reconcile();
+   expect(svc.noticeOutcomeContained('xv',wake())).toBe(false);
+   expect((svc as any).workerEffectDebt('operator-agent@kernel')).toBe(true);
+   expect(wake().delivery_state).toBe('indeterminate');
+   // Restoring the authentic body and re-running the ordinary observer pass records the
+   // exit, so the guard is the recomputed tuple itself, not a one-way latch.
+   db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(original,qid);
+   reconcile();
+   expect(svc.noticeOutcomeContained('xv',wake())).toBe(true);
+  });
+
+ it('refuses an arbitrary or spoofed expiry row that never came from the producer',()=>{
+   configureAdminOnly();
+   const qid='qitem-coordination-recovery-'+digest('forged-expiry-row').slice(0,24);
+   const body=JSON.stringify({action:'active-expiry-recover',reason:'expired-active-native-present-holder',recoveryKey:digest('forged-expiry-row'),previousQueueId:null,rigId:'xv',epoch:1,recipientGeneration:'operator-agent-g1',activeExpiry:{owner:'lead@xv',ownerGeneration:'lead-g1',expectedLeaseUntil:clock-1,custodyDigest:'x',recoveryWindowMs:60000},returnPath:{queueId:qid,actor:'operator-agent@kernel',required:'forged'},grantsAuthority:false});
+   db.transaction(()=>repo.createWithinTransaction({qitemId:qid,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',body,identityProvenance:'system:operator-authorized-coordination',nudge:false}))();
+   repo.stageWakeIntent(qid,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,'operator-agent-g1');
+   db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+qid);
+   // An assertion cannot buy admission: the key and id do not recompute.
+   expect((svc as any).systemTaskProof(qid,'operator-agent@kernel')).toBeNull();
+   claimOperator(qid);
+   repo.update({qitemId:qid,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+   reconcile();
+   expect(svc.noticeOutcomeContained('xv',db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid) as any)).toBe(false);
+   expect((svc as any).workerEffectDebt('operator-agent@kernel')).toBe(true);
+   // The same shape under another action is not admitted either: no widening.
+   const other=(svc as any).stageCoordinatorRecovery('xv',1,'operator-agent-g1','reconcile-current-coordinator-lease','current-holder-acknowledgment-or-lease',clock+60000);
+   expect(JSON.parse(repo.getById(other)!.body).activeExpiry).toBeUndefined();
+   expect((svc as any).systemTaskProof(other,'operator-agent@kernel')).not.toBeNull();
+  });
+
+ it('leaves a plain contract-free rollout item unchanged',()=>{
+   configureAdminOnly();
+   const qitemId=stageSystemAdministrativeEffect();
+   expect(JSON.parse(repo.getById(qitemId)!.body).expiryRecoveryContract).toBeUndefined();
+   claimOperator(qitemId);
+   repo.update({qitemId,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+   reconcile();
+   const wake=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qitemId) as any;
+   expect(svc.noticeOutcomeContained('xv',wake)).toBe(true);
+   expect((db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='system-wake-outcome' AND operation_id=?").get('system-wake-outcome:wake-intent-'+qitemId) as {receipt:string})).toBeTruthy();
+   expect(wake.delivery_state).toBe('indeterminate');
+  });
 
  it('a pending or sending notice of this class is never contained, even with genuine custody',()=>{
   configureAdminOnly();

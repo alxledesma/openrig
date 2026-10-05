@@ -282,7 +282,17 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
  }
  /** System administrative actions whose pointed-to task may carry an
   *  outcome-only receipt. Nothing here can grant product authority. */
- private static readonly SYSTEM_COORDINATOR_RECOVERY_ACTIONS=['recover-unavailable-coordinator','recover-expired-idle-transfer','restore-current-held-history-binding','reconcile-current-coordinator-lease'] as readonly string[];
+ private static readonly SYSTEM_COORDINATOR_RECOVERY_ACTIONS=['recover-unavailable-coordinator','recover-expired-idle-transfer','restore-current-held-history-binding','reconcile-current-coordinator-lease','active-expiry-recover'] as readonly string[];
+  /** The one lease tuple whose expiry duty may carry an outcome-only receipt. Bound
+   *  into the recovery key by the producer, so it is re-derived here, never trusted. */
+  private static readonly SYSTEM_ACTIVE_EXPIRY_ACTION='active-expiry-recover';
+  private expiryRecoveryContractProof(body:any):string|null {
+   const lease=body?.activeExpiry;
+   if(!lease||typeof lease!=='object'||Array.isArray(lease))return null;
+   if(typeof lease.owner!=='string'||!lease.owner||typeof lease.ownerGeneration!=='string'||!lease.ownerGeneration||!Number.isFinite(lease.expectedLeaseUntil))return null;
+   // Advisory fields may be absent on an older body; the exact three key inputs are not.
+   return JSON.stringify({owner:lease.owner,ownerGeneration:lease.ownerGeneration,expectedLeaseUntil:lease.expectedLeaseUntil});
+  }
  private static readonly SYSTEM_WAKE_ROLLOUT='materialize-standard-resilience';
  private static readonly SYSTEM_WAKE_HOLD='resolve-exact-coordination-task-hold';
  /** A completed detector notice is not original-work completion or delivery. */
@@ -336,12 +346,24 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
   if(!body||typeof body.rigId!=='string'||!body.rigId||typeof body.recipientGeneration!=='string'||!body.recipientGeneration)return null;
   if(body.grantsAuthority!==undefined&&body.grantsAuthority!==false)return null;
   const action=String(body.action??'');
-  if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
-   if(!Array.isArray(body.reasons)||!body.reasons.length||typeof body.rolloutKey!=='string'||!body.rolloutKey)return null;
-   const rolloutKey=digest(body.rigId+':'+body.recipientGeneration+':'+body.reasons.join('|'));
-   if(rolloutKey!==body.rolloutKey)return null;
-   if('qitem-resilience-rollout-'+digest(rolloutKey+':'+(body.previousQueueId??'initial')).slice(0,24)!==qid)return null;
-  }else if(action===CoordinationRecoveryService.SYSTEM_WAKE_HOLD){
+if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
+    if(!Array.isArray(body.reasons)||!body.reasons.length||typeof body.rolloutKey!=='string'||!body.rolloutKey)return null;
+    // Mirror the producer's key derivation exactly. An expiry-contract rollout item
+    // is keyed by its lease tuple too, so the proof must recompute the same suffix or
+    // the item's UNKNOWN wake could never be outcome-contained and would sit forever
+    // as Operator-seat debt. An absent contract keeps the original plain derivation.
+    const contract=body.expiryRecoveryContract;
+    let suffix='';
+    if(contract!==undefined){
+     if(!contract||typeof contract!=='object'||contract.schema!=='expiry-recovery-contract.v1'||!contract.token||typeof contract.token!=='object')return null;
+     const {epoch,generation}=contract.token;
+     if(contract.token.rigId!==body.rigId||!Number.isInteger(epoch)||epoch<1||typeof generation!=='string'||!generation||!Number.isFinite(contract.expectedLeaseUntil))return null;
+     suffix=':'+digest(`${epoch}:${generation}:${contract.expectedLeaseUntil}`);
+    }
+    const rolloutKey=digest(body.rigId+':'+body.recipientGeneration+':'+body.reasons.join('|')+suffix);
+    if(rolloutKey!==body.rolloutKey)return null;
+    if('qitem-resilience-rollout-'+digest(rolloutKey+':'+(body.previousQueueId??'initial')).slice(0,24)!==qid)return null;
+   }else if(action===CoordinationRecoveryService.SYSTEM_WAKE_HOLD){
    if(!this.validAccountableIntake(body.rigId,qid,q)&&!(typeof body.rootQueueId==='string'&&this.validAccountableIntakeChainItem(body.rigId,q,body.rootQueueId)))return null;
   }else if(action==='reconcile-refused-stuck-finding'){
    if(!this.diagnosticWakeProof(body.rigId,this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid),true))return null;
@@ -353,7 +375,18 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
    // pointer wake; it does not resolve the recovery or confer holder authority.
    if(!Number.isInteger(body.epoch)||body.epoch<1||typeof body.reason!=='string'||!body.reason||typeof body.recoveryKey!=='string')return null;
    if(body.previousQueueId!==null&&typeof body.previousQueueId!=='string')return null;
-   const recoveryKey=digest((body.heldHistoryAdmission?JSON.stringify(body.heldHistoryAdmission):'')+body.rigId+':'+body.epoch+':'+body.recipientGeneration+':'+action+':'+body.reason);
+   // The expiry duty's lease tuple participates in the producer's key, so it must be
+   // re-derived here from persisted fields. Authority is deliberately NOT re-read:
+   // a tuple that has since drifted must still be containable, exactly like the
+   // held-history receipts this branch already carries.
+   let lease='';
+   if(action===CoordinationRecoveryService.SYSTEM_ACTIVE_EXPIRY_ACTION){
+    // Absent or malformed frozen tuple fails closed; the expiry duty has no contract-free form.
+    const contract=this.expiryRecoveryContractProof(body);
+    if(!contract)return null;
+    lease=contract;
+   }else if(body.activeExpiry!==undefined)return null;
+   const recoveryKey=digest((body.heldHistoryAdmission?JSON.stringify(body.heldHistoryAdmission):'')+lease+body.rigId+':'+body.epoch+':'+body.recipientGeneration+':'+action+':'+body.reason);
    if(recoveryKey!==body.recoveryKey||'qitem-coordination-recovery-'+digest(recoveryKey+':'+(body.previousQueueId??'initial')).slice(0,24)!==qid)return null;
    if(body.returnPath?.queueId!==qid||body.returnPath?.actor!==recipient)return null;
   }else return null;
@@ -1116,11 +1149,24 @@ if(!effectRig)return true;
   if(this.db.prepare("SELECT 1 FROM queue_items WHERE destination_session IN (?,?) AND state IN ('pending','in-progress','blocked') AND qitem_id<>?").get(...rotationLocalAddresses(this.db,recipient),a.baton_id))return false;
   return coordinationIdle(this.activity(recipient),recipientGeneration,this.now());
  }
- private stageCoordinatorRecovery(rigId:string,epoch:number,operatorGeneration:string,action:string,reason:string,deadline:number,heldHistoryAdmission?:Record<string,unknown>):string {
-  const recoveryKey=digest((heldHistoryAdmission?JSON.stringify(heldHistoryAdmission):'')+rigId+':'+epoch+':'+operatorGeneration+':'+action+':'+reason);
-  const previous=this.db.prepare("SELECT qitem_id,state,expires_at FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_valid(body) AND json_extract(body,'$.recoveryKey')=? ORDER BY rowid DESC LIMIT 1").get(recoveryKey) as {qitem_id:string;state:string;expires_at:string|null}|undefined;
-  const queueId=previous&&['pending','in-progress','blocked'].includes(previous.state)&&(!heldHistoryAdmission||(!!previous.expires_at&&Date.parse(previous.expires_at)>this.now()))?previous.qitem_id:'qitem-coordination-recovery-'+digest(recoveryKey+':'+(previous?.qitem_id??'initial')).slice(0,24);
-  if(!this.repo.getById(queueId))this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:heldHistoryAdmission?new Date(deadline).toISOString():undefined,body:JSON.stringify({...(heldHistoryAdmission?{heldHistoryAdmission}:{}),action,reason,recoveryKey,previousQueueId:previous?.qitem_id??null,rigId,epoch,recipientGeneration:operatorGeneration,deadline,nextAction:action==='restore-current-held-history-binding'?'Have the actual current Lead author a finite held-history recovery task; current Operator must genuinely claim it and use supported held-history-recovery-bind with exact retained hashes. Preserve UNKNOWN effects, existing worker custody and all checkpoint limits. This notice is not a recovery admission, binding, takeover or acceptance. Return exact proof or a concrete protected boundary.':'Revalidate exact current native holder/Peer, plan and baton custody. A living holder may perform supported voluntary transfer; admit fresh idle or positive-absence recovery only when proven. Repair expired admissions or uncertain effects through their existing supported paths. Preserve workers and return a concrete protected boundary when evidence is unknown; do not fabricate extension or acknowledgment.',returnPath:{queueId,actor:'operator-agent@kernel',required:'Claim exact recovery item and return supported evidence or concrete protected boundary. Do not declare pickup/ACK or native absence from a role label.'}}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
+/** Same-current native occupant presence, deliberately not idle: a holder that is
+   * alive and busy is exactly the case whose lapsed lease must stay actionable instead
+   * of being read as an idle takeover opportunity. */
+  private nativeHolderPresent(session:string,generation:string):boolean {
+   const sample=this.activity(session),at=Date.parse(sample?.identityObservedAt??'');
+   return !!sample&&sample.identityVerified&&sample.generation===generation&&Number.isFinite(at)&&at<=this.now()&&this.now()-at<=3000;
+  }
+  /** A finite lease episode is one administrative intake. The exact lease tuple is part
+   * of the recovery key, so repeated ticks dedupe onto one live item, a later lease is a
+   * distinct episode, and a lapsed item is restaged through its own lineage instead of
+   * being reused forever. The custody digest is notice only: the supported recovery API
+   * re-reads exact current custody and refuses any drift. */
+  private stageCoordinatorRecovery(rigId:string,epoch:number,operatorGeneration:string,action:string,reason:string,deadline:number,heldHistoryAdmission?:Record<string,unknown>,activeExpiryLease?:{owner:string;ownerGeneration:string;expectedLeaseUntil:number;custodyDigest:string;recoveryWindowMs:number}):string {
+   const finite=!!heldHistoryAdmission||!!activeExpiryLease;
+   const recoveryKey=digest((heldHistoryAdmission?JSON.stringify(heldHistoryAdmission):'')+(activeExpiryLease?JSON.stringify({owner:activeExpiryLease.owner,ownerGeneration:activeExpiryLease.ownerGeneration,expectedLeaseUntil:activeExpiryLease.expectedLeaseUntil}):'')+rigId+':'+epoch+':'+operatorGeneration+':'+action+':'+reason);
+   const previous=this.db.prepare("SELECT qitem_id,state,expires_at FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_valid(body) AND json_extract(body,'$.recoveryKey')=? ORDER BY rowid DESC LIMIT 1").get(recoveryKey) as {qitem_id:string;state:string;expires_at:string|null}|undefined;
+   const queueId=previous&&['pending','in-progress','blocked'].includes(previous.state)&&(!finite||(!!previous.expires_at&&Date.parse(previous.expires_at)>this.now()))?previous.qitem_id:'qitem-coordination-recovery-'+digest(recoveryKey+':'+(previous?.qitem_id??'initial')).slice(0,24);
+  if(!this.repo.getById(queueId))this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:'operator-agent@kernel',expiresAt:finite?new Date(deadline).toISOString():undefined,body:JSON.stringify({...(heldHistoryAdmission?{heldHistoryAdmission}:{}),...(activeExpiryLease?{activeExpiry:activeExpiryLease}:{}),action,reason,recoveryKey,previousQueueId:previous?.qitem_id??null,rigId,epoch,recipientGeneration:operatorGeneration,deadline,nextAction:action==='restore-current-held-history-binding'?'Have the actual current Lead author a finite held-history recovery task; current Operator must genuinely claim it and use supported held-history-recovery-bind with exact retained hashes. Preserve UNKNOWN effects, existing worker custody and all checkpoint limits. This notice is not a recovery admission, binding, takeover or acceptance. Return exact proof or a concrete protected boundary.':action==='active-expiry-recover'?'Invoke supported coordinator active-expiry-recover as the current Operator with exactly this frozen rigId, epoch, holder generation and expectedLeaseUntil plus the current reconciliation digest of exact open custody. It opens one bounded reconciliation window for the same holder, moves no custody, and is not acknowledgment, qualification, admission or product dispatch. The exact same-current native holder must then genuinely acknowledge custody first, because renew refuses while the transfer is still unreconciled, and only after that acknowledgment renew through the supported coordinator API; nothing else restores that live lease. Re-read exact current authority and custody first and return a concrete supported refusal for any drift, stale or retired holder, unproven native presence or unresolved effects.':'Revalidate exact current native holder/Peer, plan and baton custody. A living holder may perform supported voluntary transfer; admit fresh idle or positive-absence recovery only when proven. Repair expired admissions or uncertain effects through their existing supported paths. Preserve workers and return a concrete protected boundary when evidence is unknown; do not fabricate extension or acknowledgment.',returnPath:{queueId,actor:'operator-agent@kernel',required:'Claim exact recovery item and return supported evidence or concrete protected boundary. Do not declare pickup/ACK or native absence from a role label.'}}),identityProvenance:'system:operator-authorized-coordination',nudge:true});
   if(heldHistoryAdmission){const opId='held-recovery-notice:'+queueId;if(!this.db.prepare('SELECT 1 FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(rigId,opId))this.authority.recordHeldRecoveryAdmission(rigId,queueId,digest(this.repo.getById(queueId)!.body),heldHistoryAdmission);}
   this.repo.stageWakeIntent(queueId,'watchdog@system','operator-agent@kernel','system:operator-authorized-coordination',true,operatorGeneration);if(action==='restore-current-held-history-binding')this.stageHeldHistoryAuthoring(rigId,queueId);return queueId;
  }
@@ -1169,6 +1215,19 @@ if(!effectRig)return true;
      this.repo.stageWakeIntent(queueId,'watchdog@system',peer!,'system:operator-authorized-coordination',true,peerGeneration!);
      return [{key:'coordinator',state:'pending-peer-acknowledgment',queueId,reason:'fresh-native-unavailable-owner',deadline:transferred.lease_until}];})();
     }catch(error){const code=heldDispatchCode(error)??(error instanceof CoordinatorFenceError?error.code:undefined);if(!code)throw error;const deadline=this.now()+(code==='coordinator_held_history_recovery_required'?Math.min(plan.stallMs,1200000):plan.stallMs);const queueId=this.stageCoordinatorRecovery(rigId,a.epoch,plan.operatorGeneration,'recover-unavailable-coordinator',code,deadline,code==='coordinator_held_history_recovery_required'?this.authority.heldRecoveryAdmission(rigId,jobId):undefined);return [{key:'coordinator',state:'held',queueId,reason:code,deadline}];}
+   }
+   // A lapsed lease on a still-current, natively present holder is actionable now:
+   // the supported bounded expiry recovery exists for exactly this, while the
+   // idle-transfer fallback can only ever leave a bare takeover hold behind.
+   if(a.state==='active'&&a.lease_until<=this.now()&&!this.authority.hasFreshUnavailableOwner(rigId)&&this.authority.generation(a.owner_session)===a.owner_generation&&this.nativeHolderPresent(a.owner_session,a.owner_generation)){
+    // Re-read current authority: never precompute a holder, epoch or lease into a
+    // duty. Any drift simply falls through to the existing fences below.
+    const current=this.authority.get(rigId);
+    if(current&&current.state==='active'&&current.owner_session===a.owner_session&&current.owner_generation===a.owner_generation&&current.epoch===a.epoch&&current.lease_until<=this.now()&&this.authority.generation(current.owner_session)===current.owner_generation){
+     const deadline=this.now()+Math.min(plan.stallMs,900000);
+     const queueId=this.stageCoordinatorRecovery(rigId,current.epoch,plan.operatorGeneration,'active-expiry-recover','expired-active-native-present-holder',deadline,undefined,{owner:current.owner_session,ownerGeneration:current.owner_generation,expectedLeaseUntil:current.lease_until,custodyDigest:this.authority.reconciliationDigest(rigId),recoveryWindowMs:Math.min(plan.acknowledgmentWindowMs??300000,900000)});
+     return [{key:'coordinator',state:'recovery-required',queueId,reason:'expired-active-native-present-holder',deadline}];
+    }
    }
    if(a.state==='active'&&this.now()-progress.at>=plan.stallMs&&plan.allowIdlePeerTransfer&&!this.authority.hasFreshUnavailableOwner(rigId)){
     const peers=(JSON.parse(a.coordinators) as string[]).filter(s=>s!==a.owner_session),peer=peers[0],peerGeneration=peer?this.authority.generation(peer):null;
