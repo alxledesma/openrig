@@ -33,6 +33,8 @@ import type { MiddlewareHandler } from "hono";
 import type { EventBus } from "../domain/event-bus.js";
 import { validateResumeToken } from "../domain/resume-token-validation.js";
 import type { PermissionDriftReader } from "../domain/permission-drift-observer.js";
+import { transportSenderSession } from "./require-sender-identity.js";
+import type { LiveProjectionRecoveryService } from "../domain/live-projection-recovery-service.js";
 import { ProcessCensus } from "../domain/process-census.js";
 import { CodexThreadIdResolver } from "../domain/codex-thread-id.js";
 import { resolveLiveCodexThreadId } from "../domain/model-divergence/current-generation-record.js";
@@ -574,6 +576,27 @@ sessionAdminRoutes.post("/:sessionName/reconcile", terminalAuthGuard(), async (c
   }
 
   return c.json(outcome, 200);
+});
+// POST /api/sessions/:sessionName/recover-live-projection — guarded recovery of
+// a falsely detached SAME live native occupant without tenure minting. Caller
+// identity is the stamped transport pair (seat env, never body); the service
+// itself asserts current Kernel Operator authority and refuses on any fence or
+// drift. This is NOT reconcile-session and never substitutes for it.
+sessionAdminRoutes.post("/:sessionName/recover-live-projection", terminalAuthGuard(), async (c) => {
+  const sessionName = decodeURIComponent(c.req.param("sessionName")!);
+  const svc = c.get("liveProjectionRecovery" as never) as LiveProjectionRecoveryService | undefined;
+  if (!svc) return c.json({ error: "live_projection_recovery_unavailable", message: "Recovery service not configured on this daemon." }, 503);
+  const actor = transportSenderSession(c), generation = c.req.header("X-OpenRig-Occupant-Generation");
+  if (!actor || !generation) return c.json({ error: "coordinator_caller_required", message: "Stamped seat identity and occupant generation headers are required." }, 403);
+  const body = await c.req.json().catch(() => ({}) as Record<string, unknown>);
+  const field = (k: string): string => typeof body[k] === "string" ? (body[k] as string) : "";
+  const outcome = await svc.recover(actor, generation, { operationId: field("operationId"), sessionId: field("sessionId"), nodeId: field("nodeId"), sessionName: field("sessionName") || sessionName, expectedGeneration: field("expectedGeneration") });
+  if (outcome.ok) return c.json(outcome, 200);
+  const status = outcome.code === "recovery_infrastructure_error" ? 500
+    : outcome.code === "operator_unauthorized" ? 403
+    : outcome.code === "session_missing" || outcome.code === "node_missing" || outcome.code === "tenure_missing" ? 404
+    : 409;
+  return c.json(outcome, status);
 });
 
 // POST /api/sessions/:sessionName/clear-attention — OPR.0.3.4.10.

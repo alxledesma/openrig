@@ -3,7 +3,7 @@ import {ResilienceRolloutService} from './domain/resilience-rollout-service.js';
 import {RuntimeOutcomeAssessment} from "./domain/runtime-outcome-assessment.js";
 import { applyHistoricalStartupRecovery } from "./domain/historical-effect-disposition.js";
 import { CoordinationRecoveryService } from "./domain/coordination-recovery-service.js";
-import {makeCoordinatorRuntimeObserver} from "./domain/coordinator-runtime-availability.js";
+import {makeCoordinatorRuntimeObserver, makePiNativeProver} from "./domain/coordinator-runtime-availability.js";
 import {makeCoordinatorContinuityPolicy} from "./domain/policies/coordinator-continuity.js";
 import { configureShadowCapture } from "./domain/shadow-capture.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "./domain/seat-delivery-guard.js";
@@ -65,6 +65,7 @@ import { SessionEnricher } from "./domain/session-enricher.js";
 import { DiscoveryRepository } from "./domain/discovery-repository.js";
 import { DiscoveryCoordinator } from "./domain/discovery-coordinator.js";
 import { ClaimService } from "./domain/claim-service.js";
+import { LiveProjectionRecoveryService } from "./domain/live-projection-recovery-service.js";
 import { SelfAttachService } from "./domain/self-attach-service.js";
 import { RigLifecycleService } from "./domain/rig-lifecycle-service.js";
 import { RigExpansionService } from "./domain/rig-expansion-service.js";
@@ -557,6 +558,12 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // dist). Shared by the Pi runtime adapter, the resume adapter, and the
   // resume-token capture sidecar reader.
   const piStateRoot = nodePath.join(OPENRIG_HOME, "state", "pi");
+  // ONE shared Pi native prover backs both the coordinator runtime observer
+  // (active-expiry-recover eligibility) and live-projection recovery.
+  const piNativeProver = makePiNativeProver(db, opts?.tmuxExec ?? execCommand, {
+    fs: { readFile: (p: string) => fs.readFileSync(p, "utf-8") }, piStateRoot,
+  });
+  queueRepoInstance.coordinatorAuthority.setRuntimeObserver(makeCoordinatorRuntimeObserver(db, opts?.tmuxExec ?? execCommand, undefined, piNativeProver));
   const piRunnerEntryPath = nodePath.resolve(import.meta.dirname, "./adapters/pi-runner.js");
   const piResume = new PiResumeAdapter(
     tmuxAdapter,
@@ -1028,6 +1035,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // OPR.0.4.6.PI1 FR-6 — pi-runner sidecar reader (the adapter exposes it).
     piRunnerStateStore: piAdapter,
   });
+  // Guarded live-projection recovery for falsely detached SAME live native
+  // occupants (no tenure minting, no adoption, no input). Reuses the shared
+  // tmux adapter, coordinator authority, event bus, and pi sidecar root.
+  const liveProjectionRecovery = new LiveProjectionRecoveryService({
+    db, tmux: tmuxAdapter, authority: queueRepoInstance.coordinatorAuthority, events: eventBus,
+    piProve: piNativeProver,
+  });
   const selfAttachService = new SelfAttachService({
     db, rigRepo, podRepo, sessionRegistry, eventBus, tmuxAdapter, transcriptStore,
     claudeContextProvisioner: claudeAdapter,
@@ -1115,6 +1129,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     discoveryCoordinator,
     discoveryRepo,
     claimService,
+    liveProjectionRecovery,
     selfAttachService,
     rigLifecycleService,
     rigExpansionService,

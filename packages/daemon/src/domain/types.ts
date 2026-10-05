@@ -125,6 +125,8 @@ export type RigEvent =
   | { type: "binding.updated"; rigId: string; nodeId: string }
   | { type: "session.status_changed"; rigId: string; nodeId: string; status: string }
   | { type: "session.detached"; rigId: string; nodeId: string; sessionName: string }
+  // Guarded live-projection recovery receipt-event (no tenure minting; proof axes live in the durable coordinator_operations receipt).
+  | { type: "session.live_projection_recovered"; rigId: string; nodeId: string; sessionName: string; sessionId: string; actor: string; actorGeneration: string; operationId: string; at: string }
   // S5 (OPR.0.5.4.7) — seat-lifecycle audit trail: the three supported seat verbs each persist
   // their mutation with actor + reason in the same transaction as the mutation itself.
   | { type: "node.model_changed"; rigId: string; nodeId: string; logicalId: string; from: string | null; to: string; reason: string; operator: string | null }

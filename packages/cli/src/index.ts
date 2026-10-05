@@ -61,6 +61,7 @@ import { addMemberCommand } from "./commands/add.js";
 import { createCommand } from "./commands/create.js";
 import { growCommand } from "./commands/grow.js";
 import { reconcileSessionCommand } from "./commands/reconcile-session.js";
+import { recoverLiveProjectionCommand } from "./commands/recover-live-projection.js";
 import { envCommand } from "./commands/env.js";
 import { askCommand } from "./commands/ask.js";
 import { chatroomCommand } from "./commands/chatroom.js";
@@ -144,6 +145,7 @@ export interface ProgramDeps {
   createDeps?: StatusDeps;
   growDeps?: StatusDeps;
   reconcileSessionDeps?: StatusDeps;
+  recoverLiveProjectionDeps?: StatusDeps;
   envDeps?: StatusDeps;
   unclaimDeps?: StatusDeps;
   releaseDeps?: StatusDeps;
@@ -241,6 +243,7 @@ export function createProgram(depsOverride?: ProgramDeps): Command {
   program.addCommand(createCommand(depsOverride?.createDeps));
   program.addCommand(growCommand(depsOverride?.growDeps));
   program.addCommand(reconcileSessionCommand(depsOverride?.reconcileSessionDeps));
+  program.addCommand(recoverLiveProjectionCommand(depsOverride?.recoverLiveProjectionDeps));
   program.addCommand(envCommand(depsOverride?.envDeps));
   program.addCommand(unclaimCommand(depsOverride?.unclaimDeps));
   program.addCommand(releaseCommand(depsOverride?.releaseDeps));
