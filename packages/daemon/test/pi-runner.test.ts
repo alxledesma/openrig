@@ -819,3 +819,179 @@ describe("quiescence evidence survives every projection write", () => {
     expect(q(f)!.settled).toBe(true);
   });
 });
+
+// ── Bounded producer refresh (F1): a QUIET settled seat must be able to renew
+// its evidence from a REAL response, never by retimestamping a stale sidecar.
+
+describe("RunnerCore bounded quiescence refresh", () => {
+  const qOf = (f: { sidecars: PiRunnerState[] }) => f.sidecars.at(-1)!.quiescence!;
+
+  it("a quiet settled seat refreshes its evidence from a real get_state response", () => {
+    const f = readyCore();
+    const first = qOf(f).observedAt;
+    expect(qOf(f).settled).toBe(true);
+    // Advance the fake clock: the refresh must move observedAt forward because
+    // the RUNNER re-proved the state, not because a reader touched the file.
+    f.io.now = () => new Date(Date.parse(first) + 5_000).toISOString();
+    // No transition occurred: the sidecar is identical until the runner asks.
+    expect(qOf(f).observedAt).toBe(first);
+    // The refresh issues exactly one bounded get_state.
+    expect(f.core.refreshQuiescence()).toBe(true);
+    expect(f.rpc.filter(r => String(r.id).startsWith("pi-runner-quiescence-refresh-"))).toHaveLength(1);
+    // Only a real response advances the record.
+    f.core.handlePiLine(JSON.stringify({
+      type: "response", id: f.rpc.at(-1)!.id, success: true,
+      data: { sessionFile: SESSION_FILE, isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+    }));
+    expect(qOf(f).settled).toBe(true);
+    expect(qOf(f).observedAt).not.toBe(first);
+  });
+
+  it("a FAILED refresh writes nothing, so the evidence ages out instead of renewing", () => {
+    const f = readyCore();
+    const before = qOf(f).observedAt;
+    const sidecarCount = f.sidecars.length;
+    expect(f.core.refreshQuiescence()).toBe(true);
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: f.rpc.at(-1)!.id, success: false, error: "no state" }));
+    // No new sidecar write at all: freshness cannot be manufactured.
+    expect(f.sidecars.length).toBe(sidecarCount);
+    expect(qOf(f).observedAt).toBe(before);
+  });
+
+  it("a missing-success response rewrites nothing, so it cannot renew freshness", () => {
+    const f = readyCore();
+    const before = qOf(f).observedAt;
+    const count = f.sidecars.length;
+    expect(f.core.refreshQuiescence()).toBe(true);
+    // success absent: the handler refuses to treat it as proof of a quiet state
+    // and writes nothing at all.
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: f.rpc.at(-1)!.id }));
+    expect(f.sidecars.length).toBe(count);
+    expect(qOf(f).observedAt).toBe(before);
+  });
+
+  it("refuses to refresh while a turn is active or a control is pending", () => {
+    const f = readyCore();
+    f.core.handleUserBlock("do work");
+    expect(f.core.refreshQuiescence()).toBe(false);
+    expect(f.rpc.filter(r => String(r.id).startsWith("pi-runner-quiescence-refresh-"))).toHaveLength(0);
+  });
+
+  it("issues at most ONE refresh in flight", () => {
+    const f = readyCore();
+    expect(f.core.refreshQuiescence()).toBe(true);
+    expect(f.core.refreshQuiescence()).toBe(false);
+    // A real response releases the guard for the next bounded tick.
+    f.core.handlePiLine(JSON.stringify({
+      type: "response", id: f.rpc.at(-1)!.id, success: true,
+      data: { sessionFile: SESSION_FILE, isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
+    }));
+    expect(f.core.refreshQuiescence()).toBe(true);
+  });
+});
+
+// ── Race: a late idle refresh must never overwrite an ACTIVE turn ───────────
+
+describe("late idle refresh cannot settle an active turn", () => {
+  const qOf = (f: { sidecars: PiRunnerState[] }) => f.sidecars.at(-1)!.quiescence!;
+  const QUIET = { sessionFile: SESSION_FILE, isStreaming: false, isCompacting: false, pendingMessageCount: 0 };
+  const BUSY = { sessionFile: SESSION_FILE, isStreaming: true, isCompacting: false, pendingMessageCount: 0 };
+
+  it("an idle response issued BEFORE agent_start is discarded, and writes nothing", () => {
+    const f = readyCore();
+    expect(f.core.refreshQuiescence()).toBe(true);      // issued while quiet
+    f.core.handlePiLine(JSON.stringify({ type: "agent_start" })); // a turn begins
+    expect(qOf(f).settled).toBe(false);
+    const afterStart = qOf(f).observedAt;
+    const writesAfterStart = f.sidecars.length;
+    // The late idle answer now arrives. It is for the PREVIOUS epoch.
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: f.rpc.at(-1)!.id, success: true, data: QUIET }));
+    // The seat must NOT be reported settled, and the sidecar must not be renewed:
+    // no write at all follows the discarded response.
+    expect(qOf(f).settled).toBe(false);
+    expect(qOf(f).observedAt).toBe(afterStart);
+    expect(f.sidecars.length).toBe(writesAfterStart);
+  });
+
+  it("an idle response issued BEFORE a submitted prompt is discarded", () => {
+    const f = readyCore();
+    expect(f.core.refreshQuiescence()).toBe(true);
+    f.core.handleUserBlock("go");                      // prompt -> new epoch
+    expect(qOf(f).settled).toBe(false);
+    const stamp = qOf(f).observedAt;
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: f.rpc.at(-1)!.id, success: true, data: QUIET }));
+    expect(qOf(f).settled).toBe(false);
+    expect(qOf(f).observedAt).toBe(stamp);
+  });
+
+  it("an idle response issued BEFORE a native control is discarded", () => {
+    const f = readyCore();
+    expect(f.core.refreshQuiescence()).toBe(true);
+    f.core.handleUserBlock("/compact go");              // control -> new epoch
+    const stamp = qOf(f).observedAt;
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: f.rpc.at(-1)!.id, success: true, data: QUIET }));
+    expect(qOf(f).settled).toBe(false);
+    expect(qOf(f).observedAt).toBe(stamp);
+  });
+
+  it("a CURRENT-epoch idle response is still honoured", () => {
+    const f = readyCore();
+    expect(f.core.refreshQuiescence()).toBe(true);
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: f.rpc.at(-1)!.id, success: true, data: QUIET }));
+    expect(qOf(f).settled).toBe(true);
+  });
+
+  it("a current-epoch BUSY response still marks the seat running", () => {
+    const f = readyCore();
+    expect(f.core.refreshQuiescence()).toBe(true);
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: f.rpc.at(-1)!.id, success: true, data: BUSY }));
+    expect(qOf(f).settled).toBe(false);
+  });
+});
+
+
+describe("Pi repair R2 refresh request lifecycle", () => {
+  const quiet = { sessionFile: SESSION_FILE, sessionId: "0197a2f0", isStreaming: false, isCompacting: false, pendingMessageCount: 0 };
+  const reply = (f: ReturnType<typeof readyCore>, id: unknown, data: Record<string, unknown> = quiet) => f.core.handlePiLine(JSON.stringify({ type: "response", id, success: true, data }));
+  it("unsolicited and duplicate quiet replies never renew evidence", () => {
+    const f = readyCore();const before = f.sidecars.length;
+    reply(f, "pi-runner-quiescence-refresh");expect(f.sidecars).toHaveLength(before);
+    f.core.refreshQuiescence();const id = f.rpc.at(-1)!.id;reply(f, id);const accepted = f.sidecars.length;
+    f.io.now = () => "2026-07-06T10:00:05Z";reply(f, id);expect(f.sidecars).toHaveLength(accepted);
+  });
+  it("wrong native session identity cannot grant or renew settled proof", () => {
+    const f = readyCore();f.core.refreshQuiescence();const before = f.sidecars.length;
+    reply(f, f.rpc.at(-1)!.id, { ...quiet, sessionFile: "/another/session.jsonl" });expect(f.sidecars).toHaveLength(before);
+    f.core.refreshQuiescence();reply(f, f.rpc.at(-1)!.id, { ...quiet, sessionId: "foreign-native" });expect(f.sidecars).toHaveLength(before);
+  });
+  it("missing native state does not renew a prior settled observation", () => {
+    const f = readyCore();f.core.refreshQuiescence();const before = f.sidecars.length;
+    reply(f, f.rpc.at(-1)!.id, { isStreaming: false, isCompacting: false, pendingMessageCount: 0 });expect(f.sidecars).toHaveLength(before);
+  });
+  it("a lost response expires; a unique successor request cannot consume its late answer", () => {
+    const f = readyCore();f.core.refreshQuiescence();const old = f.rpc.at(-1)!.id;
+    f.io.now = () => "2026-07-06T10:00:05Z";expect(f.core.refreshQuiescence()).toBe(true);const fresh = f.rpc.at(-1)!.id;expect(fresh).not.toBe(old);
+    const before = f.sidecars.length;reply(f, old);expect(f.sidecars).toHaveLength(before);expect(f.core.refreshQuiescence()).toBe(false);
+    reply(f, fresh);expect(f.sidecars).toHaveLength(before+1);
+  });
+  it("reply after its finite read deadline cannot renew even before the next tick", () => {
+    const f = readyCore();f.core.refreshQuiescence();const id = f.rpc.at(-1)!.id;const before = f.sidecars.length;
+    f.io.now = () => "2026-07-06T10:00:05Z";reply(f,id);expect(f.sidecars).toHaveLength(before);
+  });
+  it("compaction begun while read is in flight cannot be cleared by a late quiet response", () => {
+    const f = readyCore();f.core.refreshQuiescence();const id = f.rpc.at(-1)!.id;
+    f.core.handlePiLine(JSON.stringify({ type: "compaction_start" }));const before = f.sidecars.length;
+    reply(f,id);expect(f.sidecars).toHaveLength(before);expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(false);
+  });
+  it("Pi exit invalidates pending request and clears its own refresh timer", () => {
+    const f = readyCore();f.core.refreshQuiescence();const id = f.rpc.at(-1)!.id;const timer = setInterval(() => {},5000);const clear = vi.spyOn(globalThis,"clearInterval");
+    try { f.core.setQuiescenceRefreshInterval(timer);f.core.handlePiExit(0);expect(clear).toHaveBeenCalledWith(timer);const before=f.sidecars.length;reply(f,id);expect(f.sidecars).toHaveLength(before); }
+    finally { clearInterval(timer);clear.mockRestore(); }
+  });
+  it("cursor replies after failed refresh cannot retimestamp prior settled evidence", () => {
+    const f=readyCore();const observed=f.sidecars.at(-1)!.quiescence!.observedAt;f.core.refreshQuiescence();
+    f.core.handlePiLine(JSON.stringify({type:"response",id:f.rpc.at(-1)!.id,success:false,error:"unavailable"}));
+    f.io.now=()=>"2026-07-06T10:00:30Z";f.core.handlePiLine(JSON.stringify({type:"response",id:"pi-runner-cursor-refresh",success:true,data:{entries:[{id:"later-entry"}]}}));
+    expect(f.sidecars.at(-1)!.quiescence!.observedAt).toBe(observed);
+  });
+});

@@ -293,6 +293,21 @@ const CURSOR_REFRESH_ID = "pi-runner-cursor-refresh";
 // Retained fork: Pi native-control ids and the busy-state reader.
 const CONTROL_STATE_ID = "pi-runner-control-state";
 
+/** A dedicated bounded refresh request. Distinct from CONTROL_STATE_ID so a
+ *  periodic refresh can never be confused with a real control's follow-up read. */
+const QUIESCENCE_REFRESH_ID = "pi-runner-quiescence-refresh";
+
+/** How often a Pi runner RE-READS native state to keep its settled evidence
+ *  current. Must stay well under the daemon's 15s send-readiness freshness
+ *  window so a quietly settled seat can always produce fresh evidence.
+ *
+ *  This is a real refresh, not a retimestamp: each tick asks pi for state, and
+ *  the record is only rewritten when a real response arrives. A failed or
+ *  missing response leaves the previous evidence untouched and UNKNOWN-by-age,
+ *  so a broken channel ages the evidence out rather than manufacturing freshness. */
+const QUIESCENCE_REFRESH_MS = 5_000;
+const QUIESCENCE_REFRESH_TIMEOUT_MS = 2_000;
+
 function piProcessing(data: Record<string, unknown>): boolean {
   return data.isStreaming !== false || data.isCompacting !== false || data.pendingMessageCount !== 0;
 }
@@ -311,6 +326,20 @@ export class RunnerCore {
   private assistantErrorShown = false;
   // Retained fork quiescence evidence plus upstream's OMP attention/lifecycle
   // fields. These are disjoint: none overrides another.
+  /** A bounded quiescence refresh is in flight; at most one at a time. */
+  private refreshSequence = 0;
+  private pendingRefresh?: {
+    id: string; epoch: number; issuedAt: number; sessionFile: string;
+    sessionId: string | undefined; launchId: string | undefined; generation: string | undefined;
+  };
+  private quiescenceObservedAt = "";
+  private quiescenceRefreshIntervalId: ReturnType<typeof setInterval> | undefined;
+  /** The epoch at which the current turn started. Bumped by every native turn
+   *  start and every control effect. A refresh response is only honoured if the
+   *  epoch it was issued under is still current, so a slow idle answer that
+   *  arrives after a prompt or an agent_start can never overwrite a genuinely
+   *  busy seat with a stale settled verdict. */
+  private activityEpoch = 0;
   /** Whether `processing`/`controlPending` currently reflect a POSITIVE native
    *  observation (a real agent_settled, or a successful get_state proving no
    *  streaming/compacting/pending messages). Defaults false: before any such
@@ -357,6 +386,32 @@ export class RunnerCore {
     }
   }
 
+  /** Request one bounded native state read so a settled seat keeps FRESH
+   *  evidence. Genuine refresh, never a retimestamp:
+   *
+   *  - only for Pi, only when the runner already believes itself ready;
+   *  - only when not processing and no control is pending, so a turn is never
+   *    disturbed;
+   *  - at most one request in flight, so a slow channel cannot queue up;
+   *  - it asks pi for state and rewrites nothing. The evidence is advanced only
+   *    by the response handler, which re-derives settledProven from that real
+   *    response. A failed or missing response therefore cannot refresh anything.
+   *
+   *  Returns whether a request was actually issued. */
+  refreshQuiescence(): boolean {
+    if (this.runtime !== "pi") return false;
+    const now = Date.parse(this.io.now());
+    if (!Number.isFinite(now)) return false;
+    if (this.pendingRefresh && (now < this.pendingRefresh.issuedAt || now - this.pendingRefresh.issuedAt >= QUIESCENCE_REFRESH_TIMEOUT_MS)) this.pendingRefresh = undefined;
+    if (!this.ready || this.processing || this.controlPending || !this.sessionFile || this.pendingRefresh) return false;
+    const id = `${QUIESCENCE_REFRESH_ID}-${++this.refreshSequence}`;
+    this.pendingRefresh = { id, epoch: this.activityEpoch, issuedAt: now, sessionFile: this.sessionFile,
+      sessionId: this.sessionId, launchId: this.identity.launchId, generation: this.identity.generation };
+    try { this.io.sendRpc({ type: "get_state", id }); }
+    catch (error) { this.pendingRefresh = undefined; throw error; }
+    return true;
+  }
+
   /** One LF-delimited JSONL record from pi stdout. */
   handlePiLine(rawLine: string): void {
     const line = rawLine.trim();
@@ -397,6 +452,7 @@ export class RunnerCore {
         command = { type: "set_model", provider: match[1], modelId: match[2] };
       } else command = { type: "compact", ...(block === "/compact" ? {} : { customInstructions: block.slice(9) }) };
       this.controlPending = true;
+      this.invalidateRefresh();
       this.settledProven = false;
       this.writeQuiescence();
       this.io.sendRpc({ ...command, id: "pi-runner-native-control" });
@@ -440,17 +496,44 @@ export class RunnerCore {
   /** Child process exit — honest, loud, durable. */
   handlePiExit(code: number | null): void {
     this.ready = false;
+    this.invalidateRefresh();
     // Runtime-aware exit marker (upstream). An exited seat is honestly
     // non-running: never a settled one (fork), and the projection is written
     // so the exit is durable and launch-scoped like every other write.
     this.io.mirrorLine(`${PI_RUNNER_EXIT_MARKER} ${this.runtime} exited (code ${code ?? "unknown"})`);
     this.settledProven = false;
+    if (this.quiescenceRefreshIntervalId) {
+      clearInterval(this.quiescenceRefreshIntervalId);
+      this.quiescenceRefreshIntervalId = undefined;
+    }
     if (this.runtime === "pi") this.writeQuiescence({ exited: { code, at: this.io.now() } });
     else this.writeSidecar({ exited: { code, at: this.io.now() } });
     this.io.postActivity(this.activityPayload("Stop", `${this.runtime}_exited`));
   }
 
   private handleResponse(record: Record<string, unknown>): void {
+    if (this.runtime === "pi" && typeof record.id === "string" &&
+      (record.id === QUIESCENCE_REFRESH_ID || record.id.startsWith(`${QUIESCENCE_REFRESH_ID}-`))) {
+      const request = this.pendingRefresh;
+      if (!request || record.id !== request.id) return;
+      this.pendingRefresh = undefined;
+      const now = Date.parse(this.io.now());
+      if (!this.ready || this.processing || this.controlPending || request.epoch !== this.activityEpoch ||
+        !Number.isFinite(now) || now < request.issuedAt || now - request.issuedAt >= QUIESCENCE_REFRESH_TIMEOUT_MS ||
+        request.sessionFile !== this.sessionFile || request.sessionId !== this.sessionId ||
+        request.launchId !== this.identity.launchId || request.generation !== this.identity.generation ||
+        record.success !== true || record.error != null) return;
+      const data = record.data;
+      if (!data || typeof data !== "object" || Array.isArray(data)) return;
+      const state = data as Record<string, unknown>;
+      if (state.sessionFile !== request.sessionFile ||
+        (state.sessionId !== undefined && state.sessionId !== request.sessionId)) return;
+      this.processing = piProcessing(state);
+      this.settledProven = !this.processing;
+      this.writeQuiescence();
+      return;
+    }
+
     // Retained fork native controls, handled BEFORE the generic failure gate so
     // a control refusal still refreshes the cursor from native history.
     if (this.runtime === "pi" && record.id === "pi-runner-native-control") {
@@ -471,6 +554,7 @@ export class RunnerCore {
       return;
     }
     if (this.runtime === "pi" && record.id === CONTROL_STATE_ID) {
+      this.invalidateRefresh();
       this.processing = record.success !== true || piProcessing((record.data ?? {}) as Record<string, unknown>);
       // A failed or missing control-state read proves NOTHING: it leaves the
       // seat busy and the evidence non-proven rather than guessing idle.
@@ -508,6 +592,7 @@ export class RunnerCore {
       return;
     }
     if (record.id === GET_STATE_ID) {
+      if (this.runtime === "pi") this.invalidateRefresh();
       const data = (record.data ?? record.state ?? record) as Record<string, unknown>;
       const sessionFile = typeof data.sessionFile === "string" ? data.sessionFile : undefined;
       const sessionId = typeof data.sessionId === "string" ? data.sessionId : undefined;
@@ -549,11 +634,22 @@ export class RunnerCore {
       }
       return;
     }
+    if (record.id === CURSOR_REFRESH_ID || record.id === CATCH_UP_ID) {
+      const data = (record.data ?? record) as Record<string, unknown>;
+      const entries = Array.isArray(data.entries) ? data.entries : (Array.isArray(record.entries) ? record.entries : []);
+      const last = entries.at(-1);
+      const lastId = last !== null && typeof last === "object" && typeof (last as Record<string, unknown>).id === "string"
+        ? (last as Record<string, unknown>).id as string
+        : undefined;
+      if (lastId) {
+        this.lastEntryId = lastId;
+        this.writeSidecar({});
+      }
+      return;
+    }
   }
 
   private raiseAttention(subtype: "runtime_error" | "permission_prompt"): void {
-    // Runtime failures outrank denied approvals. Only emit when the visible
-    // attention changes or intervening activity replaced it.
     const next = this.attention === "runtime_error" ? this.attention : subtype;
     if (this.attention === next && this.attentionIsLatest) return;
     this.attention = next;
@@ -582,15 +678,14 @@ export class RunnerCore {
     }
     if (this.runtime === "pi") {
       if (event.type === "agent_start" || event.type === "compaction_start") {
-        this.processing = true;
-        this.settledProven = false;
-        this.writeQuiescence();
+        this.markBusy();
       }
       // agent_settled is the ONLY event that settles. agent_end deliberately does
       // not: retries, before-settle continuations and automatic compaction all
       // continue after it while isStreaming is still true (see /followup above),
       // so treating agent_end as idle would claim a working Pi seat is settled.
       if (event.type === "agent_settled") {
+        this.invalidateRefresh();
         this.processing = false;
         this.settledProven = true;
         this.writeQuiescence();
@@ -745,7 +840,7 @@ export class RunnerCore {
       sessionFile: this.sessionFile,
       lastEntryId: this.lastEntryId,
       settled: this.settledProven && !this.processing && !this.controlPending,
-      observedAt: this.io.now(),
+      observedAt: this.quiescenceObservedAt,
     };
   }
 
@@ -754,16 +849,26 @@ export class RunnerCore {
    *  so this exists only to make the transition sites self-documenting. */
   private writeQuiescence(patch: Partial<PiRunnerState> = {}): void {
     if (this.runtime !== "pi") return;
+    this.quiescenceObservedAt = this.io.now();
     this.writeSidecar(patch);
+  }
+
+  private invalidateRefresh(): void {
+    this.activityEpoch++;
+    this.pendingRefresh = undefined;
   }
 
   /** Mark the seat busy ahead of a native turn or control effect and persist
    *  that immediately, so a concurrent reader never sees a stale idle claim. */
   private markBusy(): void {
     if (this.runtime !== "pi") return;
+    this.invalidateRefresh();
     this.processing = true;
     this.settledProven = false;
     this.writeQuiescence();
+  }
+  setQuiescenceRefreshInterval(id: ReturnType<typeof setInterval> | undefined): void {
+    this.quiescenceRefreshIntervalId = id;
   }
 }
 
@@ -1078,6 +1183,15 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // Re-deliver OMP identity until the daemon confirms the resume token.
   const identityRetry = runtime === "omp" ? setInterval(() => core.retrySessionIdentity(), IDENTITY_RETRY_MS) : undefined;
   identityRetry?.unref();
+  // Pi keeps its settled evidence CURRENT by re-reading native state on a bounded
+  // interval. Without this a quietly settled seat's observedAt freezes at the last
+  // transition and the daemon's 15s freshness window refuses it forever.
+  // Pi only: OMP has no supported authoritative proof and is not granted one.
+  const quiescenceRefresh = runtime === "pi"
+    ? setInterval(() => { core.refreshQuiescence(); }, QUIESCENCE_REFRESH_MS)
+    : undefined;
+  quiescenceRefresh?.unref();
+  core.setQuiescenceRefreshInterval(quiescenceRefresh);
   readline.createInterface({ input: child.stderr }).on("line", (line) => {
     if (line.trim()) process.stdout.write(`[${runtime}:err] ${line}\n`);
   });
@@ -1106,6 +1220,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     if (exited) return;
     exited = true;
     clearInterval(identityRetry);
+    clearInterval(quiescenceRefresh);
     if (!core.isReady()) {
       console.error(transportUp
         ? "[omp-runner] ERROR OMP did not establish a resumable RPC session. Authenticate this isolated seat using HOME=<seat-root> PI_CODING_AGENT_DIR=<seat-root>/agent omp and /login, or provide its declared model provider key in the OpenRig daemon environment. Default OMP credentials are not shared."

@@ -6,10 +6,11 @@ import { OutboxHandler } from "./outbox-handler.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
-import type { TmuxAdapter } from "../adapters/tmux.js";
+import type { TmuxAdapter, TmuxResult } from "../adapters/tmux.js";
 import type { AgentActivityStore } from "./agent-activity-store.js";
 import type { EventBus } from "./event-bus.js";
 import type { AgentActivity } from "./types.js";
+import type { RuntimeAvailability } from "./coordinator-runtime-availability.js";
 import { wrapPaneEnvelope, appendDeliveredSegment, type EnvelopeScope } from "../lib/pane-envelope.js";
 import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
@@ -28,6 +29,11 @@ import { hashSentText, type CaptureObserverSink, type CaptureSlot, type Observat
 // window comfortably spans one inter-tool gap (so a mid-turn reading stays trusted) while refusing to
 // authorize a send from a reading tens of seconds old. (EXA: agtx#14, daintree#3938.)
 const SEND_READINESS_FRESHNESS_MS = 15_000;
+
+/** Finite ceiling on ONE authoritative proof read. A guarded send must never
+ *  hang on a hung observer: the read is raced and a timeout is UNKNOWN, which
+ *  the caller retries and ultimately refuses. Never lengthened at runtime. */
+const READINESS_PROOF_TIMEOUT_MS = 2_000;
 
 // Mid-work detection patterns (cheap heuristics)
 const MID_WORK_PATTERNS = [
@@ -673,6 +679,34 @@ interface SessionTransportDeps {
   /** S01/S02 P2: optional read-only capture observer. Absent by default (no activation). */
   captureObserver?: CaptureObserverSink;
   listProcesses?: NativeProcessLister;
+  /** The SAME authoritative current-generation runtime observer the coordinator
+   *  recovery guard already uses (makeCoordinatorRuntimeObserver, injected with
+   *  makePiNativeProver). Optional: absent means no Pi proof is available and
+   *  Pi readiness stays UNKNOWN exactly as before. No proof logic is duplicated
+   *  here — this seam consumes PiNativeProof/ RuntimeAvailability as-is. */
+  runtimeObserver?: (session: string) => Promise<RuntimeAvailability | null>;
+  /** Finite ceiling on the single proof read per observation. The observer is
+   *  already internally bounded (process census timeouts), but a guarded send
+   *  must never outlive waitForIdle's deadline on a hung read. */
+  readinessProofTimeoutMs?: number;
+}
+
+/** The exact Pi proof that authorised a guarded send, carried to the write
+ *  boundary so it can be re-validated there. Nothing is inferred at the paste. */
+interface PiWriteBoundaryProof { generation: string; observedAt: string }
+
+/** Per-invocation carrier for the Pi proof that authorised ONE send. Created by
+ *  the caller of waitForIdle, so it cannot be shared across seats. */
+interface PiProofOut {
+  piProof?: PiWriteBoundaryProof;
+  /** Set by the write fence when it refuses, BEFORE the adapter converts the
+   *  throw into a generic TmuxResult. This is how the typed code survives the
+   *  adapter's error classification without changing the unowned tmux adapter. */
+  refusalCode?: string;
+  refusalMessage?: string;
+  /** Whether bytes actually reached the pane. Tracked per attempt so a refusal
+   *  after a successful paste reports sent:true rather than claiming no bytes. */
+  pasteCompleted?: boolean;
 }
 
 interface SessionRow { node_id: string; session_name: string; }
@@ -696,6 +730,8 @@ export class SessionTransport {
   private activityEndpointFile: () => { baseUrl: string; token: string } | null;
   private captureObserver?: CaptureObserverSink;
   private listProcesses?: NativeProcessLister;
+  private runtimeObserver?: (session: string) => Promise<RuntimeAvailability | null>;
+  private readinessProofTimeoutMs: number;
 
   /** Retained fork fence, composed with upstream's beforeWrite seam.
    *
@@ -707,11 +743,58 @@ export class SessionTransport {
    *  proven, then the caller prerequisite, then the single tmux write.
    *
    *  Never omit the assertion: it is what makes a managed send provable. */
-  private managedWriteFence(opts: SendOpts | undefined, sessionName: string, managedProof: unknown): () => void {
+  private managedWriteFence(opts: SendOpts | undefined, sessionName: string, managedProof: unknown, piProof: PiWriteBoundaryProof | undefined, piRequired: boolean, piOut: PiProofOut): () => void {
     return () => {
-      this.coordinatorAuthority.assertManagedSend(opts?.actorSession ?? undefined, sessionName, opts?.queueAssignmentId, managedProof as never);
-      opts?.beforeWrite?.();
+      try {
+        // The LAST gate before bytes reach the pane. A Pi proof can expire across the
+        // async pane/veto captures and the settle wait, so its freshness and
+        // generation are re-checked HERE against the current clock, not against the
+        // clock captured before those awaits. Fail-closed: an expired, future-dated
+        // or rebound proof refuses the write instead of pasting on a stale verdict.
+        if (piProof) {
+          this.assertPiProofFreshAtWrite(sessionName, piProof, piOut);
+        } else if (piRequired) {
+          // Never a null-bypass: a Pi send that reached its write without carrying a
+          // proof is refused rather than pasted. This is the guard against the proof
+          // being lost between the readiness read and the write.
+          piOut.refusalCode = "pi_send_refused";
+          piOut.refusalMessage = "Pi send reached the write boundary without an authorising proof; no input written.";
+          throw new CoordinatorFenceError("pi_send_refused", piOut.refusalMessage);
+        }
+        this.coordinatorAuthority.assertManagedSend(opts?.actorSession ?? undefined, sessionName, opts?.queueAssignmentId, managedProof as never);
+        opts?.beforeWrite?.();
+      } catch (error) {
+        // The real tmux adapter catches fence errors and returns a result. Keep
+        // the exact code on this invocation, never on the shared transport.
+        if (error instanceof CoordinatorFenceError) {
+          piOut.refusalCode = error.code;
+          piOut.refusalMessage = error.message;
+        }
+        throw error;
+      }
     };
+  }
+
+  /** Re-validate the exact Pi proof that authorised this send, at the moment of
+   *  the write. Returns quietly when the proof still holds. Throws a closed-code
+   *  refusal otherwise; the write never happens. */
+  private assertPiProofFreshAtWrite(sessionName: string, piProof: PiWriteBoundaryProof, piOut: PiProofOut): void {
+    // A typed fence refusal. The caller reports the actual phase: sent:false
+    // before paste, sent:true if paste completed and Enter is now refused.
+    const refuse = (message: string): never => {
+      piOut.refusalCode = "pi_send_refused";
+      piOut.refusalMessage = message;
+      throw new CoordinatorFenceError("pi_send_refused", message);
+    };
+    const observedMs = Date.parse(piProof.observedAt);
+    if (!Number.isFinite(observedMs)) refuse("Pi proof timestamp unusable at the write boundary; this input was refused.");
+    const ageMs = this.now().getTime() - observedMs;
+    if (ageMs > this.sendReadinessFreshnessMs) refuse("Pi proof expired before the write boundary; this input was refused.");
+    if (ageMs < 0) refuse("Pi proof is future-dated at the write boundary; this input was refused.");
+    // Same seat, same occupant: a turnover between the proof read and the paste
+    // invalidates the verdict even if the timestamp is still fresh.
+    const live = this.liveOccupantGeneration(sessionName, null);
+    if (live === null || live !== piProof.generation) refuse("Pi occupant generation changed before the write boundary; this input was refused.");
   }
 
   constructor(deps: SessionTransportDeps) {
@@ -726,6 +809,8 @@ export class SessionTransport {
     this.sleep = deps.sleep ?? delay;
     this.waitForIdlePollMs = deps.waitForIdlePollMs ?? 500;
     this.sendReadinessFreshnessMs = deps.sendReadinessFreshnessMs ?? SEND_READINESS_FRESHNESS_MS;
+    this.runtimeObserver = deps.runtimeObserver;
+    this.readinessProofTimeoutMs = deps.readinessProofTimeoutMs ?? READINESS_PROOF_TIMEOUT_MS;
     this.slowOpRecorder = deps.slowOpRecorder;
     this.activityEndpointFile = deps.activityEndpointFile ?? (() => null);
     this.captureObserver = deps.captureObserver;
@@ -1043,11 +1128,34 @@ export class SessionTransport {
     return pref.desired || pref.effective ? target : null;
   }
 
+  /** Funnel the guarded write so a Pi write-boundary refusal becomes a TYPED
+   *  result. The refusal is raised inside the write (beforeInput), which is
+   *  reached through sendUnguarded or the guard operation; both are wrapped here.
+   *  Write-phase refusals are normalized inside sendUnguarded; this catches
+   *  early authority refusals before a write starts. */
+  private async guardedWrite(
+    sessionName: string,
+    run: () => Promise<SendResult>,
+  ): Promise<SendResult> {
+    try {
+      return await run();
+    } catch (err) {
+      if (err instanceof CoordinatorFenceError) {
+        return { ok: false, sessionName, sent: false, reason: err.code, error: err.message };
+      }
+      throw err;
+    }
+  }
+
   async send(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
+    // The Pi write-boundary refusal is raised INSIDE the guarded write, which can be
+    // reached through sendUnguarded or the guard operation below. Both are funnelled
+    // here so a stale/future-dated/rebound proof becomes a TYPED refusal rather than
+    // an escaping exception. Write-phase mapping preserves partial paste state.
     try { this.coordinatorAuthority.assertManagedSend(opts?.actorSession ?? undefined,sessionName,opts?.queueAssignmentId,{body:text,ids:opts?.committedOutboxIds}); }
     catch(err) { if(err instanceof CoordinatorFenceError)return {ok:false,sessionName,sent:false,reason:err.code,error:err.message};throw err; }
     const guard = this.tmuxAdapter.deliveryGuard;
-    if (!guard) return this.sendUnguarded(sessionName, text, opts);
+    if (!guard) return this.guardedWrite(sessionName, () => this.sendUnguarded(sessionName, text, opts));
     const outbox = new OutboxHandler(this.db);
     const ids = opts?.committedOutboxIds ?? [opts?.deliveryId ?? `guard-send-${randomUUID()}`];
     const retainedResult = (): SendResult => ({ ok: true, sessionName, outcome: "retained", sent: false, verified: false,
@@ -1074,7 +1182,7 @@ export class SessionTransport {
           if (prior.deliveryState === "retained" || prior.deliveryState === "retired") return retainedResult();
         }
       }
-      return await guard.operation(sessionName, () => this.sendUnguarded(sessionName, text, opts), async target => {
+      return await guard.operation(sessionName, () => this.guardedWrite(sessionName, () => this.sendUnguarded(sessionName, text, opts)), async target => {
         if (opts?.submitOnly) return { ok: false, sessionName, sent: false, reason: "typing_guard_enabled", error: "Typing guard prevents submit-only; no Enter was sent." };
         this.db.transaction(() => {
           for (const id of ids) {
@@ -1108,6 +1216,22 @@ export class SessionTransport {
   }
 
   private async sendUnguarded(sessionName: string, text: string, opts?: SendOpts): Promise<SendResult> {
+    // Per-invocation Pi proof carrier. Created HERE, inside this one send, so no
+    // other seat's concurrent send can observe, clear or inherit it, and it can
+    // never leak into a non-Pi write: the fence is only required when runtime is pi.
+    const piOut: PiProofOut = {};
+    // Real guard-backed adapters return refusals; the no-guard/test seam may
+    // throw them. Normalize only typed fences at the SAME write phase so a
+    // refusal after successful paste never escapes as a false no-bytes result.
+    const writeResult = async (write: () => Promise<TmuxResult>): Promise<TmuxResult> => {
+      try { return await write(); }
+      catch (error) {
+        if (error instanceof CoordinatorFenceError) return { ok: false, code: error.code, message: error.message };
+        throw error;
+      }
+    };
+    let piProof: PiWriteBoundaryProof | undefined;
+    let piRequired = false;
     const managedProof={body:text,ids:opts?.committedOutboxIds};
     let preVerifyContent: string | null = null;
     const sessionMeta = this.getSessionMeta(sessionName);
@@ -1287,7 +1411,7 @@ export class SessionTransport {
         "session_transport.submit",
         // Retained fork fence: the managed-send proof runs inside the same
         // write seam, so upstream's beforeWrite cannot skip coordinator authority.
-        () => this.tmuxAdapter.sendKeys(sessionName, ["Enter"], this.managedWriteFence(opts, sessionName, managedProof)),
+        () => writeResult(() => this.tmuxAdapter.sendKeys(sessionName, ["Enter"], this.managedWriteFence(opts, sessionName, managedProof, piProof, piRequired, piOut))),
         (result) => result.ok ? "ok" : "failed",
       );
       if (!submitResult.ok) {
@@ -1303,7 +1427,15 @@ export class SessionTransport {
         attachmentType: sessionMeta.attachmentType,
         timeoutMs: waitForIdleMs,
         binding: observed?.binding,
+        generation: this.liveOccupantGeneration(sessionName, sessionMeta.nodeId),
+        out: piOut,
       });
+      // A Pi send that was authorised by a proof must carry it to the write; any
+      // other Pi outcome still requires the fence, which will refuse without one.
+      if (runtime === "pi" && waitResult.ok) {
+        piRequired = true;
+        piProof = piOut.piProof;
+      }
       waitEvidence = {
         activity: waitResult.activity,
         waitedMs: waitResult.waitedMs,
@@ -1435,10 +1567,26 @@ export class SessionTransport {
     if (observed) observed.sentHash = hashSentText(text);
     const textResult = await this.runStage(
       "session_transport.send_text",
-      () => this.tmuxAdapter.sendText(sessionName, text, this.managedWriteFence(opts, sessionName, managedProof)),
+      () => writeResult(() => this.tmuxAdapter.sendText(sessionName, text, this.managedWriteFence(opts, sessionName, managedProof, piProof, piRequired, piOut))),
       (result) => result.ok ? "ok" : "failed",
     );
+    // Actual paste state for THIS attempt. Recorded before any refusal mapping so
+    // a later Enter refusal can report truthfully that bytes did reach the pane.
+    piOut.pasteCompleted = textResult.ok === true;
     if (!textResult.ok) {
+      // The adapter collapses a fence throw into a generic TmuxResult, so the
+      // typed code is restored from the per-attempt record. The fence runs BEFORE
+      // paste-buffer, so a refusal here means nothing was written.
+      if (piOut.refusalCode) {
+        return observe({
+          ok: false,
+          sessionName,
+          reason: piOut.refusalCode,
+          outcome: "failed",
+          error: piOut.refusalMessage ?? textResult.message,
+          ...(waitMode ? { sent: false, ...waitEvidence } : {}),
+        });
+      }
       return observe({
         ok: false,
         sessionName,
@@ -1457,16 +1605,16 @@ export class SessionTransport {
     // 5. Submit (Enter)
     const submitResult = await this.runStage(
       "session_transport.submit",
-      () => this.tmuxAdapter.sendKeys(sessionName, ["Enter"], this.managedWriteFence(opts, sessionName, managedProof)),
+      () => writeResult(() => this.tmuxAdapter.sendKeys(sessionName, ["Enter"], this.managedWriteFence(opts, sessionName, managedProof, piProof, piRequired, piOut))),
       (result) => result.ok ? "ok" : "failed",
     );
     if (!submitResult.ok) {
       return observe({
         ok: false,
         sessionName,
-        reason: "submit_failed",
+        reason: piOut.refusalCode ?? "submit_failed",
         outcome: "failed",
-        error: `Text is visible in '${sessionName}' but was not submitted (Enter failed). The agent may need manual attention.`,
+        error: `Text is visible in '${sessionName}' but was not submitted (Enter failed). ${piOut.refusalMessage ?? submitResult.message} The agent may need manual attention.`,
         ...(waitMode ? { sent: true, ...waitEvidence } : {}),
       });
     }
@@ -1514,7 +1662,8 @@ export class SessionTransport {
   async waitUntilIdle(sessionName: string, timeoutMs: number, signal?: AbortSignal) {
     const meta = this.getSessionMeta(sessionName);
     return this.waitForIdle({ sessionName, runtime: meta.runtime, attachmentType: meta.attachmentType, timeoutMs, signal,
-      binding: { sessionName, nodeId: meta.nodeId, occupant: meta.occupant, pane: meta.pane } });
+      binding: { sessionName, nodeId: meta.nodeId, occupant: meta.occupant, pane: meta.pane },
+      generation: this.liveOccupantGeneration(sessionName, meta.nodeId) });
   }
 
   private async waitForIdle(input: {
@@ -1524,6 +1673,12 @@ export class SessionTransport {
     timeoutMs: number;
     signal?: AbortSignal;
     binding?: ObservedBinding;
+    /** Live occupant generation observed at send time, cross-checked against the
+     *  Pi proof's generation. Absent means the Pi branch refuses as
+     *  pi_proof_generation_unbound rather than assuming continuity. */
+    generation?: string | null;
+    /** Per-invocation out-box for the authorising Pi proof. */
+    out?: PiProofOut;
   }): Promise<
     | { ok: true; activity: AgentActivity; waitedMs: number; attempts: number }
     | { ok: false; reason: string; error: string; activity: AgentActivity; waitedMs: number; attempts: number }
@@ -1605,7 +1760,7 @@ export class SessionTransport {
   /** One readiness observation, raced against the time left before the wait's deadline. Null
    *  when the deadline wins; the abandoned observation is ignored, never delivered on. */
   private async observeReadinessWithin(
-    input: { sessionName: string; runtime: string | null; attachmentType: string | null; binding?: ObservedBinding },
+    input: { sessionName: string; runtime: string | null; attachmentType: string | null; binding?: ObservedBinding; generation?: string | null; out?: PiProofOut },
     remainingMs: number,
   ): Promise<AgentActivity | null> {
     const observation = this.classifySendReadiness(input);
@@ -1668,6 +1823,10 @@ export class SessionTransport {
     runtime: string | null;
     attachmentType: string | null;
     binding?: ObservedBinding;
+    /** Live occupant generation at send time; see waitForIdle's `generation`. */
+    generation?: string | null;
+    /** Per-invocation out-box for the authorising Pi proof. */
+    out?: PiProofOut;
   }): Promise<AgentActivity> {
     const now = this.now();
     const hookActivity = this.agentActivityStore?.getLatestForNode({
@@ -1677,6 +1836,65 @@ export class SessionTransport {
     // Use the fresh runtime-hook as the authoritative signal ONLY within the tight send-readiness
     // window. Beyond it (but still inside the looser display freshness) the hook is too old to prove
     // "safe to send now" — fall through to the real-time capture-pane probe (also Codex's sole guard).
+    // ── Pi ONLY, and AUTHORITATIVE ──────────────────────────────────────────
+    //
+    // A Pi seat's idle is decided HERE and only here, by the existing
+    // current-generation quiescence proof. Two hazards this placement prevents:
+    //
+    //  1. The runtime-hook block below returns a fresh hook of ANY state, and its
+    //     stale-idle branch credits a latest-Stop hook. Pi's only Stop is
+    //     agent_end, which Pi's own runner documents as NOT settled (retries,
+    //     before-settle continuations and auto-compaction continue after it).
+    //     So a Pi Stop/agent_end must never reach that path.
+    //  2. If the proof is UNKNOWN (stale, absent, generation-mismatched,
+    //     null-settled, timed out) and we fell through to the pane heuristic, an
+    //     idle-looking Codex/Claude glyph — a bare `❯`/`›` prompt or a
+    //     `gpt-N · Context [` footer — would be credited as idle even though the
+    //     authoritative proof refused. That is exactly the fabrication to avoid.
+    //
+    // Therefore for Pi the pane may VETO (needs_input) but may never GRANT idle,
+    // and an UNKNOWN proof stays UNKNOWN instead of degrading to the pane.
+    if (input.runtime === "pi") {
+      // A hook-claimed needs_input is a veto, never a grant: safe to honour.
+      if (hookActivity && hookActivity.state === "needs_input" && hookActivity.stale !== true && this.hookFreshForSend(hookActivity, now)) {
+        return hookActivity;
+      }
+      const proof = await this.readPiReadinessProof(input, input.generation ?? null, now);
+      if (proof.state === "running") return proof;
+      if (proof.state === "needs_input") return proof;
+      if (proof.state === "idle") {
+        // Never paste onto a VISIBLE picker or permission prompt, even with a
+        // fresh settled record. Same veto the stale-idle hook path uses.
+        const veto = await probeSessionActivity({
+          sessionName: input.sessionName,
+          runtime: input.runtime,
+          attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
+          tmuxAdapter: this.tmuxAdapter,
+          now,
+          captureObserver: this.captureObserver,
+          binding: input.binding,
+        });
+        if (veto.state === "needs_input") return veto;
+        // Record the authorising proof on THIS invocation's out-box only. It is never
+        // stored on the transport and never rides on AgentActivity, so a concurrent
+        // send for another seat cannot observe, clear or inherit it.
+        if (input.out) input.out.piProof = { generation: proof.generation!, observedAt: proof.sampledAt };
+        return proof;
+      }
+      // UNKNOWN: consult the pane ONLY to veto, then return the UNKNOWN unchanged.
+      // No fall-through: a refused proof must not be rescued by rendered text.
+      const veto = await probeSessionActivity({
+        sessionName: input.sessionName,
+        runtime: input.runtime,
+        attachmentType: input.attachmentType as "tmux" | "external_cli" | null | undefined,
+        tmuxAdapter: this.tmuxAdapter,
+        now,
+        captureObserver: this.captureObserver,
+        binding: input.binding,
+      });
+      return veto.state === "needs_input" ? veto : proof;
+    }
+
     if (
       hookActivity &&
       hookActivity.evidenceSource === "runtime_hook" &&
@@ -1745,6 +1963,105 @@ export class SessionTransport {
 
   // OPR.0.4.1.10 — a runtime-hook is authoritative for send-readiness only within the tight send
   // window. No usable hook timestamp → not send-fresh (fall through to real-time capture).
+  /** Read the authoritative Pi proof ONCE, under a finite timeout, and map it to
+   *  AgentActivity without reinterpreting it.
+   *
+   *  Every uncertain outcome is UNKNOWN, never idle: no observer wired, a read
+   *  that overruns the ceiling, a null proof, an absent seat, a proof whose
+   *  generation is not the live occupant generation, a missing quiescence record,
+   *  a `settled: null` record, or a record observed before the send freshness
+   *  window. Only a fresh, generation-matched `settled: true` maps to idle, and
+   *  `settled: false` maps to running so busy always wins. An old observedAt is
+   *  never refreshed into currency. */
+  /** The LIVE occupant generation for a seat, or null. Read-only and used ONLY
+   *  to cross-check the Pi proof's generation: a proof produced for any other
+   *  generation may not authorise a send. Absent means the Pi branch refuses
+   *  rather than assuming continuity. */
+  private liveOccupantGeneration(sessionName: string, nodeId: string | null): string | null {
+    try {
+      if (nodeId) return this.sessionRegistry.currentOccupantTenure(nodeId)?.generationUuid ?? null;
+      const row = this.db.prepare("SELECT node_id FROM sessions WHERE session_name = ? ORDER BY id DESC LIMIT 1").get(sessionName) as { node_id: string } | undefined;
+      return row ? this.sessionRegistry.currentOccupantTenure(row.node_id)?.generationUuid ?? null : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async readPiReadinessProof(
+    input: { sessionName: string | null; runtime: string | null; attachmentType: string | null; binding?: ObservedBinding; generation?: string | null },
+    generation: string | null,
+    now: Date,
+  ): Promise<AgentActivity> {
+    const unknown = (reason: string): AgentActivity => ({
+      state: "unknown",
+      reason,
+      evidenceSource: "session_registry",
+      sampledAt: now.toISOString(),
+      evidence: null,
+    });
+    if (!this.runtimeObserver) return unknown("pi_proof_observer_unavailable");
+    if (!input.sessionName) return unknown("no_session");
+
+    let proof: RuntimeAvailability | null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      proof = await Promise.race([
+        this.runtimeObserver(input.sessionName),
+        new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), this.readinessProofTimeoutMs); }),
+      ]);
+    } catch {
+      return unknown("pi_proof_read_failed");
+    } finally {
+      // Always cleared: the loser of the race must not leave an orphan timer
+      // holding the event loop open for the rest of the ceiling.
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    if (proof === null) return unknown("pi_proof_read_timed_out");
+    if (proof.state !== "present") return unknown("pi_proof_not_present");
+    if (!proof.quiescence) return unknown("pi_proof_quiescence_absent");
+
+    // The observer is generation-bound by construction (MAX(generation_ordinal),
+    // kernel-verified, re-read between samples). Cross-check the caller-side
+    // binding anyway: a proof for a different occupant may never authorise a send.
+    const bindingGeneration = generation;
+    if (bindingGeneration !== null && bindingGeneration !== proof.generation) {
+      return unknown("pi_proof_generation_mismatch");
+    }
+    if (bindingGeneration === null) return unknown("pi_proof_generation_unbound");
+
+    if (proof.quiescence.settled === null) return unknown("pi_proof_quiescence_unknown");
+    if (proof.quiescence.settled === false) {
+      return {
+        state: "running",
+        reason: "pi_native_busy",
+        evidenceSource: "runtime_hook",
+        sampledAt: proof.quiescence.observedAt ?? now.toISOString(),
+        evidence: null,
+        fallback: false,
+        generation: proof.generation,
+      };
+    }
+
+    // Freshness: an old observation is not made current by being read now.
+    const observedMs = proof.quiescence.observedAt ? Date.parse(proof.quiescence.observedAt) : NaN;
+    if (!Number.isFinite(observedMs)) return unknown("pi_proof_timestamp_unusable");
+    const ageMs = this.now().getTime() - observedMs;
+    if (ageMs > this.sendReadinessFreshnessMs) return unknown("pi_proof_stale");
+    // A FUTURE-dated observation is not evidence about now. Clock skew or a
+    // rewritten sidecar must never buy the seat extra freshness credit.
+    if (ageMs < 0) return unknown("pi_proof_future_dated");
+
+    return {
+      state: "idle",
+      reason: "pi_native_settled",
+      evidenceSource: "runtime_hook",
+      sampledAt: proof.quiescence.observedAt!,
+      evidence: null,
+      fallback: false,
+      generation: proof.generation,
+    };
+  }
+
   private hookFreshForSend(activity: AgentActivity, now: Date): boolean {
     const eventMs = activity.eventAt ? Date.parse(activity.eventAt) : NaN;
     if (!Number.isFinite(eventMs)) return false;

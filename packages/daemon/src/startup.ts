@@ -647,7 +647,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const piNativeProver = makePiNativeProver(db, opts?.tmuxExec ?? execCommand, {
     fs: { readFile: (p: string) => fs.readFileSync(p, "utf-8") }, piStateRoot,
   });
-  queueRepoInstance.coordinatorAuthority.setRuntimeObserver(makeCoordinatorRuntimeObserver(db, opts?.tmuxExec ?? execCommand, undefined, piNativeProver));
+  const coordinatorRuntimeObserver = makeCoordinatorRuntimeObserver(db, opts?.tmuxExec ?? execCommand, undefined, piNativeProver);
+  queueRepoInstance.coordinatorAuthority.setRuntimeObserver(coordinatorRuntimeObserver);
   const ompStateRoot = nodePath.join(OPENRIG_HOME, "state", "omp");
   const piRunnerEntryPath = nodePath.resolve(import.meta.dirname, "./adapters/pi-runner.js");
   const piResume = new PiResumeAdapter(
@@ -1271,6 +1272,14 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         slowOpRecorder,
         activityEndpointFile: () => readActivityEndpointFile(OPENRIG_HOME),
         captureObserver: shadow.capture?.observer,
+        // The SAME authoritative current-generation observer the coordinator
+        // recovery guard already uses. Injected here so production Pi seats get
+        // a real proof rather than staying UNKNOWN. No second observer and no
+        // duplicated proof logic is created: this is the identical instance
+        // constructed above, so both consumers see one binding, one generation
+        // and one freshness story. It returns null for every non-pi runtime, so
+        // Codex/Claude readiness is untouched.
+        runtimeObserver: coordinatorRuntimeObserver,
       });
       // PL-004 Phase A revision (R1): wire QueueRepository's wake-path so
       // create / handoff / handoff-and-complete nudge by default.

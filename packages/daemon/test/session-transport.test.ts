@@ -18,7 +18,10 @@ import { SessionRegistry } from "../src/domain/session-registry.js";
 import { classifyPaneActivity, SessionTransport } from "../src/domain/session-transport.js";
 import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { EventBus } from "../src/domain/event-bus.js";
-import type { TmuxAdapter, TmuxResult } from "../src/adapters/tmux.js";
+import { TmuxAdapter, type TmuxResult } from "../src/adapters/tmux.js";
+import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
+import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
+import { SeatDeliveryGuard } from "../src/domain/seat-delivery-guard.js";
 import { createFullTestDb } from "./helpers/test-app.js";
 
 describe("agent pane activity classifier", () => {
@@ -1848,4 +1851,426 @@ describe("SessionTransport", () => {
     await transport.send("dev-impl@my-rig", H_ENVELOPE, { stampISO: "2026-08-06T17:42:09Z" });
     expect(sendTextSpy.mock.calls[0]![1]).not.toContain(" · delivered ");
   });
+});
+
+// ── Pi send readiness consumes the EXISTING authoritative current-generation
+// proof. Fixtures only; no provider, seat, signal or production access.
+//
+// The invariant under test is fail-closed: ONLY a fresh, generation-matched
+// settled:true proof may authorise a send. Busy wins, UNKNOWN stays refused, a
+// stale observation is never refreshed into currency, and Codex/Claude readiness
+// is untouched because the branch is scoped to runtime 'pi'.
+describe("Pi authoritative readiness proof", () => {
+  let db: Database.Database;
+  let rigRepo: RigRepository;
+  let sessionRegistry: SessionRegistry;
+  const GEN = "19256a00-5bce-4f22-902c-a6dcd69ea643";
+
+  beforeEach(() => {
+    db = setupDb();
+    rigRepo = new RigRepository(db);
+    sessionRegistry = new SessionRegistry(db);
+  });
+  afterEach(() => { db.close(); });
+
+  /** A Pi seat whose pane cannot be classified by any Codex/Claude idle shape.
+   *  A real occupant tenure is minted so the send-time generation is bound: the
+   *  readiness branch refuses an unbound generation rather than assuming one. */
+  function seedPiRig(mintedGeneration = GEN) {
+    const rig = rigRepo.createRig("pi-rig");
+    const node = rigRepo.addNode(rig.id, "intake.lead", { role: "worker", runtime: "pi" });
+    const session = sessionRegistry.registerSession(node.id, "intake-lead@pi-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "intake-lead@pi-rig" });
+    // NOTE: mintOccupantTenure(nodeId, kind, nativeSessionIdAtBoot?, reservedGeneration?)
+    // — the generation is the FOURTH argument. Passing it third silently becomes a
+    // boot id and mints a RANDOM generation, which the readiness branch then
+    // refuses as a mismatch. Asserted below so the fixture cannot drift again.
+    const tenure = sessionRegistry.mintOccupantTenure(node.id, "initial", undefined, mintedGeneration);
+    expect(tenure.generationUuid).toBe(mintedGeneration);
+    return { rig, node, session, tenure };
+  }
+
+  const settledAt = (ageMs: number) => new Date(Date.now() - ageMs).toISOString();
+  const proof = (over: Partial<{ state: string; generation: string; settled: boolean | null; observedAt: string | null; noQuiescence: boolean }> = {}) => ({
+    session: "intake-lead@pi-rig",
+    generation: over.generation ?? GEN,
+    state: (over.state ?? "present") as "present",
+    observedAt: Date.now(),
+    fingerprint: "fp",
+    ...(over.noQuiescence ? {} : { quiescence: { settled: over.settled === undefined ? true : over.settled, observedAt: over.observedAt ?? settledAt(0) } }),
+  });
+
+  /** A sendText that RUNS the write-boundary seam, exactly as tmux.sendText does
+   *  (mockTmux's default ignores beforeInput, which would skip the fence).
+   *
+   *  `wrote` records whether bytes actually reached the pane: the seam runs
+   *  BEFORE the write, so a fence refusal increments the call count but must
+   *  leave wrote false. Asserting on the call alone would wrongly treat an
+   *  invoked-but-blocked adapter as a delivered send. */
+  function sendTextWithFence() {
+    const spy = vi.fn(async (_t: string, _text: string, beforeInput?: () => void) => {
+      beforeInput?.();
+      spy.wrote = true;
+      return { ok: true as const };
+    });
+    spy.wrote = false;
+    return spy;
+  }
+
+  function piTransport(runtimeObserver: unknown, pane = "↩ Reply: rig send operator \"...\"\n  ⚙ read done") {
+    const sendTextSpy = sendTextWithFence();
+    const tmux = mockTmux({ capturePaneContent: async () => pane, sendText: sendTextSpy, sendKeys: async () => ({ ok: true as const }) });
+    const transport = new SessionTransport({
+      db, rigRepo, sessionRegistry, tmuxAdapter: tmux,
+      runtimeObserver: runtimeObserver as never,
+      sleep: async () => undefined,
+      waitForIdlePollMs: 1,
+      readinessProofTimeoutMs: 50,
+    });
+    return { transport, sendTextSpy };
+  }
+
+  it("sends on a fresh, generation-matched settled proof", async () => {
+    seedPiRig();
+    const { transport, sendTextSpy } = piTransport(async () => proof());
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 50 });
+    expect(result.ok).toBe(true);
+  });
+
+  it("refuses when settled is false — busy wins over the pane", async () => {
+    seedPiRig();
+    const { transport, sendTextSpy } = piTransport(async () => proof({ settled: false }));
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 20 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["settled null (unknown record)", { settled: null as boolean | null }],
+    ["quiescence absent", { noQuiescence: true }],
+    ["seat absent", { state: "absent" }],
+  ])("refuses when the proof is %s", async (_label, over) => {
+    seedPiRig();
+    const { transport, sendTextSpy } = piTransport(async () => proof(over as never));
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 20 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("refuses a STALE settled proof and never refreshes the old timestamp into currency", async () => {
+    seedPiRig();
+    // Older than SEND_READINESS_FRESHNESS_MS (15s).
+    const { transport, sendTextSpy } = piTransport(async () => proof({ settled: true, observedAt: settledAt(10 * 60 * 1000) }));
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 20 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("refuses when no observer is wired at all", async () => {
+    seedPiRig();
+    const { transport, sendTextSpy } = piTransport(undefined);
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 20 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the observer overruns the finite read timeout", async () => {
+    seedPiRig();
+    const { transport, sendTextSpy } = piTransport(() => new Promise(() => { /* never settles */ }));
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 40 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("a visible needs_input prompt vetoes even a fresh settled proof", async () => {
+    seedPiRig();
+    const permissionPane = "Do you want to proceed?\n❯ 1. Yes\n2. No";
+    const { transport, sendTextSpy } = piTransport(async () => proof(), permissionPane);
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 20 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("a CURRENT-GENERATION mismatch is refused, never credited", async () => {
+    seedPiRig();
+    const { transport, sendTextSpy } = piTransport(async () => proof({ generation: "some-previous-occupant" }));
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 20 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("an observer THROWING is unknown, never idle", async () => {
+    seedPiRig();
+    const { transport, sendTextSpy } = piTransport(async () => { throw new Error("probe exploded"); });
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 20 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  // The pane may VETO but never GRANT. A Codex/Claude idle glyph on a Pi pane must
+  // not rescue a proof the authority refused.
+  const CODEX_IDLE_GLYPH = "❯ ";
+  it.each([
+    ["stale", { settled: true, observedAt: settledAt(10 * 60 * 1000) }],
+    ["null-settled", { settled: null as boolean | null }],
+    ["generation-mismatched", { generation: "prior-occupant" }],
+  ])("a %s proof is NOT rescued by an idle-looking pane", async (_label, over) => {
+    seedPiRig();
+    const { transport, sendTextSpy } = piTransport(async () => proof(over as never), CODEX_IDLE_GLYPH);
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 30 });
+    expect(result.sent).toBe(false);
+    expect(result.activity?.state).not.toBe("idle");
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("a CODEX status-bar footer on a Pi pane does not grant idle either", async () => {
+    seedPiRig();
+    const codexFooter = "› Ask Codex to do anything\n\n  gpt-6-luna · Context [███] · ~/code";
+    const { transport, sendTextSpy } = piTransport(async () => proof({ settled: null }), codexFooter);
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 30 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  // Pi's only Stop is agent_end, which is NOT agent_settled. A Stop hook must
+  // never authorise a Pi send on its own.
+  it("a Stop/agent_end hook alone never grants idle when the current proof is unknown", async () => {
+    seedPiRig();
+    const store = new AgentActivityStore({ db, eventBus: new EventBus(db), now: () => new Date() });
+    store.recordHookEvent({ runtime: "pi", sessionName: "intake-lead@pi-rig", hookEvent: "Stop", subtype: "agent_end", occurredAt: new Date().toISOString(), generation: GEN });
+    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+    const tmux = mockTmux({ capturePaneContent: async () => CODEX_IDLE_GLYPH, sendText: sendTextSpy });
+    const transport = new SessionTransport({
+      db, rigRepo, sessionRegistry, tmuxAdapter: tmux, agentActivityStore: store,
+      runtimeObserver: async () => proof({ settled: null }) as never,
+      sleep: async () => undefined, waitForIdlePollMs: 1, readinessProofTimeoutMs: 50,
+    });
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 30 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  // F1 stale producer: the proof is fresh in the store, but the seat's evidence
+  // went stale before the paste. The write boundary must catch that.
+  it("refuses the PASTE when the proof expires across the async wait", async () => {
+    seedPiRig();
+    const observedAt = new Date(Date.now() - 14_000).toISOString(); // fresh at read
+    const sendTextSpy = sendTextWithFence();
+    const tmux = mockTmux({ capturePaneContent: async () => { clock = Date.now() + 60_000; return "↩ Reply: ...\n  ⚙ read done"; }, sendText: sendTextSpy });
+    // The clock crosses the freshness window during the subsequent pane veto,
+    // after the proof read completes: FRESH at read and STALE before paste.
+    let clock = Date.parse(observedAt);
+    const transport = new SessionTransport({
+      db, rigRepo, sessionRegistry, tmuxAdapter: tmux,
+      runtimeObserver: (async () => proof({ observedAt })) as never,
+      now: () => new Date(clock),
+      sleep: async () => undefined, waitForIdlePollMs: 1, readinessProofTimeoutMs: 50,
+    });
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 30 });
+    expect(result.sent).toBe(false);
+    expect(result.reason).toBe("pi_send_refused");
+    expect(sendTextSpy.wrote).toBe(false);
+  });
+
+  it("refuses a FUTURE-dated proof at both the read and the write", async () => {
+    seedPiRig();
+    const future = new Date(Date.now() + 60_000).toISOString();
+    const { transport, sendTextSpy } = piTransport(async () => proof({ observedAt: future }));
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 30 });
+    expect(result.sent).toBe(false);
+    expect(sendTextSpy).not.toHaveBeenCalled();
+  });
+
+  it("refuses the PASTE when the occupant generation changed after the proof", async () => {
+    const seeded = seedPiRig();
+    // The turnover happens INSIDE the proof read, i.e. AFTER the generation the
+    // daemon resolved at send entry. The read-time check sees a consistent pair,
+    // so it is the WRITE boundary that must catch the turnover.
+    let turnedOver = false;
+    const { transport, sendTextSpy } = piTransport(async () => {
+      // Exactly ONE turnover, on the first read. The generation the send resolved
+      // at entry is captured BEFORE this runs, so the read is consistent and only
+      // the write boundary sees the new occupant.
+      if (!turnedOver) {
+        turnedOver = true;
+        sessionRegistry.mintOccupantTenure(seeded.node.id, "handover", undefined, "99999999-9999-4999-8999-999999999999");
+      }
+      return proof();
+    });
+    const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 30 });
+    expect(result.sent).toBe(false);
+    expect(result.reason).toBe("pi_send_refused");
+    expect(sendTextSpy.wrote).toBe(false);
+  });
+
+  // Interleaved seats: one SessionTransport serves every seat, so a Pi proof must
+  // never be observed, cleared or inherited by another seat's send, and must never
+  // leak into a non-Pi write.
+  it("two interleaved Pi seats keep INDEPENDENT proofs; neither inherits the other", async () => {
+    const seatA = seedPiRig();
+    const rigB = rigRepo.createRig("pi-rig-b");
+    const nodeB = rigRepo.addNode(rigB.id, "intake.lead", { role: "worker", runtime: "pi" });
+    const sessionB = sessionRegistry.registerSession(nodeB.id, "intake-lead@pi-rig-b");
+    sessionRegistry.updateStatus(sessionB.id, "running");
+    sessionRegistry.updateBinding(nodeB.id, { tmuxSession: "intake-lead@pi-rig-b" });
+    sessionRegistry.mintOccupantTenure(nodeB.id, "initial", undefined, "aaaaaaaa-1111-4111-8111-111111111111");
+    void seatA;
+
+    const observedAtA = new Date(Date.now() - 5_000).toISOString();  // older
+    const observedAtB = new Date().toISOString();                    // fresh
+    const writes: string[] = [];
+    const transport = new SessionTransport({
+      db, rigRepo, sessionRegistry,
+      tmuxAdapter: mockTmux({
+        capturePaneContent: async () => "↩ Reply: ...\n  ⚙ read done",
+        sendText: async (t: string, _x: string, beforeInput?: () => void) => { beforeInput?.(); writes.push(t); return { ok: true as const }; },
+      }),
+      runtimeObserver: (async (session: string) => {
+        const isB = session.endsWith("pi-rig-b");
+        return { ...proof({ generation: isB ? "aaaaaaaa-1111-4111-8111-111111111111" : GEN, observedAt: isB ? observedAtB : observedAtA }) } as never;
+      }),
+      sleep: async () => undefined, waitForIdlePollMs: 1, readinessProofTimeoutMs: 50,
+    });
+
+    // Interleave: A, then B, then A again.
+    const a1 = await transport.send("intake-lead@pi-rig", "one", { waitForIdleMs: 40 });
+    const b1 = await transport.send("intake-lead@pi-rig-b", "two", { waitForIdleMs: 40 });
+    const a2 = await transport.send("intake-lead@pi-rig", "three", { waitForIdleMs: 40 });
+    expect([a1.sent, b1.sent, a2.sent]).toEqual([true, true, true]);
+    expect(writes).toEqual(["intake-lead@pi-rig", "intake-lead@pi-rig-b", "intake-lead@pi-rig"]);
+  });
+
+  it("a Pi proof NEVER leaks into a Codex seat's write (no Pi fence, no Pi refusal)", async () => {
+    const piSeat = seedPiRig();
+    void piSeat;
+    const rigC = rigRepo.createRig("codex-rig-c");
+    const nodeC = rigRepo.addNode(rigC.id, "orch.lead", { role: "worker", runtime: "codex" });
+    const sessionC = sessionRegistry.registerSession(nodeC.id, "orch-lead@codex-rig-c");
+    sessionRegistry.updateStatus(sessionC.id, "running");
+    sessionRegistry.updateBinding(nodeC.id, { tmuxSession: "orch-lead@codex-rig-c" });
+
+    const codexWrites: string[] = [];
+    const transport = new SessionTransport({
+      db, rigRepo, sessionRegistry,
+      tmuxAdapter: mockTmux({
+        capturePaneContent: async () => "› Ask Codex to do anything\n\n  gpt-6-luna · Context [███] · ~/code",
+        sendText: async (t: string, _x: string, beforeInput?: () => void) => { beforeInput?.(); codexWrites.push(t); return { ok: true as const }; },
+      }),
+      runtimeObserver: (async () => proof()) as never,
+      sleep: async () => undefined, waitForIdlePollMs: 1, readinessProofTimeoutMs: 50,
+    });
+    // A Pi send first, so a proof exists in this transport's recent history.
+    await transport.send("intake-lead@pi-rig", "pi-first", { waitForIdleMs: 40 });
+    const codex = await transport.send("orch-lead@codex-rig-c", "codex-second", { waitForIdleMs: 40 });
+    // Codex must be decided by its OWN pane, never refused by the Pi fence.
+    expect(codex.sent).toBe(true);
+    expect(codex.reason).not.toBe("pi_send_refused");
+    // Both sends used this one transport/adapter; the Codex write is the LAST one
+    // and was decided by its own pane, not refused by the Pi fence.
+    expect(codexWrites).toEqual(["intake-lead@pi-rig", "orch-lead@codex-rig-c"]);
+  });
+
+  it("Codex/Claude readiness is unchanged: no proof observer is consulted for another runtime", async () => {
+    const rig = rigRepo.createRig("codex-rig");
+    const node = rigRepo.addNode(rig.id, "orch.lead", { role: "worker", runtime: "codex" });
+    const session = sessionRegistry.registerSession(node.id, "orch-lead@codex-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "orch-lead@codex-rig" });
+    let observerCalls = 0;
+    const sendTextSpy = vi.fn(async () => ({ ok: true as const }));
+    const tmux = mockTmux({
+      capturePaneContent: async () => "› Ask Codex to do anything\n\n  gpt-6-luna · Context [███] · ~/code",
+      sendText: sendTextSpy,
+    });
+    const transport = new SessionTransport({
+      db, rigRepo, sessionRegistry, tmuxAdapter: tmux,
+      runtimeObserver: (async function (): Promise<unknown> { observerCalls++; return proof(); }) as never,
+      sleep: async () => undefined, waitForIdlePollMs: 1,
+    });
+    const result = await transport.send("orch-lead@codex-rig", "hello", { waitForIdleMs: 50 });
+    expect(result.sent).toBe(true);
+    // The Pi proof branch never runs for a non-pi runtime.
+    expect(observerCalls).toBe(0);
+  });
+  describe("Pi repair R2 actual adapter phase accounting", () => {
+    function realAdapter(onCommand: (cmd: string) => void = () => {}, guardedNode?: string) {
+      const commands: string[] = [];
+      const tmux = new TmuxAdapter(async cmd => {
+        commands.push(cmd); onCommand(cmd);
+        if (cmd.includes("list-panes")) return "%51|0|/synthetic|80|24|1";
+        if (cmd.includes("capture-pane")) return "↩ Reply: ...\n  ⚙ read done";
+        if (cmd.includes("pane_current_command")) return "node";
+        return "";
+      }, { writeFile: async () => {}, unlink: async () => {}, tmpName: () => "/synthetic/pi-send.txt", bufferName: () => "pi-test" });
+      if (guardedNode) {
+        migrate(db, [outboxEntriesSchema, seatDeliveryGuardSchema]);
+        tmux.deliveryGuard = new SeatDeliveryGuard(db, () => ({ nodeId: guardedNode, session: "intake-lead@pi-rig", occupant: GEN, pane: "%51" }));
+      }
+      return { tmux, commands };
+    }
+    it.each([false, true])("actual TmuxResult preserves a before-paste Pi refusal and writes no bytes (guard=%s)", async guarded => {
+      const { node } = seedPiRig(); let clock = Date.now(); const observedAt = new Date(clock).toISOString();
+      const { tmux, commands } = realAdapter(cmd => { if (cmd.includes("load-buffer")) clock += 16_000; }, guarded ? node.id : undefined);
+      const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux,
+        runtimeObserver: async () => proof({ observedAt }), now: () => new Date(clock), sleep: async () => {}, waitForIdlePollMs: 1 });
+      const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 100 });
+      expect(result, result.error).toMatchObject({ ok: false, sent: false, reason: "pi_send_refused" });
+      expect(commands.some(c => c.includes("paste-buffer"))).toBe(false);
+      expect(commands.some(c => c.includes("send-keys"))).toBe(false);
+      expect(commands.some(c => c.includes("delete-buffer"))).toBe(true);
+    });
+    it.each([false, true])("actual adapter expires at Enter: one paste, no Enter, truthful partial send (guard=%s)", async guarded => {
+      const { node } = seedPiRig(); let clock = Date.now(); const observedAt = new Date(clock).toISOString();
+      const { tmux, commands } = realAdapter(() => {}, guarded ? node.id : undefined);
+      const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux,
+        runtimeObserver: async () => proof({ observedAt }), now: () => new Date(clock),
+        sleep: async () => { clock += 16_000; }, waitForIdlePollMs: 1 });
+      const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 100 });
+      expect(result, result.error).toMatchObject({ ok: false, sent: true, reason: "pi_send_refused" });
+      expect(result.error).toContain("not submitted");
+      expect(commands.filter(c => c.includes("paste-buffer"))).toHaveLength(1);
+      expect(commands.some(c => c.includes("send-keys"))).toBe(false);
+    });
+    it("throwing Enter seam after paste also reports sent true, without replay", async () => {
+      seedPiRig(); let clock = Date.now(); const observedAt = new Date(clock).toISOString(); let pastes = 0, enters = 0;
+      const tmux = mockTmux({ capturePaneContent: async () => "↩ Reply: ...\n  ⚙ read done",
+        sendText: async (_t, _x, check) => { check?.(); pastes++; return { ok: true }; },
+        sendKeys: async (_t, _keys, check) => { check?.(); enters++; return { ok: true }; } });
+      const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux,
+        runtimeObserver: async () => proof({ observedAt }), now: () => new Date(clock),
+        sleep: async () => { clock += 16_000; }, waitForIdlePollMs: 1 });
+      const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 100 });
+      expect(result, result.error).toMatchObject({ ok: false, sent: true, reason: "pi_send_refused" });
+      expect(pastes).toBe(1); expect(enters).toBe(0);
+    });
+    it("concurrent other-seat unknown observation cannot remove this send's proof", async () => {
+      seedPiRig(); const r = rigRepo.createRig("pi-rig-b"); const n = rigRepo.addNode(r.id, "intake.lead", { role: "worker", runtime: "pi" });
+      const b = "intake-lead@pi-rig-b"; const sess = sessionRegistry.registerSession(n.id, b);
+      sessionRegistry.updateStatus(sess.id, "running");sessionRegistry.updateBinding(n.id, { tmuxSession: b });
+      sessionRegistry.mintOccupantTenure(n.id, "initial", undefined, "aaaaaaaa-1111-4111-8111-111111111111");
+      let clock = Date.now(); const observedAt = new Date(clock).toISOString();
+      let reached!: () => void, release!: () => void;
+      const paused = new Promise<void>(resolve => { reached = resolve; }); const resumed = new Promise<void>(resolve => { release = resolve; });
+      let writes = 0;
+      const tmux = mockTmux({ capturePaneContent: async () => "↩ Reply: ...\n  ⚙ read done",
+        sendText: async (target, _x, check) => { if (target !== b) { reached(); await resumed; } check?.(); writes++;return { ok: true }; } });
+      const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux,
+        runtimeObserver: async target => target === b ? null : proof({ observedAt }), now: () => new Date(clock), sleep: async () => {}, waitForIdlePollMs: 1 });
+      const a = transport.send("intake-lead@pi-rig", "A", { waitForIdleMs: 100 }); await paused;
+      const failedB = await transport.send(b, "B", { waitForIdleMs: 10 });expect(failedB.sent).toBe(false);
+      clock += 16_000;release();const result = await a;
+      expect(result, result.error).toMatchObject({ ok: false, sent: false, reason: "pi_send_refused" });expect(writes).toBe(0);
+    });
+    it("a genuine refresh during observation uses completion time, not a stale read clock", async () => {
+      seedPiRig(); let clock = Date.now(); let writes = 0;
+      const tmux = mockTmux({ capturePaneContent: async () => "↩ Reply: ...\n  ⚙ read done", sendText: async (_t, _x, check) => { check?.();writes++;return { ok: true }; } });
+      const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux,
+        runtimeObserver: async () => { clock += 1_000; return proof({ observedAt: new Date(clock).toISOString() }); },
+        now: () => new Date(clock), sleep: async () => {}, waitForIdlePollMs: 1 });
+      const result = await transport.send("intake-lead@pi-rig", "hello", { waitForIdleMs: 30 });
+      expect(result, result.error).toMatchObject({ ok: true, sent: true });expect(writes).toBe(1);
+    });
+  });
+
 });
