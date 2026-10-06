@@ -4,7 +4,10 @@ import { promisify } from "node:util";
 import path from "node:path";
 import { piSeatPaths, parsePiRunnerState } from "../adapters/pi-runner-protocol.js";
 const run = promisify(execFile);
-export interface RuntimeAvailability { session: string; generation: string; state: "present" | "absent" | "unknown"; observedAt: number; fingerprint: string }
+export interface RuntimeAvailability { session: string; generation: string; state: "present" | "absent" | "unknown"; observedAt: number; fingerprint: string; /** Optional native idle/busy evidence, carried through from the Pi native
+   *  proof. `settled: null` (or an absent field) is UNKNOWN, never idle.
+   *  Evidence only — no authority, recovery, queue, guard or send effect. */
+  quiescence?: PiQuiescenceProof }
 /** Proof that the SAME managed Pi occupant is live: runner argv binds
  * --session-name/--launch-id, the runner's typed sidecar binds launchId and
  * the exact native session-file token via the per-launch launch-id instance binding, and the
@@ -12,7 +15,16 @@ export interface RuntimeAvailability { session: string; generation: string; stat
  * equal to the node's latest occupant tenure. Environment text never leaves
  * this module except the single extracted generation token; fingerprints carry
  * only identifiers. */
-export interface PiNativeProof { state: "present" | "absent"; generation: string; launchId: string | null; fingerprint: string }
+export interface PiNativeProof { state: "present" | "absent"; generation: string; launchId: string | null; fingerprint: string; quiescence?: PiQuiescenceProof }
+/** Native idle/busy evidence carried alongside an identity proof. Evidence
+ *  ONLY — nothing here grants authority, recovery, queue, guard, qualification
+ *  or send rights.
+ *
+ *  `settled: null` is the honest UNKNOWN case and must never be read as idle:
+ *  it means the sidecar carried no quiescence record, the record was malformed,
+ *  or its bindings no longer match this exact launch/generation/session/cursor.
+ *  Adapters that cannot produce native evidence omit the field entirely. */
+export interface PiQuiescenceProof { settled: boolean | null; observedAt: string | null }
 /** Reduced, non-sensitive reason a proof came back UNKNOWN (null).
  *  Every value is a closed-vocabulary token, a count, or a boolean. Argument
  *  vectors, environment text, filesystem paths, pids and error messages are
@@ -80,6 +92,22 @@ export function makePiNativeProver(db: Database.Database, exec: (command: string
   const unknown = (code: PiProofReasonCode, extra?: { count?: number; detail?: PiProofReason["detail"] }): null => {
     diagnose([{ code, ...(extra?.count === undefined ? {} : { count: extra.count }), ...(extra?.detail === undefined ? {} : { detail: extra.detail }) }]);
     return null;
+  };
+  // Read the runner's own native quiescence record WITHOUT weakening the
+  // identity proof: a missing, malformed or stale-binding record yields
+  // settled: null (UNKNOWN), never true. Identity is still proven; only the
+  // idle claim is withheld. Failures emit NO reason — an unknown quiescence is
+  // not a proof anomaly, and the existing reason vocabulary stays closed.
+  const readQuiescence = (state: PiRunnerSide, launchFlag: string, resumeToken: string | null, generation: string): PiQuiescenceProof => {
+    const q = state?.quiescence;
+    const unknownQuiescence: PiQuiescenceProof = { settled: null, observedAt: null };
+    if (!q || typeof q !== "object") return unknownQuiescence;
+    if (typeof q.settled !== "boolean" || typeof q.observedAt !== "string") return unknownQuiescence;
+    if (q.launchId === undefined || q.launchId !== launchFlag) return unknownQuiescence;
+    if (q.generation !== undefined && q.generation !== generation) return unknownQuiescence;
+    if (q.sessionFile !== resumeToken) return unknownQuiescence;
+    if ((q.lastEntryId ?? undefined) !== (state.lastEntryId ?? undefined)) return unknownQuiescence;
+    return { settled: q.settled, observedAt: q.observedAt };
   };
   return async (session: string): Promise<PiNativeProof | null> => {
     const BINDING_SQL = `SELECT n.id AS nodeId,n.runtime,b.tmux_pane,b.tmux_session,t.generation_uuid,s.resume_token FROM sessions s JOIN nodes n ON n.id=s.node_id LEFT JOIN bindings b ON b.node_id=n.id JOIN occupant_tenures t ON t.node_id=n.id WHERE s.session_name=? AND n.runtime='pi' AND s.id=(SELECT MAX(s2.id) FROM sessions s2 WHERE s2.node_id=n.id) AND t.generation_ordinal=(SELECT MAX(x.generation_ordinal) FROM occupant_tenures x WHERE x.node_id=n.id)`;
@@ -164,7 +192,7 @@ export function makePiNativeProver(db: Database.Database, exec: (command: string
         const runnerEv = await genFor(runner.pid), piEv = await genFor(piProc.pid);
         if (runnerEv.value !== binding.generation_uuid) return unknown("generation_unverified_runner", { detail: runnerEv.value === null ? "empty" : "ok" });
         if (piEv.value !== binding.generation_uuid) return unknown("generation_unverified_child", { detail: piEv.value === null ? "empty" : "ok" });
-        return { state: "present", generation: binding.generation_uuid, launchId: launchFlag, fingerprint: JSON.stringify({ pane: match[1], runner: [runner.pid, runner.ppid], pi: [piProc.pid, piProc.ppid], launchId: launchFlag, sidecarUpdatedAt: state.updatedAt, genSources: [runnerEv.source, piEv.source] }) };
+        return { state: "present", generation: binding.generation_uuid, launchId: launchFlag, fingerprint: JSON.stringify({ pane: match[1], runner: [runner.pid, runner.ppid], pi: [piProc.pid, piProc.ppid], launchId: launchFlag, sidecarUpdatedAt: state.updatedAt, genSources: [runnerEv.source, piEv.source] }), quiescence: readQuiescence(state, launchFlag, binding.resume_token, binding.generation_uuid) };
       };
       const first = await sample(), second = await sample();
       if (!first || !second) return unknown("unstable_between_samples");
@@ -189,7 +217,7 @@ export function makeCoordinatorRuntimeObserver(db: Database.Database, exec: (com
   const binding=read();if(!binding)return null;
   // Pi seats prove through the shared native prover (the same proof serves the
   // coordinator recovery guard); an unconfigured prover stays unknown, never green.
-  if (binding.runtime === 'pi') { if (!piProbe) return null; const proof = await piProbe(session); return proof ? { session, generation: proof.generation, state: proof.state, observedAt: Date.now(), fingerprint: proof.fingerprint } : null; }
+  if (binding.runtime === 'pi') { if (!piProbe) return null; const proof = await piProbe(session); return proof ? { session, generation: proof.generation, state: proof.state, observedAt: Date.now(), fingerprint: proof.fingerprint, ...(proof.quiescence ? { quiescence: proof.quiescence } : {}) } : null; }
   if (!['codex','claude-code'].includes(binding.runtime)) return null;
   const target=binding.tmux_pane??binding.tmux_session;if(!target)return null;
   const quote=(s:string)=>"'"+s.replace(/'/g,"'\\''")+"'";

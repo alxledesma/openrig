@@ -182,3 +182,103 @@ describe("pi prover typed UNKNOWN reasons (F1)", () => {
     expect(seen).toHaveLength(0);
   });
 });
+
+// ── Native quiescence credit (evidence only) ────────────────────────────────
+// The prover keeps proving IDENTITY exactly as before; only the idle claim is
+// withheld. Missing, old or malformed metadata must degrade to UNKNOWN and
+// never become idle credit.
+
+describe("pi prover native quiescence credit", () => {
+  const row = { nodeId: "n", runtime: "pi", tmux_pane: "%4", tmux_session: null, generation_uuid: "lead-g1", resume_token: "/state/pi/lead@xv/sessions/s.json" };
+  const runnerLine = "101 100 node /d/adapters/pi-runner.js --session-name lead@xv --launch-id L-77 --state-root /state/pi";
+  const childLine = "102 101 /opt/homebrew/bin/node /x/@earendil-works/pi-coding-agent/dist/bundle/cli.js --mode rpc --session-dir /state/pi/lead@xv/sessions --name lead@xv --approve";
+  const census = () => `100 1 /bin/zsh -l\n${runnerLine}\n${childLine}`;
+  const env = (gen = "lead-g1") => `101 node pi-runner SECRET=never-logged OPENRIG_OCCUPANT_GENERATION=${gen}\n102 node cli.js OTHER=x OPENRIG_OCCUPANT_GENERATION=${gen}`;
+  const observedAt = "2026-10-05T11:59:59.000Z";
+  /** A sidecar carrying a well-formed, fully bound quiescence record. */
+  const settledSidecar = (over: Record<string, unknown> = {}) => JSON.stringify({
+    ready: true, launchId: "L-77", sessionFile: row.resume_token, lastEntryId: "e-9", updatedAt: "2026-01-01T00:00:00.000Z",
+    quiescence: { launchId: "L-77", generation: "lead-g1", sessionFile: row.resume_token, lastEntryId: "e-9", settled: true, observedAt },
+    ...over,
+  });
+  const oldSidecar = () => JSON.stringify({ ready: true, launchId: "L-77", sessionFile: row.resume_token, updatedAt: "2026-01-01T00:00:00.000Z" });
+  function prover(opts: { sidecar?: string; rows?: unknown[]; envProbe?: (p: number[]) => Promise<string>; argvCensus?: () => Promise<string> } = {}) {
+    const rows = opts.rows ?? [row];
+    const db = { prepare: () => ({ all: () => rows }) } as never;
+    return makePiNativeProver(db, async () => "%4|100|0", {
+      fs: { readFile: () => opts.sidecar ?? settledSidecar() }, piStateRoot: "/state/pi",
+      procArgs: async () => new Map(),
+      argvCensus: opts.argvCensus ?? (async () => census()), envProbe: opts.envProbe ?? (async () => env()),
+      now: () => Date.parse("2026-10-05T12:00:00Z"),
+    });
+  }
+
+  it("a valid proof with exact current bindings retains settled true", async () => {
+    expect(await prover()("lead@xv")).toMatchObject({ state: "present", generation: "lead-g1", launchId: "L-77", quiescence: { settled: true, observedAt } });
+  });
+
+  it("an OLD sidecar written before this field existed is identity-proven but UNKNOWN", async () => {
+    const proof = await prover({ sidecar: oldSidecar() })("lead@xv");
+    expect(proof).toMatchObject({ state: "present", launchId: "L-77", quiescence: { settled: null, observedAt: null } });
+    expect(proof!.quiescence!.settled).not.toBe(true);
+  });
+
+  it.each([
+    ["metadata absent", { quiescence: undefined }],
+    ["settled missing", { quiescence: { launchId: "L-77", sessionFile: "/s", lastEntryId: "e-9", observedAt } }],
+    ["settled not a boolean", { quiescence: { launchId: "L-77", sessionFile: "/s", lastEntryId: "e-9", settled: "yes", observedAt } }],
+    ["observedAt missing", { quiescence: { launchId: "L-77", sessionFile: "/s", lastEntryId: "e-9", settled: true } }],
+    ["quiescence not an object", { quiescence: "idle" }],
+    ["quiescence is null", { quiescence: null }],
+  ])("malformed metadata (%s) yields UNKNOWN, never idle", async (_label, over) => {
+    const proof = await prover({ sidecar: settledSidecar(over) })("lead@xv");
+    expect(proof).toMatchObject({ state: "present", quiescence: { settled: null, observedAt: null } });
+  });
+
+  it("a launch-id drift refuses idle credit while still proving identity", async () => {
+    const proof = await prover({ sidecar: settledSidecar({ quiescence: { launchId: "L-OLD", generation: "lead-g1", sessionFile: row.resume_token, lastEntryId: "e-9", settled: true, observedAt } }) })("lead@xv");
+    expect(proof).toMatchObject({ state: "present", quiescence: { settled: null } });
+  });
+
+  it("a generation drift refuses idle credit", async () => {
+    const proof = await prover({ sidecar: settledSidecar({ quiescence: { launchId: "L-77", generation: "lead-g0", sessionFile: row.resume_token, lastEntryId: "e-9", settled: true, observedAt } }) })("lead@xv");
+    expect(proof).toMatchObject({ state: "present", quiescence: { settled: null } });
+  });
+
+  it("a native session-file drift refuses idle credit", async () => {
+    const proof = await prover({ sidecar: settledSidecar({ quiescence: { launchId: "L-77", generation: "lead-g1", sessionFile: "/state/pi/lead@xv/sessions/other.json", lastEntryId: "e-9", settled: true, observedAt } }) })("lead@xv");
+    expect(proof).toMatchObject({ state: "present", quiescence: { settled: null } });
+  });
+
+  it("a cursor that moved past the recorded one refuses idle credit", async () => {
+    const proof = await prover({ sidecar: settledSidecar({ quiescence: { launchId: "L-77", generation: "lead-g1", sessionFile: row.resume_token, lastEntryId: "e-4", settled: true, observedAt } }) })("lead@xv");
+    expect(proof).toMatchObject({ state: "present", quiescence: { settled: null } });
+  });
+
+  it("a genuine busy claim is carried honestly as settled false, not as unknown", async () => {
+    const proof = await prover({ sidecar: settledSidecar({ quiescence: { launchId: "L-77", generation: "lead-g1", sessionFile: row.resume_token, lastEntryId: "e-9", settled: false, observedAt } }) })("lead@xv");
+    expect(proof).toMatchObject({ state: "present", quiescence: { settled: false, observedAt } });
+  });
+
+  it("absence and every UNKNOWN exit carry no idle credit at all", async () => {
+    expect((await prover({ argvCensus: async () => "100 1 /bin/zsh -l" })("lead@xv"))!.quiescence).toBeUndefined();
+    const retired = await prover({ sidecar: settledSidecar({ exited: { code: 1, at: observedAt } }) })("lead@xv");
+    expect(retired).toBeNull();
+    const drifted = await prover({ envProbe: async () => env("lead-g0") })("lead@xv");
+    expect(drifted).toBeNull();
+  });
+
+  it("quiescence credit never weakens the fingerprint double-sampling or reason vocabulary", async () => {
+    const reasons: Array<unknown> = [];
+    const rows = [row];
+    const db = { prepare: () => ({ all: () => rows }) } as never;
+    const p = makePiNativeProver(db, async () => "%4|100|0", {
+      fs: { readFile: () => settledSidecar() }, piStateRoot: "/state/pi", procArgs: async () => new Map(),
+      argvCensus: async () => census(), envProbe: async () => env(), now: () => Date.parse("2026-10-05T12:00:00Z"),
+      diagnose: r => reasons.push(...r),
+    });
+    expect(await p("lead@xv")).toMatchObject({ state: "present", quiescence: { settled: true } });
+    expect(reasons).toHaveLength(0);
+    expect(JSON.stringify(await p("lead@xv"))).not.toMatch(/pi-coding-agent|OPENRIG_OCCUPANT_GENERATION/);
+  });
+});

@@ -660,3 +660,94 @@ describe("cursor refresh via get_entries (QA RED, qitem-20260707020922)", () => 
     expect(f.sidecars.at(-1)!.lastEntryId).toBe("e5");
   });
 });
+
+// ── Durable native quiescence evidence (evidence only: no authority,
+// recovery, queue, guard, qualification or send semantics read it) ─────────
+
+describe("RunnerCore native quiescence projection", () => {
+  const q = (f: { sidecars: PiRunnerState[] }) => f.sidecars.at(-1)!.quiescence;
+
+  it("publishes settled from a quiet successful get_state, bound to this launch and native session file", () => {
+    const f = readyCore();
+    expect(q(f)).toMatchObject({ launchId: "launch-77", sessionFile: SESSION_FILE, settled: true });
+  });
+
+  it("an actual agent_start is persisted busy BEFORE any later state write", () => {
+    const f = readyCore();
+    expect(q(f)!.settled).toBe(true);
+    core_reset(f);
+    f.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    expect(q(f)!.settled).toBe(false);
+    f.core.handlePiLine(JSON.stringify({ type: "compaction_start" }));
+    expect(q(f)!.settled).toBe(false);
+    function core_reset(ff: ReturnType<typeof readyCore>) { /* keep the same core */ void ff; }
+  });
+
+  it("agent_end never settles — retries and compaction continue after it", () => {
+    const f = readyCore();
+    f.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    f.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(q(f)!.settled).toBe(false);
+  });
+
+  it("agent_settled publishes settled true", () => {
+    const f = readyCore();
+    f.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    f.core.handlePiLine(JSON.stringify({ type: "agent_settled" }));
+    expect(q(f)!.settled).toBe(true);
+  });
+
+  it("a fresh submitted turn marks busy before the RPC is issued", () => {
+    const f = readyCore();
+    expect(q(f)!.settled).toBe(true);
+    f.core.handleUserBlock("do the thing");
+    expect(q(f)!.settled).toBe(false);
+    expect(f.rpc.at(-1)).toMatchObject({ type: "prompt" });
+  });
+
+  it("an in-flight control keeps the seat busy and settles only from a following quiet get_state", () => {
+    const f = readyCore();
+    f.core.handleUserBlock("/compact Preserve assignments");
+    expect(q(f)).toMatchObject({ settled: false });
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-native-control", command: "compact", success: true }));
+    expect(q(f)!.settled).toBe(false);
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-control-state", success: true, data: { isStreaming: false, isCompacting: false, pendingMessageCount: 0 } }));
+    expect(q(f)!.settled).toBe(true);
+  });
+
+  it.each([
+    ["busy response", { type: "response", id: "pi-runner-control-state", success: true, data: { isStreaming: true, isCompacting: false, pendingMessageCount: 0 } }],
+    ["pending messages", { type: "response", id: "pi-runner-control-state", success: true, data: { isStreaming: false, isCompacting: false, pendingMessageCount: 2 } }],
+    ["failed control state", { type: "response", id: "pi-runner-control-state", success: false }],
+    ["missing control state", { type: "response", id: "pi-runner-control-state" }],
+  ])("a %s stays busy and unproven, never idle", (_label, record) => {
+    const f = readyCore();
+    f.core.handleUserBlock("/compact go");
+    f.core.handlePiLine(JSON.stringify(record));
+    expect(q(f)!.settled).toBe(false);
+  });
+
+  it("a busy initial get_state never claims settled", () => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, launchId: "launch-77" });
+    core.start();
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-get-state", data: { sessionFile: SESSION_FILE, isStreaming: true } }));
+    expect(q(f)!.settled).toBe(false);
+  });
+
+  it("an exited seat is non-running, never settled", () => {
+    const f = readyCore();
+    f.core.handlePiExit(0);
+    expect(q(f)!.settled).toBe(false);
+    expect(f.sidecars.at(-1)!.exited).toMatchObject({ code: 0 });
+  });
+
+  it("every projection is launch-stamped and carries no free-text claim", () => {
+    const f = readyCore();
+    f.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
+    f.core.handlePiLine(JSON.stringify({ type: "agent_settled" }));
+    expect(f.sidecars.length).toBeGreaterThan(2);
+    for (const s of f.sidecars) expect(s.quiescence).toMatchObject({ launchId: "launch-77", settled: expect.any(Boolean) });
+    expect(JSON.stringify(f.sidecars.at(-1)!.quiescence)).not.toMatch(/idle|quiet|free/i);
+  });
+});

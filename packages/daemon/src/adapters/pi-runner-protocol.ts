@@ -68,6 +68,38 @@ export interface PiRunnerState {
   updatedAt: string;
   /** Set when the pi process exited; the seat is honestly non-running. */
   exited?: { code: number | null; at: string };
+  /** Optional native idle/busy evidence for THIS launch, bound to the exact
+   *  launch/generation/native session file/cursor it was observed against.
+   *  Evidence only — no authority, recovery, queue or send semantics.
+   *
+   *  Reading rules (fail-closed, and shared with the native prover):
+   *   - ABSENT on any sidecar written before this field existed, or by any
+   *     writer that never observed native state. Absent means UNKNOWN.
+   *   - `settled: true` is proven ONLY when every binding field below still
+   *     matches the enclosing record. A stale launchId, a different native
+   *     session file, a drifted cursor or a malformed shape degrades to
+   *     UNKNOWN. Nothing ever infers idle from a timestamp.
+   *   - `agent_end` does NOT settle: retries, extensions and automatic
+   *     compaction continue after it while isStreaming is still true, so
+   *     only an explicit agent_settled or a successful get_state may set it. */
+  quiescence?: PiQuiescenceEvidence;
+}
+
+/** Bounded native quiescence evidence. `settled` is a positive native claim,
+ *  never inferred from absence. Unknown adapters simply omit this object. */
+export interface PiQuiescenceEvidence {
+  /** Must equal the enclosing record's launchId — this launch only. */
+  launchId?: string;
+  /** Occupant generation the runner was launched with, when known. */
+  generation?: string;
+  /** Native session file this observation was taken against. */
+  sessionFile?: string;
+  /** Durable catch-up cursor at observation time; a moved cursor invalidates. */
+  lastEntryId?: string;
+  /** True only from a real agent_settled or a quiet successful get_state. */
+  settled: boolean;
+  /** ISO timestamp of this observation. Never sufficient on its own. */
+  observedAt: string;
 }
 
 /** The launch-scoped pending record every writer uses when resetting the

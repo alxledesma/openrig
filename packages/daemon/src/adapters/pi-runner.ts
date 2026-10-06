@@ -269,6 +269,11 @@ export class RunnerCore {
   private lastEntryId: string | undefined;
   private ready = false;
   private assistantErrorShown = false;
+  /** Whether `processing`/`controlPending` currently reflect a POSITIVE native
+   *  observation (a real agent_settled, or a successful get_state proving no
+   *  streaming/compacting/pending messages). Defaults false: before any such
+   *  observation the seat is busy-by-default and evidence stays UNKNOWN. */
+  private settledProven = false;
 
   constructor(
     private io: RunnerIo,
@@ -329,16 +334,20 @@ export class RunnerCore {
         command = { type: "set_model", provider: match[1], modelId: match[2] };
       } else command = { type: "compact", ...(block === "/compact" ? {} : { customInstructions: block.slice(9) }) };
       this.controlPending = true;
+      this.settledProven = false;
+      this.writeQuiescence();
       this.io.sendRpc({ ...command, id: "pi-runner-native-control" });
       return;
     }
     if (block === "/abort") {
+      this.markBusy();
       this.io.sendRpc({ type: "abort" });
       this.io.mirrorLine("[pi-runner] abort sent");
       return;
     }
     if (block.startsWith("/followup ")) {
       const message = block.slice("/followup ".length);
+      this.markBusy();
       this.io.sendRpc({ type: "follow_up", message });
       this.io.mirrorLine(`you (follow-up) ▸ ${message}`);
       return;
@@ -346,6 +355,7 @@ export class RunnerCore {
     if (this.streaming) {
       // Mid-stream: steer delivers after the current turn's tool calls,
       // before the next model call (Pi's documented semantics).
+      this.markBusy();
       this.io.sendRpc({ type: "steer", message: block });
       this.io.mirrorLine(`you (steer) ▸ ${block}`);
       return;
@@ -359,6 +369,7 @@ export class RunnerCore {
     // keeps both cases correct on one RPC: idle → ignored, starts normally;
     // busy-but-not-mirrored-streaming → queued and delivered when the agent
     // stops. No retry, no duplicate replay.
+    this.markBusy();
     this.io.sendRpc({ type: "prompt", message: block, streamingBehavior: "followUp" });
     this.io.mirrorLine(`you ▸ ${block}`);
   }
@@ -367,7 +378,9 @@ export class RunnerCore {
   handlePiExit(code: number | null): void {
     this.ready = false;
     this.io.mirrorLine(`${PI_RUNNER_EXIT_MARKER} pi exited (code ${code ?? "unknown"})`);
-    this.writeSidecar({ exited: { code, at: this.io.now() } });
+    // An exited seat is honestly non-running: never a settled one.
+    this.settledProven = false;
+    this.writeQuiescence({ exited: { code, at: this.io.now() } });
     this.io.postActivity(this.activityPayload("Stop", "pi_exited"));
   }
 
@@ -379,6 +392,10 @@ export class RunnerCore {
         ? `[pi-runner] ${String(record.command)} completed${record.command === "get_available_models" ? ": " + (data?.models ?? []).map(m => `${m.provider}/${m.id}`).join(", ") : ""}`
         : `${PI_RUNNER_ERROR_MARKER} native control: ${String(record.error ?? "unverified response")}`);
       this.processing = true;
+      // A control's effect is unobserved until a later get_state proves it, so
+      // the seat stays busy-by-default (settledProven false) across the refresh.
+      this.settledProven = false;
+      this.writeQuiescence();
       // Controls can append entries, or emit UI IDs without an agent_end.
       // Read the current session's authoritative cursor even after refusal.
       this.io.sendRpc({ type: "get_entries", id: CURSOR_REFRESH_ID });
@@ -387,6 +404,10 @@ export class RunnerCore {
     }
     if (record.id === CONTROL_STATE_ID) {
       this.processing = record.success !== true || piProcessing((record.data ?? {}) as Record<string, unknown>);
+      // A failed or missing control-state read proves NOTHING: it leaves the
+      // seat busy and the evidence non-proven rather than guessing idle.
+      this.settledProven = record.success === true && !piProcessing((record.data ?? {}) as Record<string, unknown>);
+      this.writeQuiescence();
       return;
     }
     if (record.id === GET_STATE_ID) {
@@ -397,7 +418,10 @@ export class RunnerCore {
       this.sessionId = sessionId ?? this.sessionId;
       this.ready = true;
       this.processing = piProcessing(data);
-      this.writeSidecar({});
+      // A successful get_state is the second positive settlement source: it
+      // directly proves no streaming, no compaction and no pending messages.
+      this.settledProven = record.success !== false && !this.processing;
+      this.writeQuiescence();
       this.io.mirrorLine(`${PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
       this.io.postActivity({
         eventFamily: "session_identity",
@@ -443,8 +467,13 @@ export class RunnerCore {
   }
 
   private handleEvent(event: Record<string, unknown>): void {
-    if (event.type === "agent_start" || event.type === "compaction_start") this.processing = true;
-    if (event.type === "agent_settled") this.processing = false;
+    if (event.type === "agent_start" || event.type === "compaction_start") { this.processing = true; this.settledProven = false; this.writeQuiescence(); }
+    // agent_settled is the ONLY event that settles. agent_end deliberately does
+    // not: retries, before-settle continuations and automatic compaction all
+    // continue after it while isStreaming is still true (see the /followup note
+    // in handleUserBlock), so treating agent_end as idle would claim a settled
+    // seat that is still working.
+    if (event.type === "agent_settled") { this.processing = false; this.settledProven = true; this.writeQuiescence(); }
     const message = event.message as Record<string, unknown> | undefined;
     if (event.type === "agent_start" || (event.type === "message_start" && message?.role === "assistant")) {
       this.assistantErrorShown = false;
@@ -507,6 +536,40 @@ export class RunnerCore {
       updatedAt: this.io.now(),
       ...patch,
     });
+  }
+
+  /** Persist the current native busy/idle state, bound to this launch,
+   *  generation, native session file and durable cursor.
+   *
+   *  `settled` is only ever true from a POSITIVE observation — a real
+   *  agent_settled, or a successful get_state proving no streaming, no
+   *  compaction and no pending messages. A control in flight counts as busy
+   *  (controlPending participates), and a fresh native turn or control effect
+   *  marks busy BEFORE it is issued, so no observer can read a stale idle
+   *  projection and act on it.
+   *
+   *  This is evidence only: no authority, recovery, queue, guard,
+   *  qualification or send decision reads it. Absent metadata means UNKNOWN. */
+  private writeQuiescence(patch: Partial<PiRunnerState> = {}): void {
+    this.writeSidecar({
+      ...patch,
+      quiescence: {
+        launchId: this.identity.launchId,
+        generation: this.identity.generation,
+        sessionFile: this.sessionFile,
+        lastEntryId: this.lastEntryId,
+        settled: this.settledProven && !this.processing && !this.controlPending,
+        observedAt: this.io.now(),
+      },
+    });
+  }
+
+  /** Mark the seat busy ahead of a native turn or control effect and persist
+   *  that immediately, so a concurrent reader never sees a stale idle claim. */
+  private markBusy(): void {
+    this.processing = true;
+    this.settledProven = false;
+    this.writeQuiescence();
   }
 }
 
