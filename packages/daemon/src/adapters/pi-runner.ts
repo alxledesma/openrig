@@ -436,8 +436,9 @@ export class RunnerCore {
     if (event.type === "agent_start" || (event.type === "message_start" && message?.role === "assistant")) {
       this.assistantErrorShown = false;
     }
-    // Durable cursor: any event carrying a session-entry id advances it.
-    const entryId = typeof event.entryId === "string" ? event.entryId : (typeof event.id === "string" ? event.id : undefined);
+    // Only an explicit session-entry ID is durable. Generic event IDs include
+    // extension UI request UUIDs (notify/status/dialog), never JSONL entries.
+    const entryId = typeof event.entryId === "string" ? event.entryId : undefined;
     if (entryId) {
       this.lastEntryId = entryId;
       this.writeSidecar({});

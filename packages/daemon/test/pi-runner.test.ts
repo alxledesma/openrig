@@ -322,6 +322,13 @@ describe("RunnerCore identity + sidecar", () => {
     expect(sidecars.at(-1)!.lastEntryId).toBe("entry-7");
   });
 
+  it.each(["notify", "setStatus", "select"])("extension UI %s request IDs cannot replace a durable cursor", (method) => {
+    const { core, sidecars } = readyCore();
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-cursor-refresh", data: { entries: [{ id: "durable-entry" }] } }));
+    core.handlePiLine(JSON.stringify({ type: "extension_ui_request", id: "ephemeral-request-uuid", method }));
+    expect(sidecars.at(-1)!.lastEntryId).toBe("durable-entry");
+  });
+
   it("pi exit → EXIT marker + sidecar exited + idle activity (honest, never frozen)", () => {
     const { core, lines, sidecars, activity } = readyCore();
     core.handlePiExit(1);
