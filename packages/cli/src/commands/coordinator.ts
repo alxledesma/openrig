@@ -5,11 +5,22 @@ import { randomUUID } from "node:crypto";
 import { Command } from "commander";
 import { DaemonClient, terminalAuthHeaders } from "../client.js";
 
+const DEFAULT_READ_TIMEOUT_MS = 30_000;
+function readTimeout(value:string):number|undefined {
+ if(!/^\d+$/.test(value))return undefined;
+ const ms=Number(value);
+ return Number.isSafeInteger(ms)&&ms>=1_000&&ms<=60_000?ms:undefined;
+}
+
 /** Exact JSON contracts keep authority and evidence explicit; no implied automatic takeover. */
 export function coordinatorCommand():Command {
  const cmd=new Command("coordinator").description("Rig-scoped durable coordinator authority and admitted packages");
- cmd.command("show <rigId>").action(async(rigId:string)=>{
-   const res=await new DaemonClient().get(`/api/coordinator/${encodeURIComponent(rigId)}`, { headers: terminalAuthHeaders() });
+ cmd.command("show <rigId>")
+  .option("--read-timeout-ms <ms>","Read timeout in milliseconds (1000-60000)",String(DEFAULT_READ_TIMEOUT_MS))
+  .action(async(rigId:string,opts:{readTimeoutMs:string})=>{
+   const timeoutMs=readTimeout(opts.readTimeoutMs);
+   if(timeoutMs===undefined){process.stderr.write("read-timeout-ms must be an integer 1000-60000\n");process.exitCode=1;return;}
+   const res=await new DaemonClient().get(`/api/coordinator/${encodeURIComponent(rigId)}`, { headers: terminalAuthHeaders(), timeoutMs });
    console.log(JSON.stringify(res.data,null,2));if(res.status>=400)process.exitCode=1;
  });
  // resume-owned takes a rigId, not a contract file: the daemon derives the caller's token
@@ -35,9 +46,12 @@ export function coordinatorCommand():Command {
   .option("--operation-id <id>","Stable durable receipt id. Omitted by default, which generates a fresh id so an operator never reuses one.")
   .option("--replay-contract <file>","Submit a previously PREPARED request file exactly as prepared, under genuine native auth. Performs no read, generates no new id and retries nothing. Use after a timeout or unknown outcome.")
   .option("--lease-ms <ms>","Renewed lease in milliseconds (1000-3600000)","1200000")
-  .action(async(rigId:string,opts:{operationId?:string;replayContract?:string;leaseMs:string})=>{
+  .option("--read-timeout-ms <ms>","Initial authority read timeout in milliseconds (1000-60000)",String(DEFAULT_READ_TIMEOUT_MS))
+  .action(async(rigId:string,opts:{operationId?:string;replayContract?:string;leaseMs:string;readTimeoutMs:string})=>{
    const client=new DaemonClient(),headers=terminalAuthHeaders();
    const show=(b:unknown)=>{console.log(JSON.stringify(b,null,2));process.exitCode=1;};
+   const timeoutMs=readTimeout(opts.readTimeoutMs);
+   if(timeoutMs===undefined){process.stderr.write("read-timeout-ms must be an integer 1000-60000\n");process.exitCode=1;return;}
    if(opts.replayContract){
     // Controlled replay: submit the prepared request byte-for-byte. A fresh read here would build a
     // DIFFERENT CAS contract, which is unsafe reconstruction of an unknown effect.
@@ -62,7 +76,14 @@ export function coordinatorCommand():Command {
    const operationId=opts.operationId??randomUUID();
    // Read the CURRENT supported authority once and derive the expected contract from it, so the
    // operator never invents either field. Exactly one read and one POST: no polling and no retry.
-   const shown=await client.get(`/api/coordinator/${encodeURIComponent(rigId)}`,{ headers });
+   let shown;
+   try{shown=await client.get(`/api/coordinator/${encodeURIComponent(rigId)}`,{ headers, timeoutMs });}
+   catch(error){
+    const detail=error instanceof Error?error.message:String(error);
+    show({status:"PRE_EFFECT_READ_FAILED",phase:"initial_authority_read",postAttempts:0,preparedRequest:false,
+     diagnostic:detail,continuation:"No write was attempted and no request was prepared. After confirming the daemon is responsive, start a fresh resume-owned command to read current authority and derive a new request."});
+    return;
+   }
    if(shown.status>=400){show(shown.data);return;}
    const current=shown.data as {authority?:{epoch?:unknown};obligationsDigest?:unknown};
    const expectedEpoch=Number(current.authority?.epoch);
