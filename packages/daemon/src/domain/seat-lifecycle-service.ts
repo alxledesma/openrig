@@ -1,4 +1,5 @@
 import type { NativeProcessLister } from "./native-process-lineage.js";
+import type { NativeProcessRow } from "./native-process-lineage.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import type { SessionRegistry } from "./session-registry.js";
@@ -26,6 +27,11 @@ import { promisify } from "node:util";
 import { parse as parseToml } from "smol-toml";
 import { NativePermissionStore } from "./native-permission-store.js";
 import { validateNativePermissionSelection, unresolvedClaudePermissionModes } from "./native-permission-selection.js";
+import type { LegacyPiModuleBinding, LegacyPiTargetIdentity, LegacyPiWitnessBinding, LegacyPiWitnessResult } from "./legacy-pi-native-witness.js";
+import { classifyNodeInspectorConfiguration, qualifiesDefaultPrivateInspector } from "./pi-installation-module-resolver.js";
+import { entryShebang, filePredatesStart } from "./legacy-pi-native-provenance.js";
+import { fileURLToPath as fileUrlToPath } from "node:url";
+import { pathToFileURL } from "node:url";
 
 /**
  * S5 (OPR.0.5.4.7) — the seat-lifecycle verb surface: set-model, single-seat stop,
@@ -82,6 +88,34 @@ export interface SeatLifecycleDeps {
   piSessionTailEntryId?: (path: string) => string | null;
   /** SIGTERM delivery to ONE verified runner pid. Never a terminal keystroke. */
   killNativeProcess?: (pid: number) => void;
+  /** EXPLICIT legacy native-witness option only. The daemon-owned collector: it
+   *  builds the witness from the module binding derived here from the exact census
+   *  commands and the bounded session-file tail. Its absence is a refusal on the
+   *  legacy path and changes nothing on the ordinary path. */
+  legacyPiWitness?: LegacyPiWitnessSeam;
+  /** The CURRENT fallback-capable runner entry the same-file resume launches.
+   *  The legacy path refuses without it: it must be able to prove that the
+   *  replacement is the current runner carrying the missing-entry fallback. */
+  currentPiRunnerEntryPath?: string | null;
+  /** Daemon-owned resolver seam for the Pi CACHED-CHUNK module exporting
+   *  AgentSessionRuntime/AgentSession, tied to the exact child executable and its
+   *  launch environment. Deliberately UNWIRED in production: no trusted provenance
+   *  exists yet, so its absence refuses the explicit option with a typed blocker
+   *  instead of binding the child's entry filename. Never request-supplied. */
+  legacyPiCachedModuleUrl?: (targetStartedAtMs?: number) => { modulePath: string; entryPath: string } | null;
+  /** Daemon-set of known LEGACY runner script hashes. The live legacy runner's script
+   *  must hash to one of these, so an unrelated process is never treated as the legacy
+   *  runner. Absent or unmatched refuses: the bridge never guesses which build this is. */
+  legacyRunnerHashes?: readonly string[];
+  /** Reduced environment provenance for ONE target, from the kernel region: the seat's
+   *  generation positive control plus the NODE_OPTIONS classification. Never values. */
+  legacyEnvironmentObserver?: (input: { pid: number; generation: string }) => Promise<{
+    regionReadable: boolean; occupantGenerationMatches: boolean;
+    nodeOptions: "unset" | "present"; reasons: string[];
+  }>;
+  /** Whether a graph file predates a target's start, so today's bytes are the bytes that
+   *  were loaded. Defaults to the shipped provenance check. */
+  graphPredatesStart?: (path: string, targetStartedAtMs: number) => boolean;
   rehostPollMs?: number;
   /** Bounded READ-ONLY settling window for the post-proof observation, taken AFTER
    *  the single resume. Observation only: it never repeats the stop or the resume. */
@@ -121,6 +155,53 @@ export interface RehostPlan {
   runnerPid: number; runnerChildPid: number | null; sessionFileSha256Prefix: string;
   model: string | null; cwd: string; posture: "floor" | "full_bypass";
   authority: RehostAuthorityFact | null; sessionId: string | null;
+  /** Present ONLY for the explicit legacy native-witness option. Carries the daemon-
+   *  built witness facts; it is never accepted from a caller. */
+  legacyWitness?: LegacyPiRehostWitnessFacts | null;
+  /** The sidecar cursor as OBSERVED, kept beside the carried value so a receipt can
+   *  state plainly which cursor was bypassed and which leaf replaced it. */
+  sidecarCursorObserved?: string | null;
+}
+
+/** Why the legacy bridge could not even be ATTEMPTED. A closed vocabulary: an
+ *  unestablished mapping is a refusal, never a guessed module or a guessed port. */
+export const LEGACY_PI_BINDING_BLOCKERS = [
+  "witness_seam_unavailable",
+  "current_runner_entry_unresolved",
+  "runner_entry_unresolved",
+  "pi_child_unresolved",
+  "pi_child_module_unresolved",
+  "inspector_startup_unestablished",
+  "legacy_runner_identity_unproven",
+  "environment_control_absent",
+  "node_options_present",
+  "inspector_configuration_unestablished",
+  "binding_identity_drift",
+  "module_graph_newer_than_target",
+] as const;
+export type LegacyPiBindingBlocker = (typeof LEGACY_PI_BINDING_BLOCKERS)[number];
+
+/** The daemon-owned legacy Pi native-witness seam. Production constructs the real
+ *  collector from the module binding the service derived here from the exact census
+ *  commands; nothing here accepts a witness, leaf, path, port or pid from a caller. */
+export interface LegacyPiWitnessSeam {
+  /** `seat` is the ALREADY VERIFIED seat binding this plan holds for the target. It is carried, not
+   *  re-derived and never accepted from a caller, so the audit a witness writes before signalling
+   *  names the real rig, node and logical id instead of placeholders. */
+  witness(request: { binding: LegacyPiWitnessBinding; modules: LegacyPiModuleBinding; seat: { rigId: string; nodeId: string; logicalId: string } }): Promise<LegacyPiWitnessResult>;
+}
+
+/** What one accepted legacy witness proved, plus the binding and modules a FINAL
+ *  fresh witness must reproduce before any halt. */
+export interface LegacyPiRehostWitnessFacts {
+  nativeLeaf: string;
+  evidenceId: string;
+  rounds: number;
+  binding: LegacyPiWitnessBinding;
+  modules: LegacyPiModuleBinding;
+  /** The already-verified seat identity this witness ran against, so the FINAL witness can reuse
+   *  the same identity instead of re-deriving it or inventing one. */
+  seat: { rigId: string; nodeId: string; logicalId: string };
 }
 export interface RehostCustodySnapshot {
   tenantHash: string; resumeTokenHash: string; authorityHash: string; claimHash: string;
@@ -201,7 +282,15 @@ export interface SeatRefusal {
     | "rehost_custody_drift"
     | "rehost_post_proof_failed"
     | "rehost_post_proof_unstable"
-    | "rehost_effect_unknown";
+    | "rehost_effect_unknown"
+    // EXPLICIT legacy native-witness option. Both are PRE-EFFECT refusals: they
+    // precede every signal, so the daemon-owned mapping or the fresh witness
+    // failing leaves the old runner exactly as it was found.
+    | "rehost_legacy_witness_unavailable"
+    | "rehost_legacy_witness_refused"
+    /** B5: a diagnostic signal WAS delivered and the listener close could not be verified. UNKNOWN
+     *  outcome, never a pre-effect refusal, and never blind-retryable. */
+    | "rehost_legacy_inspector_unverified";
   message: string;
   guidance?: string;
   /** Present on an outcome whose EFFECT already happened: never true, never retryable. */
@@ -339,6 +428,15 @@ export class SeatLifecycleService {
   private readonly paneRootPid?: (nodeId: string) => Promise<number | null>;
   private readonly piSessionTailEntryId?: (path: string) => string | null;
   private readonly killNativeProcess?: (pid: number) => void;
+  private readonly legacyPiWitness?: LegacyPiWitnessSeam;
+  private readonly currentPiRunnerEntryPath: string | null;
+  private readonly legacyPiCachedModuleUrlResolver?: (targetStartedAtMs?: number) => { modulePath: string; entryPath: string } | null;
+  private readonly legacyRunnerHashes?: readonly string[];
+  private readonly graphPredatesStart?: (path: string, targetStartedAtMs: number) => boolean;
+  private readonly legacyEnvironmentObserver?: (input: { pid: number; generation: string }) => Promise<{
+    regionReadable: boolean; occupantGenerationMatches: boolean;
+    nodeOptions: "unset" | "present"; reasons: string[];
+  }>;
   private readonly rehostPollMs: number;
   private readonly postProofSettleAttempts: number;
   private readonly postProofSettleGapMs: number;
@@ -374,6 +472,12 @@ export class SeatLifecycleService {
     this.paneRootPid = deps.paneRootPid;
     this.piSessionTailEntryId = deps.piSessionTailEntryId;
     this.killNativeProcess = deps.killNativeProcess ?? ((pid) => { process.kill(pid, "SIGTERM"); });
+    this.legacyPiWitness = deps.legacyPiWitness;
+    this.currentPiRunnerEntryPath = deps.currentPiRunnerEntryPath ?? null;
+    this.legacyPiCachedModuleUrlResolver = deps.legacyPiCachedModuleUrl;
+    this.legacyRunnerHashes = deps.legacyRunnerHashes;
+    this.graphPredatesStart = deps.graphPredatesStart;
+    this.legacyEnvironmentObserver = deps.legacyEnvironmentObserver;
     this.rehostPollMs = deps.rehostPollMs ?? 250;
     this.postProofSettleAttempts = Math.max(1, Math.min(5, deps.postProofSettleAttempts ?? 3));
     this.postProofSettleGapMs = Math.max(0, deps.postProofSettleGapMs ?? 250);
@@ -1517,9 +1621,13 @@ export class SeatLifecycleService {
    * unverifiable fact refuses, and a failed stop or resume writes a failed
    * event and stops, so a blind retry cannot happen.
    */
-  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null; onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal }): Promise<RehostRunnerResult> {
+  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null; legacyNativeWitness?: boolean; onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal }): Promise<RehostRunnerResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
+    // EXPLICIT, DEFAULT-OFF. This boolean is the ONLY thing the option adds. No
+    // witness, leaf, module path, endpoint, port, pid or cursor may be supplied by a
+    // caller, and an absent value is exactly the ordinary rehost.
+    const legacyNativeWitness = input.legacyNativeWitness === true;
     const resolved = this.resolveSeat(input.seatRef);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
@@ -1559,7 +1667,7 @@ export class SeatLifecycleService {
       // is never an UNKNOWN: no runner has been touched.
       let plan: RehostPlan | SeatRefusal;
       try {
-        plan = await this.rehostPlan(resolved, sessionName, input.onPreEffectRefusal);
+        plan = await this.rehostPlan(resolved, sessionName, legacyNativeWitness, input.onPreEffectRefusal);
       } catch (error) {
         return { ok: false, code: "rehost_precondition_failed", message: `A precondition could not be evaluated (${(error as Error).message}); no runner was signalled and nothing was touched.`, guidance: "Read the seat state and retry only after the underlying condition is understood." };
       }
@@ -1575,6 +1683,15 @@ export class SeatLifecycleService {
         sessionFile: plan.sessionFile,
         sessionFileSha256Prefix: plan.sessionFileSha256Prefix,
         lastEntryId: plan.lastEntryId,
+        // The legacy option states BOTH values plainly: the cursor it bypassed and the
+        // leaf the daemon proved instead. It never edits the sidecar to match.
+        ...(plan.legacyWitness ? {
+          legacyNativeWitness: true,
+          legacyWitness: { evidenceId: plan.legacyWitness.evidenceId, rounds: plan.legacyWitness.rounds },
+          sidecarCursorObserved: plan.sidecarCursorObserved ?? null,
+          sidecarCursorCarriedForward: false,
+          leafSource: "live_child_session",
+        } : { legacyNativeWitness: false }),
         launchIdBefore: plan.launchId,
         runnerPid: plan.runnerPid,
         runnerChildPid: plan.runnerChildPid,
@@ -1588,7 +1705,7 @@ export class SeatLifecycleService {
         leaseRepairedByThisOperation: false,
       });
       } catch (error) {
-        return { ok: false, code: "rehost_receipt_unwritable", message: `The pre-effect receipt could not be written (${(error as Error).message}); no runner was signalled and nothing was touched.`, guidance: "Repair the receipt store, then re-read the seat before any rehost." };
+        return { ok: false, code: "rehost_receipt_unwritable", message: `The pre-effect receipt could not be written (${(error as Error).message}); ` + (plan.legacyWitness ? "the legacy witness rounds delivered diagnostic signals whose closes were verified; the runner was not stopped and no resume was typed." : "no runner was signalled and nothing was touched."), guidance: "Repair the receipt store, then re-read the seat before any rehost." };
       }
 
       // Stage and plan facts are declared OUTSIDE the guarded region so its catch can read
@@ -1625,7 +1742,73 @@ export class SeatLifecycleService {
         const rootRow = rootPid === null ? undefined : preStopRows.find(r => r.pid === rootPid);
         const rootIsShell = !!rootRow && SHELL_BASENAMES.has(paneShellBasename(rootRow.command) ?? "");
         if (rootPid === null || !this.ancestryReaches(preStopRows, plan.runnerPid, rootPid) || !rootIsShell)
-          return { ok: false, code: "rehost_pane_root_unresolved", message: "The authoritative tmux pane pid for this seat could not be resolved, the verified runner does not sit under exactly that pane root, or that root is not a recognisable shell. No runner was signalled and nothing was touched; no substitute root is assumed.", guidance: "Resolve the real pane root, confirm the runner ancestry, and re-read the seat before any rehost." };
+          return { ok: false, code: "rehost_pane_root_unresolved", message: "The authoritative tmux pane pid for this seat could not be resolved, the verified runner does not sit under exactly that pane root, or that root is not a recognisable shell. " + (plan.legacyWitness ? "The legacy witness rounds delivered diagnostic signals whose closes were verified; the runner was not stopped and no resume was typed." : "No runner was signalled and nothing was touched.") + " No substitute root is assumed.", guidance: "Resolve the real pane root, confirm the runner ancestry, and re-read the seat before any rehost." };
+      // The EXPLICIT legacy option takes one FINAL fresh witness here, after every
+      // other pre-stop check and immediately before the halt. It never stops the old
+      // runner and never types a resume, but its rounds DO deliver diagnostic signals:
+      // a failure after delivery is therefore the same typed UNKNOWN class as in the
+      // plan, with the real pids and an outcome audit; only a failure BEFORE any
+      // delivery stays a refusal, and even then the earlier plan rounds signalled.
+      if (plan.legacyWitness) {
+        let final: Awaited<ReturnType<SeatLifecycleService["rehostFinalWitnessAgrees"]>>;
+        try {
+          final = await this.rehostFinalWitnessAgrees(plan);
+        } catch (error) {
+          // H1-F5: an unexpected throw is NOT stop-phase SIGTERM trouble; nothing was halted.
+          // Its delivery state cannot be established, so fail closed as a possibly-signalled
+          // UNKNOWN without inventing pids. No retry, no kill, no resume.
+          return {
+            ok: false, code: "rehost_legacy_inspector_unverified",
+            message: `The final legacy witness failed unexpectedly (${(error as Error).message}); its delivery state could not be established, so both targets must be treated as possibly signalled. Read the pane and the pid-scoped listeners; the old runner was not stopped and no resume was typed.`,
+            blindRetryAllowed: false,
+            observed: { outcomeClass: "unknown", deliveredPids: [], reasons: ["witness_inconclusive"], rounds: 0 },
+          };
+        }
+        if (!final.ok) {
+          const sig = final.signal;
+          if (sig?.delivered === true && sig.closedVerified === true) {
+            // H1-F2: the round COMPLETED: signals were delivered AND verifiably closed.
+            // Truthful refusal with the real facts; never blind-retried.
+            return {
+              ok: false, code: "rehost_legacy_witness_refused",
+              message: `The FINAL witness round delivered diagnostic signals (${sig.deliveredPids.length} of 2) whose closes were verified, but the sample drifted from the accepted binding (${final.reasons.join(",")}). The old runner was not stopped and no resume was typed; read the pane before any retry.`,
+              guidance: "Read the pane; do not retry a legacy rehost while the runner or its child is changing.",
+              blindRetryAllowed: false,
+              observed: { outcomeClass: "delivered_and_closed", deliveredPids: sig.deliveredPids, auditedBeforeDelivery: sig.auditedBeforeDelivery, reasons: final.reasons, rounds: final.rounds },
+            };
+          }
+          if (sig?.delivered === true) {
+            const pids = sig.deliveredPids;
+            const closeUnverified = final.reasons.includes("inspector_close_unverified");
+            try {
+              this.appendLegacyWitnessAudit(resolved, {
+                // H1-F3: distinguishable from the plan-phase outcome event.
+                stage: "final_pre_stop",
+                witnessRefused: true, code: "rehost_legacy_inspector_unverified", reasons: final.reasons,
+                signalDelivered: true, blindRetryAllowed: false, binding: plan.legacyWitness.binding, modules: plan.legacyWitness.modules,
+                signal: { delivered: true, deliveredPids: pids, auditedBeforeDelivery: sig.auditedBeforeDelivery },
+              });
+            } catch {
+              return {
+                ok: false, code: "rehost_legacy_inspector_unverified",
+                message: `The FINAL pre-stop witness delivered a diagnostic signal (${pids.length} of 2) and the outcome audit could NOT be written, so its result is uncertain (${final.reasons.join(",")}). Read the pane and the pid-scoped listeners before anything else.`,
+                blindRetryAllowed: false,
+                observed: { outcomeClass: "unknown", outcomeAuditWritten: false, deliveredPids: pids, auditedBeforeDelivery: sig.auditedBeforeDelivery, closeUnverified, reasons: final.reasons, rounds: final.rounds },
+              };
+            }
+            const who = pids.length === 2 ? "this runner and its pi child" : pids.length === 1 ? "one of this runner's processes" : "no recorded process";
+            const closeState = closeUnverified ? "the close could not be verified" : "the outcome after signalling is not fully known";
+            return {
+              ok: false, code: "rehost_legacy_inspector_unverified",
+              message: `The FINAL pre-stop witness delivered a diagnostic signal to ${who} (${pids.length} of 2) and ${closeState} (${final.reasons.join(",")}). The old runner was NOT stopped and no resume was typed; read the pane and the pid-scoped listeners before anything else.`,
+              blindRetryAllowed: false,
+              // H1-F4: same observed shape as the audit-failed variant.
+              observed: { outcomeClass: "unknown", outcomeAuditWritten: true, deliveredPids: pids, auditedBeforeDelivery: sig.auditedBeforeDelivery, closeUnverified, reasons: final.reasons, rounds: final.rounds },
+            };
+          }
+          return { ok: false, code: "rehost_legacy_witness_refused", message: `The final pre-stop witness did not reproduce the accepted binding and leaf (${final.reasons.join(",")}). No NEW signal was delivered by this round, though the legacy witness rounds delivered diagnostic signals whose closes were verified; the old runner was not stopped and no resume was typed.`, guidance: "Read the pane; do not retry a legacy rehost while the runner or its child is changing.", observed: { reasons: final.reasons, rounds: final.rounds } };
+        }
+      }
         this.killNativeProcess?.(plan.runnerPid);
         stopVerified = await this.rehostRunnerExited(rootPid, plan.runnerPid, plan.runnerChildPid, { runnerStartedAt: preStopRunner?.startedAt, childStartedAt: preStopChild?.startedAt });
       } catch (error) {
@@ -1689,14 +1872,21 @@ export class SeatLifecycleService {
         const ok =
           !!post && post.ready && post.sessionFile === plan.sessionFile &&
           !!launchIdAfter && launchIdAfter !== plan.launchId &&
-          proof?.state === "present" && proof.generation === plan.generation && proof.launchId === launchIdAfter;
+          proof?.state === "present" && proof.generation === plan.generation && proof.launchId === launchIdAfter &&
+          // The EXPLICIT legacy option additionally requires the replacement to have
+          // ACTUALLY refreshed its cursor to the bound leaf, which must still be the
+          // bounded file tail. A stale or absent cursor is a mismatch, never credit.
+          this.legacyPostCursorAgrees(sessionName, plan);
         const sample: PostSample = { post, proof, launchIdAfter, ok };
         samples.push(sample);
         // Positive identity contradictions are terminal; later agreement cannot
         // erase a wrong generation/file or a proof of the old launch still present.
         if ((post?.sessionFile != null && post.sessionFile !== plan.sessionFile) ||
             (proof != null && proof.generation !== plan.generation) ||
-            (proof?.state === "present" && proof.launchId === plan.launchId)) break;
+            (proof?.state === "present" && proof.launchId === plan.launchId) ||
+            // A cursor that has settled on a DIFFERENT entry than the witnessed leaf is
+            // a positive contradiction about history, never a startup transient.
+            (!!plan.legacyWitness && post?.ready === true && post.lastEntryId != null && post.lastEntryId !== plan.legacyWitness.nativeLeaf)) break;
         if (ok) { settled = sample; break; }
       }
       const post = settled?.post ?? samples[samples.length - 1]?.post ?? null;
@@ -1769,6 +1959,14 @@ export class SeatLifecycleService {
         launchIdAfter,
         durableModel: plan.model,
         guardLeftEnabled: true,
+        ...(plan.legacyWitness ? {
+          legacyNativeWitness: true,
+          legacyWitness: { evidenceId: plan.legacyWitness.evidenceId, rounds: plan.legacyWitness.rounds },
+          // Post-proof credits the REFRESHED cursor reaching the witnessed leaf; the
+          // old UI-UUID cursor is still not a session entry and is not credited.
+          cursorRefreshedToLeaf: true,
+          historicalProjectionCredit: false,
+        } : { legacyNativeWitness: false }),
         authority: plan.authority,
         authorityReadOnly: true,
         leaseRepairedByThisOperation: false,
@@ -1806,7 +2004,7 @@ export class SeatLifecycleService {
   }
 
   /** Every rehost precondition, proven fresh. No partial acceptance. */
-  private async rehostPlan(resolved: ResolvedSeat, sessionName: string, onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal): Promise<RehostPlan | SeatRefusal> {
+  private async rehostPlan(resolved: ResolvedSeat, sessionName: string, legacyNativeWitness: boolean, onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal): Promise<RehostPlan | SeatRefusal> {
     const { nodeId } = resolved;
     if (this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE node_id=? AND state <> 'released' LIMIT 1").get(nodeId))
       return { ok: false, code: "rehost_reservation_active", message: "An unreleased dispatch reservation fences rehost; its cutover disposition must be settled first." };
@@ -1871,8 +2069,6 @@ export class SeatLifecycleService {
     const cursorFirst = this.piRunnerState!(sessionName)?.lastEntryId ?? null;
     const tail = this.piSessionTailEntryId!(sessionFile);
     const cursorSecond = this.piRunnerState!(sessionName)?.lastEntryId ?? null;
-    if (!cursorFirst || cursorFirst !== cursorSecond || !tail || tail !== cursorFirst)
-      return { ok: false, code: "rehost_not_idle", message: "Idle witness missing or unstable: the runner's last projected entry could not be confirmed twice-stable against the bounded session-file tail, so a turn may be in flight. Refuse rather than abort-then-proceed." };
 
     const rows = await this.listProcesses!();
     const escaped = sessionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -1881,7 +2077,109 @@ export class SeatLifecycleService {
       return { ok: false, code: "rehost_runner_pid_unresolved", message: `Expected exactly one live runner process for this launch id, found ${runners.length}; rehost refuses rather than signalling an ambiguous pid.` };
     const runner = runners[0]!;
     // The runner's pi child is the census row whose parent is the runner pid.
-    const childPid = rows.find(r => r.ppid === runner.pid && r.pid !== runner.pid)?.pid ?? null;
+    // SOLE census child: the plan and the receipt both promise exactly one. Zero or several is
+    // UNKNOWN about which child the target is, so it refuses and records the observed count.
+    const childRows = rows.filter(r => r.ppid === runner.pid && r.pid !== runner.pid);
+    if (childRows.length !== 1)
+      return {
+        ok: false, code: "rehost_legacy_witness_unavailable",
+        message: childRows.length === 0
+          ? "No pi child of the legacy runner was found in the census, so the witness target cannot be established."
+          : `The legacy runner has ${childRows.length} census children, not exactly one, so which process the witness binds is UNKNOWN.`,
+        observed: { censusChildCount: childRows.length },
+      };
+    const child = childRows[0] ?? null;
+
+    // The EXPLICIT legacy native-witness option bypasses ONE gate only: the sidecar
+    // cursor equality. That equality is invalid for this old runner, which persists a
+    // generic event id (often a UI UUID) into its durable cursor, so the cursor can
+    // name no session entry at all. Everything else above — reservation, guard,
+    // sending, tenure, session-token type, authority generation, sidecar identity,
+    // session-file existence and the shipped prover — still refuses unchanged.
+    let legacyWitness: LegacyPiRehostWitnessFacts | null = null;
+    if (legacyNativeWitness) {
+      const binding = await this.legacyWitnessBinding(runner, child, { launchId, generation, sessionFile });
+      if (!binding.ok)
+        return { ok: false, code: "rehost_legacy_witness_unavailable", message: `The explicit legacy native-witness option cannot be established for this runner (${binding.blocker}). No module path, endpoint or pid was guessed, no witness was accepted from the caller, no runner was signalled and nothing was touched.`, guidance: "Establish the exact native module mapping and the default private inspector startup configuration, then re-read the seat before any legacy rehost.", observed: { blocker: binding.blocker } };
+      // The seat identity comes from the plan's own verified resolution. Nothing extra is read and
+      // no caller supplies it.
+      const proven = await this.legacyPiWitness!.witness({
+        binding: binding.binding, modules: binding.modules,
+        seat: { rigId: resolved.entry.rigId, nodeId: resolved.nodeId, logicalId: resolved.entry.logicalId },
+      });
+      if (!proven.ok) {
+        // B5 HONEST WORDING AND CLASS. A refusal AFTER a SIGUSR1 was delivered is not a pre-effect
+        // refusal: live processes were signalled and a listener may still be open. When the close is
+        // unverified, return a typed UNKNOWN refusal with blindRetryAllowed false, and record both
+        // the delivery and its outcome durably so the operator reads the pane and listeners first.
+        // C2: the collector reports what ACTUALLY happened to a signal in this run. This is never
+        // inferred from the reason list: reasons like inspector_unavailable after a failed attach,
+        // inspector_listener_unverified, or a target-identity drift AFTER delivery are all
+        // post-signal, and the old string check called them "nothing was touched".
+        const delivered = proven.signal?.delivered === true;
+        const signalled = delivered;
+        if (signalled) {
+          // G2: a failed OUTCOME audit after a real delivery must NOT surface as a pre-effect
+          // refusal. The intent audit written before delivery still stands, so the signal is not
+          // unrecorded, but the outcome is uncertain and the refusal must say so with the real pids.
+          try {
+            this.appendLegacyWitnessAudit(resolved, {
+              witnessRefused: true, code: "rehost_legacy_inspector_unverified", reasons: proven.reasons,
+              signalDelivered: true, blindRetryAllowed: false, binding: binding.binding, modules: binding.modules,
+              // F3: carry the real facts through to the durable record.
+              signal: { delivered: true, deliveredPids: proven.signal?.deliveredPids ?? [], auditedBeforeDelivery: proven.signal?.auditedBeforeDelivery === true },
+            });
+          } catch {
+            const audited = proven.signal?.auditedBeforeDelivery === true;
+            return {
+              ok: false, code: "rehost_legacy_inspector_unverified",
+              message: `A diagnostic signal was delivered (${(proven.signal?.deliveredPids ?? []).length} of 2) and the outcome audit could NOT be written, so its result is uncertain (${proven.reasons.join(",")}). Read the pane and the pid-scoped listeners before anything else.`,
+              blindRetryAllowed: false,
+              observed: {
+                outcomeClass: "unknown", outcomeAuditWritten: false,
+                deliveredPids: proven.signal?.deliveredPids ?? [],
+                auditedBeforeDelivery: audited,
+                closeUnverified: proven.reasons.includes("inspector_close_unverified"),
+                reasons: proven.reasons,
+              },
+            };
+          }
+          // F4 HONEST WORDING AND CLASS. Name only the pids that were actually signalled, and only
+          // claim the close is unverified when a close reason is really present. It stays a typed
+          // UNKNOWN, non-retryable outcome: nothing here ever retries automatically.
+          const signalledPids = proven.signal?.deliveredPids ?? [];
+          const closeUnverified = proven.reasons.includes("inspector_close_unverified");
+          const who = signalledPids.length === 2 ? "this runner and its pi child" : signalledPids.length === 1 ? "one of this runner's processes" : "no recorded process";
+          const closeState = closeUnverified ? "the close could not be verified" : "the outcome after signalling is not fully known";
+          return {
+            ok: false, code: "rehost_legacy_inspector_unverified",
+            message: `A diagnostic signal was delivered to ${who} (${signalledPids.length} of 2) and ${closeState} (${proven.reasons.join(",")}). Read the pane and the pid-scoped listeners before anything else.`,
+            blindRetryAllowed: false,
+            observed: { outcomeClass: "unknown", deliveredPids: signalledPids, closeUnverified, reasons: proven.reasons },
+          };
+        }
+        // PRE-EFFECT refusal: nothing was signalled and nothing was touched. `observed` carries the
+        // closed reason list and round count only: no pid, port, path or command text escapes.
+        return {
+          ok: false, code: "rehost_legacy_witness_refused",
+          message: `The live legacy runner and its pi child could not be witnessed (${proven.reasons.join(",")}). No runner was signalled and nothing was touched; re-read the pane before retrying.`,
+          observed: { reasons: proven.reasons, rounds: proven.rounds },
+        };
+      }
+      // The bounded tail is still required: the leaf is credited only against the very
+      // file the plan resumes, and the collector proves the same equality internally.
+      if (!tail || tail !== proven.nativeLeaf) {
+        return { ok: false, code: "rehost_not_idle", message: "The witnessed native leaf does not equal the bounded session-file tail, so history and file disagree; refuse rather than resume onto a stale file." };
+      } else {
+        legacyWitness = {
+        nativeLeaf: proven.nativeLeaf, evidenceId: proven.evidenceId, rounds: proven.rounds,
+        binding: binding.binding, modules: binding.modules,
+        seat: { rigId: resolved.entry.rigId, nodeId: resolved.nodeId, logicalId: resolved.entry.logicalId },
+      };
+      }
+    } else if (!cursorFirst || cursorFirst !== cursorSecond || !tail || tail !== cursorFirst)
+      return { ok: false, code: "rehost_not_idle", message: "Idle witness missing or unstable: the runner's last projected entry could not be confirmed twice-stable against the bounded session-file tail, so a turn may be in flight. Refuse rather than abort-then-proceed." };
+
     const digestPrefix = this.piSessionFileDigestPrefix
       ? this.piSessionFileDigestPrefix(sessionFile)
       : (() => { try { return createHash("sha256").update(readFileSync(sessionFile)).digest("hex").slice(0, 16); } catch { return null; } })();
@@ -1889,14 +2187,296 @@ export class SeatLifecycleService {
       return { ok: false, code: "rehost_session_file_missing", message: "The persisted session file could not be read to bind its identity; rehost refuses instead of resuming an unbound file." };
     // S1 returns the PROVEN plan. Everything below only reads it.
     return {
-      generation, sessionFile, launchId, lastEntryId: cursorFirst,
-      runnerPid: runner.pid, runnerChildPid: childPid, sessionFileSha256Prefix: digestPrefix,
+      generation, sessionFile, launchId,
+      // The ordinary path carries the twice-stable sidecar cursor. The legacy option
+      // carries the leaf proven equal to the bounded tail; it never edits the sidecar.
+      lastEntryId: legacyWitness ? legacyWitness.nativeLeaf : cursorFirst,
+      runnerPid: runner.pid, runnerChildPid: child?.pid ?? null, sessionFileSha256Prefix: digestPrefix,
       model: resolved.entry.model ?? null, cwd: resolved.entry.cwd ?? "",
       // NodeInventoryEntry carries no posture; the launch posture comes from the
       // existing policy provenance, exactly as the managed start path derives it.
       posture: (this.rigRepo.getNodePolicyProvenance(nodeId)?.launchPosture ?? this.rigRepo.getRigPolicyProvenance(resolved.entry.rigName)?.launchPosture ?? "floor") as "floor" | "full_bypass",
       authority, sessionId: session.id ?? null,
+      legacyWitness,
+      sidecarCursorObserved: cursorFirst,
     };
+  }
+
+  /**
+   * The daemon-owned native mapping for ONE verified runner/child pair.
+   *
+   * Every value is derived from the EXACT census command lines of the two processes
+   * this rehost already proved, or refused. There is no caller input, no basename
+   * search, no path search, and no port of our own choosing: a mapping that cannot be
+   * established returns its closed blocker instead of an approximation.
+   */
+  private async legacyWitnessBinding(
+    runner: NativeProcessRow,
+    child: NativeProcessRow | null,
+    ids: { launchId: string; generation: string; sessionFile: string },
+  ): Promise<{ ok: true; binding: LegacyPiWitnessBinding; modules: LegacyPiModuleBinding } | { ok: false; blocker: LegacyPiBindingBlocker }> {
+    if (!this.legacyPiWitness || !this.currentPiRunnerEntryPath)
+      return { ok: false, blocker: "witness_seam_unavailable" };
+    // The REPLACEMENT must be provably the CURRENT fallback-capable runner entry this
+    // daemon launches. The legacy runner is deliberately NOT that entry: it differs by
+    // design and is the very thing being replaced. This check qualifies the resume, and
+    // never compares the live legacy runner against the current entry.
+    if (!isAbsolute(this.currentPiRunnerEntryPath) || !this.pathIsFile(this.currentPiRunnerEntryPath))
+      return { ok: false, blocker: "current_runner_entry_unresolved" };
+    const runnerEntry = this.runnerEntryFromCommand(runner.command);
+    if (!runnerEntry) return { ok: false, blocker: "runner_entry_unresolved" };
+    if (!child) return { ok: false, blocker: "pi_child_unresolved" };
+    const childStartForGraph = typeof child.startedAt === "string" ? Date.parse(child.startedAt) : Number.NaN;
+    const pi = this.legacyPiCachedModuleUrl(Number.isFinite(childStartForGraph) ? childStartForGraph : undefined);
+    if (!pi) return { ok: false, blocker: "pi_child_module_unresolved" };
+    const childModule = pi.moduleUrl;
+    // The inspector endpoint is a property of LAUNCH CONFIGURATION. Absence is never claimed
+    // from a command-line scrape: each target's node options come from its own runner tokens or,
+    // for the child, from the shebang of its resolved entry, and both must resolve to the
+    // built-in private loopback endpoint this bridge speaks. There is NO composed-argv seam: a
+    // target with no trustworthy record stays unresolved.
+    const endpoint = await this.legacyInspectorStartupEstablished(runner, child, ids);
+    if (!endpoint.ok) return { ok: false, blocker: endpoint.blocker };
+    const modules: LegacyPiModuleBinding = { runnerModuleUrl: runnerEntry, piModuleUrl: childModule };
+    const identity = (row: NativeProcessRow): LegacyPiTargetIdentity => ({ pid: row.pid, ppid: row.ppid, startedAt: row.startedAt ?? "" });
+    return {
+      ok: true, modules,
+      binding: {
+        runner: identity(runner), child: identity(child),
+        launchId: ids.launchId, generation: ids.generation, sessionFile: ids.sessionFile,
+      },
+    };
+  }
+
+  private pathIsFile(path: string): boolean {
+    try { return statSync(path).isFile(); } catch { return false; }
+  }
+
+  /** The runner's OWN loaded main module: the exact absolute script token of its
+   *  command line, realpathed to the URL the target reports as already loaded. The
+   *  legacy runner is NOT compared against the current entry; it is bound to what it
+   *  genuinely is. */
+  private runnerEntryFromCommand(command: string): string | null {
+    for (const token of command.split(/\s+/)) {
+      const cleaned = token.replace(/^["']|["'],?$/g, "");
+      if (!/^.*\/pi-runner\.(js|mjs)$/.test(cleaned)) continue;
+      if (!isAbsolute(cleaned)) continue;
+      return this.canonicalModuleUrl(cleaned);
+    }
+    return null;
+  }
+
+  /**
+   * The Pi cached-chunk module URL exporting AgentSessionRuntime/AgentSession.
+   *
+   * The child's argv is NOT a usable source: Pi's bundle entry overwrites its own
+   * process title, so the census command is the bare string `pi`. This therefore
+   * consumes the daemon-owned installation resolver's answer — the ONE canonical
+   * module in the installed package's own static import graph that both required
+   * classes are exported from — and refuses anything that is not exactly one
+   * canonical file URL. The transport still proves, per target, that the URL
+   * arrives already parsed and exporting the required names.
+   */
+  private legacyPiCachedModuleUrl(targetStartedAtMs?: number): { moduleUrl: string; entryPath: string } | null {
+    const resolved = this.legacyPiCachedModuleUrlResolver?.(targetStartedAtMs) ?? null;
+    if (!resolved || !isAbsolute(resolved.modulePath) || !isAbsolute(resolved.entryPath)) return null;
+    const moduleUrl = this.canonicalModuleUrl(resolved.modulePath);
+    return moduleUrl === null ? null : { moduleUrl, entryPath: resolved.entryPath };
+  }
+
+  /** Canonical file path from either a module URL or an already-absolute path, or
+   *  null when neither converts. Callers hold both forms: derived module bindings are
+   *  URLs while daemon-owned configured entries are paths. */
+  private fileUrlToPathSafe(value: string): string | null {
+    if (!value.startsWith("file://")) return isAbsolute(value) ? value : null;
+    try { return fileUrlToPath(value); } catch { return null; }
+  }
+
+  /** Canonical file URL for a module the target reports as already loaded. */
+  private canonicalModuleUrl(path: string): string | null {
+    let resolvedPath: string;
+    try { resolvedPath = realpathSync(path); } catch { return null; }
+    return pathToFileURL(resolvedPath).href;
+  }
+
+  /**
+   * Whether BOTH targets will open the BUILT-IN PRIVATE loopback inspector on
+   * SIGUSR1 — the only endpoint this bridge's fixed helper speaks.
+   *
+   * Absence of inspector configuration is a claim about LAUNCH CONFIGURATION, so it
+   * is never made from a command-line scrape: `ps` cannot show a target's original
+   * argv (Pi overwrites its own process title), and a scrape cannot distinguish an
+   * unconfigured launch from a hidden one. Each target must instead present the argv
+   * THE DAEMON COMPOSED for it, or a launch record that did, and that trusted argv is
+   * classified. No record is an unresolved datum, not a silent pass; anything other
+   * than the built-in private loopback default refuses.
+   *
+   * The verdict is bracketed by a fresh re-read of both process identities, so it can
+   * only ever describe the exact two processes this rehost already proved.
+   */
+  /**
+   * Inspector endpoint qualification for the EXISTING live pair.
+   *
+   * The port a SIGUSR1-opened inspector binds is set by: node flags BEFORE the script,
+   * the interpreter shebang, NODE_OPTIONS, and a config file node loads only when
+   * explicitly told to. Each is established from live provenance, never assumed:
+   *
+   *   - RUNNER: its census argv is intact (it does not rewrite its title), so the
+   *     node options it was launched with are directly observable and classified.
+   *   - CHILD: Pi rewrites its own process title, so its argv is NOT observable and
+   *     must never be inferred from it. Its node options are bounded structurally —
+   *     the runner builds the child's argv with every flag AFTER the script name, where
+   *     node treats them as script arguments — and what remains possible is the
+   *     interpreter shebang and NODE_OPTIONS, both read below.
+   *   - BOTH: the kernel environment region, with the seat's own occupant generation
+   *     as a positive control. Without a readable control an "unset" answer is not an
+   *     observation, so the read refuses instead of guessing.
+   */
+  /** The legacy runner's OWN script must predate the runner's start, on both ctime and mtime.
+   *  An unreadable or unstattable script is UNKNOWN, never a pass. */
+  private scriptPredatesStart(script: string, targetStartedAtMs: number): boolean {
+    // The daemon-configured predicate wins when supplied, so the same injectable seam already used
+    // for the Pi graph decides the runner script too. Falling back to a direct stat keeps the real
+    // daemon honest: BOTH ctime and mtime must predate the target, and an unreadable script is a
+    // refusal, never a pass.
+    const injected = this.graphPredatesStart;
+    if (injected) return injected(script, targetStartedAtMs);
+    try {
+      const stat = statSync(script);
+      return stat.ctimeMs <= targetStartedAtMs && stat.mtimeMs <= targetStartedAtMs;
+    } catch { return false; }
+  }
+
+  private async legacyInspectorStartupEstablished(
+    runner: NativeProcessRow,
+    child: NativeProcessRow,
+    ids: { launchId: string; generation: string; sessionFile: string },
+  ): Promise<{ ok: true } | { ok: false; blocker: LegacyPiBindingBlocker }> {
+    if (!runner.startedAt || !child.startedAt) return { ok: false, blocker: "binding_identity_drift" };
+    // The legacy runner must BE the proven legacy build, by content hash of its own
+    // script. An unmatched or unreadable hash is UNKNOWN, never "close enough".
+    const runnerScript = this.runnerEntryFromCommand(runner.command);
+    if (!runnerScript || !this.scriptHashIsKnownLegacy(runnerScript)) return { ok: false, blocker: "legacy_runner_identity_unproven" };
+    // TIME BINDING, correct subject: the legacy RUNNER's own script must predate the RUNNER's
+    // start. The previous check bound the REPLACEMENT entry (this.currentPiRunnerEntryPath, which
+    // is deliberately newer) to the CHILD's start, which refused every real pair after any
+    // deployment. The replacement entry is checked for existence and provenance only, never for
+    // age against the legacy target.
+    const runnerStartMs = Date.parse(runner.startedAt);
+    if (!Number.isFinite(runnerStartMs)) return { ok: false, blocker: "binding_identity_drift" };
+    if (!runnerScript || !this.scriptPredatesStart(runnerScript, runnerStartMs)) return { ok: false, blocker: "module_graph_newer_than_target" };
+    // The FULL resolved Pi graph must predate the CHILD that will load it. resolvePiInstallationModule
+    // checks every walked graph file against targetStartedAtMs, which the route's resolver closure
+    // now passes, so this is a graph-wide bound rather than two hand-picked files.
+    const childStartMs = Date.parse(child.startedAt);
+    if (!Number.isFinite(childStartMs)) return { ok: false, blocker: "binding_identity_drift" };
+    const pi = this.legacyPiCachedModuleUrl(childStartMs);
+    if (!pi) return { ok: false, blocker: "pi_child_module_unresolved" };
+    if (!this.graphPredates(pi.moduleUrl, childStartMs) || !this.graphPredates(pi.entryPath, childStartMs))
+      return { ok: false, blocker: "module_graph_newer_than_target" };
+    // Node options: the runner's are directly observable; the child's can only come
+    // from the shebang of its resolved entry.
+    const runnerVerdict = classifyNodeInspectorConfiguration(this.nodeOptionsFromCommand(runner.command));
+    if (!qualifiesDefaultPrivateInspector(runnerVerdict.configuration)) return { ok: false, blocker: "inspector_configuration_unestablished" };
+    // The interpreter line belongs to the child's ENTRY, not to the chunk that carries
+    // the classes: the shebang is how the kernel chose its interpreter.
+    const shebang = this.entryShebangFor(pi.entryPath);
+    if (shebang === null) return { ok: false, blocker: "inspector_configuration_unestablished" };
+    const shebangTokens = shebang.split(/\s+/);
+    // `#!/usr/bin/env node` resolves the interpreter through PATH; a direct
+    // `#!/abs/path/to/node` names it. Either way only a bare interpreter NAME is
+    // acceptable: a shebang carrying flags could configure the inspector itself.
+    const interpreter = shebangTokens[0]!.endsWith("/env") || shebangTokens[0] === "env" ? shebangTokens[1] : shebangTokens[0];
+    const interpreterFlags = shebangTokens[0]!.endsWith("/env") || shebangTokens[0] === "env" ? shebangTokens.slice(2) : shebangTokens.slice(1);
+    if (!interpreter || !/(^|\/)(node|bun|deno)$/.test(interpreter)) return { ok: false, blocker: "inspector_configuration_unestablished" };
+    if (classifyNodeInspectorConfiguration(interpreterFlags).configuration !== "none") return { ok: false, blocker: "inspector_configuration_unestablished" };
+    // Environment: the kernel region for BOTH targets, each with the generation control.
+    for (const row of [runner, child]) {
+      const verdict = await this.observeLegacyEnvironment(row, ids.generation);
+      if (!verdict.ok) return { ok: false, blocker: verdict.blocker };
+    }
+    return { ok: true };
+  }
+
+  /** Node options are the tokens BEFORE the script name; everything after it is a
+   *  script argument node never reads as an option. */
+  private nodeOptionsFromCommand(command: string): string[] {
+    const tokens = command.split(/\s+/).filter(token => token.length > 0);
+    const scriptIndex = tokens.findIndex(token => /\/pi-runner\.(js|mjs)$/.test(token));
+    return scriptIndex <= 0 ? [] : tokens.slice(0, scriptIndex);
+  }
+
+  private scriptHashIsKnownLegacy(moduleUrl: string): boolean {
+    const hashes = this.legacyRunnerHashes;
+    if (!hashes || hashes.length === 0) return false;
+    const digest = this.fileSha256(this.fileUrlToPathSafe(moduleUrl) ?? "");
+    return digest !== null && hashes.includes(digest);
+  }
+
+  private fileSha256(path: string): string | null {
+    try { return createHash("sha256").update(readFileSync(path)).digest("hex"); } catch { return null; }
+  }
+
+  private graphPredates(moduleUrl: string, targetStartMs: number): boolean {
+    const path = this.fileUrlToPathSafe(moduleUrl);
+    if (path === null) return false;
+    return this.graphPredatesStart ? this.graphPredatesStart(path, targetStartMs) : filePredatesStart(path, targetStartMs);
+  }
+
+  private entryShebangFor(moduleUrl: string): string | null {
+    const path = this.fileUrlToPathSafe(moduleUrl);
+    return path === null ? null : entryShebang(path);
+  }
+
+  private async observeLegacyEnvironment(row: NativeProcessRow, generation: string): Promise<{ ok: true } | { ok: false; blocker: LegacyPiBindingBlocker }> {
+    const observer = this.legacyEnvironmentObserver;
+    if (!observer) return { ok: false, blocker: "environment_control_absent" };
+    let verdict: Awaited<ReturnType<typeof observer>>;
+    try { verdict = await observer({ pid: row.pid, generation }); } catch { return { ok: false, blocker: "environment_control_absent" }; }
+    if (!verdict.regionReadable) return { ok: false, blocker: "environment_control_absent" };
+    if (!verdict.occupantGenerationMatches) return { ok: false, blocker: "environment_control_absent" };
+    // ANY present NODE_OPTIONS refuses; the value is never read or compared.
+    if (verdict.nodeOptions !== "unset") return { ok: false, blocker: "node_options_present" };
+    return { ok: true };
+  }
+
+  /** A FINAL fresh witness must reproduce the accepted binding and leaf. Any drift,
+   *  changed sample or unverified cleanup refuses BEFORE the halt (no kill, no resume),
+   *  but NOT free of consequence: this round itself signals both targets, so a failure
+   *  AFTER delivery carries the collector's real signal facts to the caller. */
+  private async rehostFinalWitnessAgrees(plan: RehostPlan): Promise<{ ok: true } | { ok: false; reasons: string[]; rounds: number; signal?: { delivered: boolean; deliveredPids: number[]; auditedBeforeDelivery: boolean; closedVerified?: boolean } }> {
+    const facts = plan.legacyWitness;
+    if (!facts || !this.legacyPiWitness) return { ok: true };
+    // The FINAL witness reuses the SAME already-verified seat identity the plan recorded. It is not
+    // re-derived here and never comes from a caller.
+    const final = await this.legacyPiWitness.witness({
+      binding: facts.binding, modules: facts.modules,
+      seat: facts.seat,
+    });
+    if (!final.ok) return { ok: false, reasons: final.reasons, rounds: final.rounds, ...(final.signal ? { signal: final.signal } : {}) };
+    // H1-F2: a COMPLETED final round that disagrees still delivered its signals and
+    // verified their closes. The acceptance receipt carries no pids (G1 egress rule), so
+    // the real targets are named from the SAME verified binding this witness signalled.
+    const closed = final.signal ? { signal: {
+      delivered: final.signal.delivered,
+      deliveredPids: final.signal.delivered ? [facts.binding.runner.pid, facts.binding.child.pid] : [],
+      auditedBeforeDelivery: final.signal.auditedBeforeDelivery, closedVerified: true,
+    } } : {};
+    if (final.nativeLeaf !== facts.nativeLeaf || final.evidenceId !== facts.evidenceId)
+      return { ok: false, reasons: ["witness_sample_drift"], rounds: final.rounds, ...closed };
+    if (final.rounds < facts.rounds) return { ok: false, reasons: ["witness_sample_drift"], rounds: final.rounds, ...closed };
+    return { ok: true };
+  }
+
+  /** Post-proof for the legacy option: the replacement's sidecar cursor must have
+   *  been REFRESHED to the bound leaf, which must still equal the bounded file tail,
+   *  in the same file and generation. A stale cursor is a mismatch, never credit. */
+  private legacyPostCursorAgrees(sessionName: string, plan: RehostPlan): boolean {
+    const facts = plan.legacyWitness;
+    if (!facts) return true;
+    const post = this.piRunnerState!(sessionName);
+    if (!post || post.lastEntryId !== facts.nativeLeaf) return false;
+    return this.piSessionTailEntryId!(plan.sessionFile) === facts.nativeLeaf;
   }
   /** Bounded poll: is the verified runner (and its pi child) gone from the census? */
   /** Every descendant of the pane root, by stable identity. */
@@ -1990,6 +2570,34 @@ export class SeatLifecycleService {
       unknownEffects: { count: unknown.length, digest: hash(unknown.map((r: { outbox_id: string; delivery_state: string; body: string }) => [r.outbox_id, r.delivery_state, createHash("sha256").update(r.body).digest("hex")])) },
       sessionFile,
     };
+  }
+
+  /** B5 durable audit for the legacy-witness path, which runs in the PLAN phase where no SeatDescriptor
+   *  or operator input exists. It records only that a diagnostic signal was delivered and what the
+   *  outcome was, so a later reader can see the delivery without trusting the refusal wording. */
+  private appendLegacyWitnessAudit(resolved: ResolvedSeat, payload: Record<string, unknown>): void {
+    const at = new Date().toISOString();
+    // F3: the delivery facts this audit exists to preserve, read from the payload the plan passed.
+    const facts = payload["signal"] as { delivered?: boolean; deliveredPids?: number[]; auditedBeforeDelivery?: boolean } | undefined;
+    const tx = this.db.transaction(() => {
+      this.eventBus.persistWithinTransaction({
+        type: "seat.runner_rehost_legacy_witness_outcome",
+        rigId: resolved.entry.rigId, nodeId: resolved.nodeId, logicalId: resolved.entry.logicalId,
+        reason: "legacy_pi_native_witness", operator: null, at,
+        witnessRefused: true, code: String(payload["code"] ?? "rehost_legacy_inspector_unverified"),
+        reasons: Array.isArray(payload["reasons"]) ? (payload["reasons"] as string[]) : [],
+        signalDelivered: true, blindRetryAllowed: false,
+        // H1-F3: which witness phase produced this outcome (default: the plan phase).
+        stage: typeof payload["stage"] === "string" ? payload["stage"] : "plan_witness",
+        // F3: the facts this audit exists to preserve must actually be persisted, not dropped.
+        deliveredPids: facts?.deliveredPids ?? [],
+        auditedBeforeDelivery: facts?.auditedBeforeDelivery === true,
+        binding: payload["binding"] ?? null, modules: payload["modules"] ?? null,
+      // H1-F3: the stage marker rides the same untyped-payload convention as every other
+      // rehost event (appendRehostEvent passes its payload through `as never`).
+      } as never);
+    });
+    tx();
   }
 
   private appendRehostEvent(type: string, seat: SeatDescriptor, input: { reason: string; operator?: string | null }, payload: Record<string, unknown>): void {

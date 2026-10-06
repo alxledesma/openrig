@@ -878,3 +878,42 @@ describe("seat request deadlines (#260)", () => {
     expect((output as { error: Error }).error.message).toContain("timed out after 5000ms");
   });
 });
+
+describe("seat rehost-runner legacy native witness flag", () => {
+  const OK = { ok: true, seat: { logicalId: "dev-impl", rigName: "seat-rig" }, generation: "g1", sessionFile: "/f", launchIdBefore: "a", launchIdAfter: "b", durableModel: null, unknownEffectsPreserved: { count: 0, digest: "d" } };
+
+  async function run(args: string[]): Promise<{ bodies: unknown[]; logs: string[]; exitCode: number | undefined }> {
+    const paths: string[] = [];
+    const postBodies: unknown[] = [];
+    const command = makeCommand(makeDeps({ status: 200, data: OK }, paths, postBodies));
+    const capture = await captureLogs(async () => {
+      await command.parseAsync(["node", "rig", "seat", ...args]);
+    });
+    return { bodies: postBodies, logs: capture.logs, exitCode: capture.exitCode };
+  }
+
+  it("transports a strict boolean and authors no proof value", async () => {
+    const off = await run(["rehost-runner", "dev-impl@seat-rig", "--reason", "r"]);
+    expect(off.bodies[0]).toEqual({ reason: "r", operator: undefined, legacyNativeWitness: false });
+    const on = await run(["rehost-runner", "dev-impl@seat-rig", "--reason", "r", "--legacy-native-witness"]);
+    expect(on.bodies[0]).toMatchObject({ legacyNativeWitness: true });
+    // Nothing a daemon would have to trust is ever authored by the client.
+    for (const body of [off.bodies[0], on.bodies[0]] as Array<Record<string, unknown>>) {
+      for (const key of ["witness", "proof", "nativeLeaf", "leaf", "leafId", "lastEntryId", "cursor", "modules", "moduleUrl", "runnerModuleUrl", "piModuleUrl", "modulePath", "scriptPath", "endpoint", "inspectorPort", "port", "pid", "runnerPid", "childPid", "sessionFile", "launchId", "generation"]) {
+        expect(key in body, key).toBe(false);
+      }
+    }
+  });
+
+  it("refuses a caller-authored proof at the daemon boundary", async () => {
+    const paths: string[] = [];
+    const postBodies: unknown[] = [];
+    const command = makeCommand(makeDeps({ status: 400, data: { error: "nativeLeaf is not accepted" } }, paths, postBodies));
+    const capture = await captureLogs(async () => {
+      await command.parseAsync(["node", "rig", "seat", "rehost-runner", "dev-impl@seat-rig", "--reason", "r", "--legacy-native-witness"]);
+    });
+    // The CLI still authors only the boolean; a proof attempt cannot be expressed.
+    expect(postBodies[0]).toEqual({ reason: "r", operator: undefined, legacyNativeWitness: true });
+    expect(capture.exitCode).toBe(1);
+  });
+});

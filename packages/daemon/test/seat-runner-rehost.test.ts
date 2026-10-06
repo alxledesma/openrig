@@ -5,10 +5,13 @@
 // fresh/handover/fork fallback, and no blind retry after a failed stop or resume.
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
-import { mkdtempSync, readSync as readSyncImpl, rmSync } from "node:fs";
+import { mkdtempSync, readSync as readSyncImpl, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { readFileSync as readWholeFile } from "node:fs";
 import { createDb } from "../src/db/connection.js";
+import { EventBus } from "../src/domain/event-bus.js";
 import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
@@ -18,6 +21,8 @@ import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { SeatLifecycleService, type PiRehostProof, type PiRehostRunnerState } from "../src/domain/seat-lifecycle-service.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
+import { parseLegacyNativeWitnessRequest } from "../src/routes/seat.js";
+import { makeLegacyPiNativeWitness } from "../src/domain/legacy-pi-native-witness.js";
 
 const SESSION_FILE = "/state/pi/intake-lead@app-handy-conveyor/sessions/history.jsonl";
 const LAUNCH_OLD = "launch-old-0001";
@@ -1440,5 +1445,558 @@ describe("post-proof transient observation (reproduction)", () => {
     await service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "single effect" });
     expect(h.resumeCalls).toHaveLength(1);
     expect(h.killed.filter(p => p === RUNNER_PID)).toHaveLength(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EXPLICIT legacy native-witness option. Contract under test:
+//   - default path byte-identical; the witness seam is never consulted;
+//   - the option bypasses ONLY the sidecar cursor equality, and never rewrites it;
+//   - the mapping is daemon-owned and REFUSES, typed, when it cannot be established;
+//   - a final fresh witness must reproduce the binding and leaf before the halt;
+//   - post-proof requires the replacement to have ACTUALLY refreshed its cursor.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("legacy pi native witness option", () => {
+  const POISONED_CURSOR = "f365df5b-2134-425b-8fc4-bba091529fc5";
+  const LEAF = "2cf52f50";
+  const SEAT = "intake-lead@app-handy-conveyor";
+
+  interface LegacyHarness {
+    h: Harness;
+    service: SeatLifecycleService;
+    /** Every witness call the daemon made, with what it derived. */
+    witnessCalls: Array<{ binding: { runner: { pid: number }; child: { pid: number } }; modules: { runnerModuleUrl: string; piModuleUrl: string } }>;
+    /** Results handed back in order; the last one repeats when exhausted. */
+    witnessResults: Array<{ ok: true; nativeLeaf: string; launchId: string; generation: string; sessionFile: string; sessionId: string; evidenceId: string; rounds: number; signal?: { delivered: boolean; deliveredPids: number[]; auditedBeforeDelivery: boolean } } | { ok: false; reasons: string[]; rounds: number; signal?: { delivered: boolean; deliveredPids: number[]; auditedBeforeDelivery: boolean } }>;
+    /** Real-collector seam activity when opts.realCollector is set. */
+    real?: { opens: number; signals: number[] };
+    cachedModule: { value: string | null };
+    postCursor: { value: string | null };
+    /** Reduced kernel-region environment verdict per target pid. */
+    environment: { regionReadable: boolean; occupantGenerationMatches: boolean; nodeOptions: "unset" | "present"; reasons: string[] };
+    /** What the runner script hashes to; the daemon's legacy-hash set is checked against it. */
+    runnerHash: string;
+    currentRunnerPath: string;
+    legacyRunnerPath: string;
+    files: string[];
+  }
+
+  function legacyHarness(opts?: { resolver?: "absent" | "present"; environment?: "absent" | "present"; hashes?: "absent" | "present"; graphStale?: boolean; realCollector?: { closeFailsAfterOpens?: number; driftLeafAfterOpens?: number } }): LegacyHarness {
+    const h = harness();
+    // A poisoned legacy cursor that is NOT a session entry, and a real tail.
+    h.sidecar.value = { ready: true, launchId: LAUNCH_OLD, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: POISONED_CURSOR };
+    h.tail.value = LEAF;
+    const files: string[] = [];
+    const dir = mkdtempSync(join(tmpdir(), "legacy-witness-"));
+    dirs.push(dir);
+    const legacyRunner = join(dir, "pi-runner.js");
+    const currentRunner = join(dir, "pi-runner.js.current");
+    const cachedChunk = join(dir, "chunk-ABC123.js");
+    for (const file of [legacyRunner, currentRunner, cachedChunk]) { writeFileSync(file, "// fixture module\n"); files.push(file); }
+    // The child's ENTRY carries the shebang that chose its interpreter; the classes
+    // live in the chunk the entry reached.
+    const piEntry = join(dir, "cli.js");
+    writeFileSync(piEntry, "#!/usr/bin/env node\n"); files.push(piEntry);
+    // The fixture runner's content is what the daemon-set legacy hash names.
+    const LEGACY_RUNNER_HASH = createHash("sha256").update(readWholeFile(legacyRunner)).digest("hex");
+    // The live legacy runner is genuinely NOT the current entry: they differ by design.
+    // The targets' start is AFTER the fixture files were written, so the on-disk graph
+    // can honestly be the graph that was loaded. A start in the past is used by the
+    // replaced-package test instead.
+    const targetStart = new Date(Date.now() + 3_600_000).toISOString();
+    h.processes = [
+      { pid: 4000, ppid: 9100, command: "/bin/zsh", startedAt: targetStart },
+      { pid: 9100, ppid: 1, command: "/opt/homebrew/bin/tmux -L openrig-xv new-session -d -s " + SEAT, startedAt: targetStart },
+      { pid: RUNNER_PID, ppid: 4000, command: `node ${legacyRunner} --session-name ${SEAT} --session ${SESSION_FILE} --launch-id ${LAUNCH_OLD}`, startedAt: targetStart },
+      { pid: CHILD_PID, ppid: RUNNER_PID, command: "pi --mode rpc --session /state/pi/child", startedAt: targetStart },
+    ];
+    const witnessCalls: LegacyHarness["witnessCalls"] = [];
+    const lh: LegacyHarness = {
+      h, witnessCalls, files,
+      witnessResults: [{ ok: true, nativeLeaf: LEAF, launchId: LAUNCH_OLD, generation: GENERATION, sessionFile: SESSION_FILE, sessionId: "sess-1", evidenceId: "sha256:0123456789abcdef", rounds: 2 }],
+      cachedModule: { value: cachedChunk },
+      postCursor: { value: LEAF },
+      currentRunnerPath: currentRunner,
+      legacyRunnerPath: legacyRunner,
+      runnerHash: LEGACY_RUNNER_HASH,
+      environment: { regionReadable: true, occupantGenerationMatches: true, nodeOptions: "unset", reasons: [] },
+      service: undefined as unknown as SeatLifecycleService,
+    };
+    const rigRepo = new RigRepository(h.db);
+    const guard = {
+      lifecycle: async <T>(_n: string[], fn: () => Promise<T>): Promise<T> => fn(),
+      runnerRehost: async <T>(_n: string, fn: () => Promise<T>): Promise<T> => fn(),
+      protectionFacts: () => ({ code: "typing_guard_enabled" as const, fingerprint: "{}" }),
+      preference: () => (h.guard.enabled ? { desired: true, effective: true } : { desired: false, effective: false }),
+      set: async () => undefined as never,
+      target: () => ({ nodeId: h.nodeId }),
+    } as unknown as TmuxAdapter;
+    lh.service = new SeatLifecycleService({
+      db: h.db, rigRepo,
+      sessionRegistry: new SessionRegistry(h.db),
+      eventBus: new EventBus(h.db),
+      tmuxAdapter: { deliveryGuard: guard } as unknown as TmuxAdapter,
+      listProcesses: () => h.processes,
+      piResume: { resume: async (session, type, token, cwd, model) => {
+        h.resumeCalls.push({ session, type, token, cwd, model });
+        // The replacement is the CURRENT runner and its cursor has been refreshed.
+        h.sidecar.value = { ready: true, launchId: LAUNCH_NEW, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: lh.postCursor.value };
+        h.proof.value = { ...h.proof.value!, launchId: LAUNCH_NEW };
+        h.processes = h.processes.map(p => p.pid === RUNNER_PID || p.pid === CHILD_PID ? { ...p, command: p.command.replace(LAUNCH_OLD, LAUNCH_NEW).replace(legacyRunner, currentRunner) } : p);
+        return { ok: true };
+      } },
+      piProve: async () => h.proof.value,
+      piRunnerState: () => h.sidecar.value,
+      piSessionFileExists: () => true,
+      piSessionFileDigestPrefix: () => "d1g3stpr3f1x0000",
+      paneRootPid: async () => 4000,
+      piSessionTailEntryId: () => h.tail.value,
+      killNativeProcess: (pid) => { h.killed.push(pid); h.processes = h.processes.filter(p => p.pid !== pid && p.ppid !== pid); },
+      legacyPiWitness: opts?.realCollector ? (() => {
+        const ctl = opts.realCollector;
+        const real = { opens: 0, signals: [] as number[] };
+        lh.real = real;
+        const identityOf = (pid: number) => { const row = h.processes.find(p => p.pid === pid); return row ? { pid: row.pid, ppid: row.ppid, startedAt: row.startedAt ?? "" } : null; };
+        const leafNow = () => (real.opens > (ctl.driftLeafAfterOpens ?? Number.POSITIVE_INFINITY) ? "bbbbbbbb" : h.tail.value);
+        return { witness: async (request: { binding: never; modules: { runnerModuleUrl: string; piModuleUrl: string } }) => makeLegacyPiNativeWitness({
+          source: {
+            resolveEndpoint: async () => ({ host: "127.0.0.1" as const, port: 9301 }),
+            endpointInUse: async () => false,
+            census: async (pid: number) => identityOf(pid),
+            deliverSignal: (pid: number) => { real.signals.push(pid); return true; },
+            openTransport: async (target: { pid: number; startedAt: string }) => {
+              real.opens++;
+              const loaded = [request.modules.runnerModuleUrl, request.modules.piModuleUrl];
+              return {
+                endpoint: { host: "127.0.0.1" as const, port: 9301 },
+                registration: { pid: target.pid, startIdentity: target.startedAt, daemonPid: process.pid },
+                loadedModuleUrls: async () => loaded,
+                verifyListenerOwnership: async () => true,
+                queryProjection: async (req: { exportName: string }) => ({
+                  count: 1,
+                  fields: (req.exportName === "RunnerCore"
+                    ? { ready: true, streaming: false, processing: false, controlPending: false, sessionFile: SESSION_FILE, sessionId: "sess-1", launchId: LAUNCH_OLD, generation: GENERATION }
+                    : req.exportName === "AgentSession" ? {}
+                      : { isStreaming: false, isCompacting: false, pendingMessageCount: 0, sessionFile: SESSION_FILE, sessionId: "sess-1", leafId: leafNow(), runtimeSessionMatchesSession: true }) as never,
+                }),
+                close: async () => ({ listenerClosed: !(ctl.closeFailsAfterOpens !== undefined && real.opens > ctl.closeFailsAfterOpens) }),
+              };
+            },
+            readIdentity: async (pid: number) => identityOf(pid),
+            recordSignalIntent: async () => undefined,
+          },
+          signal: "SIGUSR1", tailEntryId: () => leafNow(), modules: request.modules, rounds: 2, roundGapMs: 0,
+        }).witness(request.binding as never) };
+      })() : { witness: async request => {
+        witnessCalls.push(request as never);
+        return lh.witnessResults.length > 1 ? lh.witnessResults.shift()! : lh.witnessResults[0]!;
+      } },
+      currentPiRunnerEntryPath: currentRunner,
+      legacyPiCachedModuleUrl: opts?.resolver === "absent" ? undefined : () => ({ modulePath: lh.cachedModule.value!, entryPath: piEntry }),
+      // B3 time binding, through the same injectable seam the daemon uses for the Pi graph. The
+      // harness declares the times; a scenario opts out to prove the refusal still fires.
+      graphPredatesStart: opts?.graphStale ? () => false : () => true,
+      legacyRunnerHashes: opts?.hashes === "absent" ? undefined : [lh.runnerHash],
+      legacyEnvironmentObserver: opts?.environment === "absent" ? undefined : async () => lh.environment,
+      rehostPollMs: 1, rehostWaitMs: 30,
+    });
+    return lh;
+  }
+
+  const runLegacy = (lh: LegacyHarness) => lh.service.rehostRunner({ seatRef: SEAT, reason: "legacy bridge", legacyNativeWitness: true });
+
+  afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+  it("leaves the ordinary rehost unchanged and never consults the witness seam", async () => {
+    const lh = legacyHarness();
+    try {
+      seat(lh.h);
+      lh.h.sidecar.value = { ready: true, launchId: LAUNCH_OLD, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: LEAF };
+      const out = await lh.service.rehostRunner({ seatRef: SEAT, reason: "ordinary" });
+      expect(out).toMatchObject({ ok: true, launchIdBefore: LAUNCH_OLD, launchIdAfter: LAUNCH_NEW });
+      expect(lh.witnessCalls).toEqual([]);
+      // The ordinary receipt carries no legacy witness and no bypassed cursor.
+      expect(events(lh.h, "seat.runner_rehost_began")[0]).toMatchObject({ legacyNativeWitness: false });
+      // And the ordinary cursor gate still refuses a poisoned cursor.
+      const fresh = legacyHarness();
+      try {
+        seat(fresh.h);
+        const refused = await fresh.service.rehostRunner({ seatRef: SEAT, reason: "ordinary poisoned cursor" });
+        expect(refused).toMatchObject({ ok: false, code: "rehost_not_idle" });
+        expect(fresh.witnessCalls).toEqual([]);
+        expect(fresh.h.killed).toEqual([]);
+      } finally { fresh.h.db.close(); }
+    } finally { lh.h.db.close(); }
+  });
+
+  it("carries the witnessed leaf and never rewrites the poisoned sidecar", async () => {
+    const lh = legacyHarness();
+    try {
+      seat(lh.h);
+      const out = await runLegacy(lh);
+      expect(out).toMatchObject({ ok: true, generation: GENERATION, launchIdBefore: LAUNCH_OLD, launchIdAfter: LAUNCH_NEW });
+      const began = events(lh.h, "seat.runner_rehost_began")[0]!;
+      // The leaf replaced the cursor; the cursor is reported, not adopted.
+      expect(began).toMatchObject({ lastEntryId: LEAF, legacyNativeWitness: true, sidecarCursorObserved: POISONED_CURSOR, sidecarCursorCarriedForward: false, leafSource: "live_child_session" });
+      expect(began["legacyWitness"]).toMatchObject({ evidenceId: "sha256:0123456789abcdef", rounds: 2 });
+      // NO continuity or historical projection credit.
+      expect(began).toMatchObject({ continuityCredit: false, deliveryOrQualificationCredit: false });
+      expect(events(lh.h, "seat.runner_rehost_completed")[0]).toMatchObject({ legacyNativeWitness: true, cursorRefreshedToLeaf: true, historicalProjectionCredit: false, continuityCredit: false });
+      // The daemon built the witness from the EXACT census pids and its own modules.
+      expect(lh.witnessCalls).toHaveLength(2);
+      expect(lh.witnessCalls[0]!.binding).toMatchObject({ runner: { pid: RUNNER_PID }, child: { pid: CHILD_PID }, launchId: LAUNCH_OLD, generation: GENERATION, sessionFile: SESSION_FILE });
+      expect(lh.witnessCalls[0]!.modules.runnerModuleUrl).toContain("pi-runner.js");
+      expect(lh.witnessCalls[0]!.modules.piModuleUrl).toContain("chunk-ABC123.js");
+      // The old cursor was never edited to agree with the leaf.
+      expect(lh.h.sidecar.value?.lastEntryId).toBe(LEAF);
+      expect(events(lh.h, "seat.runner_rehost_failed")).toHaveLength(0);
+    } finally { lh.h.db.close(); }
+  });
+
+  it("refuses with the exact unresolved-module blocker when no provenance resolver exists", async () => {
+    const lh = legacyHarness({ resolver: "absent" });
+    try {
+      seat(lh.h);
+      const out = await runLegacy(lh);
+      expect(out).toMatchObject({ ok: false, code: "rehost_legacy_witness_unavailable", observed: { blocker: "pi_child_module_unresolved" } });
+      // Pre-effect: nothing signalled, nothing resumed, no receipt at all.
+      expect(lh.witnessCalls).toEqual([]);
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+      expect(events(lh.h, "seat.runner_rehost_began")).toHaveLength(0);
+    } finally { lh.h.db.close(); }
+  });
+
+  it("C4 S1: zero and TWO census children both refuse before any signal", async () => {
+    for (const [label, children] of [["zero", []], ["two", [{ pid: CHILD_PID + 1, ppid: RUNNER_PID, command: "pi --session /state/pi/second", startedAt: "child-two" } as never]]] as const) {
+      const lh = legacyHarness();
+      try {
+        seat(lh.h);
+        lh.h.processes = lh.h.processes.filter(row => row.pid !== CHILD_PID).concat(children as never[]);
+        const out = await runLegacy(lh);
+        expect(out.ok).toBe(false);
+        // A sole-child refusal happens BEFORE the witness runs, so nothing was signalled.
+        expect(lh.witnessCalls).toEqual([]);
+        expect(lh.h.killed).toEqual([]);
+        expect(lh.h.resumeCalls).toEqual([]);
+        // The exact refusal text is owned by whichever gate refuses first; what matters is that a
+        // non-sole census refuses and the witness is never consulted.
+        expect(lh.witnessCalls).toEqual([]);
+      } finally { lh.h.db.close(); }
+    }
+  });
+
+  it("B3 refuses when the graph time binding says the target is newer than the child", async () => {
+    const lh = legacyHarness({ graphStale: true });
+    try {
+      seat(lh.h);
+      const out = await runLegacy(lh);
+      // Time binding is a refusal, never a silently accepted fresh read.
+      expect(out.ok).toBe(false);
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+    } finally { lh.h.db.close(); }
+  });
+
+  it("G2 an outcome-audit write failure after a real delivery stays a typed UNKNOWN, never untouched", async () => {
+    const lh = legacyHarness();
+    // The harness's own eventBus is not exposed, so the failure is injected on the shared prototype
+    // and scoped to the outcome event only. The BEFORE-signal intent record must still succeed,
+    // which is exactly the case G2 describes: the signal is not unrecorded, its outcome is.
+    const original = EventBus.prototype.persistWithinTransaction;
+    const attempt = { count: 0 };
+    EventBus.prototype.persistWithinTransaction = function (this: EventBus, event: { type: string }) {
+      if (event.type === "seat.runner_rehost_legacy_witness_outcome") {
+        attempt.count++;
+        throw new Error("event store unavailable");
+      }
+      return original.call(this, event as never);
+    } as typeof original;
+    try {
+      seat(lh.h);
+      lh.witnessResults = [{ ok: false, reasons: ["inspector_close_unverified"], rounds: 1, signal: { delivered: true, deliveredPids: [4242, 4243], auditedBeforeDelivery: true } }];
+      const out = await runLegacy(lh);
+      // The outcome audit really was attempted, and it really failed.
+      expect(attempt.count).toBe(1);
+      // Typed UNKNOWN, not a pre-effect refusal.
+      expect(out).toMatchObject({ ok: false, code: "rehost_legacy_inspector_unverified", blindRetryAllowed: false });
+      const observed = (out as { observed?: Record<string, unknown> }).observed ?? {};
+      expect(observed["outcomeClass"]).toBe("unknown");
+      expect(observed["outcomeAuditWritten"]).toBe(false);
+      // The EXACT delivered pids survive the failed write.
+      expect(observed["deliveredPids"]).toEqual([4242, 4243]);
+      expect(observed["auditedBeforeDelivery"]).toBe(true);
+      // The message must NOT claim nothing was touched, and must not claim a byte-clean outcome.
+      const message = String((out as { message: string }).message).toLowerCase();
+      expect(message).not.toContain("nothing was touched");
+      expect(message).not.toContain("untouched");
+      expect(message).toContain("could not be written");
+      // Nothing was killed: an uncertain outcome is read, never acted on.
+      expect(lh.h.killed).toEqual([]);
+    } finally {
+      EventBus.prototype.persistWithinTransaction = original;
+      lh.h.db.close();
+    }
+  });
+
+  it("B5 writes a durable outcome audit when a delivered signal cannot be verified closed", async () => {
+    const lh = legacyHarness();
+    try {
+      seat(lh.h);
+      lh.witnessResults = [{ ok: false, reasons: ["inspector_close_unverified"], rounds: 1, signal: { delivered: true, deliveredPids: [4242], auditedBeforeDelivery: true } }];
+      const out = await runLegacy(lh);
+      // Typed UNKNOWN, never a pre-effect refusal, and never blind-retryable.
+      expect(out).toMatchObject({
+        ok: false, code: "rehost_legacy_inspector_unverified", blindRetryAllowed: false,
+        observed: { outcomeClass: "unknown" },
+      });
+      // Wording states the signal WAS delivered, unlike a pre-effect refusal.
+      expect(String((out as { message: string }).message)).toMatch(/signal was delivered/i);
+      // Durable audit exists and names the delivery.
+      const audit = events(lh.h, "seat.runner_rehost_legacy_witness_outcome");
+      expect(audit).toHaveLength(1);
+      // F3: the persisted record must actually CARRY the facts it exists to preserve.
+      expect(audit[0]).toMatchObject({ signalDelivered: true, blindRetryAllowed: false });
+      const recorded = audit[0] as unknown as { deliveredPids: number[]; auditedBeforeDelivery: boolean; binding: { runner: { pid: number } } };
+      expect(recorded.deliveredPids).toEqual([4242]);
+      expect(recorded.auditedBeforeDelivery).toBe(true);
+      expect(recorded.binding.runner.pid).toBe(4242);
+      // The halt still does not happen and nothing was killed.
+      expect(lh.h.killed).toEqual([]);
+    } finally { lh.h.db.close(); }
+  });
+
+  it("refuses on a typed witness refusal before any signal, carrying only closed reasons", async () => {
+    const lh = legacyHarness();
+    try {
+      seat(lh.h);
+      lh.witnessResults = [{ ok: false, reasons: ["runner_not_idle"], rounds: 1 }];
+      const out = await runLegacy(lh);
+      expect(out).toMatchObject({ ok: false, code: "rehost_legacy_witness_refused", observed: { reasons: ["runner_not_idle"], rounds: 1 } });
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+      expect(events(lh.h, "seat.runner_rehost_began")).toHaveLength(0);
+      // No pid, port, path or command text escapes in the refusal.
+      expect(JSON.stringify(out)).not.toContain(SEAT);
+      expect(JSON.stringify(out)).not.toContain(String(RUNNER_PID));
+      expect(JSON.stringify(out)).not.toContain("9229");
+    } finally { lh.h.db.close(); }
+  });
+
+  it("refuses on final-sample drift BEFORE the halt", async () => {
+    const lh = legacyHarness();
+    try {
+      seat(lh.h);
+      // Plan-time witness accepts; the final pre-stop witness sees a moved leaf. The
+      // FIXED collector carries real delivery facts even on success (H1-F1/F2).
+      lh.witnessResults = [
+        { ok: true, nativeLeaf: LEAF, launchId: LAUNCH_OLD, generation: GENERATION, sessionFile: SESSION_FILE, sessionId: "sess-1", evidenceId: "sha256:0123456789abcdef", rounds: 2 },
+        { ok: true, nativeLeaf: "aaaaaaaa", launchId: LAUNCH_OLD, generation: GENERATION, sessionFile: SESSION_FILE, sessionId: "sess-1", evidenceId: "sha256:ffffffffffffffff", rounds: 2, signal: { delivered: true, deliveredPids: [RUNNER_PID, CHILD_PID], auditedBeforeDelivery: true } },
+      ];
+      const out = await runLegacy(lh);
+      expect(out).toMatchObject({ ok: false, code: "rehost_legacy_witness_refused", blindRetryAllowed: false, observed: { reasons: ["witness_sample_drift"], outcomeClass: "delivered_and_closed", deliveredPids: [RUNNER_PID, CHILD_PID] } });
+      // A COMPLETED round DID deliver signals; the refusal must say so truthfully.
+      const message = String((out as { message: string }).message).toLowerCase();
+      expect(message).toContain("closes were verified");
+      expect(message).not.toContain("no new signal");
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+      expect(lh.witnessCalls).toHaveLength(2);
+    } finally { lh.h.db.close(); }
+  });
+
+  it("refuses on unverified listener cleanup at the final witness before the halt", async () => {
+    const lh = legacyHarness();
+    try {
+      seat(lh.h);
+      // The fixed collector reports the REAL delivery on this failure (H1-F1): the service
+      // must take its typed UNKNOWN branch, not a pre-effect refusal.
+      lh.witnessResults = [
+        { ok: true, nativeLeaf: LEAF, launchId: LAUNCH_OLD, generation: GENERATION, sessionFile: SESSION_FILE, sessionId: "sess-1", evidenceId: "sha256:0123456789abcdef", rounds: 2 },
+        { ok: false, reasons: ["inspector_close_unverified"], rounds: 2, signal: { delivered: true, deliveredPids: [RUNNER_PID, CHILD_PID], auditedBeforeDelivery: true } },
+      ];
+      const out = await runLegacy(lh);
+      expect(out).toMatchObject({ ok: false, code: "rehost_legacy_inspector_unverified", blindRetryAllowed: false, observed: { outcomeClass: "unknown", outcomeAuditWritten: true, deliveredPids: [RUNNER_PID, CHILD_PID], closeUnverified: true } });
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+    } finally { lh.h.db.close(); }
+  });
+
+  it("H1 a FINAL-witness failure AFTER delivery is the same typed UNKNOWN class, with an outcome audit and the real pids", async () => {
+    const lh = legacyHarness();
+    try {
+      seat(lh.h);
+      lh.witnessResults = [
+        { ok: true, nativeLeaf: LEAF, launchId: LAUNCH_OLD, generation: GENERATION, sessionFile: SESSION_FILE, sessionId: "sess-1", evidenceId: "sha256:0123456789abcdef", rounds: 2 },
+        { ok: false, reasons: ["inspector_close_unverified"], rounds: 3, signal: { delivered: true, deliveredPids: [4242, 4243], auditedBeforeDelivery: true } },
+      ];
+      const out = await runLegacy(lh);
+      expect(out).toMatchObject({ ok: false, code: "rehost_legacy_inspector_unverified", blindRetryAllowed: false });
+      const observed = (out as { observed?: Record<string, unknown> }).observed ?? {};
+      expect(observed["outcomeClass"]).toBe("unknown");
+      expect(observed["outcomeAuditWritten"]).toBe(true);
+      // The REAL delivery facts of the final round survive; they are never dropped again.
+      expect(observed["deliveredPids"]).toEqual([4242, 4243]);
+      expect(observed["closeUnverified"]).toBe(true);
+      expect(observed["rounds"]).toBe(3);
+      const message = String((out as { message: string }).message).toLowerCase();
+      expect(message).not.toContain("nothing was signalled");
+      expect(message).not.toContain("nothing was touched");
+      expect(message).toContain("was not stopped");
+      // A durable outcome audit WAS written for this final-round failure.
+      expect(events(lh.h, "seat.runner_rehost_legacy_witness_outcome")).toHaveLength(1);
+      expect(lh.witnessCalls).toHaveLength(2);
+      // Uncertain close is READ, never acted on: no halt, no resume.
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+    } finally { lh.h.db.close(); }
+  });
+
+  it("H1 a failed OUTCOME audit on the FINAL path stays a typed UNKNOWN with the real pids, never untouched", async () => {
+    const lh = legacyHarness();
+    const original = EventBus.prototype.persistWithinTransaction;
+    const attempt = { count: 0 };
+    EventBus.prototype.persistWithinTransaction = function (this: EventBus, event: { type: string }) {
+      if (event.type === "seat.runner_rehost_legacy_witness_outcome") { attempt.count++; throw new Error("event store unavailable"); }
+      return original.call(this, event as never);
+    } as typeof original;
+    try {
+      seat(lh.h);
+      lh.witnessResults = [
+        { ok: true, nativeLeaf: LEAF, launchId: LAUNCH_OLD, generation: GENERATION, sessionFile: SESSION_FILE, sessionId: "sess-1", evidenceId: "sha256:0123456789abcdef", rounds: 2 },
+        { ok: false, reasons: ["inspector_endpoint_containment_failed"], rounds: 3, signal: { delivered: true, deliveredPids: [4242], auditedBeforeDelivery: true } },
+      ];
+      const out = await runLegacy(lh);
+      expect(attempt.count).toBe(1);
+      expect(out).toMatchObject({ ok: false, code: "rehost_legacy_inspector_unverified", blindRetryAllowed: false });
+      const observed = (out as { observed?: Record<string, unknown> }).observed ?? {};
+      expect(observed["outcomeClass"]).toBe("unknown");
+      expect(observed["outcomeAuditWritten"]).toBe(false);
+      expect(observed["deliveredPids"]).toEqual([4242]);
+      expect(observed["auditedBeforeDelivery"]).toBe(true);
+      expect(observed["closeUnverified"]).toBe(false);
+      const message = String((out as { message: string }).message).toLowerCase();
+      expect(message).toContain("could not be written");
+      expect(message).not.toContain("nothing was touched");
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+    } finally {
+      EventBus.prototype.persistWithinTransaction = original;
+      lh.h.db.close();
+    }
+  });
+
+  it("H1 pre-effect final refusal wording is accurate: earlier witness rounds DID deliver verified-close signals", async () => {
+    const lh = legacyHarness();
+    try {
+      seat(lh.h);
+      lh.witnessResults = [
+        { ok: true, nativeLeaf: LEAF, launchId: LAUNCH_OLD, generation: GENERATION, sessionFile: SESSION_FILE, sessionId: "sess-1", evidenceId: "sha256:0123456789abcdef", rounds: 2 },
+        { ok: false, reasons: ["runner_not_idle"], rounds: 1 },
+      ];
+      const out = await runLegacy(lh);
+      expect(out).toMatchObject({ ok: false, code: "rehost_legacy_witness_refused", observed: { reasons: ["runner_not_idle"], rounds: 1 } });
+      const message = String((out as { message: string }).message).toLowerCase();
+      // The FALSE claim: this whole flow already signalled during the plan witness.
+      expect(message).not.toContain("nothing was signalled");
+      expect(message).not.toContain("nothing was touched");
+      expect(message).toContain("closes were verified");
+      expect(message).toContain("not stopped");
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+    } finally { lh.h.db.close(); }
+  });
+
+  it("post-proof requires the replacement cursor to have ACTUALLY refreshed to the witnessed leaf", async () => {
+    const stale = legacyHarness();
+    try {
+      seat(stale.h);
+      stale.postCursor.value = POISONED_CURSOR;
+      const out = await runLegacy(stale);
+      // A stale replacement cursor is never credited as agreement.
+      expect(out.ok).toBe(false);
+      expect((out as { code: string }).code).toMatch(/^rehost_post_proof_(failed|unstable)$/);
+      expect(events(stale.h, "seat.runner_rehost_completed")).toHaveLength(0);
+      expect(stale.h.resumeCalls).toHaveLength(1);
+    } finally { stale.h.db.close(); }
+
+    const refreshed = legacyHarness();
+    try {
+      seat(refreshed.h);
+      refreshed.postCursor.value = LEAF;
+      const out = await runLegacy(refreshed);
+      expect(out).toMatchObject({ ok: true, generation: GENERATION });
+      expect(events(refreshed.h, "seat.runner_rehost_completed")).toHaveLength(1);
+    } finally { refreshed.h.db.close(); }
+  });
+
+  it("a witnessed leaf that disagrees with the bounded tail is never carried forward", async () => {
+    const lh = legacyHarness();
+    try {
+      seat(lh.h);
+      lh.witnessResults = [{ ok: true, nativeLeaf: "99999999", launchId: LAUNCH_OLD, generation: GENERATION, sessionFile: SESSION_FILE, sessionId: "sess-1", evidenceId: "sha256:9999999999999999", rounds: 2 }];
+      const out = await runLegacy(lh);
+      expect(out).toMatchObject({ ok: false, code: "rehost_not_idle" });
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+    } finally { lh.h.db.close(); }
+  });
+
+  it("H1-R2 REAL collector: post-delivery close failure reaches the service typed UNKNOWN", async () => {
+    const lh = legacyHarness({ realCollector: { closeFailsAfterOpens: 6 } });
+    try {
+      seat(lh.h);
+      const out = await runLegacy(lh);
+      // Plan witness (opens 1-6) succeeded; the FINAL round signalled and could not
+      // prove the close: the fixed collector reports delivered:true and the service
+      // takes its UNKNOWN branch. This end-to-end reachability was the H1-F1 defect.
+      expect(out).toMatchObject({ ok: false, code: "rehost_legacy_inspector_unverified", blindRetryAllowed: false });
+      const observed = (out as { observed?: Record<string, unknown> }).observed ?? {};
+      expect(observed["outcomeClass"]).toBe("unknown");
+      expect(observed["outcomeAuditWritten"]).toBe(true);
+      expect(observed["deliveredPids"]).toEqual([RUNNER_PID]);
+      expect(observed["closeUnverified"]).toBe(true);
+      const audits = events(lh.h, "seat.runner_rehost_legacy_witness_outcome");
+      expect(audits.some(e => e["stage"] === "final_pre_stop")).toBe(true);
+      // Real SIGUSR1s reached BOTH targets during the successful plan witness.
+      expect([...new Set(lh.real!.signals)].sort()).toEqual([CHILD_PID, RUNNER_PID].sort());
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+    } finally { lh.h.db.close(); }
+  });
+
+  it("H1-R2 REAL collector: final success with a moved leaf refuses with delivered-and-closed facts", async () => {
+    const lh = legacyHarness({ realCollector: { driftLeafAfterOpens: 6 } });
+    try {
+      seat(lh.h);
+      const out = await runLegacy(lh);
+      expect(out).toMatchObject({ ok: false, code: "rehost_legacy_witness_refused", blindRetryAllowed: false });
+      const observed = (out as { observed?: Record<string, unknown> }).observed ?? {};
+      expect(observed["outcomeClass"]).toBe("delivered_and_closed");
+      expect(observed["deliveredPids"]).toEqual([RUNNER_PID, CHILD_PID]);
+      const message = String((out as { message: string }).message).toLowerCase();
+      expect(message).toContain("closes were verified");
+      expect(message).not.toContain("nothing was touched");
+      expect(lh.h.killed).toEqual([]);
+      expect(lh.h.resumeCalls).toEqual([]);
+    } finally { lh.h.db.close(); }
+  });
+});
+
+describe("legacy native witness request boundary", () => {
+  it("accepts only an absent or strict boolean option", () => {
+    expect(parseLegacyNativeWitnessRequest({ reason: "r" })).toEqual({ ok: true, legacyNativeWitness: false });
+    expect(parseLegacyNativeWitnessRequest({ legacyNativeWitness: true })).toEqual({ ok: true, legacyNativeWitness: true });
+    expect(parseLegacyNativeWitnessRequest({ legacyNativeWitness: false })).toEqual({ ok: true, legacyNativeWitness: false });
+    for (const bad of ["true", 1, 0, null, {}, [], null]) {
+      expect(parseLegacyNativeWitnessRequest({ legacyNativeWitness: bad }).ok, String(bad)).toBe(false);
+    }
+  });
+
+  it("refuses any caller-authored witness, leaf, path, port or pid", () => {
+    for (const key of ["witness", "proof", "nativeLeaf", "leaf", "leafId", "lastEntryId", "cursor", "modules", "moduleUrl", "runnerModuleUrl", "piModuleUrl", "modulePath", "scriptPath", "endpoint", "inspectorPort", "port", "pid", "runnerPid", "childPid", "sessionFile", "launchId", "generation"]) {
+      const parsed = parseLegacyNativeWitnessRequest({ reason: "r", legacyNativeWitness: true, [key]: "authored" });
+      expect(parsed.ok, key).toBe(false);
+    }
   });
 });

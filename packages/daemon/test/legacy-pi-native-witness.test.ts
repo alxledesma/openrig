@@ -34,6 +34,10 @@ import {
   type LegacyPiTransportSource,
   type LegacyPiWitnessFailure,
 } from "../src/domain/legacy-pi-native-witness.js";
+import {
+  buildLegacySignalIntentEvent,
+  type LegacySignalIntentSeatIdentity,
+} from "../src/routes/seat.js";
 
 const run = promisify(execFile);
 
@@ -164,6 +168,12 @@ interface Box {
   acquired: number[];
   /** Transport lifecycle in actual open/close order. */
   lifecycle: Array<{ action: "open" | "close"; pid: number }>;
+  /** Per-pid listener census state driving the B4 containment fixture. */
+  listenerStates: Map<number, { reads: number; expectedPort: number; strayPorts: number[]; publicPorts: number[] }>;
+  /** Discovered-port close attempts, asserted rather than assumed. */
+  discoveredCloseAttempts: Array<{ pid: number; port: number }>;
+  /** Reads that must pass before the expected listener appears (late-binding race). */
+  lateBindRounds: number;
 }
 
 async function box(opts?: {
@@ -187,6 +197,13 @@ async function box(opts?: {
     busyPorts: new Set(),
     acquired: [],
     lifecycle: [],
+    listenerSets: new Map(),
+    discoveredCloseAttempts: [] as Array<{ pid: number; port: number }>,
+    lateBindRounds: 0,
+    listenerStates: new Map<number, { reads: number; expectedPort: number; strayPorts: number[]; publicPorts: number[] }>(),
+    openedPorts: new Map<number, number>(),
+    extraPorts: new Map<number, number[]>(),
+    publicPorts: new Map<number, number[]>(),
   };
   return b;
 }
@@ -199,18 +216,48 @@ function source(b: Box): LegacyPiTransportSource {
     // The endpoint queue is allocation order, not a listener census. A port is
     // busy only when this fixture explicitly holds it as a foreign listener.
     endpointInUse: async endpoint => b.busyPorts.has(endpoint.port),
+    // B4: a listener that appears only after a delay, and a discovered stray port whose close is
+    // asserted rather than assumed.
+    // B4 CENSUS FIXTURE. `lateBindRounds` > 0 makes the expected port appear only after that many
+    // reads, which is exactly the late-binding race the single post-signal read used to lose.
+    // `strayPorts` adds ports that are NOT the expected endpoint; `publicPorts` adds public binds.
+    pidScopedListeners: async (pid: number) => {
+      const state = b.listenerStates.get(pid);
+      if (!state) {
+        // No explicit scenario: a healthy target bound exactly the endpoint it was opened on.
+        const opened = b.openedPorts.get(pid);
+        return { ok: true, ports: opened === undefined ? [] : [String(opened)], public: [] };
+      }
+      state.reads++;
+      if (state.reads <= b.lateBindRounds) return { ok: true, ports: [], public: [] };
+      return { ok: true, ports: [String(state.expectedPort), ...state.strayPorts.map(String)], public: state.publicPorts };
+    },
+    // B4 DISCOVERED CLOSE, asserted: the attempt is recorded and the port really is removed.
+    closeDiscoveredListener: async (pid: number, port: number) => {
+      b.discoveredCloseAttempts.push({ pid, port });
+      const extra = b.extraPorts.get(pid);
+      if (extra === undefined) return { listenerClosed: false }; // unknown state: not provable
+      // Removing the port from the census IS the verified close: a re-read would find it gone.
+      b.extraPorts.set(pid, extra.filter(p => p !== port));
+      return { listenerClosed: true };
+    },
     census: async pid => b.census.get(pid) ?? null,
-    deliverSignal: (pid, signal) => { b.signals.push({ pid, signal }); },
+    // F2: a success stub must report the ACTUAL delivery result, not void. A green suite with
+    // a void-returning stub proves nothing about delivery.
+    deliverSignal: (pid, signal) => { b.signals.push({ pid, signal }); return true; },
     openTransport: async (target, endpoint) => {
       const unit = target.pid === TARGET_CHILD.pid ? b.child : b.runner;
       unit.registration = { pid: target.pid, startIdentity: target.startedAt, daemonPid: 4242 };
       b.acquired.push(target.pid);
+      b.openedPorts.set(target.pid, endpoint.port);
       b.lifecycle.push({ action: "open", pid: target.pid });
       return {
         ...unit,
         close: async () => {
           const result = await unit.close();
           b.lifecycle.push({ action: "close", pid: target.pid });
+          // A closed unit holds no listener, so the next round's baseline must be empty again.
+          b.openedPorts.delete(target.pid);
           return result;
         },
       };
@@ -587,6 +634,35 @@ describe("legacy pi native witness: refusal before any halt", () => {
     expect(b.runner.calls.filter(c => c === "close")).toHaveLength(b.acquired.filter(pid => pid === TARGET_RUNNER.pid).length);
   });
 
+  it("H1-F1 a close failure AFTER delivery reports REAL delivered:true facts at result time", async () => {
+    const b = await box({ runner: { closeResult: false } });
+    const audits: number[] = [];
+    const out = await makeLegacyPiNativeWitness({
+      source: { ...source(b), recordSignalIntent: async (t: { pid: number }) => { audits.push(t.pid); } },
+      signal: "SIGUSR1", tailEntryId: () => b.tail.value, modules: FAKE_MODULES, rounds: 2, roundGapMs: 0,
+    }).witness({ runner: TARGET_RUNNER, child: TARGET_CHILD, launchId: LAUNCH_ID, generation: GENERATION, sessionFile: SESSION_FILE });
+    expect(out).toMatchObject({ ok: false, reasons: ["inspector_close_unverified"] });
+    // THE BUG THIS KILLS: the old eager snapshot froze these at delivered:false, making
+    // every post-signal failure look pre-effect to the service.
+    expect(out.ok === false && out.signal).toEqual({ delivered: true, deliveredPids: [TARGET_RUNNER.pid], auditedBeforeDelivery: true });
+    expect(audits.length).toBeGreaterThan(0);
+  });
+
+  it("H1-F1 round-2 sample drift AFTER delivery carries both real pids", async () => {
+    const b = await box({ child: { script: [{ runner: idleRunner(), child: idleChild(LEAF) }, { runner: idleRunner(), child: idleChild("bbbbbbbb") }] } });
+    const out = await collect(b);
+    expect(out).toMatchObject({ ok: false, reasons: ["witness_sample_drift"], rounds: 2 });
+    expect(out.ok === false && out.signal?.delivered).toBe(true);
+    expect(out.ok === false && [...new Set(out.signal?.deliveredPids)].sort()).toEqual([TARGET_CHILD.pid, TARGET_RUNNER.pid].sort());
+  });
+
+  it("H1-F2 even a SUCCESSFUL witness carries the real delivered-and-closed facts", async () => {
+    const b = await box();
+    const out = await collect(b);
+    // NO pids in an acceptance receipt (G1 egress rule); the delivery CLASS is truthful.
+    expect(out.ok === true && out.signal).toEqual({ delivered: true, auditedBeforeDelivery: false });
+  });
+
   it("never signals its own process", async () => {
     const b = await box();
     b.census.set(process.pid, { pid: process.pid, ppid: 1, startedAt: "daemon-boot" });
@@ -656,6 +732,145 @@ describe("legacy pi native witness: reduced refusal reporting", () => {
 // two ordinary Node child processes in a temp dir, one hosting a RunnerCore-shaped
 // class and one hosting a runtime/session pair. This is the part that proves the
 // unit is a working, cleanup-verifiable CDP transport rather than a no-op shim.
+describe("legacy pi endpoint containment: bounded appearance and discovered stray close", () => {
+  const witnessArgs = {
+    runner: TARGET_RUNNER, child: TARGET_CHILD,
+    launchId: LAUNCH_ID, generation: GENERATION, sessionFile: SESSION_FILE,
+  } as const;
+
+  it("B4 accepts a listener that binds LATE, after the transport handle returns", async () => {
+    const b = await box();
+    // The inspector thread binds only on the 3rd read. A single post-signal read saw an empty set
+    // and produced a spurious inspector_endpoint_containment_failed against a healthy target.
+    b.lateBindRounds = 3;
+    const out = await collectorFor(b).witness({ ...witnessArgs });
+    expect(out).toMatchObject({ ok: true });
+    expect(b.discoveredCloseAttempts).toEqual([]);
+  });
+
+  it("B4 closes the ACTUALLY DISCOVERED stray port and then refuses", async () => {
+    const b = await box();
+    const STRAY = 9333;
+    // The endpoint port is allocated dynamically, so the census derives it from the opened
+    // transport rather than hard-coding 9229, then adds the stray port the target really opened.
+    const src = source(b);
+    const realOpen = src.openTransport;
+    src.openTransport = async (target, endpoint) => {
+      const unit = await realOpen(target, endpoint);
+      b.openedPorts.set(target.pid, endpoint.port);
+      b.extraPorts.set(target.pid, [STRAY]);
+      return unit;
+    };
+    src.pidScopedListeners = async (pid: number) => {
+      const opened = b.openedPorts.get(pid);
+      if (opened === undefined) return { ok: true, ports: [], public: [] };
+      return { ok: true, ports: [String(opened), ...(b.extraPorts.get(pid) ?? []).map(String)], public: [] };
+    };
+    const out = await makeLegacyPiNativeWitness({
+      source: src, signal: "SIGUSR1", tailEntryId: () => LEAF, modules: FAKE_MODULES, rounds: 1, roundGapMs: 0,
+    }).witness({ ...witnessArgs });
+    expect(out).toMatchObject({ ok: false, reasons: ["inspector_endpoint_containment_failed"] });
+    // The close was ATTEMPTED on the discovered stray port, not on the expected endpoint.
+    expect(b.discoveredCloseAttempts.map(a => a.port)).toEqual([STRAY]);
+  });
+
+  it("C2 delivers ZERO signals when the durable before-signal intent audit cannot be written", async () => {
+    const b = await box();
+    const src = source(b);
+    // The audit is the record that a signal is about to be delivered. If it cannot be written,
+    // nothing is delivered at all.
+    (src as { recordSignalIntent?: unknown }).recordSignalIntent = async () => { throw new Error("audit unavailable"); };
+    const out = await makeLegacyPiNativeWitness({
+      source: src, signal: "SIGUSR1", tailEntryId: () => LEAF, modules: FAKE_MODULES, rounds: 1, roundGapMs: 0,
+    }).witness({ runner: TARGET_RUNNER, child: TARGET_CHILD, launchId: LAUNCH_ID, generation: GENERATION, sessionFile: SESSION_FILE });
+    expect(out).toMatchObject({ ok: false, reasons: ["signal_intent_unaudited"] });
+    expect(b.signals).toEqual([]);
+    // No transport was opened and nothing was killed.
+    expect(b.acquired).toEqual([]);
+  });
+
+  it("F2 refuses with delivered false and NEVER attaches when the signal was not delivered", async () => {
+    const b = await box();
+    const src = source(b);
+    // A refused or failed kill is not a partial success: it must refuse BEFORE the attach, typed,
+    // and must never report a delivered pid.
+    src.deliverSignal = (pid: number, signal: string) => { b.signals.push({ pid, signal }); return false; };
+    const out = await makeLegacyPiNativeWitness({
+      source: src, signal: "SIGUSR1", tailEntryId: () => LEAF, modules: FAKE_MODULES, rounds: 1, roundGapMs: 0,
+    }).witness({ runner: TARGET_RUNNER, child: TARGET_CHILD, launchId: LAUNCH_ID, generation: GENERATION, sessionFile: SESSION_FILE });
+    expect(out).toMatchObject({ ok: false, reasons: ["signal_undelivered"], signal: { delivered: false, deliveredPids: [] } });
+    // NO attach happened, so no inspector was opened and nothing could be left listening.
+    expect(b.acquired).toEqual([]);
+    expect(b.lifecycle).toEqual([]);
+  });
+
+  it("C2 reports REAL delivery facts rather than inferring them from reasons", async () => {
+    const b = await box();
+    const src = source(b);
+    const audits: number[] = [];
+    (src as { recordSignalIntent?: unknown }).recordSignalIntent = async (target: { pid: number }) => { audits.push(target.pid); };
+    const out = await makeLegacyPiNativeWitness({
+      source: src, signal: "SIGUSR1", tailEntryId: () => LEAF, modules: FAKE_MODULES, rounds: 1, roundGapMs: 0,
+    }).witness({ runner: TARGET_RUNNER, child: TARGET_CHILD, launchId: LAUNCH_ID, generation: GENERATION, sessionFile: SESSION_FILE });
+    // The intent audit was written BEFORE any delivery, and the facts say so.
+    expect(audits.length).toBeGreaterThan(0);
+    expect(out).toMatchObject({ ok: true });
+    // F3: the intent audit must name the pid, its role and the endpoint it is about to signal.
+    // One intent record per attach attempt, in the R-C-R order, once per witness run.
+    expect(audits.slice(0, 3)).toEqual([TARGET_RUNNER.pid, TARGET_CHILD.pid, TARGET_RUNNER.pid]);
+    expect(audits.length % 3).toBe(0);
+    const failing = await makeLegacyPiNativeWitness({
+      source: { ...src, preSignalSelfTest: async () => false }, signal: "SIGUSR1", tailEntryId: () => LEAF, modules: FAKE_MODULES, rounds: 1, roundGapMs: 0,
+    }).witness({ runner: TARGET_RUNNER, child: TARGET_CHILD, launchId: LAUNCH_ID, generation: GENERATION, sessionFile: SESSION_FILE });
+    // A pre-signal refusal reports delivered false: nothing was signalled. The intent
+    // audit WAS written before that point, so auditedBeforeDelivery is honestly TRUE at
+    // result time (the old eager snapshot pinned the stale pre-delivery false; H1-F1).
+    expect(failing).toMatchObject({ ok: false, reasons: ["nativetool_unavailable"], signal: { delivered: false, auditedBeforeDelivery: true } });
+  });
+
+  it("B4 refuses a public listener without attempting any close", async () => {
+    const b = await box();
+    const src = source(b);
+    const realOpen = src.openTransport;
+    src.openTransport = async (target, endpoint) => {
+      const unit = await realOpen(target, endpoint);
+      b.openedPorts.set(target.pid, endpoint.port);
+      b.publicPorts.set(target.pid, [endpoint.port]);
+      return unit;
+    };
+    src.pidScopedListeners = async (pid: number) => {
+      const opened = b.openedPorts.get(pid);
+      if (opened === undefined) return { ok: true, ports: [], public: [] };
+      return { ok: true, ports: [String(opened)], public: b.publicPorts.get(pid) ?? [] };
+    };
+    const out = await makeLegacyPiNativeWitness({
+      source: src, signal: "SIGUSR1", tailEntryId: () => LEAF, modules: FAKE_MODULES, rounds: 1, roundGapMs: 0,
+    }).witness({ ...witnessArgs });
+    expect(out).toMatchObject({ ok: false, reasons: ["inspector_endpoint_containment_failed"] });
+    // A public listener has no stray port we can attribute, so nothing is closed.
+    expect(b.discoveredCloseAttempts).toEqual([]);
+  });
+
+  it("B5 refuses without any signal when the self-test cannot run its tools", async () => {
+    const b = await box();
+    const out = await collectorFor(b, { sourceOverrides: { preSignalSelfTest: async () => false } }).witness({ ...witnessArgs });
+    expect(out).toMatchObject({ ok: false, reasons: ["nativetool_unavailable"] });
+    // Zero signals: an unusable tool must never reach delivery.
+    expect(b.signals).toEqual([]);
+  });
+
+  it("S2 the default self-test path refuses with zero signals when the tool is unresolvable", async () => {
+    const b = await box();
+    // No preSignalSelfTest override at all: the shipped default runs, and the census seam that
+    // stands in for ps/lsof is made to fail as an unresolvable tool would.
+    const out = await collectorFor(b, {
+      sourceOverrides: { pidScopedListeners: async () => ({ ok: false, ports: [], public: [] }) },
+    }).witness({ ...witnessArgs });
+    expect(out).toMatchObject({ ok: false, reasons: ["nativetool_unavailable"] });
+    expect(b.signals).toEqual([]);
+  });
+});
+
 describe.skipIf(process.platform === "win32")("legacy pi inspector transport (private fixture processes)", () => {
   let dir: string;
   let runner: ReturnType<typeof spawn> | null = null;
@@ -839,7 +1054,7 @@ describe.skipIf(process.platform === "win32")("legacy pi inspector transport (pr
           resolveEndpoint: async () => ({ host: "127.0.0.1", port: LEGACY_INSPECTOR_PORT }),
           endpointInUse,
           census: async pid => ({ pid, ppid: pid === 4242 ? 4000 : 4242, startedAt: "squatted" }),
-          deliverSignal: (pid) => { signals.push(pid); },
+          deliverSignal: (pid) => { signals.push(pid); return true; },
           openTransport: async () => { throw new Error("must never attach to a foreign listener"); },
           readIdentity: async pid => ({ pid, ppid: pid === 4242 ? 4000 : 4242, startedAt: "squatted" }),
         },
@@ -861,6 +1076,69 @@ describe.skipIf(process.platform === "win32")("legacy pi inspector transport (pr
   }, 20_000);
 });
 
+describe("legacy signal intent event construction", () => {
+  const seat: LegacySignalIntentSeatIdentity = { rigId: "xv", nodeId: "01M3QP9F8M1HZA5NDCAP79931D", logicalId: "orch1.lead" };
+  const binding = { runner: { pid: 4242 } };
+  const endpoint = { host: "127.0.0.1" as const, port: 17433 };
+  const at = "2026-10-06T08:00:00.000Z";
+
+  it("bound runner PID implies runner role", () => {
+    const target = { pid: 4242, startedAt: "2026-10-02T20:16:39.000Z" };
+    const event = buildLegacySignalIntentEvent({ seat, binding, target, endpoint, at });
+    expect(event.targetPid).toBe(4242);
+    expect(event.targetRole).toBe("runner");
+    expect(event.targetStartedAt).toBe("2026-10-02T20:16:39.000Z");
+    expect(event.endpointPort).toBe(17433);
+    expect(event.rigId).toBe("xv");
+    expect(event.nodeId).toBe("01M3QP9F8M1HZA5NDCAP79931D");
+    expect(event.logicalId).toBe("orch1.lead");
+    expect(event.at).toBe(at);
+    expect(event.type).toBe("seat.runner_rehost_legacy_signal_intent");
+    expect(event.signalDelivered).toBe(false);
+    expect(event.operator).toBe(null);
+  });
+
+  it("bound child PID implies child role", () => {
+    const target = { pid: 4243, startedAt: "2026-10-02T23:27:30.000Z" };
+    const event = buildLegacySignalIntentEvent({ seat, binding, target, endpoint, at });
+    expect(event.targetPid).toBe(4243);
+    expect(event.targetRole).toBe("child");
+    expect(event.targetStartedAt).toBe("2026-10-02T23:27:30.000Z");
+    expect(event.endpointPort).toBe(17433);
+    expect(event.rigId).toBe("xv");
+    expect(event.nodeId).toBe("01M3QP9F8M1HZA5NDCAP79931D");
+    expect(event.logicalId).toBe("orch1.lead");
+    expect(event.at).toBe(at);
+    expect(event.type).toBe("seat.runner_rehost_legacy_signal_intent");
+    expect(event.signalDelivered).toBe(false);
+    expect(event.operator).toBe(null);
+  });
+
+  it("parent/start/port/seat evidence unchanged across both roles", () => {
+    const runnerTarget = { pid: 4242, startedAt: "2026-10-02T20:16:39.000Z" };
+    const childTarget = { pid: 4243, startedAt: "2026-10-02T23:27:30.000Z" };
+    const runnerEvent = buildLegacySignalIntentEvent({ seat, binding, target: runnerTarget, endpoint, at });
+    const childEvent = buildLegacySignalIntentEvent({ seat, binding, target: childTarget, endpoint, at });
+
+    // Shared fields identical
+    expect(runnerEvent.rigId).toBe(childEvent.rigId);
+    expect(runnerEvent.nodeId).toBe(childEvent.nodeId);
+    expect(runnerEvent.logicalId).toBe(childEvent.logicalId);
+    expect(runnerEvent.at).toBe(childEvent.at);
+    expect(runnerEvent.endpointPort).toBe(childEvent.endpointPort);
+    expect(runnerEvent.type).toBe(childEvent.type);
+    expect(runnerEvent.signalDelivered).toBe(childEvent.signalDelivered);
+    expect(runnerEvent.operator).toBe(childEvent.operator);
+
+    // Role-specific fields differ
+    expect(runnerEvent.targetPid).toBe(4242);
+    expect(runnerEvent.targetRole).toBe("runner");
+    expect(runnerEvent.targetStartedAt).toBe("2026-10-02T20:16:39.000Z");
+    expect(childEvent.targetPid).toBe(4243);
+    expect(childEvent.targetRole).toBe("child");
+    expect(childEvent.targetStartedAt).toBe("2026-10-02T23:27:30.000Z");
+  });
+});
 async function identityOf(pid: number): Promise<LegacyPiTargetIdentity | null> {
   if (!Number.isInteger(pid) || pid <= 1) return null;
   try {

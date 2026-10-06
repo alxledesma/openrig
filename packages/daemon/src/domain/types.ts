@@ -182,6 +182,16 @@ export type RigEvent =
   // secret-boundary control — resume tokens are not treated as secret per the
   // 2026-07-02 founder ruling).
   | { type: "session.resume_token_captured"; rigId: string; nodeId: string; sessionName: string; sessionId: string; runtime: string; outcome: "captured" | "preserved" | "skipped"; resumeType?: string; provenance?: "adoption"; reason?: "missing_sidecar" | "parse_error" | "probe_timeout" | "invalid_token" | "stale_sidecar" | "higher_rank_present"; redacted: true }
+  // Legacy native-witness outcome. Narrow addition for the B5 audit: records that a diagnostic
+  // signal WAS delivered to a live runner and its pi child, and what the outcome was. It never
+  // asserts that a listener is closed unless the close was verified.
+  | { type: "seat.runner_rehost_legacy_signal_intent"; rigId: string; nodeId: string; logicalId: string;
+      reason: string; operator: string | null; at: string; signalDelivered: false;
+      targetPid: number; targetRole: "runner" | "child"; targetStartedAt: string; endpointPort: number }
+  | { type: "seat.runner_rehost_legacy_witness_outcome"; rigId: string; nodeId: string; logicalId: string;
+      reason: string; operator: string | null; at: string;
+      witnessRefused: true; code: string; reasons: string[]; signalDelivered: true; blindRetryAllowed: false;
+      binding: unknown; modules: unknown; deliveredPids: number[]; auditedBeforeDelivery: boolean }
   | { type: "seat.attention_cleared"; rigId: string; nodeId: string; sessionName: string; from: string; to: "ready"; clearedBy: "evidence" | "operator_attestation"; evidence?: { kind: string; state?: string; reason?: string }; reason?: string; previousError: string | null }
   | { type: "rig.imported"; rigId: string; specName: string; specVersion: string }
   // Package events (cross-rig, no rigId)

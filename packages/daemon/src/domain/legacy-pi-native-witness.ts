@@ -44,6 +44,8 @@ import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { runAsyncSite } from "./sync-site-wrap.js";
+import { resolveNativeTool } from "./codex-session-file-proof.js";
+import { readPidScopedListeners } from "./legacy-pi-native-provenance.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -66,6 +68,12 @@ export const LEGACY_WITNESS_REASONS = [
   "launch_identity_mismatch",
   "native_leaf_mismatch",
   "witness_sample_drift",
+  // G1/G2 containment: an observation tool that cannot be proven usable, or an
+  // endpoint that is not exactly the expected private loopback one.
+  "nativetool_unavailable",
+  "inspector_endpoint_containment_failed",
+  "signal_intent_unaudited",
+  "signal_undelivered",
 ] as const;
 
 export type LegacyPiWitnessReason = (typeof LEGACY_WITNESS_REASONS)[number];
@@ -83,6 +91,11 @@ export interface LegacyPiWitnessFailure {
   /** How many R-C-R rounds ran before the refusal: a count, never a timestamp. */
   rounds: number;
   detail?: string;
+  /** C2 REAL facts about this run, not inferred from the reason list. `delivered` is true only when
+   *  a signal was actually handed to a live target in THIS run; `audited` records whether the
+   *  durable before-signal intent audit was written BEFORE delivery. A caller must never guess
+   *  this from the reasons. */
+  signal?: { delivered: boolean; deliveredPids: number[]; auditedBeforeDelivery: boolean };
 }
 
 export interface LegacyPiWitnessAcceptance {
@@ -97,6 +110,11 @@ export interface LegacyPiWitnessAcceptance {
   /** Distinctive-but-opaque digest over the proven identities. Carries no pid,
    *  port, path or launch text, so it is safe in an audit receipt. */
   evidenceId: string;
+  /** H1-F2: a successful witness still delivered its activation signals: every round
+   *  signals both bound targets and closes them verified. Deliberately NO pids here:
+   *  an acceptance receipt must not echo process identifiers (G1 egress rule); the
+   *  caller already holds the verified binding identities it signalled. */
+  signal?: { delivered: boolean; auditedBeforeDelivery: boolean };
   rounds: number;
 }
 
@@ -106,13 +124,15 @@ export type LegacyPiWitnessResult =
 
 /** Reduce a refusal to the only form that may leave this module: closed reason
  *  tokens plus a round count. This is the single egress path for failures. */
-export function reduceWitnessFailure(failure: LegacyPiWitnessFailure): { reasons: LegacyPiWitnessReason[]; rounds: number } {
+export function reduceWitnessFailure(failure: LegacyPiWitnessFailure): { reasons: LegacyPiWitnessReason[]; rounds: number; signal?: LegacyPiWitnessFailure["signal"] } {
   const reasons = (failure.reasons ?? []).filter(isLegacyPiWitnessReason);
   return {
     // A refusal always names at least one closed reason. An empty set would be
     // indistinguishable from "no verdict", which is precisely the UNKNOWN defect.
     reasons: reasons.length > 0 ? reasons : ["inspector_unavailable"],
     rounds: Number.isFinite(failure.rounds) && failure.rounds > 0 ? Math.trunc(failure.rounds) : 0,
+    // C2: pass the real delivery facts through the single egress path, unchanged.
+    ...(failure.signal ? { signal: failure.signal } : {}),
   };
 }
 
@@ -191,11 +211,27 @@ export interface LegacyPiTransportSource {
   /** Fresh identity for a pid: `null` if not alive with the expected identity. */
   census(pid: number): Promise<LegacyPiTargetIdentity | null>;
   /** Deliver the activation signal to ONE pid. */
-  deliverSignal(pid: number, signal: string): void;
+  /** F2: returns TRUE only when the signal was actually delivered to the pid. */
+  deliverSignal(pid: number, signal: string): boolean;
   /** Attach to the target's already-open inspector listener on `endpoint`. */
   openTransport(target: LegacyPiTargetIdentity, endpoint: { host: "127.0.0.1"; port: number }): Promise<LegacyPiInspectorTransport>;
   /** Re-read a pid's identity AFTER the work, to prove the target did not change. */
   readIdentity(pid: number): Promise<LegacyPiTargetIdentity | null>;
+  /** G1: prove the observation tools work against this target BEFORE it is signalled.
+   *  A test double may omit this; the production source always supplies it, because a
+   *  signal whose listener cannot later be identified or closed must never be sent. */
+  preSignalSelfTest?(target: LegacyPiTargetIdentity): Promise<boolean>;
+  /** G2: the target's own listener set, for the before/after containment bracket. */
+  pidScopedListeners?(pid: number): Promise<{ ok: boolean; ports: number[]; public: number[] }>;
+  /** C2 durable BEFORE-signal intent audit. Written before ANY delivery; if it throws, the
+   *  collector delivers zero signals and refuses. Optional: without it nothing is recorded. */
+  recordSignalIntent?(target: LegacyPiTargetIdentity, endpoint: { host: "127.0.0.1"; port: number }): Promise<void>;
+  /** Verified close of a listener the target ACTUALLY opened on a discovered port other than the
+   *  expected endpoint. Optional: without it a discovered stray cannot be closed and is reported. */
+  /** F1: expectedStartedAt is MANDATORY. A discovered-endpoint close must be bracketed by the exact
+   *  original start identity; omitting it would skip the bracket entirely. */
+  closeDiscoveredListener?(pid: number, port: number, expectedStartedAt: string): Promise<{ listenerClosed: boolean }>;
+  /** Verified close of an arbitrary pid-scoped loopback port discovered after the signal. */
 }
 
 export interface LegacyPiWitnessOptions {
@@ -301,6 +337,13 @@ export function makeLegacyPiNativeWitness(options: LegacyPiWitnessOptions): Lega
   const rounds = Math.max(2, Math.trunc(options.rounds ?? DEFAULT_ROUNDS));
   const roundGapMs = options.roundGapMs ?? DEFAULT_ROUND_GAP_MS;
   const wait = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms); });
+  // Bounded listener appearance: a short, fixed attempt budget. Small enough that a target that
+  // never binds fails fast, large enough that a normal inspector thread bind is observed.
+  // The appearance window matches the attach budget (DEFAULT_LISTEN_TIMEOUT_MS). The previous 8x50ms
+  // poll was far shorter than the 8s the attach itself waits, so a late-binding target was refused
+  // and then left with an inspector nobody was watching. Early exit keeps the common case immediate.
+  const LISTENER_APPEARANCE_TIMEOUT_MS = DEFAULT_LISTEN_TIMEOUT_MS;
+  const LISTENER_APPEARANCE_DELAY_MS = 50;
 
   /** Attach, read, and ALWAYS close — including on every failure path. A unit we
    *  opened but cannot prove closed is itself a refusal: the target must never
@@ -308,20 +351,82 @@ export function makeLegacyPiNativeWitness(options: LegacyPiWitnessOptions): Lega
   async function withTransport(
     target: LegacyPiTargetIdentity,
     expectedParent: number | null,
+    delivery: { pids: number[]; audited: boolean },
     body: (transport: LegacyPiInspectorTransport) => Promise<ProjectionRead>,
   ): Promise<ProjectionRead> {
     let transport: LegacyPiInspectorTransport | null = null;
     let closeFailed = false;
+    // C2 REAL delivery facts for this run. `deliveredPids` is appended only when a signal is
+    // actually handed to a live target; `auditedBeforeDelivery` records whether the durable
+    // before-signal intent audit was written BEFORE any delivery.
     try {
       const endpoint = await options.source.resolveEndpoint();
+      // C2 DURABLE BEFORE-SIGNAL INTENT AUDIT. Written before ANY delivery; if it throws, ZERO
+      // signals are delivered, because an unrecorded delivery is the failure this exists to stop.
+      const audit = options.source.recordSignalIntent;
+      if (audit) {
+        try { await audit(target, endpoint); delivery.audited = true; }
+        catch { return "signal_intent_unaudited"; }
+      }
       // A port already in use means an inspector is open that we did not open and
       // cannot attribute. Refuse BEFORE the signal; never adopt a foreign listener.
       if (await options.source.endpointInUse(endpoint)) return "inspector_endpoint_unavailable";
+      // G1 PRE-SIGNAL SELF-TEST. The tools that prove the target and own its listener
+      // must work BEFORE a signal is sent: a signal whose listener cannot later be
+      // identified or closed is the failure this bridge must never create. A failure
+      // here refuses with zero signals delivered.
+      if (options.source.preSignalSelfTest && !(await options.source.preSignalSelfTest(target))) return "nativetool_unavailable";
       if (!(await verifyTarget(target, expectedParent))) return "target_identity_unproven";
-      options.source.deliverSignal(target.pid, options.signal);
+      // G2 BASELINE. The pid-scoped listener set must be empty before we ask the target
+      // to open one, so the listener we later see is attributable to this request.
+      if (options.source.pidScopedListeners) {
+        const baseline = await options.source.pidScopedListeners(target.pid);
+        if (!baseline.ok) return "nativetool_unavailable";
+        if (baseline.ports.length > 0 || baseline.public.length > 0) return "inspector_endpoint_unavailable";
+      }
+      // F2 TYPED PRE-EFFECT REFUSAL. A signal that was NOT delivered is not a partial success:
+      // continuing would attach to a target that never opened an inspector, and the eventual
+      // failure would be indistinguishable from a post-delivery problem. Refuse BEFORE the attach.
+      if (!options.source.deliverSignal(target.pid, options.signal)) return "signal_undelivered";
+      delivery.pids.push(target.pid);
       transport = await options.source.openTransport(target, endpoint);
       if (transport.registration.pid !== target.pid) return "target_identity_unproven";
       if (transport.registration.startIdentity !== target.startedAt) return "target_identity_unproven";
+      // G2 CONTAINMENT, BOUNDED LISTENER APPEARANCE. openTransport returns before the
+      // inspector thread has necessarily bound its socket, so the set is polled until it is
+      // non-empty or the bounded attempt budget is spent. Reading it once produced spurious
+      // refusals against a healthy target.
+      let discovered: { ports: number[]; public: number[] } | null = null;
+      if (options.source.pidScopedListeners) {
+        const bound = await pidScopedListenerSetAppears(target.pid, endpoint.port);
+        if (!bound) return "nativetool_unavailable";
+        discovered = bound.set;
+        // Nothing appeared at all: there is no discovered endpoint to close, so this is a plain
+        // containment refusal. Only a REAL stray or public listener triggers a close attempt.
+        const strayFound = discovered.ports.find(port => Number(port) !== endpoint.port);
+        if (discovered.ports.length === 0 && discovered.public.length === 0) return "inspector_endpoint_containment_failed";
+        if (discovered.public.length > 0 || discovered.ports.length !== 1 || Number(discovered.ports[0]) !== endpoint.port) {
+          // ACTUAL DISCOVERED STRAY ENDPOINT. Close the port the target really opened before
+          // refusing; the built-in close only ever targets the expected 9229, so a stray X was
+          // previously left open while the transport reported a verified close.
+          // Close ONLY a port the target actually opened on some OTHER port. A public listener has
+          // no stray port we can attribute, so it refuses without a close attempt rather than
+          // closing an endpoint we never proved was ours.
+          const closeDiscovered = options.source.closeDiscoveredListener;
+          if (strayFound !== undefined && closeDiscovered) {
+            // The expected start identity is passed so the close is bracketed by the SAME original
+            // process on both sides; a re-used pid cannot be closed by this path.
+            if (!target.startedAt.trim()) { closeFailed = true; return "inspector_endpoint_containment_failed"; }
+            const strayClosed = await closeDiscovered.call(options.source, target.pid, Number(strayFound), target.startedAt);
+            if (!strayClosed.listenerClosed) closeFailed = true;
+          } else if (strayFound !== undefined) {
+            // A stray was found but nothing can close it: that is an unverified cleanup, not a
+            // quiet refusal, so it escalates to the typed UNKNOWN close-unverified path.
+            closeFailed = true;
+          }
+          return "inspector_endpoint_containment_failed";
+        }
+      }
       if (!(await transport.verifyListenerOwnership())) return "inspector_listener_unverified";
       if (!(await verifyTarget(target, expectedParent))) return "target_identity_unproven";
       return await body(transport);
@@ -338,6 +443,31 @@ export function makeLegacyPiNativeWitness(options: LegacyPiWitnessOptions): Lega
         } catch { closeFailed = true; }
       }
       if (closeFailed) throw new LegacyPiCloseUnverified();
+    }
+  }
+
+
+  /** Bounded wait for the pid-scoped listener set to become non-empty. Each attempt reads the
+   *  live set and stops as soon as the expected port is present, a stray/public listener appears,
+   *  or the budget is spent. Never unbounded, and never concurrent probes. */
+  async function pidScopedListenerSetAppears(
+    pid: number, expectedPort: number,
+  ): Promise<{ set: { ports: number[]; public: number[] } } | null> {
+    const read = options.source.pidScopedListeners;
+    if (!read) return { set: { ports: [], public: [] } };
+    // Early exit the moment anything appears: the expected endpoint, a stray, or a public bind.
+    // The full window is bounded by DEFAULT_LISTEN_TIMEOUT_MS, matching the attach budget, so a
+    // late binder is waited for rather than refused and then left unwatched.
+    const deadline = Date.now() + LISTENER_APPEARANCE_TIMEOUT_MS;
+    for (;;) {
+      const set = await read(pid);
+      if (!set.ok) return null;
+      // Ports compare numerically: the census may report strings, and a mismatch here would look
+      // exactly like a containment failure.
+      if (set.public.length > 0 || set.ports.some(port => Number(port) === expectedPort) || set.ports.length > 0)
+        return { set };
+      if (Date.now() >= deadline) return { set };
+      await new Promise<void>((resolve) => { setTimeout(resolve, LISTENER_APPEARANCE_DELAY_MS); });
     }
   }
 
@@ -388,12 +518,12 @@ export function makeLegacyPiNativeWitness(options: LegacyPiWitnessOptions): Lega
   /** One R-C-R round: runner, child, runner again. Bracketing the child read with
    *  a second runner read means a turn that begins during the child read cannot
    *  hide between samples. */
-  async function takeRound(binding: LegacyPiWitnessBinding): Promise<RoundOutcome> {
-    const first = await withTransport(binding.runner, null, readRunner);
+  async function takeRound(binding: LegacyPiWitnessBinding, delivery: { pids: number[]; audited: boolean }): Promise<RoundOutcome> {
+    const first = await withTransport(binding.runner, null, delivery, readRunner);
     if (isReason(first)) return first;
-    const middle = await withTransport(binding.child, binding.runner.pid, readChild);
+    const middle = await withTransport(binding.child, binding.runner.pid, delivery, readChild);
     if (isReason(middle)) return middle;
-    const last = await withTransport(binding.runner, null, readRunner);
+    const last = await withTransport(binding.runner, null, delivery, readRunner);
     if (isReason(last)) return last;
     // The bracketing pair must agree: the runner did not move while we read the child.
     if (roundSignature({ runner: first, child: {} }) !== roundSignature({ runner: last, child: {} })) return "witness_sample_drift";
@@ -428,8 +558,14 @@ export function makeLegacyPiNativeWitness(options: LegacyPiWitnessOptions): Lega
 
   return {
     async witness(binding: LegacyPiWitnessBinding): Promise<LegacyPiWitnessResult> {
+      // H1-F1: facts are computed AT RESULT TIME. `delivery.pids`/`delivery.audited` are
+      // mutated by withTransport AFTER this point; a snapshot built here would freeze the
+      // empty pre-delivery state and every post-signal failure would claim delivered:false,
+      // making the service's typed UNKNOWN branch unreachable against the real collector.
+      const delivery = { pids: [] as number[], audited: false };
+      const signalFacts = () => ({ delivered: delivery.pids.length > 0, deliveredPids: [...new Set(delivery.pids)], auditedBeforeDelivery: delivery.audited });
       const fail = (reasons: LegacyPiWitnessReason[], rounds: number): LegacyPiWitnessResult => ({
-        ok: false, ...reduceWitnessFailure({ reasons, rounds }),
+        ok: false, ...reduceWitnessFailure({ reasons, rounds, signal: signalFacts() }),
       });
       // 1. The hint must be a live, non-self, correctly-parented process.
       if (!(await verifyTarget(binding.runner, null))) return fail(["target_identity_unproven"], 0);
@@ -440,7 +576,7 @@ export function makeLegacyPiNativeWitness(options: LegacyPiWitnessOptions): Lega
         if (round > 1) await wait(roundGapMs);
         let result: RoundOutcome;
         try {
-          result = await takeRound(binding);
+          result = await takeRound(binding, delivery);
         } catch (error) {
           // A close that could not be verified is its own refusal, and it outranks
           // whatever the round was reading.
@@ -465,7 +601,9 @@ export function makeLegacyPiNativeWitness(options: LegacyPiWitnessOptions): Lega
       const evidenceId = `sha256:${createHash("sha256").update(JSON.stringify([
         binding.runner.startedAt, binding.child.startedAt, decided.nativeLeaf, decided.sessionId, decided.sessionFile,
       ])).digest("hex").slice(0, 16)}`;
-      return { ok: true, evidenceId, rounds, ...decided };
+      // H1-F2: even SUCCESS carries the delivery CLASS facts (no pids, per the G1 egress
+      // rule): a witnessed round DID signal both bound targets and closed them verified.
+      return { ok: true, evidenceId, rounds, ...decided, signal: { delivered: delivery.pids.length > 0, auditedBeforeDelivery: delivery.audited } };
     },
   };
 }
@@ -773,7 +911,9 @@ export async function readProcessIdentity(pid: number): Promise<LegacyPiTargetId
   return await runAsyncSite("legacy-witness.read-identity", async () => {
     if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return null;
     try {
-      const { stdout } = await execFileAsync("ps", ["-Ao", "pid,ppid,lstart"], {
+      const psTool = resolveNativeTool("ps");
+      if (!psTool) return null;
+      const { stdout } = await execFileAsync(psTool, ["-Ao", "pid,ppid,lstart"], {
         encoding: "utf-8", maxBuffer: 8 * 1024 * 1024, env: { ...process.env, LC_ALL: "C" },
       });
       for (const line of stdout.split("\n")) {
@@ -806,8 +946,69 @@ export function makeNativeLegacyPiTransportSource(modules: LegacyPiModuleBinding
     resolveEndpoint: resolveInspectorEndpoint,
     endpointInUse,
     census: readProcessIdentity,
-    deliverSignal: (pid, signal) => { deliverTargetSignal(pid, signal); },
+    // F2: return the ACTUAL delivery result. deliverTargetSignal returns false when the kill was
+    // refused or failed, and discarding that made the collector record an attempted signal as
+    // delivered.
+    deliverSignal: (pid, signal) => deliverTargetSignal(pid, signal),
     readIdentity: readProcessIdentity,
+    // G1: both observation tools must resolve AND work against this pid before any
+    // signal. The kernel-region extractor is the service's own gate, not ours.
+    preSignalSelfTest: async (target: LegacyPiTargetIdentity) => {
+      if (!resolveNativeTool("ps") || !resolveNativeTool("lsof")) return false;
+      if (!(await readProcessIdentity(target.pid))) return false;
+      const snapshot = await readPidScopedListeners({ pid: target.pid });
+      return snapshot.ok;
+    },
+    pidScopedListeners: async (pid: number) => {
+      const snapshot = await readPidScopedListeners({ pid });
+      return { ok: snapshot.ok, ports: snapshot.ports, public: snapshot.public };
+    },
+    /**
+     * C1 PRODUCTION CLOSE of a DISCOVERED loopback endpoint.
+     *
+     * A real closure needs the CLIENT ATTACHED: InspectorClient.close() only asks the target to
+     * drop its listener through a Runtime.evaluate, and send() rejects when there is no open socket.
+     * Constructing the client and calling close without connect() therefore never evaluates anything
+     * and could only ever fall back to observing absence — it could never close the stray listener.
+     * So: connect, ask the target to close, then let close() prove the listener is gone.
+     *
+     * Ownership is bracketed by the EXACT ORIGINAL startedAt on BOTH sides of the interaction, not
+     * by "some identity is readable": a re-used pid fails the before-bracket and cannot be closed.
+     * `enable()` is deliberately NOT called: closing needs only Runtime.evaluate, and Debugger.enable
+     * would replay the target's already-parsed scripts for no benefit.
+     */
+    closeDiscoveredListener: async (pid: number, port: number, expectedStartedAt: string) => {
+      // F1 RUNTIME GUARD. The parameter is mandatory in the type, but a JavaScript caller can still
+      // omit it: that must be REFUSED at runtime, never throw and never skip the identity brackets.
+      if (typeof expectedStartedAt !== "string" || !expectedStartedAt.trim()) return { listenerClosed: false };
+      const snapshot = await readPidScopedListeners({ pid });
+      if (!snapshot.ok) return { listenerClosed: false };
+      if (snapshot.public.length > 0) return { listenerClosed: false };
+      if (!snapshot.ports.map(Number).includes(port)) return { listenerClosed: false };
+      // BEFORE bracket: the pid must be the SAME original process, not merely a live one.
+      const before = await readProcessIdentity(pid);
+      if (!before || before.startedAt !== expectedStartedAt) return { listenerClosed: false };
+      if ((await listenerPids(port)).length !== 1) return { listenerClosed: false };
+      const client = new InspectorClient("127.0.0.1", port);
+      try {
+        await client.connect(DEFAULT_LISTEN_TIMEOUT_MS);
+      } catch {
+        // Without a connection nothing can be evaluated, so no closure can be proven.
+        return { listenerClosed: false };
+      }
+      // F1 RE-BRACKET IMMEDIATELY BEFORE THE EVALUATE. connect() can take up to the full listen
+      // budget, so the process or the port owner can change inside that window. Without this check
+      // the fixed close expression would run in whatever process now answers on that port.
+      const preEvaluate = await readProcessIdentity(pid);
+      if (!preEvaluate || preEvaluate.startedAt !== expectedStartedAt) return { listenerClosed: false };
+      const preOwners = await listenerPids(port);
+      if (preOwners.length !== 1 || preOwners[0] !== pid) return { listenerClosed: false };
+      const closed = await client.close(DEFAULT_CLOSE_GRACE_MS, true);
+      // AFTER bracket: the pid must still be the same original process for that closure to be ours.
+      const after = await readProcessIdentity(pid);
+      if (!after || after.startedAt !== expectedStartedAt) return { listenerClosed: false };
+      return { listenerClosed: closed.listenerClosed };
+    },
     openTransport: async (target, endpoint) => {
       const client = new InspectorClient(endpoint.host, endpoint.port);
       let attachment: Promise<void> | undefined;
@@ -864,7 +1065,9 @@ async function waitForListener(endpoint: { host: "127.0.0.1"; port: number }, ti
  *  caller must treat as unverified rather than as absent. */
 async function listenerPids(port: number): Promise<number[]> {
   try {
-    const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { encoding: "utf-8", maxBuffer: 64 * 1024 });
+    const lsofTool = resolveNativeTool("lsof");
+    if (!lsofTool) return [];
+    const { stdout } = await execFileAsync(lsofTool, ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { encoding: "utf-8", maxBuffer: 64 * 1024 });
     return stdout.split(/\s+/).filter(Boolean).map(Number).filter(value => Number.isInteger(value));
   } catch { return []; }
 }

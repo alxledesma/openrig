@@ -658,6 +658,7 @@ Examples:
     .argument("<seat>", "Canonical session name or logical seat ref")
     .requiredOption("--reason <text>", "Audit reason recorded on the seat.runner_rehost_* events")
     .option("--operator <address>", "Operator recorded on the audit events")
+    .option("--legacy-native-witness", "EXPLICIT opt-in: prove the pre-stop idle witness from the daemon's own native evidence for a legacy Pi runner")
     .option("--json", "JSON output for agents")
     .description("Rehost a live pi seat's runner onto the SAME session file at the SAME generation")
     .addHelpText("after", `
@@ -672,11 +673,25 @@ The seat typing guard stays ENABLED on return: rehost never flushes held
 messages and never retries, releases or relabels an UNKNOWN effect. Any failed
 step writes a failed event and stops; there is no fresh, handover or fork
 fallback and no blind retry.
+
+--legacy-native-witness is an explicit, off-by-default opt-in for a seat whose
+live runner is the old Pi build. It asks the DAEMON to collect the pre-stop idle
+evidence from its own native observation of the exact live processes; it supplies
+no witness, leaf, module path, endpoint, port, pid or cursor, and the request
+authoring any of those is refused. It bypasses exactly one gate, the sidecar
+cursor equality, because that old build persists a generic event id that can name
+no session entry; every other guard, pid, module, endpoint and generation gate
+still applies, and the replacement must be the current fallback-capable runner.
+It requires the typing guard ON exactly as the ordinary rehost does, and it
+credits no continuity or historical projection.
 Examples:
   rig seat rehost-runner intake-lead@app-handy-conveyor --reason "runner qualification upgrade" --json
-  rig seat rehost-runner dev.impl --reason "upgrade runner" --operator orch-lead@my-rig`)
-    .action(async (seat: string, opts: { reason: string; operator?: string; json?: boolean }) => {
-      await runLifecycleVerb("rehost-runner", seat, { reason: opts.reason, operator: opts.operator }, opts, (data) => {
+  rig seat rehost-runner dev.impl --reason "upgrade runner" --operator orch-lead@my-rig
+  rig seat rehost-runner legacy@rig --reason "legacy runner bridge" --legacy-native-witness`)
+    .action(async (seat: string, opts: { reason: string; operator?: string; legacyNativeWitness?: boolean; json?: boolean }) => {
+      // The flag is transported as a STRICT boolean and nothing else. No proof value
+      // is ever authored here; the daemon builds the witness itself.
+      await runLifecycleVerb("rehost-runner", seat, { reason: opts.reason, operator: opts.operator, legacyNativeWitness: opts.legacyNativeWitness === true }, opts, (data) => {
         if (!data["ok"]) {
           console.error(`Rehost refused: ${String(data["code"] ?? "unknown")} - ${String(data["message"] ?? "")}`);
           return;

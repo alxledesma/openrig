@@ -27,6 +27,9 @@ import { SettingsStore } from "../domain/user-settings/settings-store.js";
 import { transportSenderSession } from "./require-sender-identity.js";
 import { PiResumeAdapter } from "../adapters/pi-resume.js";
 import { piSeatPaths, parsePiRunnerState } from "../adapters/pi-runner-protocol.js";
+import { makeLegacyPiNativeWitness, makeNativeLegacyPiTransportSource } from "../domain/legacy-pi-native-witness.js";
+import { resolvePiInstallationModule } from "../domain/pi-installation-module-resolver.js";
+import { observeLegacyPiEnvironment } from "../domain/legacy-pi-native-provenance.js";
 /** Bounded positional tail window for the idle witness; matches the native 64 KiB evidence. */
 const PI_SESSION_TAIL_WINDOW_BYTES = 65536;
 
@@ -34,6 +37,7 @@ import { makePiNativeProver } from "../domain/coordinator-runtime-availability.j
 import { execCommand } from "../adapters/tmux-exec.js";
 import { listNativeProcesses } from "../domain/native-process-lineage.js";
 import { resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const seatRoutes = new Hono();
 
@@ -259,6 +263,37 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
   return c.json(result, 404);
 });
 
+/** The exact seat identity the intent audit attributes a signal to. Taken from the plan's
+ *  already-verified seat binding; never empty and never caller-supplied. */
+export interface LegacySignalIntentSeatIdentity { rigId: string; nodeId: string; logicalId: string }
+
+/** PURE construction of the durable before-signal intent event.
+ *
+ *  G1: the role is derived from the BOUND runner pid, never from ppid. A runner's ppid is its
+ *  pane shell and is never 0, so the previous ppid test labelled BOTH targets "child" and wrote a
+ *  false fact into the audit. Everything here is a direct read of already-verified inputs: no
+ *  clock read, no I/O, no environment. `at` is passed in so the caller owns the timestamp.
+ *
+ *  F3: the record must distinguish two targets that start in the same second, so it names the
+ *  pid, its role, the shared start and the endpoint it is about to be told about.
+ */
+export function buildLegacySignalIntentEvent(input: {
+  seat: LegacySignalIntentSeatIdentity;
+  binding: { runner: { pid: number } };
+  target: { pid: number; startedAt: string };
+  endpoint: { host: "127.0.0.1"; port: number };
+  at: string;
+}) {
+  return {
+    type: "seat.runner_rehost_legacy_signal_intent" as const,
+    rigId: input.seat.rigId, nodeId: input.seat.nodeId, logicalId: input.seat.logicalId,
+    reason: "legacy_pi_native_witness", operator: null, at: input.at,
+    signalDelivered: false as const, targetPid: input.target.pid,
+    targetRole: input.target.pid === input.binding.runner.pid ? "runner" as const : "child" as const,
+    targetStartedAt: input.target.startedAt, endpointPort: input.endpoint.port,
+  };
+}
+
 // S5 (OPR.0.5.4.7) — the seat-lifecycle verb surface: set-model / stop / clean.
 // One service, one resolution path, one status mapping shared by all three verbs.
 export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifecycleService {
@@ -277,6 +312,29 @@ export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifec
   });
 }
 
+/** Keys a caller may NEVER author for the legacy native-witness option. The option
+ *  carries a strict boolean and NOTHING else: the daemon builds the witness itself,
+ *  from its own census and module bindings. A request carrying any of these is
+ *  refused outright rather than stripped, so an authored proof can never be silent. */
+export const LEGACY_WITNESS_FORBIDDEN_REQUEST_KEYS = [
+  "witness", "proof", "nativeWitness", "nativeLeaf", "leaf", "leafId",
+  "lastEntryId", "cursor", "modules", "moduleUrl", "runnerModuleUrl", "piModuleUrl",
+  "modulePath", "scriptPath", "endpoint", "inspectorPort", "port", "pid",
+  "runnerPid", "childPid", "ppid", "sessionFile", "launchId", "generation",
+] as const;
+
+/** Parse the EXPLICIT legacy native-witness option. Absent means the ordinary rehost;
+ *  present it must be a real boolean; nothing else about the bridge is settable. */
+export function parseLegacyNativeWitnessRequest(body: Record<string, unknown>): { ok: true; legacyNativeWitness: boolean } | { ok: false; error: string } {
+  for (const key of LEGACY_WITNESS_FORBIDDEN_REQUEST_KEYS) {
+    if (key in body) return { ok: false, error: `${key} is not accepted: the legacy native witness is built by the daemon, never supplied by a caller` };
+  }
+  const raw = body["legacyNativeWitness"];
+  if (raw === undefined) return { ok: true, legacyNativeWitness: false };
+  if (typeof raw !== "boolean") return { ok: false, error: "legacyNativeWitness must be a boolean when present" };
+  return { ok: true, legacyNativeWitness: raw };
+}
+
 // Same-generation Pi runner rehost. The shipped resume primitive, the shipped pi
 // native prover and the shipped runner-state parser are constructed here
 // unchanged; startup does not expose them on the request context. Paths derive
@@ -286,6 +344,8 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   const body = await c.req.json<Record<string, unknown>>();
   if (typeof body.reason !== "string" || !body.reason.trim()) return c.json({ error: "reason required" }, 400);
   if (body.operator !== undefined && typeof body.operator !== "string") return c.json({ error: "operator must be a string when present" }, 400);
+  const legacyRequest = parseLegacyNativeWitnessRequest(body);
+  if (!legacyRequest.ok) return c.json({ error: legacyRequest.error }, 400);
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
   const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter;
   const stateRoot = join(OPENRIG_HOME, "state", "pi");
@@ -300,6 +360,28 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   // observations. It is scoped to the request closure, holds no argv, env, path
   // or pid text, and is read once when the pre-effect identity refusal is built.
   const proofReasons: import("../domain/coordinator-runtime-availability.js").PiProofReason[] = [];
+  /** Bounded 64 KiB POSITIONAL tail entry id, shared by the ordinary idle gate and
+   *  the legacy witness so both credit the very same read of the very same file. */
+  const boundedTailEntryId = (p: string): string | null => {
+    try {
+      const size = statSync(p).size;
+      const window = Math.min(size, PI_SESSION_TAIL_WINDOW_BYTES);
+      const start = size - window;
+      const buffer = Buffer.alloc(window);
+      const fd = openSync(p, "r");
+      try { readSync(fd, buffer, 0, window, start); } finally { closeSync(fd); }
+      const text = buffer.toString("utf-8");
+      const lines = text.split("\n").filter(line => line.trim().length > 0);
+      const tail = lines[lines.length - 1];
+      if (!tail) return null;
+      // A single entry larger than the window means we did not see its start.
+      if (start > 0 && lines.length === 1) return null;
+      // Refuse a truncated final entry: the tail must end at a record boundary.
+      if (start > 0 && !text.endsWith("\n")) return null;
+      const parsed = JSON.parse(tail) as { id?: unknown };
+      return typeof parsed.id === "string" && /^[0-9a-f]{8}$/i.test(parsed.id) ? parsed.id : null;
+    } catch { return null; }
+  };
   const lifecycle = new SeatLifecycleService({
     db: rigRepo.db,
     rigRepo,
@@ -318,8 +400,7 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
       const p = piSeatPaths(stateRoot, sessionName).runnerStatePath;
       return existsSync(p) ? parsePiRunnerState(readFileSync(p, "utf-8")) : null;
     },
-    piSessionFileExists: (p: string) => existsSync(p),
-    // Bounded 64 KiB POSITIONAL tail: read only the last window, never the whole file.
+    piSessionFileExists: (p: string) => existsSync(p),    // Bounded 64 KiB POSITIONAL tail: read only the last window, never the whole file.
     // An entry larger than the window, or a final line without its terminating newline
     // (a partial/in-progress append), returns null so rehost refuses instead of
     // parsing an optimistic value. No transcript content is ever returned.
@@ -335,31 +416,70 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
         return `w${window}:${createHash("sha256").update(buffer).digest("hex").slice(0, 16)}`;
       } catch { return null; }
     },
-    piSessionTailEntryId: (p: string) => {
-      try {
-        const size = statSync(p).size;
-        const window = Math.min(size, PI_SESSION_TAIL_WINDOW_BYTES);
-        const start = size - window;
-        const buffer = Buffer.alloc(window);
-        const fd = openSync(p, "r");
-        try { readSync(fd, buffer, 0, window, start); } finally { closeSync(fd); }
-        const text = buffer.toString("utf-8");
-        const lines = text.split("\n").filter(line => line.trim().length > 0);
-        const tail = lines[lines.length - 1];
-        if (!tail) return null;
-        // A single entry larger than the window means we did not see its start.
-        if (start > 0 && lines.length === 1) return null;
-        // Refuse a truncated final entry: the tail must end at a record boundary.
-        if (start > 0 && !text.endsWith("\n")) return null;
-        const parsed = JSON.parse(tail) as { id?: unknown };
-        return typeof parsed.id === "string" && /^[0-9a-f]{8}$/i.test(parsed.id) ? parsed.id : null;
-      } catch { return null; }
+    piSessionTailEntryId: boundedTailEntryId,
+    // EXPLICIT legacy native-witness option only. The seam constructs the REAL
+    // collector per call, from the module binding the service derived from the exact
+    // native process commands, and passes the SAME bounded tail reader this route
+    // already trusts for the ordinary idle gate. Nothing is constructed, signalled or
+    // opened unless the explicit option asks for it.
+    legacyPiWitness: {
+      witness: request => makeLegacyPiNativeWitness({
+        source: {
+          ...makeNativeLegacyPiTransportSource(request.modules),
+          // C2 durable BEFORE-signal intent audit. Written before any delivery; if it throws the
+          // collector delivers ZERO signals and refuses, so a delivery is never unrecorded.
+          recordSignalIntent: async (target, endpoint) => {
+            // The seat identity is not in scope at this seam; the intent record is keyed by the
+            // target's own bound start identity, which is what the audit must attest anyway.
+            // The event body is built by an extracted PURE helper so the audit facts can be
+            // asserted directly, without standing up a router, a database or a witness run.
+            rigRepo.db.transaction(() => (c.get("eventBus" as never) as EventBus).persistWithinTransaction(
+              buildLegacySignalIntentEvent({ seat: request.seat, binding: request.binding, target, endpoint, at: new Date().toISOString() }),
+            ))();
+          },
+        },
+        modules: request.modules,
+        signal: "SIGUSR1",
+        tailEntryId: boundedTailEntryId,
+      }).witness(request.binding),
     },
+    // The CURRENT fallback-capable runner this route's resume launches. The legacy
+    // path refuses without it: it must be able to prove the replacement is this one.
+    currentPiRunnerEntryPath: runnerEntryPath,
+    // The Pi cached-chunk module comes from TRUSTED INSTALLATION PROVENANCE: the
+    // executable the daemon launches as the Pi runtime, resolved through that
+    // installation's own static import graph to the ONE module both required classes
+    // are exported from. It is deliberately NOT derived from the child's argv, which
+    // Pi overwrites with its own process title. The child's argv is the bare string
+    // "pi", so no census-derived binding could ever be sound. An unresolvable
+    // installation returns null and the option refuses with a typed blocker.
+    // ONE resolver call per request: the module and the entry it was reached from are
+    // the same resolved installation, so they can never come from different graphs.
+    legacyPiCachedModuleUrl: (targetStartedAtMs?: number) => {
+      const resolved = resolvePiInstallationModule({
+        executable: process.env["OPENRIG_PI_EXECUTABLE"]?.trim() || "pi",
+        pathEnv: process.env["PATH"],
+        // Every file of the walked graph must predate the child that loaded it. Passing the
+        // target start here is what makes that a graph-wide bound instead of two picked files.
+        ...(targetStartedAtMs !== undefined ? { targetStartedAtMs } : {}),
+        // Refuse a graph that could change or intercept the inspector itself.
+        scanForbiddenTokens: true,
+      });
+      return resolved.ok ? { modulePath: fileURLToPath(resolved.value.moduleUrl), entryPath: fileURLToPath(resolved.value.entryUrl) } : null;
+    },
+    // Daemon-set of PROVEN legacy runner script hashes. Daemon-owned configuration;
+    // an unmatched live script refuses rather than being treated as this build.
+    legacyRunnerHashes: (process.env["OPENRIG_LEGACY_RUNNER_HASHES"] ?? "")
+      .split(",").map(entry => entry.trim().toLowerCase()).filter(entry => /^[0-9a-f]{64}$/.test(entry)),
+    // Reduced kernel-region environment provenance per target: the seat's occupant
+    // generation positive control, plus whether NODE_OPTIONS is present. No values.
+    legacyEnvironmentObserver: input => observeLegacyPiEnvironment(input),
   });
   const result = await lifecycle.rehostRunner({
     seatRef: decodeURIComponent(c.req.param("seatRef")),
     reason: body.reason,
     operator: (body.operator as string | undefined) ?? null,
+    legacyNativeWitness: legacyRequest.legacyNativeWitness,
     onPreEffectRefusal: refusal => (refusal.code === "rehost_process_identity_unknown" ? { ...refusal, observed: { ...(refusal.observed ?? {}), reasons: [...new Set([...proofReasons.map(r => r.code), ...((refusal.observed?.reasons as string[] | undefined) ?? [])])] } } : refusal),
   });
   return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
