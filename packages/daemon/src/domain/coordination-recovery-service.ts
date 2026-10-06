@@ -15,9 +15,13 @@ const dutyKinds:Record<DutyKind,{binding:'currentHolder'|'currentOperator'|'reci
 };
 export interface DutyFacts {claim:boolean;send:boolean;act:boolean;complete:boolean;close:boolean;retired:boolean;failedByRecipient:boolean;superseded:boolean;expired:boolean;queueId:string;reason?:string}
 export interface CoordinationActivity { generation:string; identityVerified:boolean; identityObservedAt?:string|null; state:ArbitratedSeatState; witness:ActivityEvidence|null }
+/** Exact retained-history form, or a pre-bound product successor naming an immutable admitted package instance. Only the accepted disposition is resolved later, from that exact instance. */
+export type CoordinationPredecessor={queueId:string;dispositionId:string}|{packageKey:string;contractHash:string;queueId:string};
+type BoundPredecessor=Extract<CoordinationPredecessor,{packageKey:string}>;
+const isBoundPredecessor=(p:CoordinationPredecessor):p is BoundPredecessor=>!!p&&typeof p==='object'&&'packageKey' in p;
 export interface CoordinationTask {
  key:string; packageKey:string; owner:string; action:string; deadline:number; body:string; recoveryFor?:string;
- predecessors:Array<{queueId:string;dispositionId:string}>;
+ predecessors:CoordinationPredecessor[];
  admission:{generation:string;configurationDigest:string;qualificationRef:string;capacityRef:string;effortRef:string;validUntil:number};
  /** Owner boundary affects this slice only. Recovery work is a separate admitted task. */
  boundary?:"owner-access"|"owner-credential"|"owner-material"|"owner-irreversible";
@@ -73,7 +77,7 @@ export class CoordinationRecoveryService {
    if(!intake||intake.sourceSession!=='watchdog@system'||!creation||creation.state!=='pending'||creation.actor_session!=='watchdog@system'||creation.identity_provenance!=='system:operator-authorized-coordination'||(input.intakeQueueId!==expectedIntake&&!this.refreshedIntakeAuthorized(input.rigId,input.intakeQueueId,input.previousControlId,generation,h?.packageKey)&&!this.lineageIntakeAuthorized(input.rigId,input.intakeQueueId,input.previousControlId,generation,h?.packageKey))||h.recipientGeneration!==generation||h.grantsAuthority!==false||h.deadline!==Date.parse(intake.expiresAt??'')||!this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='coordination-plan' AND json_extract(receipt,'$.operatorGeneration')=?").get(input.rigId,'coordination-plan:'+h.planRevision,generation))fail('coordination_return_successor_required','Exact native exhaustion intake provenance required');
    if(!intake||intake.destinationSession!==actor||claimGeneration(input.intakeQueueId)!==generation||!['in-progress','blocked'].includes(intake.state)||!intake.expiresAt||Date.parse(intake.expiresAt)<=this.now()||h.action!=='resolve-exact-coordination-task-hold'||h.reason!=='terminal-return-duty-exhausted'||h.rigId!==input.rigId||h.retainedQueueId!==input.previousControlId||!r||!previous||!['done','failed','denied','canceled','handed-off'].includes(previous.state)||digest(previous.body)!==input.previousBodyHash||r.bodyHash!==input.previousBodyHash||r.workerGeneration!==input.workerGeneration||claimGeneration(input.previousControlId)!==input.workerGeneration||this.authority.generation(r.worker)!==input.workerGeneration||h.packageKey!==r.packageKey||!a||a.state!=='active'||a.lease_until<=this.now()||a.owner_generation!==input.holderGeneration||this.authority.generation(a.owner_session!)!==input.holderGeneration||!plan||plan.operatorGeneration!==generation||!Number.isSafeInteger(input.deadline)||input.deadline<=this.now()||input.deadline>this.now()+1200000)fail('coordination_return_successor_required','Exact claimed exhaustion intake, immutable prior native duty, current holder and finite authorization required');
    if(this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind='native-terminal-return-successor-authorization' AND json_extract(receipt,'$.previousControlId')=?").get(input.rigId,input.previousControlId))fail('coordination_return_successor_conflict','This prior duty already has its one authorized successor');
-   if(this.workerEffectDebt(r.worker)||this.db.prepare("SELECT 1 FROM outbox_entries WHERE audit_pointer=? AND delivery_state IN ('pending','sending','indeterminate')").get(input.previousControlId))fail('coordination_return_successor_unknown_effect','Reconcile unknown effects before authorizing a successor');
+   if(this.workerEffectDebt(r.worker)||this.db.prepare("SELECT * FROM outbox_entries WHERE audit_pointer=? AND delivery_state IN ('pending','sending','indeterminate')").all(input.previousControlId).some(row=>!this.noticeOutcomeContained(input.rigId,row)))fail('coordination_return_successor_unknown_effect','Reconcile unknown effects before authorizing a successor');
    const queueId='qitem-coordination-terminal-return-'+digest(input.rigId+':'+b.originalQueueId+':'+input.workerGeneration+':'+id).slice(0,24);
    const receipt={queueId,originalQueueId:b.originalQueueId,packageKey:r.packageKey,workerGeneration:input.workerGeneration,holderGeneration:input.holderGeneration,operatorGeneration:generation,previousControlId:input.previousControlId,previousBodyHash:input.previousBodyHash,intakeQueueId:input.intakeQueueId,intakeBodyHash:digest(intake!.body),expiresAt:input.deadline};
    this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,id,'native-terminal-return-successor-authorization',JSON.stringify(receipt),requestHash);
@@ -448,6 +452,13 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
     if('qitem-resilience-rollout-'+digest(rolloutKey+':'+(body.previousQueueId??'initial')).slice(0,24)!==qid)return null;
    }else if(action===CoordinationRecoveryService.SYSTEM_WAKE_HOLD){
    if(!this.validAccountableIntake(body.rigId,qid,q)&&!(typeof body.rootQueueId==='string'&&this.validAccountableIntakeChainItem(body.rigId,q,body.rootQueueId)))return null;
+  }else if(action==='record-exact-native-terminal-return'){
+   const saved=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE operation_id=? AND kind='native-terminal-return-control'").get(qid) as {rig_id:string;receipt:string}|undefined;
+   if(!saved||saved.rig_id!==body.rigId)return null;
+   let r:any;try{r=JSON.parse(saved.receipt);}catch{return null;}
+   if(r.queueId!==qid||r.bodyHash!==digest(q.body)||r.originalQueueId!==body.originalQueueId||r.packageKey!==body.packageKey||r.worker!==recipient||r.workerGeneration!==body.recipientGeneration||r.expiresAt!==Date.parse(q.expiresAt??'')||body.deadline!==r.expiresAt)return null;
+   const claim=this.db.prepare('SELECT claimed_at FROM queue_items WHERE qitem_id=?').get(qid) as {claimed_at:string|null}|undefined;
+   if(claim?.claimed_at&&Date.parse(claim.claimed_at)>r.expiresAt)return null;
   }else if(action==='reconcile-refused-stuck-finding'){
    if(!this.diagnosticWakeProof(body.rigId,this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+qid),true))return null;
   }else if(action==='reconcile-transferred-baton'){
@@ -490,6 +501,7 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
   *  rollout provenance qualifies, so a pre-plan task is never orphaned. */
  private systemWakeAuthority(rigId:string,recipient:string,generation:string,action:string):boolean {
   const plan=this.plan(rigId);
+  if(action==='record-exact-native-terminal-return')return !!plan&&plan.operatorGeneration===this.authority.generation('operator-agent@kernel')&&this.authority.generation(recipient)===generation;
   if(plan)return plan.operatorGeneration===generation;
   return action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT&&recipient==='operator-agent@kernel'&&this.authority.generation(recipient)===generation;
  }
@@ -528,8 +540,69 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
   if(!proof)return false;
   try{const p=JSON.parse(proof.receipt);return p.outboxId===row.outbox_id&&p.noticeSnapshotHash===digest(JSON.stringify(row))&&p.taskBodyHash===digest(this.repo.getById(p.taskQueueId)?.body??'')&&p.deliveryConclusion==='unknown'&&p.originalMutations===0&&p.outcomeOnly===true&&p.grantsAuthority===false;}catch{return false;}
  }
+ /** Bind only producer-authored assignment pointers to actual native pickup.
+  * Historical holder receipts prove origin, never current authority or delivery. */
+ private assignmentWakeProof(row:any):{rigId:string;queueId:string;bodyHash:string;assignmentHash:string;recipientGeneration:string;claimTransitionId:number}|null {
+  if(row.delivery_state!=='indeterminate'||row.identity_provenance!=='system:operator-authorized-coordination')return null;
+  const a=this.db.prepare('SELECT a.*,q.body,q.source_session,p.contract,p.contract_hash FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.queue_id=?').get(row.audit_pointer) as any;
+  if(!a||a.destination!==row.destination_session||a.source_session!==a.owner_session||a.body_hash!==digest(a.body)||digest(a.contract)!==a.contract_hash)return null;
+  let contract:any;try{contract=JSON.parse(a.contract);}catch{return null;}
+  if(contract.destination!==a.destination||contract.bodyHash!==a.body_hash)return null;
+  const creation=this.db.prepare('SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1').get(a.queue_id) as any;
+  if(creation?.actor_session!==a.owner_session||creation.identity_provenance!=='system:operator-authorized-coordination')return null;
+  let sender=a.owner_session,senderGeneration=a.owner_generation,bareBody='Queue handoff: '+a.queue_id+' - check your queue.';
+  let tags:any;try{tags=JSON.parse(row.tags??'[]');}catch{return null;}
+  if(!Array.isArray(tags))return null;
+  if(row.outbox_id==='wake-intent-'+a.queue_id){
+   if(tags.includes('queue:coordinator-resume'))return null;
+  }else{
+   if(tags.length!==2||tags[0]!=='queue:coordinator-resume')return null;
+   let proof:any;try{proof=JSON.parse(tags[1]);}catch{return null;}
+   if(!proof||Object.keys(proof).sort().join(',')!=='epoch,generation,recipientGeneration,rigId'||proof.rigId!==a.rig_id||!Number.isSafeInteger(proof.epoch)||proof.epoch<1||typeof proof.generation!=='string'||!proof.generation)return null;
+   const prefix='wake-intent-coordinator-'+a.queue_id+'-'+proof.epoch+'-'+proof.generation+'-';
+   if(!String(row.outbox_id).startsWith(prefix)||!/^\d+$/.test(String(row.outbox_id).slice(prefix.length)))return null;
+   const bucket=Number(String(row.outbox_id).slice(prefix.length));
+   if(bucket!==Math.floor(Date.parse(row.ts_dispatched)/30000))return null;
+   const authority=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind IN ('acknowledge','resume-owned','enable') AND json_extract(receipt,'$.rig_id')=? AND json_extract(receipt,'$.epoch')=? AND json_extract(receipt,'$.owner_session')=? AND json_extract(receipt,'$.owner_generation')=? ORDER BY rowid DESC LIMIT 1").get(a.rig_id,a.rig_id,proof.epoch,row.sender_session,proof.generation) as {receipt:string}|undefined;
+   if(!authority||proof.recipientGeneration!==this.authority.generation(a.destination))return null;
+   sender=row.sender_session;senderGeneration=proof.generation;
+   bareBody='Resume the existing pending assignment '+a.queue_id+'; verify current coordinator authority and native identity before claiming. This wake creates no new assignment or acceptance.';
+  }
+  if(row.sender_session!==sender)return null;
+  const parts=String(row.body??'').split('\n---\n'),header=parts[0]?.split('\n');
+  if(parts.length!==3||header?.length!==3||header[0]!=='From: '+sender||header[1]!=='To: '+a.destination||!/^Sent: \d{2}-\d{2} \d{2}:\d{2}Z · gen /.test(header[2]!)||!header[2]!.endsWith(' · gen '+senderGeneration.slice(0,8))||parts[1]!==bareBody||parts[2]!=='↩ Reply: rig send '+sender+' "..."')return null;
+  const generation=this.authority.generation(a.destination);
+  if(!generation||!this.systemNativeCustody(a.queue_id,a.destination,generation))return null;
+  const claim=this.db.prepare("SELECT transition_id FROM queue_transitions WHERE qitem_id=? AND state='in-progress' AND transition_note='claimed' AND actor_session=? AND identity_provenance='transport:v1' AND ts=(SELECT claimed_at FROM queue_items WHERE qitem_id=?) ORDER BY transition_id DESC LIMIT 1").get(a.queue_id,a.destination,a.queue_id) as {transition_id:number}|undefined;
+  if(!claim)return null;
+  // disposition_id advances through genuine dispose and is not dispatch identity.
+  const {disposition_id:_,body,...immutable}=a;
+  return {rigId:a.rig_id,queueId:a.queue_id,bodyHash:digest(body),assignmentHash:digest(JSON.stringify(immutable)),recipientGeneration:generation,claimTransitionId:claim.transition_id};
+ }
+ private assignmentWakeOutcomeContained(rigId:string,row:any):boolean {
+  const proof=this.assignmentWakeProof(row);if(!proof||proof.rigId!==rigId)return false;
+  const saved=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='assignment-wake-outcome'").get(rigId,'assignment-wake-outcome:'+row.outbox_id) as {receipt:string}|undefined;
+  if(!saved)return false;
+  try{const r=JSON.parse(saved.receipt);return r.noticeSnapshotHash===digest(JSON.stringify(row))&&r.assignmentHash===proof.assignmentHash&&r.taskBodyHash===proof.bodyHash&&r.taskQueueId===proof.queueId&&r.recipientGeneration===proof.recipientGeneration&&r.claimTransitionId===proof.claimTransitionId&&r.deliveryConclusion==='unknown'&&r.originalMutations===0&&r.outcomeOnly===true&&r.grantsAuthority===false;}catch{return false;}
+ }
+ private assignmentWakeCursor=new Map<string,number>();
+ private recordAssignmentWakeOutcomes(rigId:string):void {
+  let from=this.assignmentWakeCursor.get(rigId)??0,scanned=0;
+  while(scanned<2000){
+   const rows=this.db.prepare("SELECT o.rowid scan_rowid,o.* FROM coordinator_assignments a JOIN outbox_entries o ON o.audit_pointer=a.queue_id WHERE a.rig_id=? AND o.rowid>? AND o.delivery_state='indeterminate' AND NOT EXISTS(SELECT 1 FROM coordinator_operations c WHERE c.rig_id=a.rig_id AND c.operation_id='assignment-wake-outcome:'||o.outbox_id AND c.kind='assignment-wake-outcome') ORDER BY o.rowid LIMIT 200").all(rigId,from) as any[];
+   for(const scannedRow of rows){
+    const {scan_rowid:_,...row}=scannedRow,proof=this.assignmentWakeProof(row);if(!proof||proof.rigId!==rigId)continue;
+    const receipt={outboxId:row.outbox_id,noticeSnapshotHash:digest(JSON.stringify(row)),taskQueueId:proof.queueId,taskBodyHash:proof.bodyHash,assignmentHash:proof.assignmentHash,recipient:row.destination_session,recipientGeneration:proof.recipientGeneration,claimTransitionId:proof.claimTransitionId,deliveryConclusion:'unknown',originalMutations:0,outcomeOnly:true,grantsAuthority:false};
+    this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'assignment-wake-outcome:'+row.outbox_id,'assignment-wake-outcome',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   }
+   scanned+=rows.length;from=rows.length?Number(rows[rows.length-1].scan_rowid):0;
+   if(rows.length<200){from=0;break;}
+  }
+  this.assignmentWakeCursor.set(rigId,from);
+ }
  /** One bounded scan per pass, written by the registered observer path only. */
  private recordSystemWakeOutcomes(rigId:string):void {
+  this.recordAssignmentWakeOutcomes(rigId);
   // Completed scope may no longer be traversed by task reconciliation. Record only
   // exact terminal lifecycle pointer outcomes; never infer transport delivery.
   const completed=this.db.prepare("SELECT c.receipt FROM coordinator_operations c JOIN queue_items q ON q.qitem_id=json_extract(c.receipt,'$.queueId') JOIN outbox_entries o ON o.outbox_id='wake-intent-'||q.qitem_id WHERE c.rig_id=? AND c.kind='coordinator-lifecycle-control' AND q.state IN ('done','failed','denied','canceled','handed-off') AND o.delivery_state='indeterminate' AND NOT EXISTS (SELECT 1 FROM coordinator_operations p WHERE p.rig_id=c.rig_id AND p.kind='held-history-control-outcome' AND p.operation_id='held-control-outcome:'||o.outbox_id) ORDER BY c.rowid LIMIT 200").all(rigId) as Array<{receipt:string}>;
@@ -560,7 +633,7 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
  }
  /** The one consumption predicate both debt gates call. */
  noticeOutcomeContained(rigId:string,row:any):boolean {
-  return this.heldHistoryNoticeOutcomeContained(rigId,row)||this.systemWakeOutcomeContained(rigId,row)||this.diagnosticWakeContained(row);
+  return this.assignmentWakeOutcomeContained(rigId,row)||this.heldHistoryNoticeOutcomeContained(rigId,row)||this.systemWakeOutcomeContained(rigId,row)||this.diagnosticWakeContained(row);
  }
  private recordHeldHistoryNoticeOutcome(rigId:string,parent:any):void {
   const row=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+parent.queueId) as any;if(!row||!this.heldHistoryNoticeOutcomeProof(rigId,row))return;
@@ -1125,17 +1198,23 @@ private dutyProtection(rigId:string,r:any):boolean {
     if(!row)fail("coordination_package_not_admitted","Every task including recovery needs explicit admission");
     const c=JSON.parse(row!.contract);
     if(c.destination!==t.owner||c.bodyHash!==digest(t.body)||!c.returnContract?.evidenceRequired?.length)fail("coordination_package_mismatch","Exact owner/body and attributed return contract required");
-    for(const pred of t.predecessors)if(!pred.queueId||!pred.dispositionId)fail("coordination_invalid_predecessor","Exact disposition receipt required");
+    for(const pred of t.predecessors){
+     if(!pred||typeof pred!=='object'||!pred.queueId)fail("coordination_invalid_predecessor","Exact disposition receipt required");
+     if(isBoundPredecessor(pred))this.validateBoundPredecessor(plan,t,pred,old);
+     else if(!pred.dispositionId)fail("coordination_invalid_predecessor","Exact disposition receipt required");
+    }
     if(t.recoveryFor&&(!keys.has(t.recoveryFor)||t.recoveryFor===t.key))fail("coordination_invalid_recovery","Recovery must name another exact plan task");
     if(!t.recoveryFor&&!t.boundary&&!plan.tasks.some(r=>r.recoveryFor===t.key))fail("coordination_recovery_required","Every ordinary task needs a distinct admitted recovery task with concrete owner/action/deadline");
    }
    const byQueue=new Map(plan.tasks.map(t=>['qitem-coordination-'+digest(plan.rigId+':'+t.packageKey).slice(0,24),t]));
+   const byPackage=new Map(plan.tasks.map(t=>[t.packageKey,t]));
+   const parentOf=(pred:CoordinationPredecessor)=>isBoundPredecessor(pred)?byPackage.get(pred.packageKey):byQueue.get(pred.queueId);
    const visiting=new Set<string>(),visited=new Set<string>();
-   const visit=(t:CoordinationTask):void=>{if(visiting.has(t.key))fail('coordination_dependency_cycle','Recovery/dependency graph cannot cycle');if(visited.has(t.key))return;visiting.add(t.key);for(const pred of t.predecessors){const parent=byQueue.get(pred.queueId);if(parent)visit(parent);}if(t.recoveryFor)visit(plan.tasks.find(other=>other.key===t.recoveryFor)!);visiting.delete(t.key);visited.add(t.key);};
+   const visit=(t:CoordinationTask):void=>{if(visiting.has(t.key))fail('coordination_dependency_cycle','Recovery/dependency graph cannot cycle');if(visited.has(t.key))return;visiting.add(t.key);for(const pred of t.predecessors){const parent=parentOf(pred);if(parent)visit(parent);}if(t.recoveryFor)visit(plan.tasks.find(other=>other.key===t.recoveryFor)!);visiting.delete(t.key);visited.add(t.key);};
    for(const t of plan.tasks)visit(t);
    const reaches=(t:CoordinationTask,target:string,seen=new Set<string>()):boolean=>{
     if(t.key===target)return true;if(seen.has(t.key))return false;seen.add(t.key);
-    return t.predecessors.some(pred=>{const parent=byQueue.get(pred.queueId);return !!parent&&reaches(parent,target,seen);});
+    return t.predecessors.some(pred=>{const parent=parentOf(pred);return !!parent&&reaches(parent,target,seen);});
    };
    for(const t of plan.tasks)if(t.recoveryFor&&reaches(t,t.recoveryFor))fail('coordination_recovery_deadlock','Recovery cannot depend directly or transitively on its blocked task');
    const id=`coordination-plan:${plan.revision}`;
@@ -1271,7 +1350,10 @@ private dutyProtection(rigId:string,r:any):boolean {
     const retained=this.repo.getById(queueId);
     if(retained){result.push({key:t.key,state:'held',queueId,reason:retained.destinationSession===t.owner&&digest(retained.body)===digest(t.body)?'existing-queue-without-assignment':'deterministic-queue-conflict',deadline:t.deadline});continue;}
     try {
-     this.db.transaction(()=>this.repo.createWithinTransaction({qitemId:queueId,sourceSession:actor,destinationSession:t.owner,body:t.body,dispatch:{token,packageKey:t.packageKey},identityProvenance:'system:operator-authorized-coordination',nudge:true}))();
+     this.db.transaction(()=>{
+      this.repo.createWithinTransaction({qitemId:queueId,sourceSession:actor,destinationSession:t.owner,body:t.body,dispatch:{token,packageKey:t.packageKey},identityProvenance:'system:operator-authorized-coordination',nudge:true});
+      this.freezeBoundPredecessorResolution(rigId,t,plan!.revision);
+     })();
     } catch(error) {
      const code=heldDispatchCode(error);
      if(!code)throw error;
@@ -1425,7 +1507,41 @@ if(!effectRig)return true;
    this.repo.createWithinTransaction({qitemId:queueId,sourceSession:actor,destinationSession:parent!.destination,body:input.body,dispatch:{token:{rigId:input.rigId,epoch:input.epoch,generation},packageKey:input.feedbackPackageKey},identityProvenance:'transport:v1',nudge:true});return {queueId};
   }).immediate();
  }
- private predecessorsReady(rigId:string,t:CoordinationTask):boolean {return t.predecessors.every(p=>!!this.db.prepare("SELECT 1 FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.queue_id=? AND a.disposition_id=? AND q.state IN ('done','handed-off') AND EXISTS (SELECT 1 FROM coordinator_operations o WHERE o.rig_id=a.rig_id AND o.kind='coordination-accept' AND json_extract(o.receipt,'$.queueId')=a.queue_id AND json_extract(o.receipt,'$.dispositionId')=a.disposition_id)").get(rigId,p.queueId,p.dispositionId));}
+ private predecessorsReady(rigId:string,t:CoordinationTask):boolean {return t.predecessors.every(p=>isBoundPredecessor(p)?this.boundPredecessorReady(rigId,p):!!this.db.prepare("SELECT 1 FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.queue_id=? AND a.disposition_id=? AND q.state IN ('done','handed-off') AND EXISTS (SELECT 1 FROM coordinator_operations o WHERE o.rig_id=a.rig_id AND o.kind='coordination-accept' AND json_extract(o.receipt,'$.queueId')=a.queue_id AND json_extract(o.receipt,'$.dispositionId')=a.disposition_id)").get(rigId,p.queueId,p.dispositionId));}
+/** Keyed lookups only, scoped to this rig. Ready only for the exact bound instance and contract, a successful released return, and the exact coordination-accept receipt that accept() alone writes. Nothing is created or inferred here. */
+ private boundPredecessorResolution(rigId:string,p:BoundPredecessor):{dispositionId:string}|undefined {
+  const resolved=this.db.prepare("SELECT a.disposition_id dispositionId FROM coordinator_packages k JOIN coordinator_assignments a ON a.rig_id=k.rig_id AND a.package_key=k.package_key JOIN queue_items q ON q.qitem_id=a.queue_id WHERE k.rig_id=? AND k.package_key=? AND k.contract_hash=? AND a.queue_id=? AND a.disposition_id IS NOT NULL AND q.state IN ('done','handed-off') AND EXISTS (SELECT 1 FROM coordinator_operations o WHERE o.rig_id=a.rig_id AND o.operation_id='coordination-accept:'||a.package_key AND o.kind='coordination-accept' AND json_extract(o.receipt,'$.queueId')=a.queue_id AND json_extract(o.receipt,'$.dispositionId')=a.disposition_id)").get(rigId,p.packageKey,p.contractHash,p.queueId) as {dispositionId:string}|undefined;
+  if(!resolved)return undefined;
+  // Reuse the acceptance contract, including genuinely accepted repair. The
+  // durable recovery marker alone cannot veto the original's genuine acceptance.
+  try{this.authority.runtimeOutcomeAssessment?.assertAcceptance(rigId,p.packageKey);}
+  catch(error){if(error instanceof CoordinatorFenceError&&['runtime_outcome_pending','runtime_outcome_recovery_required'].includes(error.code))return undefined;throw error;}
+  return resolved;
+ }
+ private boundPredecessorReady(rigId:string,p:BoundPredecessor):boolean {return !!this.boundPredecessorResolution(rigId,p);}
+ /** Inside the successor's creation transaction: freeze the exact resolved accepted-predecessor receipt. Any failure rolls the successor's creation back. */
+ private freezeBoundPredecessorResolution(rigId:string,t:CoordinationTask,planRevision:string):void {
+  const bound=t.predecessors.filter(isBoundPredecessor);if(!bound.length)return;
+  const predecessors=bound.map(p=>{const r=this.boundPredecessorResolution(rigId,p);if(!r)fail('coordination_predecessor_unresolved','Bound predecessor lost its exact accepted return before successor creation');return {packageKey:p.packageKey,contractHash:p.contractHash,queueId:p.queueId,dispositionId:r!.dispositionId,acceptOperationId:'coordination-accept:'+p.packageKey};});
+  const receipt={predecessors,planRevision};
+  this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,`coordination-predecessor-resolution:${rigId}:${t.packageKey}`,'coordination-predecessor-resolution',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+ }
+ private validateBoundPredecessor(plan:CoordinationPlan,t:CoordinationTask,pred:BoundPredecessor,old?:CoordinationTask):void {
+  const bad=(reason:string):never=>fail('coordination_invalid_predecessor','Pre-bound successor reference refused: '+reason);
+  if(Object.keys(pred).sort().join(',')!=='contractHash,packageKey,queueId'||typeof pred.packageKey!=='string'||!pred.packageKey||typeof pred.contractHash!=='string'||!pred.contractHash||typeof pred.queueId!=='string'||!pred.queueId||'dispositionId' in pred)bad('exactly packageKey, contractHash and queueId required');
+  if(t.recoveryFor)bad('a recovery task cannot use a bound predecessor');
+  if(pred.packageKey===t.packageKey)bad('self reference');
+  const target=plan.tasks.find(other=>other.packageKey===pred.packageKey);
+  if(!target)bad('predecessor must be a task of this plan');
+  if(target!.recoveryFor)bad('a recovery task never satisfies a successor');
+  const pkg=this.db.prepare('SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(plan.rigId,pred.packageKey) as {contract_hash:string}|undefined;
+  if(!pkg||pkg.contract_hash!==pred.contractHash)bad('contract hash differs from the admitted package');
+  if(pred.queueId!=='qitem-coordination-'+digest(plan.rigId+':'+pred.packageKey).slice(0,24))bad('queue id is not the deterministic assignment instance');
+  const assignment=this.db.prepare('SELECT queue_id,body_hash FROM coordinator_assignments WHERE rig_id=? AND package_key=?').get(plan.rigId,pred.packageKey) as {queue_id:string;body_hash:string}|undefined;
+  if(!assignment&&this.repo.getById(pred.queueId))bad('retained pre-ledger queue row requires the exact queue/disposition form');
+  if(assignment&&(assignment.queue_id!==pred.queueId||assignment.body_hash!==digest(target!.body)))bad('existing assignment is a different instance');
+  if(old&&JSON.stringify(old.predecessors)!==JSON.stringify(t.predecessors)&&this.db.prepare('SELECT 1 FROM coordinator_assignments WHERE rig_id=? AND package_key=?').get(plan.rigId,t.packageKey))bad('predecessor references cannot change after assignment');
+ }
  async deliverCommitted():Promise<void>{await this.repo.drainPendingWakeIntents();}
  /** Existing Operator-registered coordinator watchdog is the only unattended actor.
   * It creates real queue intents through the same path, never acknowledgment. */
