@@ -794,6 +794,46 @@ describe("expired reconciling window bounded successor recovery",()=>{
   await expect(call({windowMs:60000})).rejects.toThrow(/Operation ID reused/);
  });
 
+ it("recovers an owner whose registered session carries a ULID id, resolving its node by session_name",async()=>{
+  await reserveConflict();ready();
+  // A real seat registers under a generated session id; its logical address is the session_name.
+  // Here the registered session id is ULID-shaped and nothing anywhere answers to the address as an
+  // id, so the owner node is reachable ONLY through the current session_name registration.
+  db.prepare("UPDATE sessions SET id=? WHERE session_name='lead@xv'").run("01M3ZPNBSGKM3WM5MQC7Q87B3H");
+  expect(db.prepare("SELECT node_id FROM sessions WHERE id='lead@xv'").get()).toBeUndefined();
+  // The node it must resolve to is the genuine node the registration binds, not the session id.
+  const nodeOf=(svc as any).nodeOf.bind(svc) as (session:string)=>string;
+  expect(nodeOf("lead@xv")).toBe((db.prepare("SELECT node_id FROM sessions WHERE session_name='lead@xv'").get() as any).node_id);
+  // The whole bounded recovery completes: same node, same generation, same native guard gates.
+  const out=await call({operationId:"ulid-session-registration"});
+  expect(out.epoch).toBe(2);
+  expect(out.incidentAnchor).toBe("xv#1#lead-g1");
+  expect(svc.get("xv")!.owner_session).toBe("lead@xv");
+  expect(ops("expired-window-successor").n).toBe(1);
+ });
+
+ it("still refuses an unregistered or host-qualified owner address at the node fence",async()=>{
+  await reserveConflict();ready();
+  const nodeOf=(svc as any).nodeOf.bind(svc) as (session:string)=>string;
+  // An address with neither a registration nor a matching node is refused, never fabricated.
+  expect(()=>nodeOf("ghost@xv")).toThrow(/not registered/);
+  // The host qualifier is never stripped: a foreign host cannot borrow this seat's node.
+  expect(()=>nodeOf("lead@other-host")).toThrow(/not registered/);
+  expect(()=>nodeOf("lead@xv@extra")).toThrow(/not registered/);
+  // End to end, the same unregistered owner cannot recover and nothing is mutated.
+  db.prepare("UPDATE coordinator_authority SET owner_session='lead@other-host' WHERE rig_id='xv'").run();
+  await expect(call({operationId:"host-qualified-owner"})).rejects.toThrow(/exact current owner generation/);
+  expect(svc.get("xv")!.epoch).toBe(1);
+  expect(ops("expired-window-successor").n).toBe(0);
+  // A deregistered owner has no current occupant registration either, so it recovers nothing: a
+  // surviving node row alone is not a live session and grants no epoch.
+  db.prepare("UPDATE coordinator_authority SET owner_session='lead@xv' WHERE rig_id='xv'").run();
+  db.prepare("DELETE FROM sessions WHERE session_name='lead@xv'").run();
+  await expect(call({operationId:"deregistered-owner"})).rejects.toThrow(/exact current owner generation/);
+  expect(svc.get("xv")!.epoch).toBe(1);
+  expect(ops("expired-window-successor").n).toBe(0);
+ });
+
  it("the genuine holder must still resume-owned separately",async()=>{
   await reserveConflict();ready();
   await call();

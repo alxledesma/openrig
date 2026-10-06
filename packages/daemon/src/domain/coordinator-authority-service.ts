@@ -70,12 +70,15 @@ export class CoordinatorAuthorityService {
   if(run!==this.availabilityRuns.get(rigId))return; // delayed probe cannot overwrite a newer observation
   for(const observation of observations)this.runtimeEvidence.set(observation.session,observation);
  }
- /** The node that backs a session, for node-scoped guard and reservation fences. */
- private nodeOf(session:string):string {
-  const node=this.db.prepare("SELECT node_id FROM sessions WHERE id=?").get(session) as {node_id:string}|undefined;
-  if(!node)reject("coordinator_unknown_session","Session is not registered");
-  return node!.node_id;
- }
+/** The node that backs a session, for node-scoped guard and reservation fences.
+   * A session is registered under its session_name with a generated id, so the logical address is
+   * resolved exactly as every other identity read here, through the canonical local lookup: its
+   * host qualifier is honoured, never stripped, and an unregistered address stays unregistered. */
+  private nodeOf(session:string):string {
+   const node=this.local(session);
+   if(!node)reject("coordinator_unknown_session","Session is not registered");
+   return node!.id;
+  }
  private excluded(session:string,generation?:string):boolean {
   const e=this.runtimeEvidence.get(session);return !!e&&e.state==='absent'&&e.session===session&&!!e.fingerprint&&e.observedAt<=this.now()&&this.now()-e.observedAt<=1000&&e.generation===(generation??this.generation(session))&&e.generation===this.generation(session);
  }
