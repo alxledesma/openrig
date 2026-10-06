@@ -14,6 +14,22 @@ export function coordinatorCommand():Command {
  });
  // resume-owned takes a rigId, not a contract file: the daemon derives the caller's token
  // and current obligations digest, so the native Lead supplies no digest and no epoch.
+ cmd.command("expired-window-recover <contractFile>")
+  .description("Operator-attributed bounded recovery for ONE already expired reconciling window, at epoch plus one, with no admission, qualification or dispatch. Requires the original spent recovery receipt, a durable different-kind operation-ID conflict, exact custody, and a positive native quiescence proof. The holder must still resume-owned separately.")
+  .action(async(file:string)=>{
+   const contract=JSON.parse(fs.readFileSync(file,"utf8"));
+   const client=new DaemonClient(),headers=terminalAuthHeaders();
+   // Prepare the exact request at owner-only permissions before the single POST, and announce the
+   // path and id first. Nothing retries: an unknown outcome is resolved with --replay-contract.
+   const dir=fs.mkdtempSync(path.join(os.tmpdir(),"openrig-expired-window-"));
+   fs.chmodSync(dir,0o700);
+   const preparedPath=path.join(dir,"prepared-request.json");
+   fs.writeFileSync(preparedPath,`${JSON.stringify(contract,null,2)}\n`,{mode:0o600});
+   process.stderr.write(`prepared request: ${preparedPath}\n`);
+   const res=await client.post("/api/coordinator/expired-window-recover",contract,{ headers });
+   const receipt:unknown=res.data;
+   console.log(JSON.stringify({...(receipt&&typeof receipt==="object"?receipt:{}),preparedContract:preparedPath},null,2));if(res.status>=400)process.exitCode=1;
+  });
  cmd.command("resume-owned <rigId>")
   .description("Continue your OWN live coordinator authority: atomically acknowledge a reconciling owner and renew it. Reads the current authority once to derive the expected epoch and obligations digest, so you supply neither. Never recovers an expired lease.")
   .option("--operation-id <id>","Stable durable receipt id. Omitted by default, which generates a fresh id so an operator never reuses one.")

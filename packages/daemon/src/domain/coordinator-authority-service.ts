@@ -499,6 +499,90 @@ export class CoordinatorAuthorityService {
    return out;
   }).immediate();
  }
+ /** Bounded recovery for ONE expired reconciling window, for the same native holder whose single
+  *  reconciliation-recover was already consumed.
+  *
+  *  It grants a fresh bounded reconciling window at epoch+1 and nothing else: no active state, no
+  *  admission, no qualification, no dispatch, no queue/resource/UNKNOWN disposal, and the original
+  *  operation and baton are preserved. The genuine holder must still separately resume-owned.
+  *
+  *  The incident anchor is derived from the STORED spent recovery receipt, never from the current
+  *  epoch or from a successor receipt, so a successor cannot regenerate an incident key. Exactly one
+  *  successor is allowed per anchor, across epochs, until a genuine acknowledge/resume-owned ends the
+  *  incident. */
+ recoverExpiredReconciling(actor:string, callerGeneration:string, input:{
+  rigId:string; operationId:string; windowMs:number;
+  expectedEpoch:number; expectedOwnerGeneration:string; expectedCustodyDigest:string;
+  conflictOperationId:string; conflictKind:string;
+  quiescenceProof:{settled:boolean|null;observedAt:string|null;generation:string|null;launch:string|null;pid:number|null};
+ }):{authority:Authority;incidentAnchor:string;epoch:number;windowMs:number;leaseUntil:number;operationId:string} {
+  return this.db.transaction(() => {
+   // Genuine native Operator attribution only; the holder cannot invoke its own escape hatch.
+   this.operator(actor,callerGeneration);
+   if(typeof input.operationId!=="string"||!input.operationId.trim()||input.operationId.length>160)reject("coordinator_invalid_operation","Bounded attributed operation ID required");
+   if(typeof input.conflictOperationId!=="string"||!input.conflictOperationId.trim()||input.conflictOperationId.length>160)reject("coordinator_invalid_operation","The conflicting operation ID must be the real one");
+   if(typeof input.conflictKind!=="string"||!input.conflictKind.trim())reject("coordinator_invalid_operation","The conflicting operation kind must be named");
+   if(!Number.isSafeInteger(input.windowMs)||input.windowMs<10000||input.windowMs>900000)reject("coordinator_invalid_ack_window","Recovery window must be 10 seconds to 15 minutes");
+   const found=this.get(input.rigId);
+   if(!found)reject("coordinator_not_enabled","Rig authority is not enabled");
+   const row=found!;
+   // The exact recorded current owner generation.
+   if(row.owner_generation!==input.expectedOwnerGeneration||this.generation(row.owner_session)!==row.owner_generation)reject("coordinator_retired","The exact current owner generation is required");
+   // Replay is resolved BEFORE any mutable-state CAS, so an exact replay of a timed-out call returns
+   // its durable receipt instead of colliding with the state that same call itself produced.
+   const request={actor,callerGeneration,input};
+   const replay=this.replay(input.rigId,input.operationId,"expired-window-successor",request);if(replay)return replay as {authority:Authority;incidentAnchor:string;epoch:number;windowMs:number;leaseUntil:number;operationId:string};
+   // The EXPIRED reconciling window of the exact recorded epoch.
+   if(row.state!=="reconciling")reject("coordinator_reconciliation_changed","Only an expired reconciling window has a supported bounded recovery");
+   if(row.epoch!==input.expectedEpoch)reject("coordinator_cas_lost","Authority epoch differs from the expected read");
+   if(row.lease_until>this.now())reject("coordinator_reconciliation_not_expired","This recovery is only for an already expired reconciling window");
+   // Exact custody: the same obligations the holder read. Nothing is disposed, so historical effect
+   // debt is preserved and heldCount is never required to be zero.
+   if(this.reconciliationDigest(input.rigId)!==input.expectedCustodyDigest)reject("coordinator_reconciliation_changed","Custody changed since the expected read; reconcile before recovering");
+   // A retired or unavailable holder is not a recovery subject.
+   if(this.excluded(row.owner_session,row.owner_generation))reject("coordinator_owner_unavailable","The recorded owner is retired or unavailable");
+   // Native proof seam: the adjacent PiNativeProof.quiescence shape is consumed structurally and
+   // never defined here. Only an exact POSITIVE settled proof for THIS generation and launch passes;
+   // missing, null, malformed or foreign proof refuses. Fresh presence alone is not quiescence.
+   const proof=input.quiescenceProof;
+   if(!proof||typeof proof!=="object"||proof.settled!==true||typeof proof.observedAt!=="string"||!proof.observedAt.trim()
+    ||!Number.isFinite(Date.parse(proof.observedAt))||Date.parse(proof.observedAt)>this.now())reject("coordinator_quiescence_unproven","A positive native quiescence proof with an observation time is required");
+   if(proof.generation!==row.owner_generation)reject("coordinator_generation_mismatch","Quiescence proof must carry the current owner generation");
+   if(typeof proof.launch!=="string"||!proof.launch.trim()||!Number.isSafeInteger(proof.pid)||proof.pid!<=0)reject("coordinator_quiescence_unproven","Quiescence proof must identify the current native launch and process");
+   // No sending and no live reservations may be outstanding for the holder.
+   const live=this.db.prepare("SELECT reservation_id FROM seat_dispatch_reservations WHERE node_id=? AND state IN ('reserved','started')").all(row.owner_session) as {reservation_id:string}[];
+   if(live.length)reject("coordinator_dispatch_reserved","An outstanding dispatch reservation forbids this recovery");
+   // The ORIGINAL spent recovery receipt must exist for this exact epoch. The incident anchor comes
+   // from that stored receipt, not from the current epoch and not from any successor receipt.
+   const spent=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='reconciliation-recover' AND json_extract(receipt,'$.epoch')<=? ORDER BY rowid DESC LIMIT 1").get(input.rigId,row.epoch) as {receipt:string}|undefined;
+   if(!spent)reject("coordinator_reconciliation_unrecovered","The original spent recovery receipt for this epoch is required");
+   // Narrow once after the refusal; both reads are inside this transaction.
+   const spentReceipt=JSON.parse(spent!.receipt) as {epoch:number;owner_generation:string;state:string};
+   if(spentReceipt.state!=="reconciling"||spentReceipt.epoch>row.epoch||spentReceipt.owner_generation!==row.owner_generation)reject("coordinator_reconciliation_changed","The stored recovery receipt does not match the current incident");
+   const incidentAnchor=`${input.rigId}#${spentReceipt.epoch}#${spentReceipt.owner_generation}`;
+   // One successor per incident, across epochs. A successor receipt can never reset the anchor.
+   // A genuine successful acknowledgment ends the incident, so no successor window applies at all. It
+   // must be STRICTLY later than the stored recovery receipt: the acknowledgment that preceded the
+   // incident is not its ending.
+   if(this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind IN ('acknowledge','resume-owned') AND json_extract(receipt,'$.state')='active' AND json_extract(receipt,'$.epoch')>?").get(input.rigId,spentReceipt.epoch))reject("coordinator_incident_closed","The holder already acknowledged this incident; no successor window applies");
+   // Exactly one successor per incident, across epochs. A successor receipt can never reset the anchor.
+   if(this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind='expired-window-successor' AND json_extract(receipt,'$.incidentAnchor')=?").get(input.rigId,incidentAnchor))reject("coordinator_incident_successor_exhausted","This incident already consumed its single bounded successor window");
+   // Known backend NO-EFFECT conflict evidence only: a durable, different-kind reservation of the
+   // same operation ID. A fabricated failed ACK receipt cannot satisfy this.
+   if(input.conflictKind==="acknowledge"||input.conflictKind==="expired-window-successor")reject("coordinator_unsupported_conflict","That kind is not no-effect conflict evidence for a failed acknowledgment");
+   const reserved=this.db.prepare("SELECT kind FROM coordinator_operations WHERE rig_id=? AND operation_id=?").get(input.rigId,input.conflictOperationId) as {kind:string}|undefined;
+   if(!reserved)reject("coordinator_conflict_unproven","No durable conflicting operation ID is recorded");
+   if(reserved!.kind!==input.conflictKind)reject("coordinator_conflict_unproven","The named conflicting kind differs from the durable receipt");
+   // Same holder, same custody, same baton, epoch plus one. No automatic active state.
+   const leaseUntil=this.now()+input.windowMs;
+   this.db.prepare("UPDATE coordinator_authority SET epoch=epoch+1,lease_until=?,state='reconciling',operation_id=? WHERE rig_id=? AND epoch=?").run(leaseUntil,input.operationId,input.rigId,row.epoch);
+   const authority=this.get(input.rigId)!;
+   const receipt={authority,incidentAnchor,epoch:authority.epoch,windowMs:input.windowMs,leaseUntil,operationId:input.operationId};
+   this.log(input.rigId,input.operationId,"expired-window-successor",receipt,request);
+   return receipt;
+  }).immediate();
+ }
+
  transfer(actor:string, callerGeneration:string, input:{expected:CoordinatorToken;oldOwner:string;recipient:string;recipientGeneration:string;operationId:string;leaseMs:number;recoveryEvidenceId?:string}): Authority {
    return this.db.transaction(() => {
      const old=this.get(input.expected.rigId); if (!old) reject("coordinator_not_enabled","Rig is not enabled");

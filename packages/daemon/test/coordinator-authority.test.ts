@@ -551,3 +551,151 @@ describe("coordinator resume-owned shared native owner continuation",()=>{
   expect(after.unknown).toEqual(before.unknown);
  });
 });
+
+describe("expired reconciling window bounded successor recovery",()=>{
+ let dir:string,db:Database.Database,repo:QueueRepository,svc:CoordinatorAuthorityService,clock:number;
+ const lease=10000;
+ beforeEach(async()=>{
+  dir=mkdtempSync(join(tmpdir(),"expired-window-"));db=createDb(join(dir,"db.sqlite"));seed(db);
+  const bus=new EventBus(db);repo=new QueueRepository(db,bus,{resolveOccupantGeneration:s=>svc.generation(s)});repo.attachOutbox(new OutboxHandler(db));
+  clock=10000;svc=new CoordinatorAuthorityService(db,bus,repo.transitionLog,()=>clock);
+  await repo.create({qitemId:"baton",sourceSession:"operator-agent@kernel",destinationSession:"lead@xv",body:"coordinate",nudge:false});
+  svc.enable("operator-agent@kernel","operator-agent-g1",{rigId:"xv",batonId:"baton",owner:"lead@xv",ownerGeneration:"lead-g1",coordinators:["lead@xv","peer@xv"],leaseMs:lease,operationId:"enable"});
+  db.prepare("UPDATE coordinator_authority SET lease_until=?").run(Date.now()+3600000);
+  svc.acknowledge("lead@xv",token,{operationId:"ack",obligationsDigest:svc.reconciliationDigest("xv")});
+  // Spend the single reconciliation-recover, then let that window expire.
+  db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=? WHERE rig_id='xv'").run(clock-1);
+  svc.recoverReconciliation("operator-agent@kernel","operator-agent-g1",{token:{rigId:"xv",epoch:1,generation:"lead-g1"},operationId:"spent-recovery",obligationsDigest:svc.reconciliationDigest("xv"),windowMs:60000});
+  // That one reconciliation window is now spent and has itself expired.
+  db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(clock-1);
+ });
+ afterEach(()=>{db.close();rmSync(dir,{recursive:true,force:true});});
+ const ops=(kind:string)=>db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind=?").get(kind) as any;
+ const transitions=()=>db.prepare("SELECT count(*) n FROM queue_transitions WHERE qitem_id='baton'").get() as any;
+ const custody=()=>svc.reconciliationDigest("xv");
+ const proof=()=>({settled:true,observedAt:new Date(clock-50).toISOString(),generation:"lead-g1",launch:"tmux:lead-g1",pid:4321});
+ // A durable, different-kind reservation of the same operation ID: real backend no-effect evidence.
+ const reserveConflict=async()=>{
+  // Real no-effect evidence: the SAME operation id was already durably taken on this rig by a
+  // different kind, so the backend refused the holder's acknowledge under it. The holder's ACK
+  // never committed and there is no fabricated receipt.
+  db.prepare("UPDATE coordinator_authority SET state='active',lease_until=? WHERE rig_id='xv'").run(clock+5000);
+  svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"handy-native-activation",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
+  expect(db.prepare("SELECT kind FROM coordinator_operations WHERE rig_id='xv' AND operation_id='handy-native-activation'").get()).toEqual({kind:"resume-owned"});
+  // Restore the spent, expired reconciling window this recovery exists for.
+  db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=? WHERE rig_id='xv'").run(clock-1);
+ };
+ const call=(over:Record<string,unknown>={})=>svc.recoverExpiredReconciling("operator-agent@kernel","operator-agent-g1",{
+  rigId:"xv",operationId:"successor-1",windowMs:120000,
+  expectedEpoch:1,expectedOwnerGeneration:"lead-g1",expectedCustodyDigest:custody(),
+  conflictOperationId:"handy-native-activation",conflictKind:"resume-owned",
+  quiescenceProof:proof(),...over});
+
+ it("grants exactly one bounded successor window at epoch plus one",async()=>{
+  await reserveConflict();
+  const before=transitions().n;
+  const out=call();
+  expect(out.incidentAnchor).toBe("xv#1#lead-g1");
+  expect(out.epoch).toBe(2);
+  expect(out.leaseUntil).toBe(clock+120000);
+  // Reconciling only: never active, and the original operation and baton are preserved.
+  const row=svc.get("xv")!;
+  expect(row.state).toBe("reconciling");
+  expect(row.baton_id).toBe("baton");
+  expect(row.owner_session).toBe("lead@xv");
+  expect(row.owner_generation).toBe("lead-g1");
+  expect(row.lease_until).toBe(clock+120000);
+  // No queue mutation, no dispatch, no admission, no qualification.
+  expect(transitions().n).toBe(before);
+  expect(db.prepare("SELECT count(*) n FROM coordinator_packages WHERE rig_id='xv'").get()).toEqual({n:0});
+  expect(ops("expired-window-successor").n).toBe(1);
+ });
+
+ it("refuses a second successor for the same incident across epochs",async()=>{
+  await reserveConflict();
+  call();
+  // The new window expires too, and a second attempt at the same incident must refuse.
+  db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(clock-1);
+  expect(()=>call({operationId:"successor-2",expectedEpoch:svc.get("xv")!.epoch})).toThrow(/already consumed its single bounded successor window/);
+  expect(ops("expired-window-successor").n).toBe(1);
+ });
+
+ it("closes the incident once the holder genuinely acknowledges",async()=>{
+  await reserveConflict();
+  call();
+  // The holder genuinely acknowledges and resumes the successor window, which ends the incident.
+  expect(svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-ends-incident",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")}).state).toBe("active");
+  db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=? WHERE rig_id='xv'").run(clock-1);
+  expect(()=>call({operationId:"successor-after-ack",expectedEpoch:svc.get("xv")!.epoch})).toThrow(/already acknowledged this incident/);
+  expect(ops("expired-window-successor").n).toBe(1);
+ });
+
+ it("refuses missing, null, malformed and foreign-generation quiescence proof",async()=>{
+  await reserveConflict();
+  for(const [why,bad] of [["missing",undefined],["null settled",{...proof(),settled:null}],["false",{...proof(),settled:false}],["no observedAt",{...proof(),observedAt:null}],["future",{...proof(),observedAt:new Date(clock+5000).toISOString()}],["foreign generation",{...proof(),generation:"other-gen"}],["no launch",{...proof(),launch:null}],["bad pid",{...proof(),pid:0}]] as const){
+   expect(()=>call({operationId:"proof-"+why.replace(/\s/g,"-"),quiescenceProof:bad})).toThrow();
+   expect(svc.get("xv")!.epoch).toBe(1);
+   expect(ops("expired-window-successor").n).toBe(0);
+  }
+  // A well-formed proof for the exact generation and launch passes.
+  expect(call().epoch).toBe(2);
+ });
+
+ it("refuses a non-Operator caller and a foreign owner generation",async()=>{
+  await reserveConflict();
+  expect(()=>svc.recoverExpiredReconciling("lead@xv","lead-g1",{rigId:"xv",operationId:"holder-self",windowMs:120000,expectedEpoch:1,expectedOwnerGeneration:"lead-g1",expectedCustodyDigest:custody(),conflictOperationId:"handy-native-activation",conflictKind:"resume-owned",quiescenceProof:proof()})).toThrow(/Kernel Operator owns/);
+  expect(()=>call({operationId:"wrong-gen",expectedOwnerGeneration:"other-gen"})).toThrow(/exact current owner generation/);
+  expect(()=>call({operationId:"wrong-epoch",expectedEpoch:9})).toThrow(/epoch differs/);
+  expect(ops("expired-window-successor").n).toBe(0);
+ });
+
+ it("refuses without the original spent recovery receipt or with conflicting custody",async()=>{
+  await reserveConflict();
+  db.prepare("DELETE FROM coordinator_operations WHERE kind='reconciliation-recover' AND rig_id='xv'").run();
+  expect(()=>call({operationId:"no-spent"})).toThrow(/original spent recovery receipt/);
+  expect(()=>call({operationId:"drift-custody",expectedCustodyDigest:"0".repeat(64)})).toThrow(/Custody changed/);
+  expect(ops("expired-window-successor").n).toBe(0);
+ });
+
+ it("refuses absent conflict evidence, a fabricated ACK receipt and a lying kind",async()=>{
+  await reserveConflict();
+  expect(()=>call({operationId:"no-conflict",conflictOperationId:"never-recorded"})).toThrow(/No durable conflicting operation ID/);
+  expect(()=>call({operationId:"lying-kind",conflictKind:"transfer"})).toThrow(/differs from the durable receipt/);
+  // A caller cannot supply a receipt; only a durable different-kind row counts.
+  expect(()=>call({operationId:"ack-kind",conflictKind:"acknowledge"})).toThrow(/not no-effect conflict evidence/);
+  expect(ops("expired-window-successor").n).toBe(0);
+ });
+
+ it("refuses a live window, an out-of-range window and a non-expired reconciling state",async()=>{
+  await reserveConflict();
+  db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(clock+5000);
+  expect(()=>call({operationId:"live-window"})).toThrow(/already expired reconciling window/);
+  db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(clock-1);
+  for(const windowMs of [9999,900001]){
+   expect(()=>call({operationId:"window-"+windowMs,windowMs})).toThrow(/10 seconds to 15 minutes/);
+  }
+  db.prepare("UPDATE coordinator_authority SET state='active' WHERE rig_id='xv'").run();
+  expect(()=>call({operationId:"active-state"})).toThrow(/Only an expired reconciling window/);
+  expect(ops("expired-window-successor").n).toBe(0);
+ });
+
+ it("replays exactly under the same operation id with no second window",async()=>{
+  await reserveConflict();
+  const first=call();
+  expect(first.epoch).toBe(2);
+  db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(clock+999999);
+  const again=call();
+  expect(again).toEqual(first);
+  expect(ops("expired-window-successor").n).toBe(1);
+  // A changed payload under the same id refuses.
+  expect(()=>call({windowMs:60000})).toThrow(/Operation ID reused/);
+ });
+
+ it("the genuine holder must still resume-owned separately",async()=>{
+  await reserveConflict();
+  call();
+  // Reconciling with an epoch the holder did not read yet: resume-owned still refuses a stale contract.
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-after-successor",expectedEpoch:1,expectedObligationsDigest:custody()})).toThrow(/epoch advanced/);
+  expect(svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-after-successor-2",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:custody()}).state).toBe("active");
+ });
+});

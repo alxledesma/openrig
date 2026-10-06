@@ -108,6 +108,29 @@ describe("real managed queue/transport boundary",()=>{
   expect(anonymous.status).toBe(403);
   expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE operation_id LIKE 'http-resume-%'").get()).toEqual({n:1});
  });
+ it("expired-window-recover requires Operator identity and exact native attestation",async()=>{
+  const op={"X-OpenRig-Session":"operator-agent@kernel","X-OpenRig-Occupant-Generation":"operator-agent-g1"};
+  const shown=await (await app.request("/api/coordinator/xv",{headers:{Authorization:"Bearer test-token"}})).json() as any;
+  const body={rigId:"xv",operationId:"http-recover",windowMs:120000,expectedEpoch:shown.authority.epoch,expectedOwnerGeneration:"lead-g1",expectedCustodyDigest:shown.obligationsDigest,conflictOperationId:"never-recorded",conflictKind:"resume-owned",quiescenceProof:{settled:true,observedAt:new Date().toISOString(),generation:"lead-g1",launch:"tmux:lead",pid:1234}};
+  // A live reconciling window is not a recovery subject.
+  const live=await call("/api/coordinator/expired-window-recover",body,{...op,Authorization:"Bearer test-token"});
+  expect(live.status).toBe(409);
+  // The holder can never invoke this path itself.
+  const holder=await call("/api/coordinator/expired-window-recover",body,{...caller,Authorization:"Bearer test-token"});
+  expect(holder.status).toBe(409);
+  expect((await holder.json()).error).toBe("coordinator_operator_required");
+  // No identity header never reaches authority.
+  const anonymous=await call("/api/coordinator/expired-window-recover",body,{Authorization:"Bearer test-token"});
+  expect(anonymous.status).toBe(403);
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE operation_id='http-recover'").get()).toEqual({n:0});
+  // With an expired window it reaches authority and refuses only on absent conflict evidence, proving
+  // the Operator path and the proof fence are actually evaluated.
+  db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=? WHERE rig_id='xv'").run(1);
+  const unproven=await call("/api/coordinator/expired-window-recover",{...body,quiescenceProof:{...body.quiescenceProof,settled:null}},{...op,Authorization:"Bearer test-token"});
+  expect(unproven.status).toBe(409);
+  expect((await unproven.json()).error).toBe("coordinator_quiescence_unproven");
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE operation_id='http-recover'").get()).toEqual({n:0});
+ });
  it("registered native identity mapping does not assume logical-id equals session stem",async()=>{
   db.prepare("UPDATE nodes SET logical_id='orch1.lead' WHERE id='lead@xv'").run();
   const result=await call("/api/queue/create",{destinationSession:"builder@xv",body:"build",dispatch:{token,packageKey:"p"},nudge:false},caller);expect(result.status).toBe(201);

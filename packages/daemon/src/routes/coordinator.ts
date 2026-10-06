@@ -61,7 +61,13 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
       // caller and the live authority row inside the service.
       return c.json(svc.resumeOwned(actor,generation,await c.req.json()));
      }
-     if(operation==="active-expiry-recover"){const b=await c.req.json();await svc.refreshRuntimeAvailability(b.token?.rigId);return c.json(svc.recoverExpiredActive(actor,generation,b));}
+     if(operation==="expired-window-recover"){
+      // Operator-attributed bounded recovery of ONE already expired reconciling window. The native
+      // quiescence proof travels in the body as data and is validated structurally in the service;
+      // no caller identity is ever taken from it.
+      return c.json(svc.recoverExpiredReconciling(actor,generation,await c.req.json()));
+    }
+    if(operation==="active-expiry-recover"){const b=await c.req.json();await svc.refreshRuntimeAvailability(b.token?.rigId);return c.json(svc.recoverExpiredActive(actor,generation,b));}
      if(operation==="reconciliation-recover")return c.json(svc.recoverReconciliation(actor,generation,await c.req.json()));
      if(operation==="renew"){
        const b=await c.req.json();if(b.token?.generation!==generation)throw new CoordinatorFenceError("coordinator_generation_mismatch","Token and caller generation differ");return c.json(svc.renew(actor,b.token,b.leaseMs,b.operationId));
