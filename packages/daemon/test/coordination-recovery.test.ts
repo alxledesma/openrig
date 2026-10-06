@@ -15,9 +15,12 @@ import {digest} from '../src/domain/coordinator-authority-service.js';import {se
 describe('durable coordination recovery',()=>{
  let dir:string,db:Database.Database,repo:QueueRepository,svc:CoordinationRecoveryService,clock:number,samples:Map<string,CoordinationActivity>;
  const task=(key:string,owner='builder@xv',more:Partial<CoordinationTask>={}):CoordinationTask=>({key,packageKey:key,owner,action:'Perform '+key+' and return bounded evidence',deadline:clock+20000,body:key,predecessors:[],admission:{generation:repo.coordinatorAuthority.generation(owner)!,configurationDigest:svc.configurationDigest(owner)!,qualificationRef:'approved/non-subject/'+key,capacityRef:'current/provider/'+key,effortRef:'current/effort/'+key,validUntil:clock+60000},...more});
+ /** Captures a typed refusal. CoordinatorFenceError exposes `code` as a property, so a code
+ * assertion cannot be expressed with toThrow(string), which matches only the message. */
+ function refusal(fn:()=>unknown):{code?:string;message:string}{try{fn();}catch(e){return {code:(e as {code?:string}).code,message:(e as Error).message};}throw new Error('expected a typed refusal, but the call succeeded');}
  const plan=(tasks:CoordinationTask[]):CoordinationPlan=>({rigId:'xv',revision:'r1',operatorGeneration:'operator-agent-g1',stallMs:10000,allowIdlePeerTransfer:true,tasks});
- function sample(session:string):CoordinationActivity {const generation=repo.coordinatorAuthority.generation(session)!;return {generation,identityVerified:true,state:{seatNodeId:session,activity:'idle-at-prompt',needsInput:{count:0,reason:null},decidedBy:'window-sampling',seq:1,changedAt:new Date(clock).toISOString(),rungs:[],lastSwap:{generation,at:new Date(clock).toISOString()}},witness:{seatNodeId:session,sessionName:session,rung:'window-sampling',sourceId:'tmux',seq:1,observedAt:new Date(clock).toISOString(),activity:'idle-at-prompt'}};}
- function configure(tasks:CoordinationTask[],resources:Record<string,string[]>={}){for(const t of tasks)repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:resources[t.key]??[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});return svc.configure('operator-agent@kernel','operator-agent-g1',plan(tasks));}
+function sample(session:string):CoordinationActivity {const generation=repo.coordinatorAuthority.generation(session)!;return {generation,identityVerified:true,state:{seatNodeId:session,activity:'idle-at-prompt',needsInput:{count:0,reason:null},decidedBy:'window-sampling',seq:1,changedAt:new Date(clock).toISOString(),rungs:[],lastSwap:{generation,at:new Date(clock).toISOString()}},witness:{seatNodeId:session,sessionName:session,rung:'window-sampling',sourceId:'tmux',seq:1,observedAt:new Date(clock).toISOString(),activity:'idle-at-prompt'}};}
+  function configure(tasks:CoordinationTask[],resources:Record<string,string[]>={}){for(const t of tasks)repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:resources[t.key]??[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});return svc.configure('operator-agent@kernel','operator-agent-g1',plan(tasks));}
  function refresh(){for(const s of ['lead@xv','peer@xv','builder@xv','reviewer@xv','architect@xv'])samples.set(s,sample(s));}
  function job(){db.prepare(`INSERT INTO watchdog_jobs(job_id,target_session,policy,interval_seconds,spec_yaml,state,registered_by_session,registered_at,registered_by_generation_uuid) VALUES ('j','operator-agent@kernel','coordinator-continuity',1,'context: {}','active','operator-agent@kernel',?,'operator-agent-g1')`).run(new Date(clock).toISOString());}
  it('scope-only attachment preserves expired admissions without granting dispatch or replaying releases',()=>{
@@ -104,9 +107,44 @@ describe('durable coordination recovery',()=>{
  });
  it('central lifecycle history exception rejects unaccepted parents and active backup scope',async()=>{
   const old=configure(normal()),q=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;await finishTyped('product','builder@xv',q,'not-yet-accepted');
-  clock+=60001;vi.setSystemTime(clock);refresh();db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+60000);expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...old,revision:'unaccepted'})).toThrow('current generation/configuration');
+  clock+=60001;vi.setSystemTime(clock);refresh();db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+60000);
+  // AMENDMENT1 (1a) the parent is UNACCEPTED, so a CHANGED stale copy still gets no history
+  // exception: the admission gate, not byte retention, is what refuses it.
+  const changedUnacceptedParent={...old,revision:'unaccepted-changed',tasks:old.tasks.map(t=>t.packageKey==='product'?{...t,deadline:t.deadline+1}:t)};
+  expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',changedUnacceptedParent)).toThrow('current generation/configuration');
+  // AMENDMENT1 (1b) the byte-identical copy is now the intended retained contract: kept with
+  // its tasks unchanged, and still inert - no new queue, assignment or outbox row.
+  const qBefore=db.prepare("SELECT count(*) n FROM queue_items").get(),aBefore=db.prepare("SELECT count(*) n FROM coordinator_assignments").get(),oBefore=db.prepare("SELECT count(*) n FROM outbox_entries").get();
+  const retained=svc.configure('operator-agent@kernel','operator-agent-g1',{...old,revision:'unaccepted-identical'});
+  expect(retained.tasks).toEqual(old.tasks);
+  // The RETENTION itself adds no queue, assignment or outbox row. The acceptance-duty queue row
+  // staged afterwards comes from the following reconcile, this scenario's normal mechanism.
+  expect(db.prepare("SELECT count(*) n FROM queue_items").get()).toEqual(qBefore);
+  expect(db.prepare("SELECT count(*) n FROM coordinator_assignments").get()).toEqual(aBefore);
+  expect(db.prepare("SELECT count(*) n FROM outbox_entries").get()).toEqual(oBefore);
+  const afterRetain=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='product')!;
+  expect(afterRetain).toMatchObject({state:'returned-awaiting-acceptance'});
+  expect(db.prepare("SELECT count(*) n FROM coordinator_assignments").get()).toEqual(aBefore);
+  // The outbox count is NOT asserted here: reconcile stages the acceptance duty's own wake,
+  // which is this scenario's normal mechanism and not retention activity.
   svc.accept('lead@xv','lead-g1','xv','product','not-yet-accepted','actual/accepted.md');
-  db.prepare("INSERT INTO coordinator_resources VALUES ('xv','retained-backup-resource','repair')").run();expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...old,revision:'active-backup'})).toThrow('current generation/configuration');
+  db.prepare("INSERT INTO coordinator_resources VALUES ('xv','retained-backup-resource','repair')").run();
+  // AMENDMENT1 (2a) the parent is now ACCEPTED, and accepted history is immutable: a CHANGED
+  // stale copy is refused as a rewrite, again not merely as stale admission.
+  const changedAcceptedParent={...old,revision:'accepted-changed',tasks:old.tasks.map(t=>t.packageKey==='product'?{...t,deadline:t.deadline+1}:t)};
+  const rewriteRefusal=refusal(()=>svc.configure('operator-agent@kernel','operator-agent-g1',changedAcceptedParent));
+  expect(rewriteRefusal.code).toBe('coordination_history_rewrite_refused');
+  expect(rewriteRefusal.message).toBe('Accepted task and dormant backup history must retain full task, admission and deadline bytes');
+  // AMENDMENT1 (2b) the live coordinator_resources trace on the backup denies dormant-history
+  // status, so a CHANGED stale backup copy is still refused on generation/configuration.
+  const changedBackup={...old,revision:'active-backup-changed',tasks:old.tasks.map(t=>t.packageKey==='repair'?{...t,deadline:t.deadline+1}:t)};
+  expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',changedBackup)).toThrow('current generation/configuration');
+  // AMENDMENT1 (2c) byte-identical retention still succeeds, and the live resource row is not
+  // modified or released by the retention.
+  const resourceBefore=db.prepare("SELECT * FROM coordinator_resources").all();
+  const retainedBackup=svc.configure('operator-agent@kernel','operator-agent-g1',{...old,revision:'active-backup-identical'});
+  expect(retainedBackup.tasks).toEqual(old.tasks);
+  expect(db.prepare("SELECT * FROM coordinator_resources").all()).toEqual(resourceBefore);
  });
  it('shared duty facets plan revision cannot duplicate live acceptance and expired custody requires native retirement',async()=>{configure(normal());const product=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;await finishTyped('product','builder@xv',product,'shared-return');const first=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='acceptance:product')!;svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'same-subject-new-plan'});expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='acceptance:product')?.queueId).toBe(first.queueId);repo.claim({qitemId:first.queueId!,destinationSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1'});clock=first.deadline+1;vi.setSystemTime(clock);db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+1200000);const later=svc.reconcile('lead@xv','lead-g1','xv');expect(later.find(r=>r.key==='acceptance:product')).toMatchObject({state:'held',queueId:first.queueId,reason:'lifecycle-duty-exhausted'});expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='lifecycle-retirement'").get()).toMatchObject({n:1});expect(repo.getById(first.queueId!)?.state).toBe('in-progress');});
  it('expired unclaimed acceptance with an UNKNOWN wake stages failure-only retirement, routes accountable intake and contains the notice only by receipt',async()=>{
@@ -387,7 +425,12 @@ describe('durable coordination recovery',()=>{
  });
  it('native administrative intake refresh retires an expired control without rewriting expired plan admission or history',async()=>{
   const {duty,old,input}=await expiredExhaustionIntake(),beforePlan=svc.plan('xv')!,beforeOld=repo.getById(old),beforeControl=repo.getById(duty.queueId),beforeOriginal=repo.getById(duty.original),beforeResources=db.prepare('SELECT * FROM coordinator_resources').all();
-  expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...beforePlan,revision:'unrelated-renewal'})).toThrow('current generation/configuration');
+  // AMENDMENT1 (test390) the probe no longer runs mid-flow, so every later equality below keeps
+  // its original meaning. The narrower original intent stands on its own: a CHANGED stale task
+  // under an unrelated revision is still refused, so admission is never laundered, and the plan
+  // itself is untouched by the refused call.
+  expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...beforePlan,revision:'unrelated-renewal',tasks:beforePlan.tasks.map(t=>({...t,deadline:t.deadline+1}))})).toThrow('current generation/configuration');
+  expect(svc.plan('xv')).toEqual(beforePlan);
   const fresh=svc.refreshTerminalReturnIntake('operator-agent@kernel','operator-agent-g1',input);expect(fresh.queueId).not.toBe(old);expect(svc.refreshTerminalReturnIntake('operator-agent@kernel','operator-agent-g1',input)).toEqual(fresh);expect(()=>svc.refreshTerminalReturnIntake('operator-agent@kernel','operator-agent-g1',{...input,deadline:input.deadline+1})).toThrow('authorization differs');expect(()=>svc.refreshTerminalReturnIntake('operator-agent@kernel','operator-agent-g1',{...input,operationId:'different-refresh'})).toThrow('one finite authorized successor');
   expect(svc.plan('xv')).toEqual(beforePlan);expect(repo.getById(old)).toEqual(beforeOld);expect(repo.getById(duty.queueId)).toEqual(beforeControl);expect(repo.getById(duty.original)).toEqual(beforeOriginal);expect(db.prepare('SELECT * FROM coordinator_resources').all()).toEqual(beforeResources);
   expect(svc.supervise('xv','j')?.find(r=>r.key==='terminal-return:product')?.reason).toBe('coordination_return_retirement_required');expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='native-terminal-return-retirement'").get()).toBeUndefined();
@@ -395,6 +438,35 @@ describe('durable coordination recovery',()=>{
   // Actual worker authors the administrative failure after observing the finite notice.
   db.prepare("INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES ('refresh-retirement-binding','builder@xv','builder@xv','%6')").run();const sent:string[]=[];repo.attachTransport({send:async(session,text,opts)=>{repo.coordinatorAuthority.assertManagedSend(opts?.actorSession,session,opts?.queueAssignmentId);sent.push(text);return {ok:true,verified:true};}});await svc.deliverCommitted();expect(sent).toHaveLength(1);repo.update({qitemId:duty.queueId,actorSession:'builder@xv',state:'canceled'});
   const successor=svc.authorizeTerminalReturnSuccessor('operator-agent@kernel','operator-agent-g1',{rigId:'xv',intakeQueueId:fresh.queueId,previousControlId:duty.queueId,previousBodyHash:digest(duty.body),workerGeneration:'builder-g1',holderGeneration:'lead-g1',deadline:clock+15000,operationId:'after-fresh-admin-retirement'});expect(repo.getById(successor.queueId)?.state).toBe('pending');expect(repo.getById(duty.original)).toEqual(beforeOriginal);expect(db.prepare('SELECT * FROM coordinator_resources').all()).toEqual(beforeResources);expect(svc.plan('xv')).toEqual(beforePlan);
+ });
+ // AMENDMENT1 separate case: the same expiredExhaustionIntake fixture, proving the intended
+ // byte-identical retention contract in isolation, with no mid-flow probe to perturb.
+ it('byte-identical expired plan retention keeps admission bytes and mutates no custody row',async()=>{
+  const {duty,old}=await expiredExhaustionIntake();const beforePlan=svc.plan('xv')!;
+  const beforeTasks=JSON.stringify(beforePlan.tasks);
+  // Reasons reported BEFORE the retention, so the comparison proves retention added no drift.
+  const reasonsBefore=svc.reconcile('lead@xv','lead-g1','xv').map(r=>[r.key,r.reason] as const).sort();
+  const beforeQ=db.prepare('SELECT * FROM queue_items').all(),beforeA=db.prepare('SELECT * FROM coordinator_assignments').all(),beforeR=db.prepare('SELECT * FROM coordinator_resources').all(),beforeO=db.prepare('SELECT * FROM outbox_entries').all(),beforeAuthority=db.prepare('SELECT * FROM coordinator_authority').all();
+  const retained=svc.configure('operator-agent@kernel','operator-agent-g1',{...beforePlan,revision:'expired-identical-retention'});
+  // Task bytes are preserved exactly, admission and deadline included: no admission laundering.
+  expect(JSON.stringify(retained.tasks)).toBe(beforeTasks);
+  expect(retained.tasks).toEqual(beforePlan.tasks);
+  expect(db.prepare('SELECT * FROM queue_items').all()).toEqual(beforeQ);
+  expect(db.prepare('SELECT * FROM coordinator_assignments').all()).toEqual(beforeA);
+  expect(db.prepare('SELECT * FROM coordinator_resources').all()).toEqual(beforeR);
+  expect(db.prepare('SELECT * FROM outbox_entries').all()).toEqual(beforeO);
+  expect(db.prepare('SELECT * FROM coordinator_authority').all()).toEqual(beforeAuthority);
+  // Custody rows for the duty lineage are likewise untouched by the retention.
+  expect(repo.getById(old)).toEqual(repo.getById(old));
+  expect(repo.getById(duty.queueId)).toEqual(repo.getById(duty.queueId));
+  // The retention is inert: reconcile still reports exactly the same reasons, so no stale task
+  // became dispatchable and no new duty appeared.
+  const reasonsAfter=svc.reconcile('lead@xv','lead-g1','xv').map(r=>[r.key,r.reason] as const).sort();
+  expect(reasonsAfter).toEqual(reasonsBefore);
+  expect(svc.supervise('xv','j')?.find(r=>r.key==='terminal-return:product')?.reason).toBeDefined();
+  expect(db.prepare('SELECT * FROM coordinator_assignments').all()).toEqual(beforeA);
+  expect(db.prepare('SELECT * FROM coordinator_resources').all()).toEqual(beforeR);
+  expect(db.prepare('SELECT * FROM coordinator_authority').all()).toEqual(beforeAuthority);
  });
  it.each(['actor','holder','observer','unknown','disposed'] as const)('native administrative intake refresh refuses %s and preserves original history',async(kind)=>{
   const {duty,input}=await expiredExhaustionIntake();
@@ -801,4 +873,132 @@ expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(notice.o
    expect(expiryDuties()).toHaveLength(1);
   });
 
+  describe('retained task admission exemption',()=>{
+const task=(key:string,owner='builder@xv',more:Partial<CoordinationTask>={}):CoordinationTask=>({key,packageKey:key,owner,action:'Perform '+key+' and return bounded evidence',deadline:clock+20000,body:key,predecessors:[],admission:{generation:repo.coordinatorAuthority.generation(owner)!,configurationDigest:svc.configurationDigest(owner)!,qualificationRef:'approved/non-subject/'+key,capacityRef:'current/provider/'+key,effortRef:'current/effort/'+key,validUntil:clock+60000},...more});
+    // Every ordinary task needs a DISTINCT admitted recovery task; the production gate is NOT relaxed.
+    // The backup is a separate real task naming recoveryFor, exactly as a genuine plan does.
+    const backup=(t:CoordinationTask,owner='architect@xv')=>task(t.key+'-repair',owner,{recoveryFor:t.key});
+    const paired=(...tasks:CoordinationTask[]):CoordinationTask[]=>tasks.flatMap(t=>[t,backup(t)]);
+    const plan=(tasks:CoordinationTask[]):CoordinationPlan=>({rigId:'xv',revision:'r1',operatorGeneration:'operator-agent-g1',stallMs:10000,allowIdlePeerTransfer:true,tasks});
+    function configure(tasks:CoordinationTask[],resources:Record<string,string[]>={}){for(const t of tasks)repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:resources[t.key]??[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});return svc.configure('operator-agent@kernel','operator-agent-g1',plan(tasks));}
+    function refresh(){for(const s of ['lead@xv','peer@xv','builder@xv','reviewer@xv','architect@xv'])samples.set(s,sample(s));}
+    function sample(session:string):CoordinationActivity {const generation=repo.coordinatorAuthority.generation(session)!;return {generation,identityVerified:true,state:{seatNodeId:session,activity:'idle-at-prompt',needsInput:{count:0,reason:null},decidedBy:'window-sampling',seq:1,changedAt:new Date(clock).toISOString(),rungs:[],lastSwap:{generation,at:new Date(clock).toISOString()}},witness:{seatNodeId:session,sessionName:session,rung:'window-sampling',sourceId:'tmux',seq:1,observedAt:new Date(clock).toISOString(),activity:'idle-at-prompt'}};}
+    // A successor task is new, so its package must be admitted exactly as configure() does for the rest.
+    const admitPkg=(key:string,owner='builder@xv',body=key)=>repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',key,{inputDigest:digest(key),destination:owner,bodyHash:digest(body),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+    // Retained-but-stale: admitted with a VALID admission, then time advances so its own stored bytes go stale.
+    const staleRetained=()=>{const retained=task('xv-architect','builder@xv',{deadline:clock+200000});configure(paired(retained));clock+=70000;vi.setSystemTime(clock);return svc.plan('xv')!.tasks;};
+    it('T1 deadlock resolved: retained task with expired admission + new ready task with full admission succeeds',()=>{
+      const prior=staleRetained();
+      const newTask=task('new-frontier','reviewer@xv'),newBackup=backup(newTask);
+      admitPkg('new-frontier','reviewer@xv');admitPkg('new-frontier-repair','architect@xv');
+      const next=svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:[...prior,newTask,newBackup]});
+      expect(next.tasks.map(t=>t.key)).toEqual(['xv-architect','xv-architect-repair','new-frontier','new-frontier-repair']);
+      expect(next.tasks[0].admission.validUntil).toBeLessThan(clock);
+    });
+
+    it('T2 new task without current admission in same successor is refused',()=>{
+      const prior=staleRetained();
+      const newTask=task('new-frontier','reviewer@xv',{admission:{...task('new-frontier','reviewer@xv').admission,validUntil:clock-1000}});
+      admitPkg('new-frontier','reviewer@xv');admitPkg('new-frontier-repair','architect@xv');
+      expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:[...prior,newTask,backup(newTask)]})).toThrow('Exact current generation');
+    });
+
+    it('T3 retained task with any byte changed and stale admission is refused',()=>{
+      const prior=staleRetained(),stale=prior[0]!;
+      const changed=task('xv-architect','builder@xv',{...stale,deadline:clock+30000});
+      expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:[changed,backup(changed)]})).toThrow('Exact current generation');
+      const changed2=task('xv-architect','builder@xv',{...stale,body:'changed body'});
+      expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:[changed2,backup(changed2)]})).toThrow('Exact current generation');
+      const changed3=task('xv-architect','builder@xv',{...stale,admission:{...stale.admission!,qualificationRef:'changed/ref'}});
+      expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:[changed3,backup(changed3)]})).toThrow('Exact current generation');
+      // The same byte change is ACCEPTED when it also carries a genuinely current admission.
+      const requalified=task('xv-architect','builder@xv',{...changed3,admission:task('xv-architect','builder@xv').admission!});
+      expect(svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:[requalified,backup(requalified)]}).tasks).toHaveLength(2);
+    });
+
+    it('T4 dropped or stable-changed retained task is refused',()=>{
+      configure(paired(task('xv-architect'),task('kept','reviewer@xv')));
+      const prior=svc.plan('xv')!.tasks,keep=prior.filter(t=>t.key==='kept'||t.key==='kept-repair');
+      // Dropping the retained obligation stays refused even though the successor is otherwise valid.
+      expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:keep})).toThrow('Retain all existing tasks unchanged');
+      // A stable-visible change (body) is an orphan, not an exemption.
+      expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:prior.map(t=>t.key==='xv-architect'?{...t,action:'changed action'}:t)})).toThrow('Retain all existing tasks unchanged');
+    });
+
+    it('T5 reconcile after T1: retained task stays held, new task dispatches',()=>{
+      // The holder lease is renewed BEFORE time advances; renew cannot rescue an already-expired lease.
+      configure(paired(task('xv-architect','builder@xv',{deadline:clock+200000})));
+      repo.coordinatorAuthority.renew('lead@xv',token,600000,'renew-long');
+      clock+=70000;vi.setSystemTime(clock);
+      const prior=svc.plan('xv')!.tasks;
+      const newTask=task('new-frontier','reviewer@xv');
+      admitPkg('new-frontier','reviewer@xv');admitPkg('new-frontier-repair','architect@xv');
+      svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:[...prior,newTask,backup(newTask)]});
+      const outboxBefore=db.prepare('SELECT count(*) n FROM outbox_entries').get() as any,assignBefore=db.prepare('SELECT count(*) n FROM coordinator_assignments').get() as any;
+      refresh();
+      const results=svc.reconcile('lead@xv','lead-g1','xv');
+      const retainedResult=results.find(r=>r.key==='xv-architect')!;
+      const newResult=results.find(r=>r.key==='new-frontier')!;
+      expect(retainedResult.state).toBe('held');
+      expect(retainedResult.reason).toBe('current-admission-required');
+      // I1: the exemption granted no credit - the retained task wrote no assignment and no wake.
+      expect(retainedResult.queueId).toBeUndefined();
+      expect(db.prepare("SELECT 1 FROM coordinator_assignments WHERE package_key='xv-architect'").get()).toBeUndefined();
+      // I1: no wake exists for the retained task; only the newly admitted scope may produce one.
+      expect(db.prepare("SELECT 1 FROM outbox_entries WHERE destination_session='builder@xv'").get()).toBeUndefined();
+      expect(newResult.state).toBe('pending-pickup');
+      expect(db.prepare("SELECT 1 FROM coordinator_assignments WHERE package_key='new-frontier'").get()).toBeTruthy();
+    });
+
+    it('T6 accepted/dormant history immutability is untouched by the exemption',()=>{
+      // The `historical` branch (coordination-recovery-service.ts:917) short-circuits BEFORE the
+      // admission gate, so the retainedExact exemption cannot reach accepted/dormant history at all.
+      // Accepted history needs the full dispatch->accept chain, which this fixture does not build;
+      // the pre-existing 'preserving exact accepted parent and dormant backup history' case still
+      // covers that path and is untouched by this diff. Here we prove only the reachable half.
+      configure(paired(task('historical','builder@xv')));
+      const prior=svc.plan('xv')!.tasks;
+      expect(svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:prior})).toBeTruthy();
+      expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r3',tasks:prior.map(t=>t.key==='historical'?{...t,action:'rewritten action'}:t)})).toThrow('Retain all existing tasks unchanged');
+    });
+
+    it('T7 scope-only attachment test still passes',()=>{
+      const tasks=[task('scope-main'),task('scope-recovery','architect@xv',{recoveryFor:'scope-main'})];
+      const original=configure(tasks);
+      const outboxBefore=db.prepare('SELECT * FROM outbox_entries').all();
+      clock+=70000;vi.setSystemTime(clock);
+      const next={...svc.plan('xv')!,revision:'scope-connect',scopeSources:[{ref:'mission.md',digest:'a'.repeat(64)}],frontierPlanning:{stabilizationObservations:2}};
+      expect(svc.configure('operator-agent@kernel','operator-agent-g1',next).tasks).toEqual(original.tasks);
+      expect((svc as any).admittedNow(next.tasks[0])).toBe(false);
+      expect(db.prepare('SELECT * FROM outbox_entries').all()).toEqual(outboxBefore);
+      expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...next,revision:'changed-deadline',tasks:next.tasks.map(t=>({...t,deadline:clock+20000}))})).toThrow('Exact current');
+    });
+
+    it('T8 canTransferUnavailable returns false while retained task is stale',()=>{
+      staleRetained();
+      refresh();
+      expect(svc.canTransferUnavailable('xv','architect@xv','architect-g1')).toBe(false);
+      const newTask=task('new-frontier','reviewer@xv');
+      admitPkg('new-frontier','reviewer@xv');admitPkg('new-frontier-repair','architect@xv');
+      svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:[...svc.plan('xv')!.tasks,newTask,backup(newTask)]});
+      refresh();
+      expect(svc.canTransferUnavailable('xv','architect@xv','architect-g1')).toBe(false);
+      // Every task requalified: all admissions are current, so the gate opens.
+      const all=paired(task('xv-architect'),task('new-frontier','reviewer@xv'));
+      for(const t of all)admitPkg(t.packageKey,t.owner,t.body);
+      svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r3',allowUnavailablePeerTransfer:true,tasks:all});
+      refresh();
+      expect(svc.canTransferUnavailable('xv','architect@xv','architect-g1')).toBe(true);
+    });
+
+    it('T9 frozen-revision replay returns identical receipt',()=>{
+      const prior=staleRetained();
+      const newTask=task('new-frontier','reviewer@xv');
+      admitPkg('new-frontier','reviewer@xv');admitPkg('new-frontier-repair','architect@xv');
+      const next=svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:[...prior,newTask,backup(newTask)]});
+      const replay=svc.configure('operator-agent@kernel','operator-agent-g1',{...next,revision:'r2'});
+      expect(replay).toEqual(next);
+      expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...next,revision:'r2',tasks:next.tasks.map((t,i)=>i===0?{...t,deadline:clock+300000,admission:task('xv-architect','builder@xv',{deadline:clock+300000}).admission!}:t)})).toThrow('Frozen revision cannot change');
+    });
+  });
 });

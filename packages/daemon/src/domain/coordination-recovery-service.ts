@@ -915,9 +915,15 @@ private dutyProtection(rigId:string,r:any):boolean {
    for(const t of plan.tasks){
     const old=prior?.tasks.find(previous=>previous.key===t.key),historical=!!old&&(this.acceptedTaskHistory(plan.rigId,old)||this.dormantRecoveryHistory(plan.rigId,old,prior!));
     if(historical&&JSON.stringify(old)!==JSON.stringify(t))fail('coordination_history_rewrite_refused','Accepted task and dormant backup history must retain full task, admission and deadline bytes');
+    // A task byte-identical to the same-key task in the IMMEDIATELY prior plan is RETAINED, not
+    // re-admitted: it keeps its own admission bytes and this writes nothing. No admission field is
+    // changed, no package/queue/claim/authority write and no wake occurs, so no credit is created.
+    // reconcile()'s admittedNow() and the held reason 'current-admission-required' remain the sole
+    // activation gates, and any later byte change makes it a changed task under the full gate.
+    const retainedExact=!!old&&JSON.stringify(old)===JSON.stringify(t);
     if(!t.key||!t.action.trim()||!Number.isFinite(t.deadline)||(t.deadline<=this.now()&&!prior?.tasks.some(old=>old.key===t.key&&stable(old)===stable(t)))||!t.body||!Array.isArray(t.predecessors))fail("coordination_invalid_task","Concrete action, future deadline, predecessors and exact body required");
     const ad=t.admission;
-    if(!historical&&!scopeOnly&&(!ad||ad.generation!==this.authority.generation(t.owner)||ad.configurationDigest!==this.configurationDigest(t.owner)||!ad.qualificationRef||!ad.capacityRef||!ad.effortRef||!Number.isFinite(ad.validUntil)||ad.validUntil<=this.now()))fail('coordination_current_admission_required','Exact current generation/configuration, qualification/capacity/effort evidence and expiry required');
+    if(!historical&&!scopeOnly&&!retainedExact&&(!ad||ad.generation!==this.authority.generation(t.owner)||ad.configurationDigest!==this.configurationDigest(t.owner)||!ad.qualificationRef||!ad.capacityRef||!ad.effortRef||!Number.isFinite(ad.validUntil)||ad.validUntil<=this.now()))fail('coordination_current_admission_required','Exact current generation/configuration, qualification/capacity/effort evidence and expiry required');
     if(t.boundary&&!['owner-access','owner-credential','owner-material','owner-irreversible'].includes(t.boundary))fail("coordination_invalid_boundary","Unknown boundary");
     const row=this.db.prepare("SELECT contract FROM coordinator_packages WHERE rig_id=? AND package_key=?").get(plan.rigId,t.packageKey) as {contract:string}|undefined;
     if(!row)fail("coordination_package_not_admitted","Every task including recovery needs explicit admission");
