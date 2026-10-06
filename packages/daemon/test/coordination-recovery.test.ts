@@ -765,9 +765,7 @@ expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(notice.o
    const body=JSON.parse(q.body);
    expect(body).toMatchObject({action:'active-expiry-recover',reason:'expired-active-native-present-holder',previousQueueId:null,rigId:'xv',epoch:1,recipientGeneration:'operator-agent-g1'});
    expect(body.activeExpiry).toEqual({owner:'lead@xv',ownerGeneration:'lead-g1',expectedLeaseUntil:repo.coordinatorAuthority.get('xv')!.lease_until,custodyDigest:repo.coordinatorAuthority.reconciliationDigest('xv'),recoveryWindowMs:300000});
-   expect(body.nextAction).toContain('active-expiry-recover');
-   expect(body.nextAction).toContain('genuinely acknowledge custody first');
-   expect(body.nextAction).toContain('only after that acknowledgment renew');
+   expect(body.nextAction).toMatch(/blocked[\s\S]*genuine original holder[\s\S]*exact current owner generation[\s\S]*supported queue claim[\s\S]*must not claim on the holder[\s\S]*does not renew or extend the expired authority[\s\S]*current Operator[\s\S]*active-expiry-recover[\s\S]*freshly computed current reconciliation digest[\s\S]*Never reuse this notice’s staged custody digest[\s\S]*same-current native holder must use supported resume-owned to acknowledge and renew atomically/);
    expect('grantsAuthority' in body).toBe(false);
    expect(q.expiresAt).toBe(new Date(result[0].deadline!).toISOString());
    // Precedence is proven, not assumed: the idle-transfer fallback cannot also stage its hold.
