@@ -23,9 +23,19 @@ export function coordinatorCommand():Command {
    // A fresh generated id removes the reused-operation-id failure at its source. There is NO
    // automatic retry: a failed call is retried deliberately by passing the printed exact id back.
    const operationId=opts.operationId??randomUUID();
-   const res=await new DaemonClient().post(`/api/coordinator/resume-owned`,{rigId,leaseMs,operationId},{ headers: terminalAuthHeaders() });
+   const client=new DaemonClient();
+   // Read the CURRENT supported authority once and derive the expected epoch and obligations
+   // digest from it, so the operator never invents either field. Exactly one read and one POST:
+   // no polling and no retry, so an obligation that moves in between refuses rather than races.
+   const shown=await client.get(`/api/coordinator/${encodeURIComponent(rigId)}`,{ headers: terminalAuthHeaders() });
+   if(shown.status>=400){console.log(JSON.stringify(shown.data,null,2));process.exitCode=1;return;}
+   const current=shown.data as {authority?:{epoch?:unknown};obligationsDigest?:unknown};
+   const expectedEpoch=Number(current.authority?.epoch);
+   const expectedObligationsDigest=typeof current.obligationsDigest==="string"?current.obligationsDigest:"";
+   if(!Number.isSafeInteger(expectedEpoch)||!expectedObligationsDigest){process.stderr.write("authority read did not supply a current epoch and obligations digest; nothing was changed\n");process.exitCode=1;return;}
+   const res=await client.post(`/api/coordinator/resume-owned`,{rigId,leaseMs,operationId,expectedEpoch,expectedObligationsDigest},{ headers: terminalAuthHeaders() });
    const receipt:unknown=res.data;
-   console.log(JSON.stringify({...(receipt&&typeof receipt==="object"?receipt:{}),operationId,operationIdSource:generated?"generated":"supplied"},null,2));if(res.status>=400)process.exitCode=1;
+   console.log(JSON.stringify({...(receipt&&typeof receipt==="object"?receipt:{}),operationId,operationIdSource:generated?"generated":"supplied",expectedEpoch,expectedObligationsDigest},null,2));if(res.status>=400)process.exitCode=1;
   });
 for(const op of ["active-expiry-recover","held-history-adopt","held-history-recovery-bind","outbox-abandon-evidence","outbox-abandon-continue","outcome-qualification-refresh","outcome-recovery-bind","outbox-abandon-authorize","outbox-abandon-notify","enable","transfer","acknowledge","renew","admit","dispose","recover","legacy-inventory","migrate-legacy","diagnostic-wake-dispose","coordination-plan","coordination-reconcile","coordination-accept","coordination-continue-custody","outcome-configure","resilience-materialize","reconciliation-recover","coordination-worker-probe","coordination-return-successor","coordination-return-continue","coordination-return-retire","coordination-return-intake-refresh","coordination-lifecycle-recovery","coordination-frontier-plan","coordination-frontier-admit","coordination-frontier-confirm","coordination-frontier-boundary"]){
    cmd.command(`${op} <contractFile>`).description(op==="dispose"?'Submit {"rigId":"...","packageKey":"original admitted package key","dispositionId":"new worker-authored JSON return queue ID"}. The original worker may dispose its own terminal return; holder role is not required.':"Submit exact frozen JSON contract; caller identity/generation derive from seat environment")

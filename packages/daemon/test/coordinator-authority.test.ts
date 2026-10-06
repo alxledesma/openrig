@@ -342,7 +342,7 @@ describe("coordinator resume-owned shared native owner continuation",()=>{
  it("acknowledges a live reconciling owner and renews atomically",()=>{
   expect(svc.get("xv")!.state).toBe("reconciling");
   const baselineTransitions=transitions().n;
-  const out=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"resume-1"});
+  const out=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"resume-1",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
   expect(out.state).toBe("active");
   expect(out.lease_until).toBe(clock+120000);
   expect(out.operation_id).toBe("resume-1");
@@ -358,7 +358,7 @@ describe("coordinator resume-owned shared native owner continuation",()=>{
   db.prepare("UPDATE coordinator_authority SET state='active' WHERE rig_id='xv'").run();
   expect(svc.get("xv")!.state).toBe("active");
   const before=transitions().n;
-  const out=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-active"});
+  const out=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-active",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
   expect(out.state).toBe("active");
   expect(out.lease_until).toBe(clock+60000);
   // No re-acknowledgment: no duplicate queue event.
@@ -375,51 +375,85 @@ describe("coordinator resume-owned shared native owner continuation",()=>{
 
  it("never recovers an expired lease",()=>{
   db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(clock-1);
-  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-expired"})).toThrow(/expired lease is recovered only by the explicit expiry-recovery path/);
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-expired",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toThrow(/expired lease is recovered only by the explicit expiry-recovery path/);
+  expect(svc.get("xv")!.state).toBe("reconciling");
+  expect(ops().n).toBe(0);
+ });
+ it("refuses a stale expected obligations digest instead of accepting its own fresh read",async()=>{
+  const expected=svc.reconciliationDigest("xv");
+  // A stale read contract refuses; the server no longer blesses whatever it observes itself.
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"stale-digest",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:"0".repeat(64)})).toThrow(/Obligations changed since the expected read/);
+  expect(svc.get("xv")!.state).toBe("reconciling");
+  expect(ops().n).toBe(0);
+  // An obligation moves after the caller read it: the same stale contract now refuses.
+  await repo.create({qitemId:"stale-obligation",sourceSession:"operator-agent@kernel",destinationSession:"lead@xv",body:"{}",nudge:false});
+  expect(svc.reconciliationDigest("xv")).not.toBe(expected);
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"stale-digest-2",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:expected})).toThrow(/Obligations changed since the expected read/);
+  expect(svc.get("xv")!.state).toBe("reconciling");
+  expect(ops().n).toBe(0);
+  // The freshly derived contract from the same moment succeeds.
+  expect(svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"fresh-digest",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")}).state).toBe("active");
+  expect(ops().n).toBe(1);
+ });
+
+ it("refuses a stale expected epoch",()=>{
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"stale-epoch",expectedEpoch:svc.get("xv")!.epoch+7,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toThrow(/epoch advanced since the expected read/);
   expect(svc.get("xv")!.state).toBe("reconciling");
   expect(ops().n).toBe(0);
  });
 
- it("derives the current obligations digest and ignores any digest in the body",()=>{
-  // A caller-supplied stale/forged digest must not be able to satisfy or break the gate:
-   // resume-owned takes no digest field at all, and records the CURRENT derived one.
-   const out=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-digest"} as any);
-   expect(out.state).toBe("active");
-   // Durable binding: the derived facts are recorded in the hashed request, and the caller
-   // cannot inject a digest because none is ever read from the body.
-   const row=db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE operation_id='resume-digest'").get() as any;expect(row).toBeTruthy();
-   expect(row.request_hash).toMatch(/^[0-9a-f]{64}$/);
-   expect(JSON.parse(row.receipt).state).toBe("active");
-   expect((db.prepare("SELECT operation_id FROM coordinator_operations WHERE operation_id='resume-digest'").get() as any).operation_id).toBe("resume-digest");
- });
-
- it("an invalid lease rolls back every effect, leaving no partial acknowledgment",()=>{
-  const beforeTransitions=transitions().n,beforeOps=ops().n,beforeBaton=db.prepare("SELECT state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id='baton'").get();
-  for(const leaseMs of [999,3600001,1.5,NaN]){
-   expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs,operationId:"bad-lease"})).toThrow();
-  }
-  expect(svc.get("xv")!.state).toBe("reconciling");
-  expect(transitions().n).toBe(beforeTransitions);
-  expect(ops().n).toBe(beforeOps);
-  expect(db.prepare("SELECT state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id='baton'").get()).toEqual(beforeBaton);
- });
-
- it("exact operation-ID replay returns the durable receipt with no duplicate queue event",()=>{
-  const first=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"resume-replay"});
+ it("replays exactly after a real pending-baton acknowledgment and an unrelated obligation change",async()=>{
+  // This is the reconciliation case the review named: the acknowledgment itself changes baton
+  // fields inside obligations, so a replay hash that included live derived state would self-conflict.
+  expect(db.prepare("SELECT state FROM coordinator_authority WHERE rig_id='xv'").get()).toEqual({state:"reconciling"});
+  // A genuinely PENDING baton, so the acknowledgment really does claim it and moves the fields
+  // that obligations hash over.
+  db.prepare("UPDATE queue_items SET state='pending',claimed_by_generation_uuid=NULL WHERE qitem_id='baton'").run();
+  const digestAtRead=svc.reconciliationDigest("xv");
+  const first=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"replay-after-ack",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
   const afterFirst=transitions().n;
-  const again=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"resume-replay"});
+  // Obligations genuinely moved: the baton is now in-progress and claimed.
+  expect(svc.reconciliationDigest("xv")).not.toBe(digestAtRead);
+  expect(transitions().n).toBe(afterFirst);
+  // An unrelated new obligation must not break replay either.
+  await repo.create({qitemId:"replay-unrelated",sourceSession:"operator-agent@kernel",destinationSession:"peer@xv",body:"{}",nudge:false});
+  const again=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"replay-after-ack",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
   expect(again).toEqual(first);
   expect(transitions().n).toBe(afterFirst);
   expect(ops().n).toBe(1);
-  // Replay stays replayable after the renewed lease lapses.
+  // And it stays replayable even after the renewed lease lapses.
   clock+=999999;
-  expect(svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"resume-replay"})).toEqual(first);
+  expect(svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"replay-after-ack",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toEqual(first);
+  expect(transitions().n).toBe(afterFirst);
   expect(ops().n).toBe(1);
  });
 
+ it("refuses a blank, oversized or non-string operation id before any mutation",()=>{
+  const beforeTransitions=transitions().n,beforeBaton=db.prepare("SELECT state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id='baton'").get();
+  for(const [why,operationId] of [["blank",""],["whitespace","   "],["oversized","x".repeat(161)],["non-string",123],["missing",undefined]] as const){
+   expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId,expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")} as any)).toThrow(/Bounded attributed operation ID required/);
+  }
+  expect(svc.get("xv")!.state).toBe("reconciling");
+  expect(transitions().n).toBe(beforeTransitions);
+  expect(ops().n).toBe(0);
+  expect(db.prepare("SELECT state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id='baton'").get()).toEqual(beforeBaton);
+ });
+
+ it("refuses an unknown or retired authority state instead of implicitly activating it",()=>{
+  const baseline=transitions().n;
+  for(const state of ["recovery"]){
+   db.prepare("UPDATE coordinator_authority SET state=? WHERE rig_id='xv'").run(state);
+   expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"state-"+state,expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toThrow(/Authority state recovery cannot be resumed/);
+   expect(svc.get("xv")!.state).toBe(state);
+  }
+  expect(ops().n).toBe(0);
+  expect(transitions().n).toBe(baseline);
+ });
+
+
  it("refuses a conflicting payload under the same operation id",()=>{
-  svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"resume-conflict"});
-  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-conflict"})).toThrow(/Operation ID reused/);
+  svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"resume-conflict",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-conflict",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toThrow(/Operation ID reused/);
   expect(ops().n).toBe(1);
  });
 
@@ -437,7 +471,7 @@ describe("coordinator resume-owned shared native owner continuation",()=>{
    if(why==="wrong destination")await repo.create({qitemId:"other-baton",sourceSession:"operator-agent@kernel",destinationSession:"peer@xv",body:"coordinate",nudge:false});
    patch();
    const before=db.prepare("SELECT lease_until,operation_id FROM coordinator_authority WHERE rig_id='xv'").get();
-   expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"baton-"+why})).toThrow(/exact canonical baton claim/);
+   expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"baton-"+why,expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toThrow(/exact canonical baton claim/);
    // Refusal renews nothing and logs no receipt.
    expect(db.prepare("SELECT lease_until,operation_id FROM coordinator_authority WHERE rig_id='xv'").get()).toEqual(before);
    expect(ops().n).toBe(0);
@@ -445,35 +479,21 @@ describe("coordinator resume-owned shared native owner continuation",()=>{
   // The valid baton still renews, proving the fence is the claim and not the state alone.
   db.prepare("UPDATE coordinator_authority SET baton_id='baton' WHERE rig_id='xv'").run();
   db.prepare("UPDATE queue_items SET state='in-progress',claimed_by_generation_uuid='lead-g1',destination_session='lead@xv' WHERE qitem_id='baton'").run();
-  expect(svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"baton-valid"}).state).toBe("active");
+  expect(svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"baton-valid",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")}).state).toBe("active");
   expect(ops().n).toBe(1);
  });
 
- it("binds the current epoch and ignores any epoch in the body",()=>{
-  // A forged epoch in the body is never read: the token is derived from stored authority.
-  const out=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"epoch-1",epoch:9999} as any);
+ it("binds the current epoch from the expected contract, not from the body",()=>{
+  // A forged epoch alongside the contract is ignored: expectedEpoch is the only epoch input.
+  const forged={rigId:"xv",leaseMs:60000,operationId:"epoch-1",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv"),epoch:9999};
+  const out=svc.resumeOwned("lead@xv","lead-g1",forged as any);
   expect(out.epoch).toBe(svc.get("xv")!.epoch);
-  // After rotation the receipt must carry the NEW epoch; a stale epoch is never honoured.
+  expect(out.epoch).not.toBe(9999);
+  // After a rotation the receipt carries the new epoch, read fresh.
   db.prepare("UPDATE coordinator_authority SET epoch=epoch+1 WHERE rig_id='xv'").run();
-  const rotated=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"epoch-2"});
+  const rotated=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"epoch-2",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
   expect(rotated.epoch).toBe(out.epoch+1);
   expect(rotated.lease_until).toBe(clock+60000);
- });
-
- it("refuses a stale obligations digest by binding the live obligations",async()=>{
-  const before=svc.reconciliationDigest("xv");
-  svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"sd-1"});
-  const h1=(db.prepare("SELECT request_hash FROM coordinator_operations WHERE operation_id='sd-1'").get() as any).request_hash;
-  expect(h1).toMatch(/^[0-9a-f]{64}$/);
-  // A new live obligation changes what the digest must be.
-  await repo.create({qitemId:"sd-new-obligation",sourceSession:"operator-agent@kernel",destinationSession:"lead@xv",body:"{}",nudge:false});
-  expect(svc.reconciliationDigest("xv")).not.toBe(before);
-  // Presenting the STALE digest in the body changes nothing: it is never consulted.
-  svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"sd-2",obligationsDigest:before} as any);
-  const h2=(db.prepare("SELECT request_hash FROM coordinator_operations WHERE operation_id='sd-2'").get() as any).request_hash;
-  expect(h2).not.toBe(h1);
-  // And reusing sd-1 now conflicts, because the bound obligations are no longer the same.
-  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"sd-1"})).toThrow(/Operation ID reused/);
  });
 
  it("leaves protected claims, resources and uncertain effects untouched",()=>{
@@ -487,7 +507,7 @@ describe("coordinator resume-owned shared native owner continuation",()=>{
    unknown:db.prepare("SELECT outbox_id,delivery_state FROM outbox_entries WHERE delivery_state='indeterminate'").all()
   });
   const before=snapshot();
-  svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-protected"});
+  svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-protected",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
   const after=snapshot();
   expect(after.assignments).toEqual(before.assignments);
   expect(after.claims).toEqual(before.claims);

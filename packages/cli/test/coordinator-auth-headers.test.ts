@@ -28,7 +28,7 @@ beforeEach(() => {
   fs.writeFileSync(path.join(home, "terminal-token"), token, { mode: 0o600 });
   calls = [];
   const svc: Record<string, unknown> = {
-    get: (rigId: string) => ({ rigId }), obligations: () => [], reconciliationDigest: () => "fixture-digest",
+    get: (rigId: string) => ({ rigId, epoch: 4, state: "reconciling" }), obligations: () => [], reconciliationDigest: () => "fixture-digest",
     refreshRuntimeAvailability: async () => {},
     legacyInventory: (rigId: string, authorizationId: string) => {
       calls.push({ operation: "legacy-inventory", body: { rigId, authorizationId } }); return { rigId };
@@ -68,23 +68,30 @@ function contractFile(overrides: Record<string, unknown> = {}): string {
 }
 
 describe("resume-owned command contract", () => {
-  it("generates a fresh exact operation id by default and prints the id actually used", async () => {
+  it("derives the expected epoch and digest from one show read, then POSTs once", async () => {
+    const get = vi.spyOn(DaemonClient.prototype, "get");
     const post = vi.spyOn(DaemonClient.prototype, "post");
-    const log = vi.mocked(console.log);
     await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig"]);
+    // Exactly one supported read and exactly one POST: no polling, no retry.
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(get.mock.calls[0]?.[0]).toBe("/api/coordinator/test-rig");
+    expect(get.mock.calls[0]?.[1]).toEqual({ headers: { Authorization: `Bearer ${token}` } });
+    expect(post).toHaveBeenCalledTimes(1);
     expect(post.mock.calls[0]?.[0]).toBe("/api/coordinator/resume-owned");
     expect(post.mock.calls[0]?.[2]).toEqual({ headers: { Authorization: `Bearer ${token}` } });
-    const body = post.mock.calls[0]?.[1] as { rigId: string; leaseMs: number; operationId: string };
+    const body = post.mock.calls[0]?.[1] as Record<string, unknown>;
+    // The expected contract comes from the read, so the operator invents neither field.
+    expect(body.expectedEpoch).toBe(4);
+    expect(body.expectedObligationsDigest).toBe("fixture-digest");
     expect(body.rigId).toBe("test-rig");
     expect(body.leaseMs).toBe(1200000);
-    // A fresh generated id: never a reuse of the operator's earlier attempt.
     expect(body.operationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-    // The printed receipt reports the exact id used, so it can be replayed deliberately.
-    const printed = JSON.parse(String((log.mock.calls.at(-1)?.[0] as string)));
+    // No epoch or generation is trusted from the body beyond the derived expected contract.
+    expect(Object.keys(body).sort()).toEqual(["expectedEpoch", "expectedObligationsDigest", "leaseMs", "operationId", "rigId"]);
+    const printed = JSON.parse(String((vi.mocked(console.log).mock.calls.at(-1)?.[0] as string)));
     expect(printed.operationId).toBe(body.operationId);
     expect(printed.operationIdSource).toBe("generated");
     expect(printed.state).toBe("active");
-    // Identity derives from the seat environment; a body claim could not win.
     expect(calls[0]?.actor).toBe(actor);
     expect(calls[0]?.generation).toBe(generation);
     expect(process.exitCode).toBeUndefined();
@@ -93,20 +100,29 @@ describe("resume-owned command contract", () => {
     const post = vi.spyOn(DaemonClient.prototype, "post");
     await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig", "--operation-id", "controlled-replay-1", "--lease-ms", "60000"]);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.body).toEqual({ rigId: "test-rig", leaseMs: 60000, operationId: "controlled-replay-1" });
+    expect(calls[0]?.body).toEqual({ rigId: "test-rig", leaseMs: 60000, operationId: "controlled-replay-1", expectedEpoch: 4, expectedObligationsDigest: "fixture-digest" });
     const printed = JSON.parse(String((vi.mocked(console.log).mock.calls.at(-1)?.[0] as string)));
     expect(printed.operationId).toBe("controlled-replay-1");
     expect(printed.operationIdSource).toBe("supplied");
-    // No automatic mutation retry: exactly one call for one invocation.
     expect(post).toHaveBeenCalledTimes(1);
   });
-  it("sends no caller epoch or generation and refuses an out-of-range lease before any call", async () => {
+  it("refuses an out-of-range lease before reading or posting anything", async () => {
     const post = vi.spyOn(DaemonClient.prototype, "post");
+    const get = vi.spyOn(DaemonClient.prototype, "get");
     await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig", "--lease-ms", "999"]);
     expect(post).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
     expect(calls).toHaveLength(0);
     expect(process.exitCode).toBe(1);
     expect(vi.mocked(console.log).mock.calls).toHaveLength(0);
+  });
+  it("does not post when the supported read supplies no usable contract", async () => {
+    vi.spyOn(DaemonClient.prototype, "get").mockResolvedValue({ status: 200, data: { authority: {}, obligationsDigest: "" } } as never);
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+    await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig"]);
+    expect(post).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
   });
 });
 

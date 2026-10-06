@@ -66,7 +66,15 @@ describe("real managed queue/transport boundary",()=>{
   db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=?,operation_id='custody' WHERE rig_id='xv'").run(live);
   // The real CLI sends the installed native bearer plus seat identity headers.
   const native={...caller,Authorization:"Bearer test-token"};
-  const forged={rigId:"xv",leaseMs:120000,operationId:"http-resume-1",token:{rigId:"other",epoch:9999,generation:"attacker-gen"},obligationsDigest:"attacker-digest",actorSession:"attacker@elsewhere"};
+  // The supported read requires the same native bearer the CLI already sends.
+  const shown=await app.request("/api/coordinator/xv",{headers:{Authorization:"Bearer test-token"}});
+  expect(shown.status).toBe(200);
+  const current=await shown.json() as any;
+  // The command derives its expected contract from this supported read, never from a hand-typed field.
+  expect(current.obligationsDigest).toMatch(/^[0-9a-f]{64}$/);
+  expect(current.authority.epoch).toBeGreaterThan(0);
+  // Extra body claims must not be able to influence the outcome.
+  const forged={rigId:"xv",leaseMs:120000,operationId:"http-resume-1",expectedEpoch:current.authority.epoch,expectedObligationsDigest:current.obligationsDigest,token:{rigId:"other",epoch:9999,generation:"attacker-gen"},actorSession:"attacker@elsewhere",obligationsDigest:"attacker-digest"};
   const ok=await call("/api/coordinator/resume-owned",forged,native);
   expect(ok.status).toBe(200);
   const receipt=await ok.json() as any;
@@ -76,16 +84,27 @@ describe("real managed queue/transport boundary",()=>{
   expect(receipt.owner_session).toBe("lead@xv");
   expect(receipt.owner_generation).toBe("lead-g1");
   expect(receipt.operation_id).toBe("http-resume-1");
+  // A stale expected contract refuses instead of silently resuming fresh state: an obligation
+  // that moves after the read invalidates the digest the caller presented.
+  await repo.create({qitemId:"stale-obligation",sourceSession:"operator-agent@kernel",destinationSession:"lead@xv",body:"{}",nudge:false});
+  const stale=await call("/api/coordinator/resume-owned",{rigId:"xv",leaseMs:120000,operationId:"http-resume-4",expectedEpoch:current.authority.epoch,expectedObligationsDigest:current.obligationsDigest},native);
+  expect(stale.status).toBe(409);
+  expect((await stale.json()).error).toBe("coordinator_reconciliation_changed");
+  // A stale epoch refuses the same way.
+  const staleEpoch=await call("/api/coordinator/resume-owned",{rigId:"xv",leaseMs:120000,operationId:"http-resume-5",expectedEpoch:current.authority.epoch+5,expectedObligationsDigest:current.obligationsDigest},native);
+  expect(staleEpoch.status).toBe(409);
+  expect((await staleEpoch.json()).error).toBe("coordinator_cas_lost");
   expect(receipt.lease_until).toBeGreaterThan(Date.now());
   const logged=db.prepare("SELECT request_hash FROM coordinator_operations WHERE operation_id='http-resume-1'").get() as any;
   expect(logged.request_hash).toMatch(/^[0-9a-f]{64}$/);
   // A foreign generation header cannot resume the owner's authority.
   db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=? WHERE rig_id='xv'").run(live);
-  const foreign=await call("/api/coordinator/resume-owned",{rigId:"xv",leaseMs:120000,operationId:"http-resume-2"},{...native,"X-OpenRig-Occupant-Generation":"rotated-gen"});
+  const again=await (await app.request("/api/coordinator/xv",{headers:{Authorization:"Bearer test-token"}})).json() as any;
+  const foreign=await call("/api/coordinator/resume-owned",{rigId:"xv",leaseMs:120000,operationId:"http-resume-2",expectedEpoch:again.authority.epoch,expectedObligationsDigest:again.obligationsDigest},{...native,"X-OpenRig-Occupant-Generation":"rotated-gen"});
   expect(foreign.status).toBe(409);
   expect((await foreign.json()).error).toBe("coordinator_generation_mismatch");
   // A missing identity header is refused at the boundary and never reaches authority.
-  const anonymous=await call("/api/coordinator/resume-owned",{rigId:"xv",leaseMs:120000,operationId:"http-resume-3"},{Authorization:"Bearer test-token"});
+  const anonymous=await call("/api/coordinator/resume-owned",{rigId:"xv",leaseMs:120000,operationId:"http-resume-3",expectedEpoch:again.authority.epoch,expectedObligationsDigest:again.obligationsDigest},{Authorization:"Bearer test-token"});
   expect(anonymous.status).toBe(403);
   expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE operation_id LIKE 'http-resume-%'").get()).toEqual({n:1});
  });

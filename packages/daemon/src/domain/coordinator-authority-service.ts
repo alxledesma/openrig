@@ -436,7 +436,7 @@ export class CoordinatorAuthorityService {
   *  recoverable through the explicit expiry-recovery path. An already ACTIVE owner may renew
   *  here with equivalent fences. No admissions, qualifications, product acceptance, model
   *  change or UNKNOWN handling occurs, and nothing is retried automatically. */
- resumeOwned(actor:string, callerGeneration:string, input:{rigId:string;leaseMs:number;operationId:string}): Authority {
+ resumeOwned(actor:string, callerGeneration:string, input:{rigId:string;leaseMs:number;operationId:string;expectedEpoch:number;expectedObligationsDigest:string}): Authority {
   return this.db.transaction(() => {
    const found=this.get(input.rigId);
    if(!found)reject("coordinator_not_enabled","Rig authority is not enabled");
@@ -448,21 +448,31 @@ export class CoordinatorAuthorityService {
    if(row.owner_session!==actor)reject("coordinator_retired","Only the genuine recorded owner may resume its own authority");
    if(row.owner_generation!==callerGeneration)reject("coordinator_generation_mismatch","Immutable caller generation differs from the recorded owner generation");
    this.caller(actor,callerGeneration);
+   // Bounded, attributed durable operation ID, validated before any mutation.
+   if(typeof input.operationId!=="string"||!input.operationId.trim()||input.operationId.length>160)reject("coordinator_invalid_operation","Bounded attributed operation ID required");
    this.validLease(input.leaseMs);
-   // Derived BEFORE the replay check and never supplied by the caller, so the replay request
-   // hash is byte-identical to the request that is logged on a fresh call.
-   const token:CoordinatorToken={rigId:input.rigId,epoch:row.epoch,generation:callerGeneration};
-   const obligationsDigest=digest(canonical(this.obligations(input.rigId)));
-   let acknowledged=row.state!=="active";
-   // `acknowledged` is deliberately NOT part of the hashed request: it flips once the mutation
-   // lands, which would make an exact replay hash-differ and self-conflict. It is observable
-   // from the receipt (reconciling -> active) instead.
-   const request={actor,callerGeneration,input,token,obligationsDigest};
-   // Exact operation-ID replay returns the durable receipt; a changed payload under the same
-   // id refuses. Checked before the lease gate so a genuine replay stays replayable.
+   // The replay hash covers ONLY the immutable authenticated caller and the caller's own durable
+   // contract: rig, lease and operation id. It deliberately EXCLUDES both expectedEpoch and
+   // expectedObligationsDigest, because those are observed live state: a real acknowledgment changes
+   // baton fields inside obligations, so hashing them would make an exact replay self-conflict the
+   // moment any obligation moved, defeating reconciliation of unknown effects. A changed lease or
+   // rig under the same operation id still refuses as a conflicting payload.
+   const request={actor,callerGeneration,rigId:input.rigId,leaseMs:input.leaseMs,operationId:input.operationId};
    const replay=this.replay(input.rigId,input.operationId,"resume-owned",request);if(replay)return replay as Authority;
+   // Only these two states may continue. Any unknown or retired state refuses; nothing is implicitly
+   // activated.
+   if(row.state!=="active"&&row.state!=="reconciling")reject("coordinator_reconciliation_changed",`Authority state ${row.state} cannot be resumed; explicit recovery is required`);
+   // The caller's expected read contract must still be current. The CLI derives both from the
+   // supported show surface, so the operator never invents them, and a value that went stale in the
+   // meantime refuses instead of silently accepting a fresh read.
+   if(row.epoch!==input.expectedEpoch)reject("coordinator_cas_lost","Authority epoch advanced since the expected read; re-read and resume again");
+   const current=digest(canonical(this.obligations(input.rigId)));
+   if(current!==input.expectedObligationsDigest)reject("coordinator_reconciliation_changed","Obligations changed since the expected read; reconcile exact assignments, claims and uncertain nudge effects before resuming");
    // An expired lease NEVER resumes. Resume continues a LIVE window; recovery is separate.
    if(row.lease_until<=this.now())reject("coordinator_lease_expired","An expired lease is recovered only by the explicit expiry-recovery path, never by resume-owned");
+   // Derived, never supplied: the caller's own token for this current generation.
+   const token:CoordinatorToken={rigId:input.rigId,epoch:row.epoch,generation:callerGeneration};
+   let acknowledged=row.state!=="active";
    if(row.state==="active"){
     // An ACTIVE owner renewing here faces the SAME fence as assertOwner/renew: the exact
     // canonical baton must be in-progress and claimed by THIS current native generation.
@@ -470,9 +480,9 @@ export class CoordinatorAuthorityService {
     const baton=this.db.prepare("SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?").get(row.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string}|undefined;
     if(!baton||baton.destination_session!==actor||baton.state!=="in-progress"||baton.claimed_by_generation_uuid!==token.generation)reject("coordinator_baton_mismatch","Active authority requires its exact canonical baton claim");
    }
-   if(row.state!=="active"){
-    const baton=this.db.prepare("SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?").get(row.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string|null}|undefined;
-    if(!baton||baton.destination_session!==actor||!["pending","in-progress"].includes(baton.state)||(baton.claimed_by_generation_uuid!==null&&baton.claimed_by_generation_uuid!==token.generation))reject("coordinator_baton_mismatch","Cannot acknowledge another incarnation's baton");
+   if(acknowledged){
+    const baton=this.db.prepare("SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?").get(row.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string}|undefined;
+    if(!baton||baton.destination_session!==actor||!["pending","in-progress"].includes(baton.state)||(baton.claimed_by_generation_uuid!==null&&baton.claimed_by_generation_uuid!==token.generation))reject("coordinator_baton_mismatch","Reconciliation requires its exact canonical baton destined to the caller");
     const ts=new Date(this.now()).toISOString();
     this.db.prepare("UPDATE queue_items SET state='in-progress',claimed_at=COALESCE(claimed_at,?),claimed_by_generation_uuid=?,ts_updated=? WHERE qitem_id=?").run(ts,token.generation,ts,row.baton_id);
     this.transitions?.append({qitemId:row.baton_id,state:"in-progress",actorSession:actor,transitionNote:`coordinator epoch ${token.epoch} acknowledged and reconciled`,identityProvenance:"transport:v1"});
