@@ -379,6 +379,9 @@ export class RunnerCore {
         ? `[pi-runner] ${String(record.command)} completed${record.command === "get_available_models" ? ": " + (data?.models ?? []).map(m => `${m.provider}/${m.id}`).join(", ") : ""}`
         : `${PI_RUNNER_ERROR_MARKER} native control: ${String(record.error ?? "unverified response")}`);
       this.processing = true;
+      // Controls can append entries, or emit UI IDs without an agent_end.
+      // Read the current session's authoritative cursor even after refusal.
+      this.io.sendRpc({ type: "get_entries", id: CURSOR_REFRESH_ID });
       this.io.sendRpc({ type: "get_state", id: CONTROL_STATE_ID });
       return;
     }
@@ -410,6 +413,16 @@ export class RunnerCore {
       return;
     }
     if (record.id === CURSOR_REFRESH_ID || record.id === CATCH_UP_ID) {
+      if (record.success === false) {
+        // A historical UI UUID may have poisoned catchUpSince. The exact
+        // missing-entry response permits one read-only full cursor refresh;
+        // never repeat prompts/controls or overwrite from a failed response.
+        if (record.id === CATCH_UP_ID && record.command === "get_entries"
+          && record.error === `Entry not found: ${this.opts.catchUpSince}`) {
+          this.io.sendRpc({ type: "get_entries", id: CURSOR_REFRESH_ID });
+        }
+        return;
+      }
       const data = (record.data ?? record) as Record<string, unknown>;
       const entries = Array.isArray(data.entries) ? data.entries : (Array.isArray(record.entries) ? record.entries : []);
       const last = entries.at(-1);

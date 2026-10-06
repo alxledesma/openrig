@@ -623,6 +623,31 @@ describe("cursor refresh via get_entries (QA RED, qitem-20260707020922)", () => 
     expect(f.sidecars.at(-1)!.lastEntryId).toBe("e3");
   });
 
+  it("missing inherited cursor refreshes without replaying controls", () => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION }, { catchUpSince: "poisoned-uuid" });
+    core.start();
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-catch-up", command: "get_entries", success: false, error: "Entry not found: poisoned-uuid" }));
+    expect(f.rpc.at(-1)).toEqual({ type: "get_entries", id: "pi-runner-cursor-refresh" });
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-cursor-refresh", success: true, data: { entries: [{ id: "saved-tail" }] } }));
+    expect(f.sidecars.at(-1)!.lastEntryId).toBe("saved-tail");
+    expect(f.rpc.every(r => r.type === "get_state" || r.type === "get_entries")).toBe(true);
+  });
+
+  it.each([true, false])("compact response (%s) refreshes the durable cursor", (success) => {
+    const { core, rpc } = readyCore();
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-native-control", command: "compact", success }));
+    expect(rpc).toContainEqual({ type: "get_entries", id: "pi-runner-cursor-refresh" });
+  });
+
+  it("failed cursor response cannot publish an unverified entry", () => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION }, { catchUpSince: "saved-tail" });
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-cursor-refresh", success: false, data: { entries: [{ id: "unverified" }] } }));
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-get-state", data: { sessionFile: SESSION_FILE, sessionId: "x" } }));
+    expect(f.sidecars.at(-1)!.lastEntryId).toBe("saved-tail");
+  });
+
   it("an empty/id-less entries response leaves the cursor untouched (never regresses)", () => {
     const f = fakeIo();
     const core = new RunnerCore(f.io, { sessionName: SESSION, launchId: "launch-9" }, { catchUpSince: "e5" });
