@@ -20,6 +20,8 @@ export interface PackageContract {
  scopeCitations?: Array<{ref:string;digest:string}>;
 }
 export interface HeldHistoryRef {outboxId:string;rowHash:string;custodyHash:string;quarantineHash:string;operationHash:string}
+/** Exact, recomputable evidence for one adopted row whose queue custody moved only by ts_updated. */
+export interface CustodyAttestationEvidence {outboxId:string;adoptionPostCustodyHash:string;attestedCustodyHash:string;drift:Array<{path:'queue.ts_updated';frozen:string;current:string}>;cause:{queueId:string;transitionId:number;ts:string;state:string;actorSession:string;identityProvenance:'transport:v1'};history:{count:number;digest:string}}
 export interface LegacyInventory { heldHistory?:HeldHistoryRef[]; rows: Array<{queueId:string;rowHash:string}>; uncertainEffects: string[]; snapshotDigest:string }
 export interface LegacyEnrollment {
  rigId:string;batonId:string;owner:string;ownerGeneration:string;coordinators:string[];leaseMs:number;operationId:string;
@@ -269,17 +271,25 @@ export class CoordinatorAuthorityService {
  }
 /** Static containment permits ordinary dispatch; finite recovery still gates takeover. */
   isAdoptedHistoryContained(rigId:string,row:Record<string,unknown>):boolean {
+    const base=this.adoptionBase(rigId,row);
+    if(!base)return false;
+    const live=this.compatibleAdoptedCustody(this.historyCustody(row) as Record<string,unknown>,base.frozen);
+    // Exact frozen custody, OR the exact current custody bytes an Operator attested for THIS adoption.
+    return canonical(live)===canonical(base.frozen)||this.custodyAttested(rigId,String(row.outbox_id),String(base.adopted.post_custody_hash),digest(canonical(live)));
+  }
+  /** Every immutable adoption check that does not look at current custody. The frozen reference is the
+   *  receipt, hashed at adoption; current bytes are only ever read through it. */
+  private adoptionBase(rigId:string,row:Record<string,unknown>):{adopted:Record<string,unknown>;held:HeldHistoryRef;receipt:any;frozen:Record<string,unknown>}|null {
     const adopted=this.db.prepare('SELECT * FROM coordinator_held_history WHERE rig_id=? AND outbox_id=?').get(rigId,row.outbox_id) as Record<string,unknown>|undefined;
     const held=adopted?this.containedHistory(row):null;
-    if(!held||adopted!.original_row_hash!==held.rowHash||adopted!.quarantine_hash!==held.quarantineHash||adopted!.quarantine_operation_hash!==held.operationHash)return false;
-    let receipt:any;try{receipt=JSON.parse(String(adopted!.receipt));}catch{return false;}
-    if(!receipt||receipt.kind!=='coordinator-held-history-adoption.v1'||receipt.actor!=='operator-agent@kernel'||typeof receipt.generation!=='string'||receipt.deliveryConclusion!=='unknown'||receipt.originalMutations!==0||receipt.pre?.outboxId!==row.outbox_id||receipt.pre?.rowHash!==held.rowHash||receipt.pre?.quarantineHash!==held.quarantineHash||receipt.pre?.operationHash!==held.operationHash)return false;
-    // The frozen reference is the receipt, hashed at adoption; current bytes are only read through it.
+    if(!held||adopted!.original_row_hash!==held.rowHash||adopted!.quarantine_hash!==held.quarantineHash||adopted!.quarantine_operation_hash!==held.operationHash)return null;
+    let receipt:any;try{receipt=JSON.parse(String(adopted!.receipt));}catch{return null;}
+    if(!receipt||receipt.kind!=='coordinator-held-history-adoption.v1'||receipt.actor!=='operator-agent@kernel'||typeof receipt.generation!=='string'||receipt.deliveryConclusion!=='unknown'||receipt.originalMutations!==0||receipt.pre?.outboxId!==row.outbox_id||receipt.pre?.rowHash!==held.rowHash||receipt.pre?.quarantineHash!==held.quarantineHash||receipt.pre?.operationHash!==held.operationHash)return null;
     const original=receipt.postCustody;
-    if(original===null||typeof original!=='object'||Array.isArray(original))return false;
+    if(original===null||typeof original!=='object'||Array.isArray(original))return null;
     const frozen=original as Record<string,unknown>;
-    if(digest(canonical(frozen))!==adopted!.post_custody_hash)return false;
-    return canonical(this.compatibleAdoptedCustody(this.historyCustody(row) as Record<string,unknown>,frozen))===canonical(frozen);
+    if(digest(canonical(frozen))!==adopted!.post_custody_hash)return null;
+    return {adopted:adopted!,held,receipt,frozen};
   }
   /** Queue columns added after an adoption receipt was frozen. Migrations 090 (reply_to) and 091
    * (human_questions, human_answers) are nullable and purely additive, so an originally absent
@@ -296,6 +306,97 @@ export class CoordinatorAuthorityService {
       if(!Object.prototype.hasOwnProperty.call(frozen,column)&&queue[column]===null)delete queue[column];
     return {...current,queue};
   }
+
+ // ------------------------------------------------------------ custody attestation
+ // An adopted row's frozen custody includes queue.ts_updated, so a recorded same-state touch of the
+ // queue item breaks exact containment although nothing custody-relevant changed. Adoption is
+ // immutable and cannot be repeated, so the supported repair is an append-only Operator attestation of
+ // the EXACT current custody bytes, bound to a recorded cause. It edits no adoption, quarantine,
+ // outbox or queue row and never converts UNKNOWN into delivered.
+ private static readonly ISO_MS=/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+ /** Transitions of one queue item whose timestamp is at or after `sinceTs`, live and archived, in id order. */
+ private custodyTransitions(queueId:string,sinceTs:string):Array<{transition_id:number;ts:string;state:string;actor_session:string|null;identity_provenance:string|null}> {
+   const tables=['queue_transitions'];
+   if(this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue_transitions_archive'").get())tables.push('queue_transitions_archive');
+   const rows=tables.flatMap(t=>this.db.prepare(`SELECT transition_id,ts,state,actor_session,identity_provenance FROM ${t} WHERE qitem_id=? AND ts>=?`).all(queueId,sinceTs)) as Array<{transition_id:number;ts:string;state:string;actor_session:string|null;identity_provenance:string|null}>;
+   return rows.sort((a,b)=>a.transition_id-b.transition_id);
+ }
+ /** The exact evidence one adopted row's attestation must carry, derived only from live immutable records. */
+ private custodyEvidence(rigId:string,outboxId:string):{ok:true;evidence:CustodyAttestationEvidence;ref:HeldHistoryRef}|{ok:false;code:string;message:string} {
+   const no=(code:string,message:string)=>({ok:false as const,code,message});
+   const row=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(outboxId) as Record<string,unknown>|undefined;
+   if(!row)return no('custody_attestation_unknown_effect','No such effect');
+   const base=this.adoptionBase(rigId,row);
+   if(!base)return no('custody_attestation_not_adopted','Row is not exactly adopted with intact immutable containment');
+   const frozen=base.frozen,live=this.compatibleAdoptedCustody(this.historyCustody(row) as Record<string,unknown>,frozen),liveHash=digest(canonical(live));
+   if(canonical(live)===canonical(frozen))return no('custody_attestation_not_needed','Current custody already equals the frozen adoption');
+   if(this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='held-history-custody-attestation-effect'").get(rigId,'held-custody-attest:'+outboxId+':'+liveHash))return no('custody_attestation_already_attested','These exact current custody bytes are already attested');
+   const fq=frozen.queue,lq=live.queue,isObject=(v:unknown):v is Record<string,unknown>=>v!==null&&typeof v==='object'&&!Array.isArray(v);
+   if(!isObject(fq)||!isObject(lq))return no('custody_attestation_queue_required','Frozen and current queue custody must both exist');
+   const strip=(c:Record<string,unknown>,q:Record<string,unknown>)=>{const queue={...q};delete queue.ts_updated;return {...c,queue};};
+   if(canonical(strip(live,lq))!==canonical(strip(frozen,fq)))return no('custody_attestation_not_timestamp_only','Only queue.ts_updated may differ from the frozen custody');
+   const was=fq.ts_updated,now=lq.ts_updated;
+   if(typeof was!=='string'||typeof now!=='string'||!CoordinatorAuthorityService.ISO_MS.test(was)||!CoordinatorAuthorityService.ISO_MS.test(now)||!(Date.parse(now)>Date.parse(was)))return no('custody_attestation_timestamp_invalid','Current ts_updated must be a later millisecond ISO timestamp than the frozen one');
+   const queueId=String(lq.qitem_id),history=this.custodyTransitions(queueId,was);
+   if(history.some(t=>t.state!==fq.state))return no('custody_attestation_state_cycle','A transition after the frozen timestamp has a different state; custody was exercised and cannot be attested');
+   const causes=history.filter(t=>t.ts===now&&t.state===lq.state&&t.identity_provenance==='transport:v1'&&typeof t.actor_session==='string'&&t.actor_session.length>0);
+   if(causes.length===0)return no('custody_attestation_cause_missing','No recorded native transition has exactly the current ts_updated and the current state');
+   if(causes.length>1)return no('custody_attestation_cause_ambiguous','More than one recorded native transition has the current ts_updated');
+   const c=causes[0]!;
+   return {ok:true,ref:base.held,evidence:{outboxId,adoptionPostCustodyHash:String(base.adopted.post_custody_hash),attestedCustodyHash:liveHash,
+     drift:[{path:'queue.ts_updated',frozen:was,current:now}],
+     cause:{queueId,transitionId:c.transition_id,ts:c.ts,state:c.state,actorSession:String(c.actor_session),identityProvenance:'transport:v1'},
+     history:{count:history.length,digest:digest(canonical(history.map(t=>[t.transition_id,t.ts,t.state,t.actor_session,t.identity_provenance])))}}};
+ }
+ /** Read-only: the exact evidence the Operator would attest, or the typed reason a row cannot be attested. */
+ describeHeldHistoryCustody(actor:string,generation:string,input:{rigId:string;outboxIds:string[]}):unknown {
+   this.operator(actor,generation);
+   if(!input||typeof input!=='object'||Object.keys(input).sort().join(',')!=='outboxIds,rigId'||typeof input.rigId!=='string'||!Array.isArray(input.outboxIds)||input.outboxIds.length<1||input.outboxIds.length>2000||input.outboxIds.some(id=>typeof id!=='string'||!id.trim())||new Set(input.outboxIds).size!==input.outboxIds.length)reject('coordinator_held_history_contract','Exact bounded unique outbox ids required');
+   return {rigId:input.rigId,effects:input.outboxIds.map(id=>{const r=this.custodyEvidence(input.rigId,id);return r.ok?{outboxId:id,ok:true,evidence:r.evidence}:{outboxId:id,ok:false,code:r.code,message:r.message};})};
+ }
+ /** Append-only attestation of exact current custody for already adopted rows; see the block comment above. */
+ attestHeldHistoryCustody(actor:string,generation:string,input:{rigId:string;operationId:string;expected:CoordinatorToken;effects:CustodyAttestationEvidence[];recovery:{queueId:string;rowHash:string}}):unknown {
+   return this.db.transaction(()=>{
+     this.operator(actor,generation);
+     if(!input||typeof input!=='object'||Object.keys(input).sort().join(',')!=='effects,expected,operationId,recovery,rigId'||typeof input.rigId!=='string'||typeof input.operationId!=='string'||!input.operationId.trim()||!input.expected||Object.keys(input.expected).sort().join(',')!=='epoch,generation,rigId'||input.expected.rigId!==input.rigId||!Number.isSafeInteger(input.expected.epoch)||typeof input.expected.generation!=='string'||!Array.isArray(input.effects)||input.effects.length<1||input.effects.length>2000||input.effects.some(e=>!e||typeof e!=='object'||typeof e.outboxId!=='string')||new Set(input.effects.map(e=>e.outboxId)).size!==input.effects.length)reject('coordinator_held_history_contract','Exact bounded current-epoch custody attestation contract required');
+     const request={actor,generation,input};const prior=this.replay(input.rigId,input.operationId,'held-history-custody-attestation',request);if(prior)return prior;
+     const current=this.get(input.rigId);if(!current)reject('coordinator_not_enabled','Current enabled authority required');
+     const a=this.assertOwner(current!.owner_session,input.expected);
+     if(!this.coordinatorMembersValid(input.rigId,a.owner_session,this.coordinatorMembers(a)))reject('coordinator_invalid_members','Current registered coordinator occupants required');
+     // The evidence is recomputed from live immutable records inside this transaction and must equal the request exactly.
+     const refs:HeldHistoryRef[]=[];
+     input.effects.forEach(entry=>{
+       const r=this.custodyEvidence(input.rigId,entry.outboxId);
+       if(!r.ok)reject(r.code,r.message);
+       if(canonical(r.ok?r.evidence:null)!==canonical(entry))reject('custody_attestation_evidence_drift','Attested evidence differs from the live immutable records; describe again');
+       if(r.ok)refs.push(r.ref);
+     });
+     const recoveryBinding=this.validateHeldRecovery(actor,generation,{rigId:input.rigId,operationId:input.operationId,owner:a.owner_session,ownerGeneration:a.owner_generation,heldHistoryRecovery:input.recovery} as LegacyEnrollment,refs);
+     for(const queueId of [a.baton_id,input.recovery.queueId]){
+       const claim=this.db.prepare("SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? AND state='in-progress' AND transition_note='claimed' ORDER BY transition_id DESC LIMIT 1").get(queueId) as {actor_session:string;identity_provenance:string}|undefined;
+       if(!claim||claim.actor_session!==(queueId===a.baton_id?a.owner_session:actor)||claim.identity_provenance!=='transport:v1')reject('coordinator_held_history_contract','Actual current native holder and Operator recovery claims required');
+     }
+     const receipt={kind:'coordinator-held-history-custody-attestation.v1',actor,generation,epoch:a.epoch,owner:a.owner_session,ownerGeneration:a.owner_generation,expected:input.expected,effects:input.effects,recovery:input.recovery,recoveryBinding,deliveryConclusion:'unknown',originalMutations:0};
+     this.log(input.rigId,input.operationId,'held-history-custody-attestation',receipt,request);
+     // One direct-lookup marker per exact (row, custody bytes) so containment never scans the operations table.
+     for(const e of input.effects){const m={attestationOperationId:input.operationId,outboxId:e.outboxId,adoptionPostCustodyHash:e.adoptionPostCustodyHash,attestedCustodyHash:e.attestedCustodyHash};this.log(input.rigId,'held-custody-attest:'+e.outboxId+':'+e.attestedCustodyHash,'held-history-custody-attestation-effect',m,m);}
+     return receipt;
+   }).immediate();
+ }
+ /** True only for an Operator attestation of exactly these current custody bytes for exactly this adoption. */
+ private custodyAttested(rigId:string,outboxId:string,adoptionPostCustodyHash:string,attestedCustodyHash:string):boolean {
+   const get=(id:string,kind:string)=>this.db.prepare('SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind=?').get(rigId,id,kind) as {receipt:string}|undefined;
+   const marker=get('held-custody-attest:'+outboxId+':'+attestedCustodyHash,'held-history-custody-attestation-effect');
+   if(!marker)return false;
+   try{
+     const m=JSON.parse(marker.receipt);
+     if(!m||m.outboxId!==outboxId||m.adoptionPostCustodyHash!==adoptionPostCustodyHash||m.attestedCustodyHash!==attestedCustodyHash||typeof m.attestationOperationId!=='string')return false;
+     const parent=get(m.attestationOperationId,'held-history-custody-attestation');if(!parent)return false;
+     const r=JSON.parse(parent.receipt);
+     return !!r&&r.kind==='coordinator-held-history-custody-attestation.v1'&&r.actor==='operator-agent@kernel'&&r.deliveryConclusion==='unknown'&&r.originalMutations===0&&Array.isArray(r.effects)
+       &&r.effects.some((e:any)=>e?.outboxId===outboxId&&e.adoptionPostCustodyHash===adoptionPostCustodyHash&&e.attestedCustodyHash===attestedCustodyHash);
+   }catch{return false;}
+ }
  /** Exact immutable adopted cohort for a current Lead's administrative authoring duty.
   * This is evidence, never a live recovery binding or delivery conclusion. */
  heldHistoryAuthoringSnapshot(rigId:string):HeldHistoryRef[] {

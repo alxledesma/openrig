@@ -51,6 +51,8 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
      if(operation==="legacy-inventory"){const b=await c.req.json();return c.json(svc.legacyInventory(b.rigId,b.authorizationId,b.adoptHeldHistory===true));}
      if(operation==="held-history-adopt")return c.json(svc.adoptHeldHistory(actor,generation,await c.req.json()));
      if(operation==="held-history-recovery-bind")return c.json(svc.bindHeldHistoryRecovery(actor,generation,await c.req.json()));
+     if(operation==="held-history-custody-evidence")return c.json(svc.describeHeldHistoryCustody(actor,generation,await c.req.json()));
+     if(operation==="held-history-custody-attest")return c.json(svc.attestHeldHistoryCustody(actor,generation,await c.req.json()));
      if(operation==="migrate-legacy")return c.json(svc.migrateLegacy(actor,generation,await c.req.json()),201);
      if(operation==="enable")return c.json(svc.enable(actor,generation,await c.req.json()),201);
      if(operation==="transfer"){const b=await c.req.json();await svc.refreshRuntimeAvailability(b.expected?.rigId);return c.json(svc.transfer(actor,generation,b));}
