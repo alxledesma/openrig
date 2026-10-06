@@ -97,6 +97,11 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   for(const t of [next,backup])repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
   const observed=svc.reconcile('lead@xv','lead-g1','xv'),intake=observed.find(r=>r.key==='materialization:new-frontier')!;expect(intake.state).toBe('pending-native-materialization');
   expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='materialization:new-frontier')?.queueId).toBe(intake.queueId);const packet=JSON.parse(repo.getById(intake.queueId!)!.body);expect(packet.acceptedPredecessors).toContainEqual({queueId:q,dispositionId:'historical-return',evidenceRef:'actual/accepted-parent.md'});
+  // The newly accountable backup hold creates a real notice; it must settle before pickup.
+  expect(svc.dutyFacts(intake.queueId!).claim).toBe(false);
+  repo.attachTransport({send:async(session,_text,opts)=>{repo.coordinatorAuthority.assertManagedSend(opts?.actorSession,session,opts?.queueAssignmentId);return {ok:true,verified:true};}});
+  await svc.deliverCommitted();
+  expect(svc.dutyFacts(intake.queueId!).claim).toBe(true);
   repo.claim({qitemId:intake.queueId!,destinationSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1'});expect(()=>repo.update({qitemId:intake.queueId!,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'})).toThrow('Exact native acceptance');
   const proposal={...historical,revision:'materialized-r2',tasks:[...historical.tasks,next,backup]};
   for(const patch of [{body:'rewritten'},{admission:{...historical.tasks[0].admission,validUntil:clock+60000}},{predecessors:[{queueId:q,dispositionId:'changed'}]},{deadline:clock+20000}])expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...proposal,tasks:[{...historical.tasks[0],...patch},historical.tasks[1],next,backup]})).toThrow('history must retain');
@@ -145,6 +150,25 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   const retainedBackup=svc.configure('operator-agent@kernel','operator-agent-g1',{...old,revision:'active-backup-identical'});
   expect(retainedBackup.tasks).toEqual(old.tasks);
   expect(db.prepare("SELECT * FROM coordinator_resources").all()).toEqual(resourceBefore);
+ });
+ it.each([['pending','done'],['indeterminate','done'],['indeterminate','failed']] as const)('first lifecycle protected by %s debt after %s routes one intake and preserves uncertainty',async(state,terminal)=>{
+ configure(normal());const q=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;await finishTyped('product','builder@xv',q,'first-protected-return');
+ if(terminal==='failed')db.prepare("UPDATE queue_items SET state='failed' WHERE qitem_id=?").run(q);
+ db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state) VALUES('first-debt','watchdog@system','lead@xv','unresolved',?,?)").run(new Date(clock).toISOString(),state);
+ const debt=db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='first-debt'").get();
+ const held=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key===(terminal==='done'?'acceptance:product':'recovery:product'))!;
+ expect(held).toMatchObject({state:'held',reason:'lifecycle-recipient-protected',subject:{packageKey:'product',owner:'lead@xv'}});expect(held.queueId).toBeUndefined();
+ const intakes=()=>db.prepare("SELECT body FROM queue_items WHERE json_valid(body) AND json_extract(body,'$.reason')='lifecycle-recipient-protected'").all() as {body:string}[];
+ expect(intakes()).toHaveLength(1);expect(JSON.parse(intakes()[0].body)).toMatchObject({packageKey:'product',recipientGeneration:'operator-agent-g1',grantsAuthority:false});
+ svc.reconcile('lead@xv','lead-g1','xv');expect(intakes()).toHaveLength(1);expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='first-debt'").get()).toEqual(debt);expect(repo.getById(q)?.state).toBe(terminal);
+ });
+ it('first return-contract drift routes an accountable intake without changing original custody',async()=>{
+ configure(normal());const q=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;await finishTyped('product','builder@xv',q,'drift-return');
+ db.prepare("UPDATE queue_items SET body='drifted' WHERE qitem_id='drift-return'").run();const before=repo.getById(q);
+ const held=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='acceptance:product')!;
+ expect(held).toMatchObject({state:'held',queueId:q,reason:'lifecycle-return-contract-drift',subject:{packageKey:'product',owner:'lead@xv'}});
+ const intakes=()=>db.prepare("SELECT body FROM queue_items WHERE json_valid(body) AND json_extract(body,'$.reason')='lifecycle-return-contract-drift'").all();
+ expect(intakes()).toHaveLength(1);svc.reconcile('lead@xv','lead-g1','xv');expect(intakes()).toHaveLength(1);expect(repo.getById(q)).toEqual(before);
  });
  it('shared duty facets plan revision cannot duplicate live acceptance and expired custody requires native retirement',async()=>{configure(normal());const product=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;await finishTyped('product','builder@xv',product,'shared-return');const first=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='acceptance:product')!;svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'same-subject-new-plan'});expect(svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='acceptance:product')?.queueId).toBe(first.queueId);repo.claim({qitemId:first.queueId!,destinationSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1'});clock=first.deadline+1;vi.setSystemTime(clock);db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+1200000);const later=svc.reconcile('lead@xv','lead-g1','xv');expect(later.find(r=>r.key==='acceptance:product')).toMatchObject({state:'held',queueId:first.queueId,reason:'lifecycle-duty-exhausted'});expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='lifecycle-retirement'").get()).toMatchObject({n:1});expect(repo.getById(first.queueId!)?.state).toBe('in-progress');});
  it('expired unclaimed acceptance with an UNKNOWN wake stages failure-only retirement, routes accountable intake and contains the notice only by receipt',async()=>{
