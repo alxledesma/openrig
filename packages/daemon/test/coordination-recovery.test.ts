@@ -1251,6 +1251,101 @@ describe('admission-refresh lifecycle duty',()=>{
   expect(expired.queueId).toBeUndefined();
   expect(db.prepare("SELECT count(*) n FROM coordinator_assignments WHERE package_key='expired'").get()).toEqual({n:0});
  });
+
+  /** A task whose admission AND whose owner's dispatch restriction have both elapsed. The
+   *  restriction is configured while it is still future, then the clock advances past it, so
+   *  the fixture reaches the real ordering defect rather than a refused plan. */
+  const SCOPED_STALE=(owner='reviewer@xv')=>{
+   configure([task('expired',owner),task('expired-repair','architect@xv',{recoveryFor:'expired'})]);
+   const admittedAt=svc.plan('xv')!.tasks.find(t=>t.key==='expired')!.admission.validUntil;
+   repo.coordinatorAuthority.renew('lead@xv',token,600000,'scoped-stale-window');
+   svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'scoped-r2',dispatchRestrictions:[{session:owner,generation:repo.coordinatorAuthority.generation(owner)!,packageKeys:['expired'],validUntil:admittedAt+1000,evidenceRef:'native/checkpoint-scope.json'}]});
+   clock=admittedAt+2000;vi.setSystemTime(clock);refresh();return admittedAt;
+  };
+
+  it('RS1 a stale UNASSIGNED task under an expired dispatch scope gets its exact duty and a deduplicated finite intake',()=>{
+   const admittedAt=SCOPED_STALE();
+   const results=svc.reconcile('lead@xv','lead-g1','xv');
+   // The dispatch hold is unchanged and still hard: no assignment, no queue row for the task.
+   expect(results.find(r=>r.key==='expired')).toMatchObject({state:'held',reason:'dispatch-scope-expired'});
+   expect(db.prepare("SELECT count(*) n FROM coordinator_assignments WHERE package_key='expired'").get()).toEqual({n:0});
+   expect(repo.getById('qitem-coordination-'+digest('xv:expired').slice(0,24))).toBeNull();
+   // The duty exists anyway, is exact and is bound to LIVE owner facts only.
+   const r=refreshReceipt('expired')!;
+   expect(r).toBeTruthy();
+   expect(r.recipient).toBe('operator-agent@kernel');
+   expect(r.staleReason).toBe('expired');
+   expect(r.ownerGeneration).toBe(repo.coordinatorAuthority.generation('reviewer@xv'));
+   expect(r.liveConfigurationDigest).toBe(svc.configurationDigest('reviewer@xv'));
+   expect(r.priorAdmission.validUntil).toBe(admittedAt);
+   expect(r.planRevision).toBe(svc.plan('xv')!.revision);
+   // The duty's own result row is only propagated when the duty is itself HELD, exactly as
+   // the current-admission-required branch does. A staged duty is proven by its durable row.
+   expect(results.find(x=>x.key==='admission-refresh:expired')).toBeUndefined();
+   expect(repo.getById(r.queueId)).toMatchObject({destinationSession:'operator-agent@kernel',state:'pending'});
+   expect(Date.parse(repo.getById(r.queueId)!.expiresAt!)).toBeGreaterThan(clock);
+   const body=JSON.parse((db.prepare('SELECT body FROM queue_items WHERE qitem_id=?').get(r.queueId) as any).body);
+   expect(body.action).toBe('refresh-exact-expired-task-admission');
+   expect(body.grantsAuthority).toBe(false);
+   // The scope hold is now an accountable finite intake, and one reconcile stages exactly one.
+   const intakes=()=>db.prepare("SELECT qitem_id,body FROM queue_items WHERE json_valid(body) AND json_extract(body,'$.reason')='dispatch-scope-expired'").all() as any[];
+   expect(intakes()).toHaveLength(1);
+   const hold=JSON.parse(intakes()[0].body);
+   expect(hold).toMatchObject({action:'resolve-exact-coordination-task-hold',packageKey:'expired',taskOwner:'reviewer@xv',recipientGeneration:'operator-agent-g1',grantsAuthority:false});
+   expect(repo.getById(intakes()[0].qitem_id)).toMatchObject({destinationSession:'operator-agent@kernel'});
+   expect(Date.parse(repo.getById(intakes()[0].qitem_id)!.expiresAt!)).toBeLessThanOrEqual(clock+1200000);
+   // Repeat reconciliation is deduplicated: no second duty and no second intake.
+   svc.reconcile('lead@xv','lead-g1','xv');
+   expect(refreshAll().filter(x=>x.packageKey==='expired')).toHaveLength(1);
+   expect(intakes()).toHaveLength(1);
+  });
+
+  it('RS2 an admission-only successor keeps the expired scope byte-identical and still undispatchable',()=>{
+   SCOPED_STALE();
+   const prior=svc.plan('xv')!,restriction=JSON.stringify(prior.dispatchRestrictions![0]);
+   svc.reconcile('lead@xv','lead-g1','xv');
+   const current=prior.tasks.find(t=>t.key==='expired')!,r=refreshReceipt('expired')!;
+   const refreshed={...current,admission:{generation:r.ownerGeneration,configurationDigest:r.liveConfigurationDigest,qualificationRef:'<new-qualification-proof>',capacityRef:'<new-capacity-proof>',effortRef:'<new-effort-proof>',validUntil:clock+900000}};
+   const next=svc.configure('operator-agent@kernel','operator-agent-g1',{...prior,revision:'admission-only-r3',tasks:prior.tasks.map(t=>t.key==='expired'?refreshed:t)});
+   // The restriction is retained as history with identical bytes, and still evaluates expired.
+   expect(JSON.stringify(next.dispatchRestrictions![0])).toBe(restriction);
+   expect((svc as any).dispatchScopeHold(next,next.tasks.find(t=>t.key==='expired')!)).toBe('dispatch-scope-expired');
+   // The refreshed admission is genuinely current, yet scope still blocks dispatch.
+   expect((svc as any).admittedNow(next.tasks.find(t=>t.key==='expired')!)).toBe(true);
+   const results=svc.reconcile('lead@xv','lead-g1','xv');
+   expect(results.find(r=>r.key==='expired')).toMatchObject({state:'held',reason:'dispatch-scope-expired'});
+   expect(db.prepare("SELECT count(*) n FROM coordinator_assignments WHERE package_key='expired'").get()).toEqual({n:0});
+   expect(repo.getById('qitem-coordination-'+digest('xv:expired').slice(0,24))).toBeNull();
+   // Any CHANGED restriction is a new disposition and keeps the full current gate.
+   expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...next,revision:'changed-scope-r4',dispatchRestrictions:[{...next.dispatchRestrictions![0],evidenceRef:'native/different-scope.json'}]})).toThrow('future expiry');
+   expect(JSON.stringify(svc.plan('xv')!.dispatchRestrictions![0])).toBe(restriction);
+  });
+
+  it('RS3 assigned and accepted rows are unchanged, and an UNKNOWN owner effect still suppresses the scoped duty',async()=>{
+   configure(normal());
+   const q=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;
+   await finishTyped('product','builder@xv',q,'accepted-return');
+   svc.accept('lead@xv','lead-g1','xv','product','accepted-return','actual/accepted.md');
+   repo.coordinatorAuthority.renew('lead@xv',token,600000,'rs3-window');
+   const acceptedBytes=JSON.stringify(svc.plan('xv')!.tasks.find(t=>t.key==='product')!);
+   const scope=[{session:'builder@xv',generation:'builder-g1',packageKeys:['product'] as string[],validUntil:clock+1000,evidenceRef:'native/accepted-scope.json'},{session:'architect@xv',generation:'architect-g1',packageKeys:['repair'] as string[],validUntil:clock+1000,evidenceRef:'native/repair-scope.json'}];
+   svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'rs3-scoped-r2',dispatchRestrictions:scope});
+   clock+=900001;vi.setSystemTime(clock);refresh();
+   // The holder's lease must still be live for the reconcile to be the supported path; the
+   // same holder, epoch and generation are retained, so no authority is re-granted here.
+   db.prepare('UPDATE coordinator_authority SET lease_until=?').run(clock+1200000);
+   // The Architect's uncertain effect is preserved and blocks any new duty for its task.
+   db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state) VALUES('w-unknown-scope','watchdog@system','architect@xv','live',?,'indeterminate')").run(new Date(clock).toISOString());
+   const results=svc.reconcile('lead@xv','lead-g1','xv');
+   // The accepted row follows its existing path: no duty, same queue id, untouched bytes.
+   expect(results.find(r=>r.key==='product')).toMatchObject({state:'accepted',queueId:q});
+   expect(refreshAll().map(r=>r.packageKey)).not.toContain('product');
+   expect(JSON.stringify(svc.plan('xv')!.tasks.find(t=>t.key==='product')!)).toBe(acceptedBytes);
+   // The scope-held unassigned task stays held, and the UNKNOWN owner effect still suppresses its duty.
+   expect(results.find(r=>r.key==='repair')).toMatchObject({state:'held',reason:'dispatch-scope-expired'});
+   expect(refreshAll().map(r=>r.packageKey)).not.toContain('repair');
+   expect(db.prepare("SELECT outbox_id,delivery_state FROM outbox_entries WHERE outbox_id='w-unknown-scope'").get()).toEqual({outbox_id:'w-unknown-scope',delivery_state:'indeterminate'});
+  });
 });
 
 });

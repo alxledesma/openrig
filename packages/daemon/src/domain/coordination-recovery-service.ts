@@ -34,7 +34,9 @@ const successfulReturn=(state:string,disposition:string|null):boolean=>!!disposi
    * staged or renewed. Any other hold stays a bare observation. */
 export const FRONTIER_INTAKE_ROUTED_REASONS=['frontier-planning-duty-exhausted','frontier-boundary-blocked','frontier-boundary-declined','frontier-operator-absent'] as readonly string[];
 export const LIFECYCLE_INTAKE_RENEWAL_REASONS=['lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
-export const INTAKE_ROUTED_REASONS=['uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict','terminal-return-incarnation-changed','terminal-return-contract-drift','terminal-return-duty-exhausted','terminal-return-seat_dispatch_reserved','terminal-return-coordinator_resource_conflict','lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
+/** An expired dispatch scope is an accountable Operator boundary, not a silent hold: the
+ *  restriction itself is never renewed or released by the intake it raises. */
+export const INTAKE_ROUTED_REASONS=['uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict','terminal-return-incarnation-changed','terminal-return-contract-drift','terminal-return-duty-exhausted','terminal-return-seat_dispatch_reserved','terminal-return-coordinator_resource_conflict','lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift','dispatch-scope-expired',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
 function heldDispatchCode(error:unknown):string|undefined {
  const e=error as {code?:string;message?:string};
  if(e.code==='SQLITE_CONSTRAINT_TRIGGER'&&e.message==='seat_dispatch_reserved')return 'seat_dispatch_reserved';
@@ -984,9 +986,16 @@ private dutyProtection(rigId:string,r:any):boolean {
    if(plan.refreshDispatchIdentity!==undefined&&typeof plan.refreshDispatchIdentity!=='boolean')fail('coordination_invalid_identity_refresh','Identity refresh requires strict explicit boolean');
    if(plan.dispatchRestrictions!==undefined&&!scopeOnly){
     if(!Array.isArray(plan.dispatchRestrictions)||new Set(plan.dispatchRestrictions.map(r=>r.session)).size!==plan.dispatchRestrictions.length)fail('coordination_invalid_dispatch_scope','Unique explicit dispatch restrictions required');
+    // A restriction reproduced BYTE-IDENTICALLY from the prior plan is retained history,
+    // not a renewed scope. It may keep its elapsed validUntil so an admission-only successor
+    // can refresh a task's own evidence while the scope stay expired and undispatchable;
+    // dispatchScopeHold() still returns dispatch-scope-expired for it, so nothing dispatches.
+    // Anything changed, removed or extended is a NEW disposition and keeps the full gate.
+    const retainedRestrictions=new Set((prior?.dispatchRestrictions??[]).map(r=>JSON.stringify(r)));
     for(const r of plan.dispatchRestrictions){
      if(r.checkpointDisposition!==undefined&&r.checkpointDisposition!=='release-listed-packages')fail('coordination_invalid_checkpoint_disposition','Explicit listed-package checkpoint disposition required');
-     if(!r.session||r.generation!==this.authority.generation(r.session)||!Array.isArray(r.packageKeys)||!r.packageKeys.length||new Set(r.packageKeys).size!==r.packageKeys.length||r.packageKeys.some(key=>!plan.tasks.some(t=>t.owner===r.session&&t.packageKey===key))||!Number.isFinite(r.validUntil)||r.validUntil<=this.now()||typeof r.evidenceRef!=='string'||!r.evidenceRef.trim())fail('coordination_invalid_dispatch_scope','Exact current owner, admitted packages, future expiry and evidence required');
+     const retained=retainedRestrictions.has(JSON.stringify(r));
+     if(!r.session||r.generation!==this.authority.generation(r.session)||!Array.isArray(r.packageKeys)||!r.packageKeys.length||new Set(r.packageKeys).size!==r.packageKeys.length||r.packageKeys.some(key=>!plan.tasks.some(t=>t.owner===r.session&&t.packageKey===key))||!Number.isFinite(r.validUntil)||(!retained&&r.validUntil<=this.now())||typeof r.evidenceRef!=='string'||!r.evidenceRef.trim())fail('coordination_invalid_dispatch_scope','Exact current owner, admitted packages, future expiry and evidence required');
     }
    }
   if(plan.scopeSources!==undefined&&(!Array.isArray(plan.scopeSources)||new Set(plan.scopeSources.map(s=>s?.ref)).size!==plan.scopeSources.length||plan.scopeSources.some(s=>!s||typeof s.ref!=='string'||!s.ref.trim()||typeof s.digest!=='string'||!/^[0-9a-f]{64}$/.test(s.digest))))fail('coordination_invalid_scope_sources','Unique scope refs with exact sha256 digests required');
@@ -1088,7 +1097,20 @@ private dutyProtection(rigId:string,r:any):boolean {
      const state=accepted?'accepted':semanticRecovery?'recovery-required:semantic-incomplete':successfulReturn(assigned.state,assigned.disposition_id)?'returned-awaiting-acceptance':picked?'picked-up':assigned.state==='pending'?'pending-pickup':`recovery-required:${assigned.state}`;
      result.push({key:t.key,state,queueId:assigned.queue_id,deadline:t.deadline,...(!assigned.disposition_id&&this.now()>t.deadline?{reason:'deadline-exceeded: concrete recovery owner/action remains '+t.owner+' / '+t.action}:{})});continue;
     }
-    if(dispatchHold){result.push({key:t.key,state:'held',reason:dispatchHold,deadline:t.deadline});continue;}
+    // Dispatch scope is a hard no-assignment gate and stays one: nothing below stages a
+     // queue row, package claim or worker wake for a task it holds. Admission refresh is a
+     // SEPARATE finite duty about the task's own evidence, so an unassigned task under an
+     // expired scope still gets its exact duty instead of a silent hold — the same staging
+     // the current-admission-required branch performs below. Worker effect debt still
+     // suppresses it: an UNKNOWN effect keeps the owner protected before any new duty.
+     if(dispatchHold){
+      result.push({key:t.key,state:'held',reason:dispatchHold,deadline:t.deadline});
+      if(!this.workerEffectDebt(t.owner)){
+       const scoped=this.stageAdmissionRefreshDuty(rigId,t);
+       if(scoped?.state==='held')
+        result.push({key:scoped.key,state:'held',reason:scoped.reason,deadline:scoped.deadline??t.deadline,...(scoped.queueId?{queueId:scoped.queueId}:{}),...(scoped.activityEvidence?{activityEvidence:scoped.activityEvidence}:{})});
+      }
+      continue;}
     if(t.recoveryFor){
      const target=plan!.tasks.find(other=>other.key===t.recoveryFor)!;
      const targetAssignment=this.db.prepare("SELECT q.state,a.disposition_id FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=?").get(rigId,target.packageKey) as {state:string;disposition_id:string|null}|undefined;
