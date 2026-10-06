@@ -62,10 +62,11 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
       return c.json(svc.resumeOwned(actor,generation,await c.req.json()));
      }
      if(operation==="expired-window-recover"){
-      // Operator-attributed bounded recovery of ONE already expired reconciling window. The native
-      // quiescence proof travels in the body as data and is validated structurally in the service;
-      // no caller identity is ever taken from it.
-      return c.json(svc.recoverExpiredReconciling(actor,generation,await c.req.json()));
+      // Operator-attributed bounded recovery of ONE already expired reconciling window. Availability
+      // is refreshed here so the service reads its OWN current native evidence, including positive
+      // quiescence; the body carries no proof at all.
+      const b=await c.req.json();await svc.refreshRuntimeAvailability(b.rigId);
+      return c.json(svc.recoverExpiredReconciling(actor,generation,b));
     }
     if(operation==="active-expiry-recover"){const b=await c.req.json();await svc.refreshRuntimeAvailability(b.token?.rigId);return c.json(svc.recoverExpiredActive(actor,generation,b));}
      if(operation==="reconciliation-recover")return c.json(svc.recoverReconciliation(actor,generation,await c.req.json()));

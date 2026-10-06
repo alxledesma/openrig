@@ -15,7 +15,7 @@ export function coordinatorCommand():Command {
  // resume-owned takes a rigId, not a contract file: the daemon derives the caller's token
  // and current obligations digest, so the native Lead supplies no digest and no epoch.
  cmd.command("expired-window-recover <contractFile>")
-  .description("Operator-attributed bounded recovery for ONE already expired reconciling window, at epoch plus one, with no admission, qualification or dispatch. Requires the original spent recovery receipt, a durable different-kind operation-ID conflict, exact custody, and a positive native quiescence proof. The holder must still resume-owned separately.")
+  .description("Operator-attributed bounded recovery for ONE already expired reconciling window, at epoch plus one, with no admission, qualification or dispatch. Requires the original spent recovery receipt, a durable different-kind operation-ID conflict, exact custody, a delivery guard that is desired AND effective, and the service's own freshly refreshed positive native quiescence observation. The body carries no proof: the daemon reads its own native evidence. The holder must still resume-owned separately.")
   .action(async(file:string)=>{
    const contract=JSON.parse(fs.readFileSync(file,"utf8"));
    const client=new DaemonClient(),headers=terminalAuthHeaders();

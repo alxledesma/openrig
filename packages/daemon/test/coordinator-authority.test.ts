@@ -573,28 +573,30 @@ describe("expired reconciling window bounded successor recovery",()=>{
  const ops=(kind:string)=>db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind=?").get(kind) as any;
  const transitions=()=>db.prepare("SELECT count(*) n FROM queue_transitions WHERE qitem_id='baton'").get() as any;
  const custody=()=>svc.reconciliationDigest("xv");
- const proof=()=>({settled:true,observedAt:new Date(clock-50).toISOString(),generation:"lead-g1",launch:"tmux:lead-g1",pid:4321});
+ // Real internal native evidence: the service reads its own refreshed observation, never a body field.
+ const observe=(state:"present"|"absent"|"unknown"="present",quiescence:{settled:boolean|null;observedAt:string|null}|null={settled:true,observedAt:new Date(clock-50).toISOString()},generation="lead-g1")=>{
+  svc.setRuntimeObserver(async session=>({session,generation,state,observedAt:clock-1,fingerprint:"test-native-observation",quiescence} as never));
+ };
+ const guard=(desired:number,effective:number)=>db.prepare("INSERT INTO seat_delivery_guards(node_id,desired,effective,actor,reason,changed_at) VALUES('lead@xv',?,?,'test','test','2026-01-01T00:00:00.000Z') ON CONFLICT(node_id) DO UPDATE SET desired=excluded.desired,effective=excluded.effective").run(desired,effective);
+ const guardOn=()=>guard(1,1);
  // A durable, different-kind reservation of the same operation ID: real backend no-effect evidence.
+ // The incident's own spent recovery receipt IS the durable evidence: coordinator_operations is keyed
+ // by (rig, operation id), so the holder's acknowledge under that same id is what the backend refused.
  const reserveConflict=async()=>{
-  // Real no-effect evidence: the SAME operation id was already durably taken on this rig by a
-  // different kind, so the backend refused the holder's acknowledge under it. The holder's ACK
-  // never committed and there is no fabricated receipt.
-  db.prepare("UPDATE coordinator_authority SET state='active',lease_until=? WHERE rig_id='xv'").run(clock+5000);
-  svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"handy-native-activation",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
-  expect(db.prepare("SELECT kind FROM coordinator_operations WHERE rig_id='xv' AND operation_id='handy-native-activation'").get()).toEqual({kind:"resume-owned"});
-  // Restore the spent, expired reconciling window this recovery exists for.
   db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=? WHERE rig_id='xv'").run(clock-1);
  };
- const call=(over:Record<string,unknown>={})=>svc.recoverExpiredReconciling("operator-agent@kernel","operator-agent-g1",{
+ const ready=()=>{observe();guardOn();};
+ // The route refreshes availability before the mutation; the test does the same.
+ const call=async(over:Record<string,unknown>={})=>{await svc.refreshRuntimeAvailability("xv");return svc.recoverExpiredReconciling("operator-agent@kernel","operator-agent-g1",{
   rigId:"xv",operationId:"successor-1",windowMs:120000,
   expectedEpoch:1,expectedOwnerGeneration:"lead-g1",expectedCustodyDigest:custody(),
-  conflictOperationId:"handy-native-activation",conflictKind:"resume-owned",
-  quiescenceProof:proof(),...over});
+  conflictOperationId:"spent-recovery",conflictKind:"reconciliation-recover",
+  ...over});};
 
  it("grants exactly one bounded successor window at epoch plus one",async()=>{
-  await reserveConflict();
+  await reserveConflict();ready();
   const before=transitions().n;
-  const out=call();
+  const out=await call();
   expect(out.incidentAnchor).toBe("xv#1#lead-g1");
   expect(out.epoch).toBe(2);
   expect(out.leaseUntil).toBe(clock+120000);
@@ -612,88 +614,146 @@ describe("expired reconciling window bounded successor recovery",()=>{
  });
 
  it("refuses a second successor for the same incident across epochs",async()=>{
-  await reserveConflict();
-  call();
+  await reserveConflict();ready();
+  await call();
   // The new window expires too, and a second attempt at the same incident must refuse.
   db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(clock-1);
-  expect(()=>call({operationId:"successor-2",expectedEpoch:svc.get("xv")!.epoch})).toThrow(/already consumed its single bounded successor window/);
+  await expect(call({operationId:"successor-2",expectedEpoch:svc.get("xv")!.epoch})).rejects.toThrow(/already consumed its single bounded successor window/);
   expect(ops("expired-window-successor").n).toBe(1);
  });
 
  it("closes the incident once the holder genuinely acknowledges",async()=>{
-  await reserveConflict();
-  call();
+  await reserveConflict();ready();
+  await call();
   // The holder genuinely acknowledges and resumes the successor window, which ends the incident.
   expect(svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-ends-incident",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")}).state).toBe("active");
   db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=? WHERE rig_id='xv'").run(clock-1);
-  expect(()=>call({operationId:"successor-after-ack",expectedEpoch:svc.get("xv")!.epoch})).toThrow(/already acknowledged this incident/);
+  await expect(call({operationId:"successor-after-ack",expectedEpoch:svc.get("xv")!.epoch})).rejects.toThrow(/already acknowledged this incident/);
   expect(ops("expired-window-successor").n).toBe(1);
  });
 
- it("refuses missing, null, malformed and foreign-generation quiescence proof",async()=>{
-  await reserveConflict();
-  for(const [why,bad] of [["missing",undefined],["null settled",{...proof(),settled:null}],["false",{...proof(),settled:false}],["no observedAt",{...proof(),observedAt:null}],["future",{...proof(),observedAt:new Date(clock+5000).toISOString()}],["foreign generation",{...proof(),generation:"other-gen"}],["no launch",{...proof(),launch:null}],["bad pid",{...proof(),pid:0}]] as const){
-   expect(()=>call({operationId:"proof-"+why.replace(/\s/g,"-"),quiescenceProof:bad})).toThrow();
+ it("refuses missing, absent, null, false and foreign-generation internal quiescence evidence",async()=>{
+  await reserveConflict();ready();
+  for(const [why,setter] of [
+   ["no observation",()=>svc.setRuntimeObserver(async()=>null)],
+   ["absent occupant",()=>observe("absent",{settled:true,observedAt:new Date(clock-50).toISOString()})],
+   ["unknown occupant",()=>observe("unknown",{settled:true,observedAt:new Date(clock-50).toISOString()})],
+   ["absent quiescence",()=>observe("present",null)],
+   ["null settled",()=>observe("present",{settled:null,observedAt:new Date(clock-50).toISOString()})],
+   ["false settled",()=>observe("present",{settled:false,observedAt:new Date(clock-50).toISOString()})],
+   ["null observedAt",()=>observe("present",{settled:true,observedAt:null})],
+   ["malformed observedAt",()=>observe("present",{settled:true,observedAt:"not-a-time"})],
+   ["future observedAt",()=>observe("present",{settled:true,observedAt:new Date(clock+5000).toISOString()})],
+   ["foreign generation",()=>observe("present",{settled:true,observedAt:new Date(clock-50).toISOString()},"other-gen")],
+   ["stale observation",()=>{observe();svc.setRuntimeObserver(async session=>({session,generation:"lead-g1",state:"present",observedAt:clock-5000,fingerprint:"test-native-observation",quiescence:{settled:true,observedAt:new Date(clock-50).toISOString()}} as never));}]
+  ] as const){
+   setter();await svc.refreshRuntimeAvailability("xv");
+   await expect(call({operationId:"proof-"+why.replace(/\s/g,"-")})).rejects.toThrow();
    expect(svc.get("xv")!.epoch).toBe(1);
    expect(ops("expired-window-successor").n).toBe(0);
   }
-  // A well-formed proof for the exact generation and launch passes.
-  expect(call().epoch).toBe(2);
+  // Real, current, positive internal evidence passes.
+  ready();await svc.refreshRuntimeAvailability("xv");
+  expect((await call()).epoch).toBe(2);
+ });
+
+ it("refuses a caller-authored proof, since the contract carries no proof field",async()=>{
+  await reserveConflict();
+  // With NO internal native evidence at all, a fabricated launch/pid in the body cannot rescue the call.
+  await expect(call({operationId:"forged-proof",quiescenceProof:{settled:true,observedAt:new Date(clock-50).toISOString(),generation:"lead-g1",launch:"forged-launch",pid:999999}} as never)).rejects.toThrow(/fresh current native observation/);
+  expect(ops("expired-window-successor").n).toBe(0);
+  // A body proof field is ignored as data once real internal evidence exists.
+  ready();expect((await call({quiescenceProof:{settled:false,observedAt:null,generation:"attacker",launch:"forged",pid:1}} as never)).epoch).toBe(2);
+ });
+
+ it("refuses unless the owner node's delivery guard is desired AND effective",async()=>{
+  await reserveConflict();observe();await svc.refreshRuntimeAvailability("xv");
+  await expect(call({operationId:"no-guard"})).rejects.toThrow(/guard must be desired AND effective/);
+  guard(1,0);
+  await expect(call({operationId:"guard-effective-off"})).rejects.toThrow(/guard must be desired AND effective/);
+  guard(0,1);
+  await expect(call({operationId:"guard-desired-off"})).rejects.toThrow(/guard must be desired AND effective/);
+  expect(ops("expired-window-successor").n).toBe(0);
+  guardOn();expect((await call({operationId:"guard-on"})).epoch).toBe(2);
+ });
+
+ it("refuses a live reservation bound to the owner node or session, and an undelivered send",async()=>{
+  await reserveConflict();ready();
+  db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES('r1','op1','lead@xv','lead@xv','lead-g1','n1','operator-agent@kernel','operator-agent-g1','h','{}','{}','reserved','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')").run();
+  await expect(call({operationId:"node-reservation"})).rejects.toThrow(/outstanding dispatch reservation/);
+  // The same reservation registered against the node while naming another session is still caught.
+  db.prepare("UPDATE seat_dispatch_reservations SET session_name='someone-else'").run();
+  await expect(call({operationId:"node-reservation-2"})).rejects.toThrow(/outstanding dispatch reservation/);
+  db.prepare("DELETE FROM seat_dispatch_reservations").run();
+  db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state) VALUES('w-pending','lead@xv','builder@xv','{}',?,'pending')").run(new Date().toISOString());
+  await expect(call({operationId:"send-in-flight"})).rejects.toThrow(/undelivered send/);
+  expect(ops("expired-window-successor").n).toBe(0);
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  expect((await call({operationId:"send-clear"})).epoch).toBe(2);
  });
 
  it("refuses a non-Operator caller and a foreign owner generation",async()=>{
-  await reserveConflict();
-  expect(()=>svc.recoverExpiredReconciling("lead@xv","lead-g1",{rigId:"xv",operationId:"holder-self",windowMs:120000,expectedEpoch:1,expectedOwnerGeneration:"lead-g1",expectedCustodyDigest:custody(),conflictOperationId:"handy-native-activation",conflictKind:"resume-owned",quiescenceProof:proof()})).toThrow(/Kernel Operator owns/);
-  expect(()=>call({operationId:"wrong-gen",expectedOwnerGeneration:"other-gen"})).toThrow(/exact current owner generation/);
-  expect(()=>call({operationId:"wrong-epoch",expectedEpoch:9})).toThrow(/epoch differs/);
+  await reserveConflict();ready();
+  expect(()=>svc.recoverExpiredReconciling("lead@xv","lead-g1",{rigId:"xv",operationId:"holder-self",windowMs:120000,expectedEpoch:1,expectedOwnerGeneration:"lead-g1",expectedCustodyDigest:custody(),conflictOperationId:"spent-recovery",conflictKind:"reconciliation-recover"})).toThrow(/Kernel Operator owns/);
+  await expect(call({operationId:"wrong-gen",expectedOwnerGeneration:"other-gen"})).rejects.toThrow(/exact current owner generation/);
+  await expect(call({operationId:"wrong-epoch",expectedEpoch:9})).rejects.toThrow(/epoch differs/);
   expect(ops("expired-window-successor").n).toBe(0);
  });
 
  it("refuses without the original spent recovery receipt or with conflicting custody",async()=>{
-  await reserveConflict();
+  await reserveConflict();ready();
   db.prepare("DELETE FROM coordinator_operations WHERE kind='reconciliation-recover' AND rig_id='xv'").run();
-  expect(()=>call({operationId:"no-spent"})).toThrow(/original spent recovery receipt/);
-  expect(()=>call({operationId:"drift-custody",expectedCustodyDigest:"0".repeat(64)})).toThrow(/Custody changed/);
+  await expect(call({operationId:"no-spent"})).rejects.toThrow(/original spent recovery receipt/);
+  await expect(call({operationId:"drift-custody",expectedCustodyDigest:"0".repeat(64)})).rejects.toThrow(/Custody changed/);
   expect(ops("expired-window-successor").n).toBe(0);
  });
 
- it("refuses absent conflict evidence, a fabricated ACK receipt and a lying kind",async()=>{
-  await reserveConflict();
-  expect(()=>call({operationId:"no-conflict",conflictOperationId:"never-recorded"})).toThrow(/No durable conflicting operation ID/);
-  expect(()=>call({operationId:"lying-kind",conflictKind:"transfer"})).toThrow(/differs from the durable receipt/);
-  // A caller cannot supply a receipt; only a durable different-kind row counts.
-  expect(()=>call({operationId:"ack-kind",conflictKind:"acknowledge"})).toThrow(/not no-effect conflict evidence/);
+ it("binds conflict evidence to the original incident and refuses unrelated ids or fabricated kinds",async()=>{
+  await reserveConflict();ready();
+  // An operation id that is not this incident's own spent recovery operation cannot stand in, even
+  // when a durable row of some other kind exists.
+  await expect(call({operationId:"unrelated-conflict",conflictOperationId:"ack"})).rejects.toThrow(/original incident's own spent recovery operation/);
+  await expect(call({operationId:"never-recorded",conflictOperationId:"never-recorded"})).rejects.toThrow(/original incident's own spent recovery operation/);
+  // A caller cannot name an acknowledge or a successor as the conflicting kind.
+  await expect(call({operationId:"ack-kind",conflictKind:"acknowledge"})).rejects.toThrow(/incident's own durable recovery operation/);
+  await expect(call({operationId:"successor-kind",conflictKind:"expired-window-successor"})).rejects.toThrow(/incident's own durable recovery operation/);
+  // The receipt itself, not a fabricated failure receipt, is the only accepted evidence.
+  await expect(call({operationId:"lying-kind",conflictKind:"transfer"})).rejects.toThrow(/incident's own durable recovery operation/);
+  expect(ops("expired-window-successor").n).toBe(0);
+  // Removing the durable receipt removes the evidence entirely.
+  db.prepare("DELETE FROM coordinator_operations WHERE rig_id='xv' AND kind='reconciliation-recover'").run();
+  await expect(call({operationId:"no-receipt"})).rejects.toThrow(/original spent recovery receipt/);
   expect(ops("expired-window-successor").n).toBe(0);
  });
 
  it("refuses a live window, an out-of-range window and a non-expired reconciling state",async()=>{
-  await reserveConflict();
+  await reserveConflict();ready();
   db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(clock+5000);
-  expect(()=>call({operationId:"live-window"})).toThrow(/already expired reconciling window/);
+  await expect(call({operationId:"live-window"})).rejects.toThrow(/already expired reconciling window/);
   db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(clock-1);
   for(const windowMs of [9999,900001]){
-   expect(()=>call({operationId:"window-"+windowMs,windowMs})).toThrow(/10 seconds to 15 minutes/);
+   await expect(call({operationId:"window-"+windowMs,windowMs})).rejects.toThrow(/10 seconds to 15 minutes/);
   }
   db.prepare("UPDATE coordinator_authority SET state='active' WHERE rig_id='xv'").run();
-  expect(()=>call({operationId:"active-state"})).toThrow(/Only an expired reconciling window/);
+  await expect(call({operationId:"active-state"})).rejects.toThrow(/Only an expired reconciling window/);
   expect(ops("expired-window-successor").n).toBe(0);
  });
 
  it("replays exactly under the same operation id with no second window",async()=>{
-  await reserveConflict();
-  const first=call();
+  await reserveConflict();ready();
+  const first=await call();
   expect(first.epoch).toBe(2);
   db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(clock+999999);
-  const again=call();
+  const again=await call();
   expect(again).toEqual(first);
   expect(ops("expired-window-successor").n).toBe(1);
   // A changed payload under the same id refuses.
-  expect(()=>call({windowMs:60000})).toThrow(/Operation ID reused/);
+  await expect(call({windowMs:60000})).rejects.toThrow(/Operation ID reused/);
  });
 
  it("the genuine holder must still resume-owned separately",async()=>{
-  await reserveConflict();
-  call();
+  await reserveConflict();ready();
+  await call();
   // Reconciling with an epoch the holder did not read yet: resume-owned still refuses a stale contract.
   expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-after-successor",expectedEpoch:1,expectedObligationsDigest:custody()})).toThrow(/epoch advanced/);
   expect(svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"resume-after-successor-2",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:custody()}).state).toBe("active");

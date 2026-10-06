@@ -108,28 +108,39 @@ describe("real managed queue/transport boundary",()=>{
   expect(anonymous.status).toBe(403);
   expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE operation_id LIKE 'http-resume-%'").get()).toEqual({n:1});
  });
- it("expired-window-recover requires Operator identity and exact native attestation",async()=>{
+ it("expired-window-recover requires Operator identity, real internal quiescence and explicit guard ON",async()=>{
   const op={"X-OpenRig-Session":"operator-agent@kernel","X-OpenRig-Occupant-Generation":"operator-agent-g1"};
+  const auth={...op,Authorization:"Bearer test-token"};
   const shown=await (await app.request("/api/coordinator/xv",{headers:{Authorization:"Bearer test-token"}})).json() as any;
-  const body={rigId:"xv",operationId:"http-recover",windowMs:120000,expectedEpoch:shown.authority.epoch,expectedOwnerGeneration:"lead-g1",expectedCustodyDigest:shown.obligationsDigest,conflictOperationId:"never-recorded",conflictKind:"resume-owned",quiescenceProof:{settled:true,observedAt:new Date().toISOString(),generation:"lead-g1",launch:"tmux:lead",pid:1234}};
-  // A live reconciling window is not a recovery subject.
-  const live=await call("/api/coordinator/expired-window-recover",body,{...op,Authorization:"Bearer test-token"});
-  expect(live.status).toBe(409);
-  // The holder can never invoke this path itself.
-  const holder=await call("/api/coordinator/expired-window-recover",body,{...caller,Authorization:"Bearer test-token"});
-  expect(holder.status).toBe(409);
-  expect((await holder.json()).error).toBe("coordinator_operator_required");
-  // No identity header never reaches authority.
-  const anonymous=await call("/api/coordinator/expired-window-recover",body,{Authorization:"Bearer test-token"});
-  expect(anonymous.status).toBe(403);
-  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE operation_id='http-recover'").get()).toEqual({n:0});
-  // With an expired window it reaches authority and refuses only on absent conflict evidence, proving
-  // the Operator path and the proof fence are actually evaluated.
+  // The body carries NO proof at all: the service reads its own refreshed native evidence.
+  const body={rigId:"xv",operationId:"http-recover",windowMs:120000,expectedEpoch:shown.authority.epoch,expectedOwnerGeneration:"lead-g1",expectedCustodyDigest:shown.obligationsDigest,conflictOperationId:"never-recorded",conflictKind:"reconciliation-recover"};
+  // A fabricated proof in the body is ignored as data and cannot substitute for native evidence.
+  const forged={...body,quiescenceProof:{settled:true,observedAt:new Date().toISOString(),generation:"lead-g1",launch:"forged-launch",pid:999999}};
   db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=? WHERE rig_id='xv'").run(1);
-  const unproven=await call("/api/coordinator/expired-window-recover",{...body,quiescenceProof:{...body.quiescenceProof,settled:null}},{...op,Authorization:"Bearer test-token"});
-  expect(unproven.status).toBe(409);
-  expect((await unproven.json()).error).toBe("coordinator_quiescence_unproven");
-  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE operation_id='http-recover'").get()).toEqual({n:0});
+  const unobserved=await call("/api/coordinator/expired-window-recover",forged,auth);
+  expect(unobserved.status).toBe(409);
+  expect((await unobserved.json()).error).toBe("coordinator_owner_unobserved");
+  // An absent delivery guard refuses. This is intentional: the operator must enable it explicitly.
+  repo.coordinatorAuthority.setRuntimeObserver(async session=>({session,generation:"lead-g1",state:"present",observedAt:Date.now(),fingerprint:"http-native",quiescence:{settled:true,observedAt:new Date().toISOString()}} as never));
+  const noGuard=await call("/api/coordinator/expired-window-recover",body,auth);
+  expect(noGuard.status).toBe(409);
+  expect((await noGuard.json()).error).toBe("coordinator_guard_not_enabled");
+  // Guard desired but not effective still refuses.
+  db.prepare("INSERT INTO seat_delivery_guards(node_id,desired,effective,actor,reason,changed_at) VALUES('lead@xv',1,0,'test','test','2026-01-01T00:00:00.000Z')").run();
+  expect((await call("/api/coordinator/expired-window-recover",body,auth)).status).toBe(409);
+  db.prepare("UPDATE seat_delivery_guards SET effective=1 WHERE node_id='lead@xv'").run();
+  // Real internal evidence plus guard ON now reaches the incident fences: this fixture has no spent
+  // recovery receipt, so it refuses on the ORIGINAL receipt requirement rather than on proof or guard.
+  const reached=await call("/api/coordinator/expired-window-recover",body,auth);
+  expect(reached.status).toBe(409);
+  expect((await reached.json()).error).toBe("coordinator_reconciliation_unrecovered");
+  // Quiescence must be genuinely positive: a null settled observation refuses.
+  repo.coordinatorAuthority.setRuntimeObserver(async session=>({session,generation:"lead-g1",state:"present",observedAt:Date.now(),fingerprint:"http-native",quiescence:{settled:null,observedAt:null}} as never));
+  expect((await call("/api/coordinator/expired-window-recover",{...body,operationId:"http-recover-2"},auth)).status).toBe(409);
+  // The holder can never invoke this path itself, and no identity never reaches authority.
+  expect((await call("/api/coordinator/expired-window-recover",body,{...caller,Authorization:"Bearer test-token"})).status).toBe(409);
+  expect((await call("/api/coordinator/expired-window-recover",body,{Authorization:"Bearer test-token"})).status).toBe(403);
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE operation_id LIKE 'http-recover%'").get()).toEqual({n:0});
  });
  it("registered native identity mapping does not assume logical-id equals session stem",async()=>{
   db.prepare("UPDATE nodes SET logical_id='orch1.lead' WHERE id='lead@xv'").run();

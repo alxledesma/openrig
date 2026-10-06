@@ -70,6 +70,12 @@ export class CoordinatorAuthorityService {
   if(run!==this.availabilityRuns.get(rigId))return; // delayed probe cannot overwrite a newer observation
   for(const observation of observations)this.runtimeEvidence.set(observation.session,observation);
  }
+ /** The node that backs a session, for node-scoped guard and reservation fences. */
+ private nodeOf(session:string):string {
+  const node=this.db.prepare("SELECT node_id FROM sessions WHERE id=?").get(session) as {node_id:string}|undefined;
+  if(!node)reject("coordinator_unknown_session","Session is not registered");
+  return node!.node_id;
+ }
  private excluded(session:string,generation?:string):boolean {
   const e=this.runtimeEvidence.get(session);return !!e&&e.state==='absent'&&e.session===session&&!!e.fingerprint&&e.observedAt<=this.now()&&this.now()-e.observedAt<=1000&&e.generation===(generation??this.generation(session))&&e.generation===this.generation(session);
  }
@@ -514,7 +520,6 @@ export class CoordinatorAuthorityService {
   rigId:string; operationId:string; windowMs:number;
   expectedEpoch:number; expectedOwnerGeneration:string; expectedCustodyDigest:string;
   conflictOperationId:string; conflictKind:string;
-  quiescenceProof:{settled:boolean|null;observedAt:string|null;generation:string|null;launch:string|null;pid:number|null};
  }):{authority:Authority;incidentAnchor:string;epoch:number;windowMs:number;leaseUntil:number;operationId:string} {
   return this.db.transaction(() => {
    // Genuine native Operator attribution only; the holder cannot invoke its own escape hatch.
@@ -541,20 +546,35 @@ export class CoordinatorAuthorityService {
    if(this.reconciliationDigest(input.rigId)!==input.expectedCustodyDigest)reject("coordinator_reconciliation_changed","Custody changed since the expected read; reconcile before recovering");
    // A retired or unavailable holder is not a recovery subject.
    if(this.excluded(row.owner_session,row.owner_generation))reject("coordinator_owner_unavailable","The recorded owner is retired or unavailable");
-   // Native proof seam: the adjacent PiNativeProof.quiescence shape is consumed structurally and
-   // never defined here. Only an exact POSITIVE settled proof for THIS generation and launch passes;
-   // missing, null, malformed or foreign proof refuses. Fresh presence alone is not quiescence.
-   const proof=input.quiescenceProof;
-   if(!proof||typeof proof!=="object"||proof.settled!==true||typeof proof.observedAt!=="string"||!proof.observedAt.trim()
-    ||!Number.isFinite(Date.parse(proof.observedAt))||Date.parse(proof.observedAt)>this.now())reject("coordinator_quiescence_unproven","A positive native quiescence proof with an observation time is required");
-   if(proof.generation!==row.owner_generation)reject("coordinator_generation_mismatch","Quiescence proof must carry the current owner generation");
-   if(typeof proof.launch!=="string"||!proof.launch.trim()||!Number.isSafeInteger(proof.pid)||proof.pid!<=0)reject("coordinator_quiescence_unproven","Quiescence proof must identify the current native launch and process");
-   // No sending and no live reservations may be outstanding for the holder.
-   const live=this.db.prepare("SELECT reservation_id FROM seat_dispatch_reservations WHERE node_id=? AND state IN ('reserved','started')").all(row.owner_session) as {reservation_id:string}[];
+   // Native quiescence is read ONLY from the service's own freshly refreshed runtime evidence. No
+   // caller-supplied proof is accepted anywhere in this contract: an authored launch or pid could be
+   // fabricated, so it is structurally impossible to pass one in. The route refreshes availability
+   // immediately before this mutation.
+   const ownerNode=this.nodeOf(row.owner_session);
+   const evidence=this.runtimeEvidence.get(row.owner_session);
+   // Exact current native occupant, freshly observed: same session, current generation, really present.
+   if(!evidence||evidence.session!==row.owner_session||evidence.generation!==row.owner_generation||evidence.state!=="present"||!evidence.fingerprint)reject("coordinator_owner_unobserved","A fresh current native observation of the owner is required");
+   // Narrow once after the refusal; the observation is not replaced inside this transaction.
+   const observed=evidence!;
+   if(observed.observedAt>this.now()||this.now()-observed.observedAt>1000)reject("coordinator_owner_unobserved","The native observation is stale; refresh it before recovering");
+   // Positive settled quiescence only. `settled: null`, absent, or false is UNKNOWN and refuses:
+   // fresh presence alone is not quiescence.
+   const settled=observed.quiescence?.settled;
+   const observedAt=observed.quiescence?.observedAt;
+   if(settled!==true)reject("coordinator_quiescence_unproven","A positive native settled quiescence observation is required");
+   if(typeof observedAt!=="string"||!observedAt.trim()||!Number.isFinite(Date.parse(observedAt))||Date.parse(observedAt)>this.now())reject("coordinator_quiescence_unproven","The quiescence observation must carry a real, non-future observation time");
+   // Guard ON: the actual existing delivery guard for the owner's own node, desired AND effective.
+   const guard=this.db.prepare("SELECT desired,effective FROM seat_delivery_guards WHERE node_id=?").get(ownerNode) as {desired:number;effective:number}|undefined;
+   if(!guard||guard.desired!==1||guard.effective!==1)reject("coordinator_guard_not_enabled","The owner node's delivery guard must be desired AND effective before this recovery");
+   // No sending effects and no live reservations may be outstanding. The reservation is bound to the
+   // owner NODE and the owner SESSION; comparing node_id to a session name missed real reservations.
+   const live=this.db.prepare("SELECT reservation_id FROM seat_dispatch_reservations WHERE (node_id=? OR session_name=?) AND state IN ('reserved','started')").all(ownerNode,row.owner_session) as {reservation_id:string}[];
    if(live.length)reject("coordinator_dispatch_reserved","An outstanding dispatch reservation forbids this recovery");
+   const sending=this.db.prepare("SELECT outbox_id FROM outbox_entries WHERE delivery_state='pending' AND (sender_session=? OR destination_session=?)").all(row.owner_session,row.owner_session) as {outbox_id:string}[];
+   if(sending.length)reject("coordinator_send_in_flight","An undelivered send for the owner forbids this recovery");
    // The ORIGINAL spent recovery receipt must exist for this exact epoch. The incident anchor comes
    // from that stored receipt, not from the current epoch and not from any successor receipt.
-   const spent=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='reconciliation-recover' AND json_extract(receipt,'$.epoch')<=? ORDER BY rowid DESC LIMIT 1").get(input.rigId,row.epoch) as {receipt:string}|undefined;
+   const spent=this.db.prepare("SELECT operation_id,receipt FROM coordinator_operations WHERE rig_id=? AND kind='reconciliation-recover' AND json_extract(receipt,'$.epoch')<=? ORDER BY rowid DESC LIMIT 1").get(input.rigId,row.epoch) as {operation_id:string;receipt:string}|undefined;
    if(!spent)reject("coordinator_reconciliation_unrecovered","The original spent recovery receipt for this epoch is required");
    // Narrow once after the refusal; both reads are inside this transaction.
    const spentReceipt=JSON.parse(spent!.receipt) as {epoch:number;owner_generation:string;state:string};
@@ -569,10 +589,12 @@ export class CoordinatorAuthorityService {
    if(this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind='expired-window-successor' AND json_extract(receipt,'$.incidentAnchor')=?").get(input.rigId,incidentAnchor))reject("coordinator_incident_successor_exhausted","This incident already consumed its single bounded successor window");
    // Known backend NO-EFFECT conflict evidence only: a durable, different-kind reservation of the
    // same operation ID. A fabricated failed ACK receipt cannot satisfy this.
-   if(input.conflictKind==="acknowledge"||input.conflictKind==="expired-window-successor")reject("coordinator_unsupported_conflict","That kind is not no-effect conflict evidence for a failed acknowledgment");
-   const reserved=this.db.prepare("SELECT kind FROM coordinator_operations WHERE rig_id=? AND operation_id=?").get(input.rigId,input.conflictOperationId) as {kind:string}|undefined;
-   if(!reserved)reject("coordinator_conflict_unproven","No durable conflicting operation ID is recorded");
-   if(reserved!.kind!==input.conflictKind)reject("coordinator_conflict_unproven","The named conflicting kind differs from the durable receipt");
+   // The conflict must be THIS incident's own spent recovery operation, read from the durable receipt
+   // rather than from the caller. coordinator_operations is keyed by (rig, operation id), so the
+   // holder reusing that exact id for an acknowledge is what the backend refused, and the durable row
+   // for it is the recovery itself. An unrelated operation ID can never stand in.
+   if(input.conflictOperationId!==spent!.operation_id)reject("coordinator_conflict_unproven","The conflicting operation ID must be the original incident's own spent recovery operation");
+   if(input.conflictKind!=="reconciliation-recover")reject("coordinator_unsupported_conflict","The conflicting kind must be the incident's own durable recovery operation, never an acknowledge or a successor");
    // Same holder, same custody, same baton, epoch plus one. No automatic active state.
    const leaseUntil=this.now()+input.windowMs;
    this.db.prepare("UPDATE coordinator_authority SET epoch=epoch+1,lease_until=?,state='reconciling',operation_id=? WHERE rig_id=? AND epoch=?").run(leaseUntil,input.operationId,input.rigId,row.epoch);
