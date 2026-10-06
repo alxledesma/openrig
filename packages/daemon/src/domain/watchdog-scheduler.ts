@@ -1,3 +1,4 @@
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { WatchdogJob, WatchdogJobsRepository } from "./watchdog-jobs-repository.js";
 import type { WatchdogPolicyEngine } from "./watchdog-policy-engine.js";
 
@@ -41,6 +42,8 @@ export interface WatchdogSchedulerDeps {
   clearTimer?: (handle: NodeJS.Timeout) => void;
   /** Reconcile durable domain state before taking the due-job snapshot. */
   beforeTick?: () => void;
+  /** Real I/O turn between jobs; injectable only for deterministic tests. */
+  yieldToEventLoop?: () => Promise<void>;
   /** Notification on tick errors (for telemetry; defaults to console.error). */
   onTickError?: (err: unknown) => void;
 }
@@ -53,6 +56,7 @@ export class WatchdogScheduler {
   private readonly setTimer: (cb: () => void, ms: number) => NodeJS.Timeout;
   private readonly clearTimer: (handle: NodeJS.Timeout) => void;
   private readonly beforeTick?: () => void;
+  private readonly yieldToEventLoop: () => Promise<void>;
   private readonly onTickError: (err: unknown) => void;
 
   private timer: NodeJS.Timeout | null = null;
@@ -63,6 +67,7 @@ export class WatchdogScheduler {
   constructor(deps: WatchdogSchedulerDeps) {
     this.jobsRepo = deps.jobsRepo;
     this.beforeTick = deps.beforeTick;
+    this.yieldToEventLoop = deps.yieldToEventLoop ?? (() => yieldToEventLoop());
     this.policyEngine = deps.policyEngine;
     this.tickIntervalMs = deps.tickIntervalMs ?? 1000;
     this.now = deps.now ?? (() => new Date());
@@ -135,8 +140,12 @@ export class WatchdogScheduler {
     for (const job of active) {
       if (this.shuttingDown) return;
       if (!isDue(job, nowMs)) continue;
+      await this.yieldToEventLoop();
+      if (this.shuttingDown) return;
+      const current = this.jobsRepo.getById(job.jobId);
+      if (!current || current.state !== "active" || !isDue(current, nowMs)) continue;
       try {
-        await this.policyEngine.evaluate(job, passStartedAt.toISOString());
+        await this.policyEngine.evaluate(current, passStartedAt.toISOString());
       } catch (err) {
         this.onTickError(err);
       }
