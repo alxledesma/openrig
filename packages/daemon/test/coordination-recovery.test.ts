@@ -18,9 +18,9 @@ describe('durable coordination recovery',()=>{
  /** Captures a typed refusal. CoordinatorFenceError exposes `code` as a property, so a code
  * assertion cannot be expressed with toThrow(string), which matches only the message. */
  function refusal(fn:()=>unknown):{code?:string;message:string}{try{fn();}catch(e){return {code:(e as {code?:string}).code,message:(e as Error).message};}throw new Error('expected a typed refusal, but the call succeeded');}
- const plan=(tasks:CoordinationTask[]):CoordinationPlan=>({rigId:'xv',revision:'r1',operatorGeneration:'operator-agent-g1',stallMs:10000,allowIdlePeerTransfer:true,tasks});
+ const plan=(tasks:CoordinationTask[],overrides:Partial<CoordinationPlan>={}):CoordinationPlan=>({rigId:'xv',revision:'r1',operatorGeneration:'operator-agent-g1',stallMs:10000,allowIdlePeerTransfer:true,...overrides,tasks});
 function sample(session:string):CoordinationActivity {const generation=repo.coordinatorAuthority.generation(session)!;return {generation,identityVerified:true,state:{seatNodeId:session,activity:'idle-at-prompt',needsInput:{count:0,reason:null},decidedBy:'window-sampling',seq:1,changedAt:new Date(clock).toISOString(),rungs:[],lastSwap:{generation,at:new Date(clock).toISOString()}},witness:{seatNodeId:session,sessionName:session,rung:'window-sampling',sourceId:'tmux',seq:1,observedAt:new Date(clock).toISOString(),activity:'idle-at-prompt'}};}
-  function configure(tasks:CoordinationTask[],resources:Record<string,string[]>={}){for(const t of tasks)repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:resources[t.key]??[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});return svc.configure('operator-agent@kernel','operator-agent-g1',plan(tasks));}
+  function configure(tasks:CoordinationTask[],resources:Record<string,string[]>={},planOverrides:Partial<CoordinationPlan>={}){for(const t of tasks)repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:resources[t.key]??[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});return svc.configure('operator-agent@kernel','operator-agent-g1',plan(tasks,planOverrides));}
  function refresh(){for(const s of ['lead@xv','peer@xv','builder@xv','reviewer@xv','architect@xv'])samples.set(s,sample(s));}
  function job(){db.prepare(`INSERT INTO watchdog_jobs(job_id,target_session,policy,interval_seconds,spec_yaml,state,registered_by_session,registered_at,registered_by_generation_uuid) VALUES ('j','operator-agent@kernel','coordinator-continuity',1,'context: {}','active','operator-agent@kernel',?,'operator-agent-g1')`).run(new Date(clock).toISOString());}
  it('scope-only attachment preserves expired admissions without granting dispatch or replaying releases',()=>{
@@ -750,7 +750,7 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
 expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(notice.outbox_id)).toEqual(notice);
   });
 
-  function expiredPresentSetup(){configure(normal());job();samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});svc.supervise('xv','j');repo.coordinatorAuthority.renew('lead@xv',token,10000,'short-lease');clock+=10001;vi.setSystemTime(clock);refresh();samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});return {expectedLeaseUntil:repo.coordinatorAuthority.get('xv')!.lease_until};}
+  function expiredPresentSetup(planOverrides:Partial<CoordinationPlan>={}){configure(normal(),{},planOverrides);job();samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});svc.supervise('xv','j');repo.coordinatorAuthority.renew('lead@xv',token,10000,'short-lease');clock+=10001;vi.setSystemTime(clock);refresh();samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});return {expectedLeaseUntil:repo.coordinatorAuthority.get('xv')!.lease_until};}
   const expiryDuties=()=>db.prepare("SELECT qitem_id,body FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_valid(body) AND json_extract(body,'$.action')='active-expiry-recover' ORDER BY rowid").all() as Array<{qitem_id:string;body:string}>;
   const intentActions=()=>db.prepare("SELECT json_extract(body,'$.action') a,count(*) n FROM queue_items WHERE destination_session='operator-agent@kernel' AND json_valid(body) GROUP BY a").all() as Array<{a:string|null;n:number}>;
 
@@ -803,6 +803,49 @@ expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(notice.o
    expect(expiryDuties()).toHaveLength(1);
    expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind IN ('coordination-task-hold-lineage','native-terminal-return-retirement')").get()).toBeUndefined();
    expect(repo.coordinatorAuthority.get('xv')).toMatchObject({epoch:1,state:'active'});
+  });
+
+  it('keeps active-expiry intake live for its acknowledgment window rather than the stall threshold',()=>{
+   expiredPresentSetup({stallMs:60000,acknowledgmentWindowMs:300000});
+   const first=svc.supervise('xv','j')!,firstId=first[0].queueId!,firstItem=repo.getById(firstId)!;
+   const originalWake=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+firstId);
+   const originalLease=repo.coordinatorAuthority.get('xv')!.lease_until;
+   expect(firstItem.expiresAt).toBe(new Date(clock+300000).toISOString());
+   expect(JSON.parse(firstItem.body).activeExpiry.recoveryWindowMs).toBe(300000);
+   expect(originalWake).toBeDefined();
+   db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+firstId);
+   const unknownWake=db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+firstId);
+
+   clock+=60001;vi.setSystemTime(clock);refresh();
+   samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});
+   const afterStall=svc.supervise('xv','j')!;
+   expect(afterStall[0].queueId).toBe(firstId);
+   expect(repo.getById(firstId)).toEqual(firstItem);
+   expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+firstId)).toEqual(unknownWake);
+   expect(repo.coordinatorAuthority.get('xv')!.lease_until).toBe(originalLease);
+
+   clock+=239998;vi.setSystemTime(clock);refresh();
+   samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});
+   expect(svc.supervise('xv','j')![0].queueId).toBe(firstId);
+   expect(repo.getById(firstId)).toEqual(firstItem);
+   expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+firstId)).toEqual(unknownWake);
+   expect(repo.coordinatorAuthority.get('xv')!.lease_until).toBe(originalLease);
+
+   clock+=1;vi.setSystemTime(clock);refresh();
+   samples.set('lead@xv',{...sample('lead@xv'),identityObservedAt:new Date(clock).toISOString()});
+   const successor=svc.supervise('xv','j')!,successorId=successor[0].queueId!,successorItem=repo.getById(successorId)!;
+   expect(successorId).not.toBe(firstId);
+   expect(JSON.parse(successorItem.body)).toMatchObject({
+    action:'active-expiry-recover',
+    previousQueueId:firstId,
+    recoveryKey:JSON.parse(firstItem.body).recoveryKey,
+    activeExpiry:{expectedLeaseUntil:originalLease,recoveryWindowMs:300000},
+   });
+   expect(successorItem.expiresAt).toBe(new Date(clock+300000).toISOString());
+   expect(db.prepare('SELECT count(*) n FROM outbox_entries WHERE outbox_id IN (?,?)').get('wake-intent-'+firstId,'wake-intent-'+successorId)).toEqual({n:2});
+   expect(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+firstId)).toEqual(unknownWake);
+   expect(repo.coordinatorAuthority.get('xv')!.lease_until).toBe(originalLease);
+   expect(expiryDuties()).toHaveLength(2);
   });
 
   it('new later lease distinct episode',async()=>{

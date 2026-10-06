@@ -1348,8 +1348,9 @@ if(!effectRig)return true;
     // duty. Any drift simply falls through to the existing fences below.
     const current=this.authority.get(rigId);
     if(current&&current.state==='active'&&current.owner_session===a.owner_session&&current.owner_generation===a.owner_generation&&current.epoch===a.epoch&&current.lease_until<=this.now()&&this.authority.generation(current.owner_session)===current.owner_generation){
-     const deadline=this.now()+Math.min(plan.stallMs,900000);
-     const queueId=this.stageCoordinatorRecovery(rigId,current.epoch,plan.operatorGeneration,'active-expiry-recover','expired-active-native-present-holder',deadline,undefined,{owner:current.owner_session,ownerGeneration:current.owner_generation,expectedLeaseUntil:current.lease_until,custodyDigest:this.authority.reconciliationDigest(rigId),recoveryWindowMs:Math.min(plan.acknowledgmentWindowMs??300000,900000)});
+     const recoveryWindowMs=Math.min(plan.acknowledgmentWindowMs??300000,900000);
+     const deadline=this.now()+recoveryWindowMs;
+     const queueId=this.stageCoordinatorRecovery(rigId,current.epoch,plan.operatorGeneration,'active-expiry-recover','expired-active-native-present-holder',deadline,undefined,{owner:current.owner_session,ownerGeneration:current.owner_generation,expectedLeaseUntil:current.lease_until,custodyDigest:this.authority.reconciliationDigest(rigId),recoveryWindowMs});
      return [{key:'coordinator',state:'recovery-required',queueId,reason:'expired-active-native-present-holder',deadline}];
     }
    }
