@@ -285,6 +285,10 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
     exists: (p: string) => existsSync(p),
     mkdirp: (p: string) => mkdirSync(p, { recursive: true }),
   };
+  // F1 collector: collects only reduced reason codes from this request's proof
+  // observations. It is scoped to the request closure, holds no argv, env, path
+  // or pid text, and is read once when the pre-effect identity refusal is built.
+  const proofReasons: import("../domain/coordinator-runtime-availability.js").PiProofReason[] = [];
   const lifecycle = new SeatLifecycleService({
     db: rigRepo.db,
     rigRepo,
@@ -298,7 +302,7 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
     activityOracle: (c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined) ?? undefined,
     listProcesses: () => listNativeProcesses(),
     piResume: new PiResumeAdapter(tmuxAdapter, fsOps, { stateRoot, runnerEntryPath }),
-    piProve: makePiNativeProver(rigRepo.db, execCommand, { fs: { readFile: (p: string) => readFileSync(p, "utf-8") }, piStateRoot: stateRoot }),
+    piProve: makePiNativeProver(rigRepo.db, execCommand, { fs: { readFile: (p: string) => readFileSync(p, "utf-8") }, piStateRoot: stateRoot, diagnose: reasons => { proofReasons.push(...reasons); } }),
     piRunnerState: (sessionName: string) => {
       const p = piSeatPaths(stateRoot, sessionName).runnerStatePath;
       return existsSync(p) ? parsePiRunnerState(readFileSync(p, "utf-8")) : null;
@@ -345,6 +349,7 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
     seatRef: decodeURIComponent(c.req.param("seatRef")),
     reason: body.reason,
     operator: (body.operator as string | undefined) ?? null,
+    onPreEffectRefusal: refusal => (refusal.code === "rehost_process_identity_unknown" ? { ...refusal, observed: { ...(refusal.observed ?? {}), reasons: [...new Set([...proofReasons.map(r => r.code), ...((refusal.observed?.reasons as string[] | undefined) ?? [])])] } } : refusal),
   });
   return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
 });

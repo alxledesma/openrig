@@ -33,6 +33,9 @@ interface Harness {
   resumeCalls: Array<{ session: string; type: string | null; token: string | null; cwd: string; model?: string | null }>;
   sidecar: { value: PiRehostRunnerState | null };
   proof: { value: PiRehostProof | null };
+  /** When set, piProve consumes this sequence instead of the static value, so a
+   *  transient-null-then-present re-observation can be driven deterministically. */
+  proofSeq: { queue: Array<PiRehostProof | null> };
   processes: NativeProcessRow[];
   tail: { value: string | null };
   fileExists: { value: boolean };
@@ -64,6 +67,7 @@ function harness(): Harness {
     resumeCalls,
     sidecar: { value: { ready: true, launchId: LAUNCH_OLD, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: "tail-1" } },
     proof: { value: { state: "present", generation: GENERATION, launchId: LAUNCH_OLD, fingerprint: "{}" } },
+    proofSeq: { queue: [] as Array<PiRehostProof | null> },
     processes: [
       // The pane ROOT shell, then the runner and its pi child beneath it.
       { pid: 4000, ppid: 9100, command: "/bin/zsh", startedAt: "root-boot" },
@@ -121,7 +125,7 @@ function harness(): Harness {
       h.onResume.value?.();
       return h.resumeResult.value;
     } },
-    piProve: async () => h.proof.value,
+    piProve: async () => (h.proofSeq.queue.length ? h.proofSeq.queue.shift()! : h.proof.value),
     piRunnerState: () => h.sidecar.value,
     piSessionFileExists: () => h.fileExists.value,
     // Bounded identity digest seam: the fixture names a session file that does not
@@ -224,7 +228,7 @@ describe("same-generation pi runner rehost", () => {
       ["effect in flight", x => { x.db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state,guard_binding) VALUES ('w-send','watchdog@system','intake-lead@app-handy-conveyor','live',?,'sending','{\"pane\":\"%4\"}')").run(new Date().toISOString()); }, "rehost_outbox_sending"],
       ["sidecar not ready", x => { x.sidecar.value = { ready: false, launchId: LAUNCH_OLD, sessionFile: SESSION_FILE, lastEntryId: "tail-1" }; }, "rehost_sidecar_unverified"],
       ["session file missing", x => { x.fileExists.value = false; }, "rehost_session_file_missing"],
-      ["proof absent", x => { x.proof.value = null; }, "rehost_process_identity_unproven"],
+      ["proof absent", x => { x.proof.value = null; }, "rehost_process_identity_unknown"],
       ["proof generation mismatch", x => { x.proof.value = { state: "present", generation: "rotated-generation", launchId: LAUNCH_OLD, fingerprint: "{}" }; }, "rehost_process_identity_unproven"],
       ["proof launch scope mismatch", x => { x.proof.value = { state: "present", generation: GENERATION, launchId: "some-other-launch", fingerprint: "{}" }; }, "rehost_process_identity_unproven"],
       ["ambiguous runner pid", x => { x.processes = [...x.processes, { pid: 9999, ppid: 4000, command: "node /x/pi-runner.js --session-name intake-lead@app-handy-conveyor --launch-id launch-old-0001" }]; }, "rehost_runner_pid_unresolved"],
@@ -1248,4 +1252,85 @@ describe("same-generation pi runner rehost", () => {
       { pid: CHILD_PID, ppid: RUNNER_PID, command: "pi --session /state/pi/child", startedAt: "child-boot" },
     ];
   }
+});
+// F1/F2/F3: typed diagnostics for an UNOBSERVABLE native proof. A null proof is an
+// inconclusive OBSERVATION, never a positive identity mismatch, and the pre-effect
+// re-observation budget is bounded, read-only and fails closed.
+describe("pi proof observation diagnostics (F1/F2/F3)", () => {
+  const healthy = { state: "present" as const, generation: GENERATION, launchId: LAUNCH_OLD, fingerprint: "{}" };
+
+  it("null proof becomes rehost_process_identity_unknown and reports the bounded attempt count", async () => {
+    const h = harness();
+    seat(h);
+    h.runtime.value = "pi";
+    h.proof.value = null;
+    const out = await h.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "persistent probe failure" });
+    expect(out.ok).toBe(false);
+    expect(out.ok === false && out.code).toBe("rehost_process_identity_unknown");
+    // One initial observation plus at most two extra attempts, then it fails closed.
+    expect(out.ok === false && (out as { observed?: { observations?: number } }).observed?.observations).toBe(3);
+  });
+
+  it("a transient null followed by present is absorbed by the bounded re-observation", async () => {
+    const h = harness();
+    seat(h);
+    h.runtime.value = "pi";
+    h.proofSeq.queue = [null, healthy];
+    const out = await h.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "transient then healthy" });
+    expect(h.proofSeq.queue.length).toBe(0);
+    expect(out.ok).toBe(true);
+  });
+
+  it("an observed-but-mismatched proof keeps rehost_process_identity_unproven and names the disagreement", async () => {
+    for (const bad of [
+      { state: "present" as const, generation: "rotated-generation", launchId: LAUNCH_OLD, fingerprint: "{}" },
+      { state: "present" as const, generation: GENERATION, launchId: "some-other-launch", fingerprint: "{}" },
+      { state: "absent" as const, generation: GENERATION, launchId: null, fingerprint: "{}" },
+    ]) {
+      const h = harness();
+      seat(h);
+      h.runtime.value = "pi";
+      h.proof.value = bad;
+      const out = await h.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "mismatch" });
+      expect(out.ok).toBe(false);
+      expect(out.ok === false && out.code).toBe("rehost_process_identity_unproven");
+      expect(out.ok === false && (out as { observed?: { state?: string } }).observed?.state).toBe(bad.state);
+    }
+  });
+
+  it("both identity refusals are pre-effect: nothing is signalled and no event is written", async () => {
+    for (const value of [null, { state: "present" as const, generation: "rotated-generation", launchId: "other-launch", fingerprint: "{}" }]) {
+      const h = harness();
+      seat(h);
+      h.runtime.value = "pi";
+      h.proof.value = value;
+      const eventsBefore = (h.db.prepare("SELECT count(*) n FROM events").get() as { n: number }).n;
+      const out = await h.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "pre-effect" });
+      expect(out.ok).toBe(false);
+      expect((out as { observed?: { effectApplied?: unknown } }).observed?.effectApplied).toBeUndefined();
+      expect((h.db.prepare("SELECT count(*) n FROM events").get() as { n: number }).n).toBe(eventsBefore);
+      // The sidecar still names the OLD launch: nothing was signalled or relaunched.
+      expect(h.sidecar.value).toMatchObject({ ready: true, launchId: LAUNCH_OLD });
+      expect(h.killed.length).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("the identity refusals never leak argv, environment, path or pid text", async () => {
+    const h = harness();
+    seat(h);
+    h.runtime.value = "pi";
+    h.proof.value = null;
+    const out = await h.service.rehostRunner({
+      seatRef: "intake-lead@app-handy-conveyor",
+      reason: "leak probe",
+      onPreEffectRefusal: r => ({ ...r, observed: { ...(r.observed ?? {}), reasons: ["generation_unverified_child"] } }),
+    });
+    const text = JSON.stringify(out);
+    expect(text).not.toContain("SECRET");
+    expect(text).not.toContain(SESSION_FILE);
+    expect(text).not.toContain(LAUNCH_OLD);
+    expect(text).not.toContain("OPENRIG_OCCUPANT_GENERATION");
+    expect(text).not.toMatch(/\/state\/pi/);
+    expect(text).not.toContain("pi-runner.js");
+  });
 });

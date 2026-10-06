@@ -83,6 +83,11 @@ export interface SeatLifecycleDeps {
   killNativeProcess?: (pid: number) => void;
   rehostPollMs?: number;
   rehostWaitMs?: number;
+  /** Up to two EXTRA full strict read-only pre-effect proof observations, spaced
+   *  by rehostReobserveGapMs, inside the already-held guard lease. Bounded, never
+   *  post-effect, and it does not weaken the prover's own double-sample rules. */
+  rehostReobserveAttempts?: number;
+  rehostReobserveGapMs?: number;
 }
 
 /** Structural view of the shipped PiResumeAdapter: only `resume` is used, and
@@ -183,6 +188,7 @@ export interface SeatRefusal {
     | "rehost_sidecar_unverified"
     | "rehost_session_file_missing"
     | "rehost_process_identity_unproven"
+    | "rehost_process_identity_unknown"
     | "rehost_runner_pid_unresolved"
     | "rehost_not_idle"
     | "rehost_stop_unverified"
@@ -326,6 +332,8 @@ export class SeatLifecycleService {
   private readonly piSessionTailEntryId?: (path: string) => string | null;
   private readonly killNativeProcess?: (pid: number) => void;
   private readonly rehostPollMs: number;
+  private readonly rehostReobserveAttempts: number;
+  private readonly rehostReobserveGapMs: number;
   private readonly rehostWaitMs: number;
 
   constructor(deps: SeatLifecycleDeps) {
@@ -358,6 +366,8 @@ export class SeatLifecycleService {
     this.killNativeProcess = deps.killNativeProcess ?? ((pid) => { process.kill(pid, "SIGTERM"); });
     this.rehostPollMs = deps.rehostPollMs ?? 250;
     this.rehostWaitMs = deps.rehostWaitMs ?? 20_000;
+    this.rehostReobserveAttempts = Math.max(0, Math.min(2, deps.rehostReobserveAttempts ?? 2));
+    this.rehostReobserveGapMs = Math.max(0, deps.rehostReobserveGapMs ?? 300);
   }
 
   /** Audited future-launch directory selection; never sends input or restarts a seat. */
@@ -1450,7 +1460,7 @@ export class SeatLifecycleService {
    * unverifiable fact refuses, and a failed stop or resume writes a failed
    * event and stops, so a blind retry cannot happen.
    */
-  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null }): Promise<RehostRunnerResult> {
+  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null; onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal }): Promise<RehostRunnerResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     const resolved = this.resolveSeat(input.seatRef);
@@ -1492,7 +1502,7 @@ export class SeatLifecycleService {
       // is never an UNKNOWN: no runner has been touched.
       let plan: RehostPlan | SeatRefusal;
       try {
-        plan = await this.rehostPlan(resolved, sessionName);
+        plan = await this.rehostPlan(resolved, sessionName, input.onPreEffectRefusal);
       } catch (error) {
         return { ok: false, code: "rehost_precondition_failed", message: `A precondition could not be evaluated (${(error as Error).message}); no runner was signalled and nothing was touched.`, guidance: "Read the seat state and retry only after the underlying condition is understood." };
       }
@@ -1673,7 +1683,7 @@ export class SeatLifecycleService {
   }
 
   /** Every rehost precondition, proven fresh. No partial acceptance. */
-  private async rehostPlan(resolved: ResolvedSeat, sessionName: string): Promise<RehostPlan | SeatRefusal> {
+  private async rehostPlan(resolved: ResolvedSeat, sessionName: string, onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal): Promise<RehostPlan | SeatRefusal> {
     const { nodeId } = resolved;
     if (this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE node_id=? AND state <> 'released' LIMIT 1").get(nodeId))
       return { ok: false, code: "rehost_reservation_active", message: "An unreleased dispatch reservation fences rehost; its cutover disposition must be settled first." };
@@ -1713,9 +1723,23 @@ export class SeatLifecycleService {
     if (!this.piSessionFileExists!(sessionFile))
       return { ok: false, code: "rehost_session_file_missing", message: "The persisted session file no longer exists; stop-and-ask. Rehost never falls back to a fresh, forked or blank occupant." };
 
-    const proof = await this.piProve!(sessionName);
-    if (!proof || proof.state !== "present" || proof.generation !== generation || proof.launchId !== launchId)
-      return { ok: false, code: "rehost_process_identity_unproven", message: "Live pi process identity is not proven for this exact launch id and generation; rehost refuses before touching any process." };
+    // F1/F2/F3. The prover yields null for ~14 distinct UNKNOWN causes, so a null is
+    // UNKNOWN OBSERVATION, never a positive identity mismatch. Re-observe a bounded
+    // number of extra times, read-only and BEFORE any kill, to absorb a transient
+    // single-call probe failure. A persistent null still fails closed.
+    let proof: PiRehostProof | null = await this.piProve!(sessionName);
+    let observations = 1;
+    while (!proof && observations <= this.rehostReobserveAttempts) {
+      await new Promise<void>(resolve => setTimeout(resolve, this.rehostReobserveGapMs));
+      observations++;
+      proof = await this.piProve!(sessionName);
+    }
+    if (!proof || proof.state !== "present" || proof.generation !== generation || proof.launchId !== launchId) {
+      const refusal: SeatRefusal = !proof
+        ? { ok: false, code: "rehost_process_identity_unknown", message: `Live pi process identity could not be OBSERVED for this seat after ${observations} read-only attempt(s); observation was inconclusive, so rehost refuses before touching any process.`, observed: { observations } }
+        : { ok: false, code: "rehost_process_identity_unproven", message: "Live pi process identity was observed but does not match this exact launch id and generation; rehost refuses before touching any process.", observed: { state: proof.state, generation: proof.generation, launchId: proof.launchId, expectedGeneration: generation, expectedLaunchId: launchId, observations } };
+      return onPreEffectRefusal ? onPreEffectRefusal(refusal) : refusal;
+    }
 
     // F4/F5: read the sidecar cursor TWICE and require it stable, then read a BOUNDED
     // positional tail. The shared prover double-samples identity but exposes lastEntryId

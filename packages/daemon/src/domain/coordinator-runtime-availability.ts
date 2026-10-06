@@ -13,7 +13,35 @@ export interface RuntimeAvailability { session: string; generation: string; stat
  * this module except the single extracted generation token; fingerprints carry
  * only identifiers. */
 export interface PiNativeProof { state: "present" | "absent"; generation: string; launchId: string | null; fingerprint: string }
-export interface PiNativeProverOptions { fs: { readFile(path: string): string }; piStateRoot: string; argvCensus?: () => Promise<string>; envProbe?: (pids: number[]) => Promise<string>; procArgs?: (pids: number[]) => Promise<Map<number, string | null>> }
+/** Reduced, non-sensitive reason a proof came back UNKNOWN (null).
+ *  Every value is a closed-vocabulary token, a count, or a boolean. Argument
+ *  vectors, environment text, filesystem paths, pids and error messages are
+ *  structurally excluded: an exception contributes only its constructor name. */
+export type PiProofReasonCode =
+  | "binding_rows"
+  | "no_pane_target"
+  | "tmux_probe_failed"
+  | "census_empty"
+  | "census_invalid"
+  | "duplicate_pids"
+  | "runner_count"
+  | "pi_child_count"
+  | "sidecar_unreadable"
+  | "sidecar_exited"
+  | "sidecar_not_ready"
+  | "sidecar_launch_mismatch"
+  | "sidecar_session_file_mismatch"
+  | "kernel_probe_failed"
+  | "generation_unverified_runner"
+  | "generation_unverified_child"
+  | "unstable_between_samples"
+  | "binding_changed"
+  | "exception";
+export interface PiProofReason { code: PiProofReasonCode; count?: number; detail?: "ok" | "timeout" | "error" | "empty" | "absent"; }
+/** Receives exactly one reason at each null exit. Default is a no-op so every
+ *  existing consumer is unchanged unless it opts in. */
+export type PiProofDiagnose = (reasons: PiProofReason[]) => void;
+export interface PiNativeProverOptions { fs: { readFile(path: string): string }; piStateRoot: string; argvCensus?: () => Promise<string>; envProbe?: (pids: number[]) => Promise<string>; procArgs?: (pids: number[]) => Promise<Map<number, string | null>>; diagnose?: PiProofDiagnose }
 // Reads the kernel's stored process args+env (sysctl KERN_PROCARGS2, mib
 // {CTL_KERN=1, KERN_PROCARGS2=49, pid}) and prints ONLY `<pid>\t<token>` for
 // the allowlisted OPENRIG_OCCUPANT_GENERATION when exactly one sanitized
@@ -46,24 +74,36 @@ export function makePiNativeProver(db: Database.Database, exec: (command: string
     } catch { /* unavailable: ps fallback below decides */ }
     return map;
   });
+  const diagnose = opts.diagnose ?? (() => {});
+  // One null exit emits exactly one reason code. Counts and closed-vocabulary
+  // detail only: never argv, env, path or pid text.
+  const unknown = (code: PiProofReasonCode, extra?: { count?: number; detail?: PiProofReason["detail"] }): null => {
+    diagnose([{ code, ...(extra?.count === undefined ? {} : { count: extra.count }), ...(extra?.detail === undefined ? {} : { detail: extra.detail }) }]);
+    return null;
+  };
   return async (session: string): Promise<PiNativeProof | null> => {
-    const read = () => {
-      const rows = db.prepare(`SELECT n.id AS nodeId,n.runtime,b.tmux_pane,b.tmux_session,t.generation_uuid,s.resume_token FROM sessions s JOIN nodes n ON n.id=s.node_id LEFT JOIN bindings b ON b.node_id=n.id JOIN occupant_tenures t ON t.node_id=n.id WHERE s.session_name=? AND n.runtime='pi' AND s.id=(SELECT MAX(s2.id) FROM sessions s2 WHERE s2.node_id=n.id) AND t.generation_ordinal=(SELECT MAX(x.generation_ordinal) FROM occupant_tenures x WHERE x.node_id=n.id)`).all(session) as Array<{ nodeId: string; runtime: string; tmux_pane: string | null; tmux_session: string | null; generation_uuid: string; resume_token: string | null }>;
-      return rows.length === 1 ? rows[0] : undefined;
-    };
+    const BINDING_SQL = `SELECT n.id AS nodeId,n.runtime,b.tmux_pane,b.tmux_session,t.generation_uuid,s.resume_token FROM sessions s JOIN nodes n ON n.id=s.node_id LEFT JOIN bindings b ON b.node_id=n.id JOIN occupant_tenures t ON t.node_id=n.id WHERE s.session_name=? AND n.runtime='pi' AND s.id=(SELECT MAX(s2.id) FROM sessions s2 WHERE s2.node_id=n.id) AND t.generation_ordinal=(SELECT MAX(x.generation_ordinal) FROM occupant_tenures x WHERE x.node_id=n.id)`;
+    const bindingRows = (): Array<{ nodeId: string; runtime: string; tmux_pane: string | null; tmux_session: string | null; generation_uuid: string; resume_token: string | null }> =>
+      db.prepare(BINDING_SQL).all(session) as Array<{ nodeId: string; runtime: string; tmux_pane: string | null; tmux_session: string | null; generation_uuid: string; resume_token: string | null }>;
+    const read = () => { const rows = bindingRows(); return rows.length === 1 ? rows[0] : undefined; };
     const binding = read();
-    if (!binding) return null;
+    if (!binding) {
+      let count = -1;
+      try { count = bindingRows().length; } catch { count = -1; }
+      return unknown("binding_rows", { count });
+    }
     const target = binding.tmux_pane ?? binding.tmux_session;
-    if (!target) return null;
+    if (!target) return unknown("no_pane_target");
     try {
       const sample = async (): Promise<PiNativeProof | null> => {
         const pane = (await exec(`tmux display-message -p -t ${quote(target)} '#{pane_id}|#{pane_pid}|#{pane_dead}'`)).trim();
         const match = pane.match(/^(%\d+)\|(\d+)\|([01])$/);
-        if (!match) return null;
+        if (!match) return unknown("tmux_probe_failed");
         const lines = (await argvCensus()).trim().split("\n");
-        if (!lines.length || lines.some(l => !/^\d+\s+\d+\s+\S/.test(l.trim()))) return null;
+        if (!lines.length) return unknown("census_empty");
+        if (lines.some(l => !/^\d+\s+\d+\s+\S/.test(l.trim()))) return unknown("census_invalid");
         const parsed = lines.map(l => { const m = l.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/); return { pid: Number(m![1]), ppid: Number(m![2]), argv: m![3]! }; });
-        if (new Set(parsed.map(r => r.pid)).size !== parsed.length) return null;
+        if (new Set(parsed.map(r => r.pid)).size !== parsed.length) return unknown("duplicate_pids");
         const descendants = new Set<number>([Number(match[2])]); let changed = true;
         while (changed) { changed = false; for (const r of parsed) if (descendants.has(r.ppid) && !descendants.has(r.pid)) { descendants.add(r.pid); changed = true; } }
         const runners = parsed.filter(r => descendants.has(r.pid) && r.argv.includes("pi-runner.js") && new RegExp(`--session-name\\s+'?${session.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'?(\\s|$)`).test(r.argv));
@@ -73,9 +113,9 @@ export function makePiNativeProver(db: Database.Database, exec: (command: string
           // or a dead retained pane. Anything ambiguous stays unknown.
           if (root && ['zsh', 'bash', 'sh', 'fish'].includes(path.basename(root.argv.split(" ")[0]!).replace(/^-/, "")) && !parsed.some(r => descendants.has(r.pid) && r.pid !== root.pid)) return { state: "absent", generation: binding.generation_uuid, launchId: null, fingerprint: JSON.stringify({ pane: match[1], rootShell: true }) };
           if (match[3] === "1") return { state: "absent", generation: binding.generation_uuid, launchId: null, fingerprint: JSON.stringify({ pane: match[1], deadPane: true }) };
-          return null;
+          return unknown("census_invalid", { detail: "absent" });
         }
-        if (runners.length !== 1) return null;
+        if (runners.length !== 1) return unknown("runner_count", { count: runners.length });
         const runner = runners[0]!;
         const launchFlag = runner.argv.match(/--launch-id\s+(\S+)/)?.[1] ?? null;
         // The Pi child runs as node|bun executing the pi-coding-agent CLI entry
@@ -86,17 +126,19 @@ export function makePiNativeProver(db: Database.Database, exec: (command: string
         while (grew) { grew = false; for (const pid of [...underRunner]) for (const c of childrenOf.get(pid) ?? []) if (!underRunner.has(c.pid)) { underRunner.add(c.pid); grew = true; } }
         const isPiEntrypoint = (argv: string) => /\bpi-coding-agent\S*\s/.test(argv + " ") && argv.includes("--mode") && /--mode\s+rpc/.test(argv) || path.basename(argv.split(" ")[0]!) === "pi";
         const piProcs = parsed.filter(r => underRunner.has(r.pid) && r.pid !== runner.pid && isPiEntrypoint(r.argv));
-        if (piProcs.length !== 1) return null;
+        if (piProcs.length !== 1) return unknown("pi_child_count", { count: piProcs.length });
         const piProc = piProcs[0]!;
-        let state: PiRunnerSide; try { state = parsePiRunnerState(opts.fs.readFile(piSeatPaths(opts.piStateRoot, session).runnerStatePath)); } catch { return null; }
-        if (!state) return null;
+        let state: PiRunnerSide; try { state = parsePiRunnerState(opts.fs.readFile(piSeatPaths(opts.piStateRoot, session).runnerStatePath)); } catch { return unknown("sidecar_unreadable"); }
+        if (!state) return unknown("sidecar_unreadable");
         // A live runner AND live Pi child contradicting an exited sidecar marker
         // (e.g. a previous instance's marker during replacement startup) is
         // UNKNOWN, never positive absence: false absent would feed authority
         // logic exclusion evidence about a live coordinator. Genuine absence is
         // only the bare-shell / dead-pane forms established above.
-        if (state.exited) return null;
-        if (!state.ready || state.launchId !== launchFlag || !launchFlag || state.sessionFile !== binding.resume_token || !binding.resume_token) return null;
+        if (state.exited) return unknown("sidecar_exited");
+        if (!state.ready) return unknown("sidecar_not_ready");
+        if (!launchFlag || state.launchId !== launchFlag) return unknown("sidecar_launch_mismatch");
+        if (state.sessionFile !== binding.resume_token || !binding.resume_token) return unknown("sidecar_session_file_mismatch");
         // No clock-freshness requirement: pi-runner writes the sidecar only on
         // state/event transitions, so a healthy IDLE runner legitimately carries
         // an old updatedAt. Identity binds through the per-launch minted launch-id
@@ -120,13 +162,21 @@ export function makePiNativeProver(db: Database.Database, exec: (command: string
           return { value: found.length === 1 ? found[0]! : null, source: "ps" };
         };
         const runnerEv = await genFor(runner.pid), piEv = await genFor(piProc.pid);
-        if (runnerEv.value !== binding.generation_uuid || piEv.value !== binding.generation_uuid) return null;
+        if (runnerEv.value !== binding.generation_uuid) return unknown("generation_unverified_runner", { detail: runnerEv.value === null ? "empty" : "ok" });
+        if (piEv.value !== binding.generation_uuid) return unknown("generation_unverified_child", { detail: piEv.value === null ? "empty" : "ok" });
         return { state: "present", generation: binding.generation_uuid, launchId: launchFlag, fingerprint: JSON.stringify({ pane: match[1], runner: [runner.pid, runner.ppid], pi: [piProc.pid, piProc.ppid], launchId: launchFlag, sidecarUpdatedAt: state.updatedAt, genSources: [runnerEv.source, piEv.source] }) };
       };
       const first = await sample(), second = await sample();
-      if (!first || !second || first.fingerprint !== second.fingerprint || JSON.stringify(read()) !== JSON.stringify(binding)) return null;
+      if (!first || !second) return unknown("unstable_between_samples");
+      if (first.fingerprint !== second.fingerprint) return unknown("unstable_between_samples");
+      if (JSON.stringify(read()) !== JSON.stringify(binding)) return unknown("binding_changed");
       return second;
-    } catch { return null; }
+    } catch (error) {
+      // Only the error CLASS name; never the message, which can embed argv or env.
+      const kind = (error as { constructor?: { name?: string } } | null | undefined)?.constructor?.name;
+      diagnose([{ code: "exception", detail: kind === "TimeoutError" ? "timeout" : kind === "Error" ? "error" : "absent" }]);
+      return null;
+    }
   };
 }
 type PiRunnerSide = ReturnType<typeof parsePiRunnerState>;

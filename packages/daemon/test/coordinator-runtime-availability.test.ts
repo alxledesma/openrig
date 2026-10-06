@@ -1,4 +1,4 @@
-import {describe,it,expect} from "vitest";
+import {describe,it,expect,beforeEach} from "vitest";
 import {makeCoordinatorRuntimeObserver, makePiNativeProver, type PiNativeProof} from "../src/domain/coordinator-runtime-availability.js";
 const binding={id:"node",runtime:"codex",tmux_pane:"%4",tmux_session:"lead@pilot",generation_uuid:"generation-1"};
 const stamp="Fri Oct 2 20:00:00 2026";
@@ -84,5 +84,101 @@ describe("shared Pi native prover", () => {
     expect(await makeCoordinatorRuntimeObserver(db, async () => "%4|100|0")( "lead@xv")).toBeNull();
     expect(await makeCoordinatorRuntimeObserver(db, async () => "%4|100|0", undefined, async () => proof)("lead@xv")).toMatchObject({ state: "present", generation: "lead-g1" });
     expect(await makeCoordinatorRuntimeObserver(db, async () => "%4|100|0", undefined, async () => null)("lead@xv")).toBeNull();
+  });
+});
+
+// F1: every null exit of the Pi prover reports exactly one reduced reason code,
+// and no reason ever carries argv, environment, path or pid text.
+describe("pi prover typed UNKNOWN reasons (F1)", () => {
+  const row = { nodeId: "n", runtime: "pi", tmux_pane: "%4", tmux_session: null, generation_uuid: "lead-g1", resume_token: "/state/pi/lead@xv/sessions/s.json" };
+  const runnerLine = "101 100 node /d/adapters/pi-runner.js --session-name lead@xv --launch-id L-77 --state-root /state/pi";
+  const childLine = "102 101 /opt/homebrew/bin/node /x/@earendil-works/pi-coding-agent/dist/bundle/cli.js --mode rpc --session-dir /state/pi/lead@xv/sessions --name lead@xv --approve";
+  const census = (child = childLine) => `100 1 /bin/zsh -l\n${runnerLine}\n${child}`;
+  const env = (gen = "lead-g1") => `101 node pi-runner SECRET=never-logged OPENRIG_OCCUPANT_GENERATION=${gen}\n102 node cli.js OTHER=x OPENRIG_OCCUPANT_GENERATION=${gen}`;
+  const sidecar = (over: Record<string, unknown> = {}) => JSON.stringify({ ready: true, launchId: "L-77", sessionFile: row.resume_token, updatedAt: "2026-01-01T00:00:00.000Z", ...over });
+  const seen: Array<unknown> = [];
+  const calls: Array<unknown[]> = [];
+  function prover(opts: { rows?: unknown[]; exec?: () => Promise<string>; argvCensus?: () => Promise<string>; envProbe?: (p: number[]) => Promise<string>; sidecar?: string; procArgs?: (p: number[]) => Promise<Map<number, string | null>> } = {}) {
+    const rows = opts.rows ?? [row];
+    const db = { prepare: () => ({ all: () => rows }) } as never;
+    return makePiNativeProver(db, opts.exec ?? (async () => "%4|100|0"), {
+      fs: { readFile: () => opts.sidecar ?? sidecar() }, piStateRoot: "/state/pi",
+      procArgs: opts.procArgs ?? (async () => new Map()),
+      argvCensus: opts.argvCensus ?? (async () => census()), envProbe: opts.envProbe ?? (async () => env()),
+      now: () => Date.parse("2026-10-05T12:00:00Z"),
+      // Each diagnose CALL must carry exactly one reason; the double sample means
+      // several calls per proof. Record one entry per call.
+      diagnose: r => { calls.push(r); seen.push(...r); },
+    });
+  }
+  beforeEach(() => { seen.length = 0; calls.length = 0; });
+
+  const CODES = new Set(["binding_rows","no_pane_target","tmux_probe_failed","census_empty","census_invalid","duplicate_pids","runner_count","pi_child_count","sidecar_unreadable","sidecar_exited","sidecar_not_ready","sidecar_launch_mismatch","sidecar_session_file_mismatch","generation_unverified_runner","generation_unverified_child","unstable_between_samples","binding_changed","exception"]);
+  const cases: Array<[string, Parameters<typeof prover>[0]]> = [
+    ["no binding row", { rows: [] as unknown[] }],
+    ["ambiguous binding rows", { rows: [row, row] }],
+    ["no pane target", { rows: [{ ...row, tmux_pane: null, tmux_session: null }] }],
+    ["tmux probe unparseable", { exec: async () => "not-a-pane" }],
+    ["census empty", { argvCensus: async () => "" }],
+    ["census invalid", { argvCensus: async () => "malformed line" }],
+    ["duplicate pids", { argvCensus: async () => `${runnerLine}\n${runnerLine}` }],
+    ["two runners", { argvCensus: async () => `${runnerLine}\n102 100 node /d/adapters/pi-runner.js --session-name lead@xv --launch-id L-77\n${childLine}` }],
+    ["wrong pi child count", { argvCensus: async () => `${runnerLine}\n102 101 node pi\n103 101 node pi` }],
+    ["sidecar unreadable", { sidecar: "{not json" }],
+    ["sidecar exited", { sidecar: sidecar({ exited: { code: 1, at: "2026-10-05T11:00:00.000Z" } }) }],
+    ["sidecar not ready", { sidecar: sidecar({ ready: false }) }],
+    ["sidecar launch mismatch", { sidecar: sidecar({ launchId: "L-78" }) }],
+    ["sidecar session file mismatch", { sidecar: sidecar({ sessionFile: "/state/pi/lead@xv/sessions/other.json" }) }],
+    ["generation absent on runner", { envProbe: async () => `101 node pi-runner no-token\n102 node cli.js OPENRIG_OCCUPANT_GENERATION=lead-g1` }],
+    ["generation absent on child", { envProbe: async () => `101 node pi-runner OPENRIG_OCCUPANT_GENERATION=lead-g1\n102 node cli.js no-token` }],
+    ["generation contradicts tenure", { envProbe: async () => env("lead-GHOST") }],
+    ["census changes between samples", { argvCensus: (() => { let n = 0; return async () => (n++ === 0 ? census() : census("103 102 /bin/sh")); })() }],
+    ["exec throws", { exec: async () => { throw new Error("tmux exploded /state/pi/lead@xv SECRET=never-logged"); } }],
+  ];
+  it.each(cases)("%s yields null with exactly one reason per diagnose call", async (_name, opts) => {
+    expect(await prover(opts)("lead@xv")).toBeNull();
+    // The prover double-samples, so one proof may produce several diagnose calls.
+    // EVERY call carries exactly ONE reason drawn from the closed code set.
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) expect(call).toHaveLength(1);
+    for (const r of seen) expect(CODES.has((r as { code: string }).code)).toBe(true);
+  });
+
+  it("no reason ever carries argv, environment, path or pid text", async () => {
+    const cases: Array<Parameters<typeof prover>[0]> = [
+      { rows: [] }, { exec: async () => "not-a-pane" }, { argvCensus: async () => "malformed line" },
+      { sidecar: sidecar({ launchId: "L-78" }) }, { envProbe: async () => `101 node pi-runner SECRET=never-logged no-token\n102 node cli.js OPENRIG_OCCUPANT_GENERATION=lead-g1` },
+      { exec: async () => { throw new Error("boom SECRET=never-logged /state/pi/lead@xv pid 4242"); } },
+    ];
+    for (const opts of cases) {
+      seen.length = 0;
+      await prover(opts)("lead@xv");
+      const text = JSON.stringify(seen);
+      expect(seen.length).toBeGreaterThan(0);
+      expect(text).not.toContain("SECRET");
+      expect(text).not.toContain("never-logged");
+      expect(text).not.toContain("/state/pi");
+      expect(text).not.toContain("pi-runner.js");
+      expect(text).not.toContain("4242");
+      expect(text).not.toContain("101");
+      expect(text).not.toContain("boom");
+    }
+  });
+
+  it("the exception reason carries only an error class token, never the message", async () => {
+    await prover({ exec: async () => { throw new Error("SENSITIVE detail here"); } })("lead@xv");
+    expect(seen.length).toBeGreaterThan(0);
+    for (const r of seen) expect(r).toEqual({ code: "exception", detail: "error" });
+    expect(JSON.stringify(seen)).not.toContain("SENSITIVE");
+  });
+
+  it("a healthy proof emits no reason at all", async () => {
+    expect(await prover()("lead@xv")).toMatchObject({ state: "present" });
+    expect(seen).toHaveLength(0);
+  });
+
+  it("a positive absence also emits no reason", async () => {
+    expect(await prover({ argvCensus: async () => "100 1 /bin/zsh -l" })("lead@xv")).toMatchObject({ state: "absent" });
+    expect(seen).toHaveLength(0);
   });
 });
