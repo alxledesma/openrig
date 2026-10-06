@@ -396,6 +396,38 @@ describe("coordinator resume-owned shared native owner continuation",()=>{
   expect(ops().n).toBe(1);
  });
 
+ it("acknowledges a genuinely pending, unclaimed (null) baton but refuses a foreign claim",()=>{
+  // A freshly transferred or enabled owner may hold a pending baton nobody has claimed yet.
+  db.prepare("UPDATE queue_items SET state='pending',claimed_by_generation_uuid=NULL WHERE qitem_id='baton'").run();
+  const out=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"null-baton-ok",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
+  expect(out.state).toBe("active");
+  expect(db.prepare("SELECT state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id='baton'").get()).toEqual({state:"in-progress",claimed_by_generation_uuid:"lead-g1"});
+  expect(ops().n).toBe(1);
+  // A pending baton already claimed by ANOTHER generation still refuses.
+  db.prepare("UPDATE coordinator_authority SET state='reconciling' WHERE rig_id='xv'").run();
+  db.prepare("UPDATE queue_items SET state='pending',claimed_by_generation_uuid='other-gen' WHERE qitem_id='baton'").run();
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"null-baton-foreign",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toThrow(/exact canonical baton/);
+  expect(svc.get("xv")!.state).toBe("reconciling");
+  expect(ops().n).toBe(1);
+  // The active branch stays strict: in-progress and claimed by the current generation only.
+  db.prepare("UPDATE coordinator_authority SET state='active' WHERE rig_id='xv'").run();
+  db.prepare("UPDATE queue_items SET state='pending',claimed_by_generation_uuid=NULL WHERE qitem_id='baton'").run();
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"active-null-baton",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toThrow(/exact canonical baton claim/);
+  expect(ops().n).toBe(1);
+ });
+
+ it("refuses a changed expected epoch or digest under the same operation id",()=>{
+  const before=ops().n;
+  svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"payload-guard",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
+  expect(ops().n).toBe(before+1);
+  // Both expected fields are immutable submitted input, so changing either under the same id is a
+  // conflicting payload rather than a silent receipt.
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"payload-guard",expectedEpoch:svc.get("xv")!.epoch+3,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toThrow(/Operation ID reused/);
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"payload-guard",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:"0".repeat(64)})).toThrow(/Operation ID reused/);
+  expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:99000,operationId:"payload-guard",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toThrow(/Operation ID reused/);
+  expect(ops().n).toBe(before+1);
+ });
+
  it("refuses a stale expected epoch",()=>{
   expect(()=>svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:60000,operationId:"stale-epoch",expectedEpoch:svc.get("xv")!.epoch+7,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toThrow(/epoch advanced since the expected read/);
   expect(svc.get("xv")!.state).toBe("reconciling");
@@ -410,20 +442,23 @@ describe("coordinator resume-owned shared native owner continuation",()=>{
   // that obligations hash over.
   db.prepare("UPDATE queue_items SET state='pending',claimed_by_generation_uuid=NULL WHERE qitem_id='baton'").run();
   const digestAtRead=svc.reconciliationDigest("xv");
-  const first=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"replay-after-ack",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
+  // The prepared contract: exactly what a timed-out call would resubmit via --replay-contract.
+  const prepared={rigId:"xv",leaseMs:120000,operationId:"replay-after-ack",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:digestAtRead};
+  const first=svc.resumeOwned("lead@xv","lead-g1",prepared);
   const afterFirst=transitions().n;
   // Obligations genuinely moved: the baton is now in-progress and claimed.
   expect(svc.reconciliationDigest("xv")).not.toBe(digestAtRead);
   expect(transitions().n).toBe(afterFirst);
   // An unrelated new obligation must not break replay either.
   await repo.create({qitemId:"replay-unrelated",sourceSession:"operator-agent@kernel",destinationSession:"peer@xv",body:"{}",nudge:false});
-  const again=svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"replay-after-ack",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")});
+  // Replay resubmits the ORIGINAL prepared contract, never a fresh read.
+  const again=svc.resumeOwned("lead@xv","lead-g1",prepared);
   expect(again).toEqual(first);
   expect(transitions().n).toBe(afterFirst);
   expect(ops().n).toBe(1);
   // And it stays replayable even after the renewed lease lapses.
   clock+=999999;
-  expect(svc.resumeOwned("lead@xv","lead-g1",{rigId:"xv",leaseMs:120000,operationId:"replay-after-ack",expectedEpoch:svc.get("xv")!.epoch,expectedObligationsDigest:svc.reconciliationDigest("xv")})).toEqual(first);
+  expect(svc.resumeOwned("lead@xv","lead-g1",prepared)).toEqual(first);
   expect(transitions().n).toBe(afterFirst);
   expect(ops().n).toBe(1);
  });

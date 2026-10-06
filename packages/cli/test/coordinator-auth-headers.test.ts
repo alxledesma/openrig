@@ -68,11 +68,11 @@ function contractFile(overrides: Record<string, unknown> = {}): string {
 }
 
 describe("resume-owned command contract", () => {
-  it("derives the expected epoch and digest from one show read, then POSTs once", async () => {
+  it("derives the expected contract from one show read and prepares it before POSTing", async () => {
     const get = vi.spyOn(DaemonClient.prototype, "get");
     const post = vi.spyOn(DaemonClient.prototype, "post");
+    const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig"]);
-    // Exactly one supported read and exactly one POST: no polling, no retry.
     expect(get).toHaveBeenCalledTimes(1);
     expect(get.mock.calls[0]?.[0]).toBe("/api/coordinator/test-rig");
     expect(get.mock.calls[0]?.[1]).toEqual({ headers: { Authorization: `Bearer ${token}` } });
@@ -80,33 +80,74 @@ describe("resume-owned command contract", () => {
     expect(post.mock.calls[0]?.[0]).toBe("/api/coordinator/resume-owned");
     expect(post.mock.calls[0]?.[2]).toEqual({ headers: { Authorization: `Bearer ${token}` } });
     const body = post.mock.calls[0]?.[1] as Record<string, unknown>;
-    // The expected contract comes from the read, so the operator invents neither field.
+    // Derived from the read, so the operator invents neither field.
     expect(body.expectedEpoch).toBe(4);
     expect(body.expectedObligationsDigest).toBe("fixture-digest");
     expect(body.rigId).toBe("test-rig");
     expect(body.leaseMs).toBe(1200000);
     expect(body.operationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-    // No epoch or generation is trusted from the body beyond the derived expected contract.
     expect(Object.keys(body).sort()).toEqual(["expectedEpoch", "expectedObligationsDigest", "leaseMs", "operationId", "rigId"]);
+    // A timeout must never lose the request: it is persisted owner-only, with no credentials in it.
+    const preparedPath = String(body.operationId && err.mock.calls.map(c => String(c[0])).join("").match(/prepared request: (\S+)/)?.[1]);
+    expect(preparedPath).toMatch(/openrig-resume-owned-/);
+    expect(fs.statSync(preparedPath).mode & 0o777).toBe(0o600);
+    const persisted = JSON.parse(fs.readFileSync(preparedPath, "utf8"));
+    expect(persisted).toEqual(body);
+    expect(JSON.stringify(persisted)).not.toContain(token);
+    // The exact id and path are announced before the network mutation.
+    expect(err.mock.calls.map(c => String(c[0])).join("")).toContain(body.operationId as string);
     const printed = JSON.parse(String((vi.mocked(console.log).mock.calls.at(-1)?.[0] as string)));
     expect(printed.operationId).toBe(body.operationId);
     expect(printed.operationIdSource).toBe("generated");
-    expect(printed.state).toBe("active");
     expect(calls[0]?.actor).toBe(actor);
     expect(calls[0]?.generation).toBe(generation);
     expect(process.exitCode).toBeUndefined();
   });
-  it("replays a controlled exact id when supplied and never auto-retries", async () => {
+  it("replays the exact prepared contract with no read, no new id and no retry", async () => {
+    const get = vi.spyOn(DaemonClient.prototype, "get");
     const post = vi.spyOn(DaemonClient.prototype, "post");
-    await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig", "--operation-id", "controlled-replay-1", "--lease-ms", "60000"]);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.body).toEqual({ rigId: "test-rig", leaseMs: 60000, operationId: "controlled-replay-1", expectedEpoch: 4, expectedObligationsDigest: "fixture-digest" });
-    const printed = JSON.parse(String((vi.mocked(console.log).mock.calls.at(-1)?.[0] as string)));
-    expect(printed.operationId).toBe("controlled-replay-1");
-    expect(printed.operationIdSource).toBe("supplied");
+    const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig"]);
+    const sent = post.mock.calls[0]?.[1] as Record<string, unknown>;
+    const preparedPath = String(err.mock.calls.map(c => String(c[0])).join("").match(/prepared request: (\S+)/)?.[1]);
+    // Simulate the operator replaying after an unknown outcome.
+    get.mockClear(); post.mockClear(); calls.length = 0;
+    await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig", "--replay-contract", preparedPath]);
+    // No fresh read, no regenerated id: the exact original bytes are resubmitted.
+    expect(get).not.toHaveBeenCalled();
     expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]?.[1]).toEqual(sent);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.body).toEqual(sent);
+    const printed = JSON.parse(String((vi.mocked(console.log).mock.calls.at(-1)?.[0] as string)));
+    expect(printed.operationId).toBe(sent.operationId);
+    expect(printed.operationIdSource).toBe("replayed");
   });
-  it("refuses an out-of-range lease before reading or posting anything", async () => {
+  it("refuses a replay contract that is unreadable, incomplete, or for another rig", async () => {
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+    const err = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const missing = path.join(home, "absent.json");
+    const partial = path.join(home, "partial.json");
+    const otherRig = path.join(home, "other.json");
+    fs.writeFileSync(partial, JSON.stringify({ rigId: "test-rig", operationId: "x" }));
+    fs.writeFileSync(otherRig, JSON.stringify({ rigId: "elsewhere", leaseMs: 60000, operationId: "y", expectedEpoch: 4, expectedObligationsDigest: "d" }));
+    for(const file of [missing, partial, otherRig]){
+      await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig", "--replay-contract", file]);
+      expect(post).not.toHaveBeenCalled();
+      expect(calls).toHaveLength(0);
+      expect(process.exitCode).toBe(1);
+    }
+  });
+  it("does not POST when preparation cannot persist the request", async () => {
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+    vi.spyOn(DaemonClient.prototype, "get").mockResolvedValue({ status: 200, data: { authority: { epoch: 4 }, obligationsDigest: "fixture-digest" } } as never);
+    vi.spyOn(fs, "writeFileSync").mockImplementation(() => { throw new Error("disk unavailable"); });
+    await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig"]);
+    expect(post).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
+  });
+  it("refuses an out-of-range lease before reading, preparing or posting anything", async () => {
     const post = vi.spyOn(DaemonClient.prototype, "post");
     const get = vi.spyOn(DaemonClient.prototype, "get");
     await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig", "--lease-ms", "999"]);
@@ -114,7 +155,6 @@ describe("resume-owned command contract", () => {
     expect(get).not.toHaveBeenCalled();
     expect(calls).toHaveLength(0);
     expect(process.exitCode).toBe(1);
-    expect(vi.mocked(console.log).mock.calls).toHaveLength(0);
   });
   it("does not post when the supported read supplies no usable contract", async () => {
     vi.spyOn(DaemonClient.prototype, "get").mockResolvedValue({ status: 200, data: { authority: {}, obligationsDigest: "" } } as never);

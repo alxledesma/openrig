@@ -38,8 +38,13 @@ caller's own token and the current obligations digest from immutable seat
 identity, so no digest or epoch is supplied by hand; acknowledgment and renewal
 land in one transaction behind the canonical baton claim, and an active owner may
 renew here under the same fences. The operation id is generated fresh unless one
-is passed explicitly to replay deliberately, and a lapsed lease always refuses
-here: expired authority is recovered only by the explicit expiry-recovery path.
+is passed explicitly, and a lapsed lease always refuses here: expired authority is
+recovered only by the explicit expiry-recovery path. The command persists the
+exact prepared request at owner-only permissions before it touches the network
+and prints that path and id, so a lost response or timeout never loses the
+original contract. Resuming that contract with `--replay-contract` performs no
+read and mints no new id; a fresh read would build a different contract and
+would not be a safe reconstruction of an unknown effect. Nothing retries itself.
 
 Additional source changes cover managed cmux sizing, generation-bound native
 session receipts, audited existing-seat profile/cwd selection and exact outbox
