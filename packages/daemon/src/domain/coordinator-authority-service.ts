@@ -959,6 +959,18 @@ export class CoordinatorAuthorityService {
      const r=this.get(token.rigId)!;this.log(token.rigId,operationId,"renew",r,{token,leaseMs});return r;
    }).immediate();
  }
+  /** P3a read-only durable lookup of ONE recorded operation, keyed exactly by
+   *  (rigId, operationId) — the PRIMARY KEY; no history scan, no transaction, no effect,
+   *  and nothing here grants authority. A row that cannot be parsed is reported typed,
+   *  NEVER as absent: absence must not be inferable into a rejection. Returns null only
+   *  for a genuinely unrecorded operation. */
+  operationReceipt(rigId: string, operationId: string): { rigId: string; operationId: string; kind: string; requestHash: string; receiptDigest: string; receipt: unknown } | null {
+    const row = this.db.prepare("SELECT rig_id,operation_id,kind,receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=?").get(rigId, operationId) as { rig_id: string; operation_id: string; kind: string; receipt: string; request_hash: string } | undefined;
+    if (!row) return null;
+    let receipt: unknown;
+    try { receipt = JSON.parse(row.receipt); } catch { throw new CoordinatorFenceError("coordinator_operation_receipt_unreadable", "A durable operation row exists but its receipt cannot be read; reconcile manually and never treat it as absent"); }
+    return { rigId: row.rig_id, operationId: row.operation_id, kind: row.kind, requestHash: row.request_hash, receiptDigest: digest(row.receipt), receipt };
+  }
  /** Read-only discovery of the frozen return contract; never grants authority or acceptance. */
  returnInstructionsFor(queueId:string) {
    if(!this.available())return null;

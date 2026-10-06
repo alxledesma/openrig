@@ -16,6 +16,21 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
    const rigId=c.req.param("rigId"), authority=svc.get(rigId);
    return authority?c.json({authority,coordinationPlan:svc.coordinationRecovery?.plan(rigId)??null,frontier:svc.coordinationRecovery?.frontierProjection(rigId)??null,obligations:svc.obligations(rigId),obligationsDigest:svc.reconciliationDigest(rigId)}):c.json({error:"coordinator_not_enabled"},404);
  });
+ // P3a: exact durable operation readback for lease-duty reconciliation. Read-only,
+ // authenticated by the same bearer middleware as every other coordinator read; grants
+ // nothing and mutates nothing. A missing row is a typed 404 operation_not_recorded —
+ // which alone NEVER proves rejection (the request may still be in flight); an unreadable
+ // durable row is refused typed, never disguised as absence.
+ app.get("/:rigId/operations/:operationId",c=>{
+   const svc=(c.get("queueRepo" as never) as QueueRepository).coordinatorAuthority;
+   try {
+     const row=svc.operationReceipt(c.req.param("rigId"),c.req.param("operationId"));
+     return row?c.json(row):c.json({error:"operation_not_recorded"},404);
+   } catch(err) {
+     if(err instanceof CoordinatorFenceError)return c.json({error:err.code,message:err.message},409);
+     throw err;
+   }
+ });
  app.post("/:operation",async c=>{
    // No active token means controls are unavailable rather than silently unauthenticated.
    if(!opts.bearerToken)return c.json({error:"coordinator_authenticated_control_required"},503);
