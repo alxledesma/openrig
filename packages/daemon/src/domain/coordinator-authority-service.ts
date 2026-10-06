@@ -370,11 +370,16 @@ export class CoordinatorAuthorityService {
  assertCurrentOperator(actor:string,generation:string):void {this.operator(actor,generation);}
  assertCurrentOwner(actor:string,token:CoordinatorToken):void {this.assertOwner(actor,token);}
  obligations(rigId:string): unknown[] {
+   const localBySession=new Map<string,{rig_id:string;id:string}|undefined>();
+   const local=(session:string)=>{
+     if(!localBySession.has(session))localBySession.set(session,this.local(session));
+     return localBySession.get(session);
+   };
    const assignments=this.db.prepare(`SELECT a.package_key,a.queue_id,a.disposition_id,q.state,q.destination_session,q.claimed_at,q.claimed_by_generation_uuid,q.last_nudge_attempt,q.last_nudge_result,a.body_hash FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? ORDER BY a.package_key`).all(rigId);
    const stages=this.db.prepare("SELECT a.*,q.state,q.claimed_by_generation_uuid,q.last_nudge_attempt,q.last_nudge_result FROM coordinator_stage_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? ORDER BY a.queue_id").all(rigId);
    const resources=this.db.prepare("SELECT * FROM coordinator_resources WHERE rig_id=? ORDER BY resource_key").all(rigId);
    const queue=this.db.prepare("SELECT qitem_id,source_session,destination_session,state,claimed_by_generation_uuid,minting_generation_uuid,last_nudge_attempt,last_nudge_result FROM queue_items WHERE state NOT IN ('done','failed','denied','canceled','cancelled','handed-off') ORDER BY qitem_id").all() as Array<Record<string,unknown>>;
-   return [{assignments,stages,resources,openQueue:queue.filter(q=>this.local(String(q.source_session))?.rig_id===rigId||this.local(String(q.destination_session))?.rig_id===rigId)}];
+   return [{assignments,stages,resources,openQueue:queue.filter(q=>local(String(q.source_session))?.rig_id===rigId||local(String(q.destination_session))?.rig_id===rigId)}];
  }
  /** One explicit, bounded extension for an expired unacknowledged transfer.
   * Never elects a new owner, acknowledges work, or grants retired rights. */

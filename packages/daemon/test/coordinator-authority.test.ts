@@ -1,4 +1,4 @@
-import { beforeEach,afterEach,describe,it,expect } from "vitest";
+import { beforeEach,afterEach,describe,it,expect,vi } from "vitest";
 import { mkdtempSync,rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -84,6 +84,21 @@ describe("coordinator exclusion and custody",()=>{
   await absent("absent",0,"retired");expect(svc.observeContinuity("xv")).toBeNull();
   await absent();expect(svc.observeContinuity("xv")).not.toBeNull();
   expect(db.prepare("SELECT 1 FROM sessions WHERE session_name='lead@xv'").get()).toBeTruthy();
+ });
+ it("memoizes local obligation lookups only for one snapshot",()=>{
+  const address="new-seat@xv";
+  db.prepare("UPDATE queue_items SET source_session=?,destination_session=? WHERE qitem_id='baton'").run(address,address);
+  const resolveLocal=(svc as any).local.bind(svc) as (session:string)=>{rig_id:string;id:string}|undefined;
+  let binding:{rig_id:string;id:string}|undefined;
+  const local=vi.spyOn(svc as any,"local").mockImplementation((session:string)=>session===address?binding:resolveLocal(session));
+
+  expect((svc.obligations("xv")[0] as any).openQueue).toEqual([]);
+  expect(local.mock.calls.filter(([session])=>session===address)).toHaveLength(1);
+
+  binding={rig_id:"xv",id:"new-seat@xv"};
+  const refreshed=svc.obligations("xv")[0] as any;
+  expect(refreshed.openQueue.map((row:any)=>row.qitem_id)).toEqual(["baton"]);
+  expect(local.mock.calls.filter(([session])=>session===address)).toHaveLength(2);
  });
  const contract=()=>({inputDigest:digest("inputs"),destination:"builder@xv",bodyHash:digest("build"),resources:["source/a"],returnContract:{destination:"lead@xv",evidenceRequired:["test-report"]}});
  const transfer=()=>svc.transfer("lead@xv","lead-g1",{expected:token,oldOwner:"lead@xv",recipient:"peer@xv",recipientGeneration:"peer-g1",leaseMs:10000,operationId:"transfer"});
