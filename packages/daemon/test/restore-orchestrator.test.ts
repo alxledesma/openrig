@@ -360,6 +360,9 @@ describe("RestoreOrchestrator", () => {
       const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: testCase.runtime, cwd: "/work" });
       const sessionName = `r${String(index + 1).padStart(2, "0")}-resume`;
       sessionRegistry.registerSession(node.id, sessionName);
+      // Legitimate positive-continuity evidence for the S-B guard: the current
+      // session row records the exact native conversation being resumed.
+      db.prepare("UPDATE sessions SET resume_token='resume-token' WHERE node_id=?").run(node.id);
       const generation = sessionRegistry.currentOccupantTenure(node.id)!.generationUuid;
       let releaseResume!: () => void;
       const resumeGate = new Promise<void>((resolve) => { releaseResume = resolve; });

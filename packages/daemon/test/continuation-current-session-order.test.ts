@@ -1,0 +1,25 @@
+import { afterEach, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createDb } from '../src/db/connection.js';
+import { seed } from './helpers/coordinator-fixture.js';
+import { continuationLedgerGeneration } from '../src/domain/restore-orchestrator.js';
+const dir = mkdtempSync(join(tmpdir(), 'continuation-current-order-'));
+const db = createDb(join(dir, 'scratch.sqlite'));
+afterEach(() => { db.close(); rmSync(dir, { recursive: true, force: true }); });
+it('inherits only the newest native conversation when IDs sort in the opposite order', () => {
+  seed(db);
+  db.prepare("UPDATE sessions SET created_at='2000-01-01 00:00:00', resume_token='OLDER' WHERE id='lead@xv'").run();
+  const row = db.prepare("SELECT * FROM sessions WHERE id='lead@xv'").get() as Record<string, unknown>;
+  row.id = '0-newer-session'; row.created_at = '2026-10-06 00:00:00'; row.resume_token = 'CURRENT';
+  const keys = Object.keys(row);
+  db.prepare(`INSERT INTO sessions (${keys.map(k => `"${k}"`).join(',')}) VALUES (${keys.map(() => '?').join(',')})`).run(...keys.map(k => row[k]));
+  expect(continuationLedgerGeneration(db, 'lead@xv', 'CURRENT-GENERATION', 'CURRENT')).toEqual({ generation: 'CURRENT-GENERATION' });
+  expect('refusal' in continuationLedgerGeneration(db, 'lead@xv', 'CURRENT-GENERATION', 'OLDER')).toBe(true);
+  const missingRequest = continuationLedgerGeneration(db, 'lead@xv', 'CURRENT-GENERATION', null);
+  expect('refusal' in missingRequest && missingRequest.refusal.message).toContain('continuation_identity_unproven');
+  db.prepare("UPDATE sessions SET resume_token=NULL WHERE id='0-newer-session'").run();
+  const missingRecord = continuationLedgerGeneration(db, 'lead@xv', 'CURRENT-GENERATION', 'CURRENT');
+  expect('refusal' in missingRecord && missingRecord.refusal.message).toContain('continuation_identity_unproven');
+});

@@ -14,6 +14,46 @@ const CODEX_TYPES = new Set(["codex_id", "codex_last"]);
 const SHELL_COMMANDS = new Set(["bash", "fish", "nu", "sh", "tmux", "zsh"]);
 
 export { type ResumeResult };
+/** Parse ONLY the leading KEY=VALUE assignment block of a composed launch command
+ * using the actual supported emitter grammar (shellQuote single-quote wrapping with
+ * '"'"' escapes, mixed quoted/unquoted segments, whole-field 'K=V' form). Quote-aware:
+ * whitespace INSIDE quotes never splits a field; the block ends at the first complete
+ * non-assignment token. Text embedded in another variable's value can therefore never
+ * masquerade as a binding, and paths containing spaces parse correctly. */
+function takeAssignment(s: string): { key: string; value: string; rest: string } | null {
+  let i = s.match(/^\s+/)?.[0].length ?? 0;
+  let key = "", value = "", inValue = false;
+  while (i < s.length) {
+    const c = s[i]!;
+    if (c === "'" || c === '"') {
+      const q = c; i++; let seg = "";
+      while (i < s.length && s[i] !== q) { seg += s[i]!; i++; }
+      if (i >= s.length) return null; // unterminated quote: refuse the block here
+      i++;
+      if (!inValue && seg.includes("=")) { const [k, ...r] = seg.split("="); key += k!; value += r.join("="); inValue = true; }
+      else if (inValue) value += seg; else key += seg;
+      continue;
+    }
+    if (/\s/.test(c)) break;
+    if (c === "=" && !inValue) { inValue = true; i++; continue; }
+    if (inValue) value += c; else key += c;
+    i++;
+  }
+  if (!inValue || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return null;
+  return { key, value, rest: s.slice(i).replace(/^\s+/, "") };
+}
+export function leadingEnvAssignments(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  let rest = text.startsWith("/usr/bin/env ") ? text.slice(13) : text.startsWith("env ") ? text.slice(4) : text;
+  for (;;) {
+    const a = takeAssignment(rest);
+    if (!a) break;
+    out[a.key] = a.value;
+    if (!a.rest) break;
+    rest = a.rest;
+  }
+  return out;
+}
 
 interface CodexResumeOptions {
   seatLaunchEnvironment?: SeatLaunchEnvironment;
@@ -58,6 +98,10 @@ export class CodexResumeAdapter {
     model?: string | null,
     // #75: optional reasoning effort for the seat.
     effort?: string | null,
+    // S-A (ROOT-CODEX-GENERATION-ARCHITECTURE): ledger-owned generation for a
+    // continuation relaunch. When set it overrides the session-environment copy that
+    // handover deliberately leaves stale; absent = byte-identical prior behavior.
+    ledgerGeneration?: string,
   ): Promise<ResumeResult> {
     if (!this.canResume(resumeType, resumeToken)) {
       return { ok: false, code: "no_resume", message: "Codex resume not available" };
@@ -106,9 +150,15 @@ export class CodexResumeAdapter {
     );
 
     const launchEnv = [this.options.launchPath ? `PATH=${shellQuote(this.options.launchPath)}` : "", this.options.codexHome ? `CODEX_HOME=${shellQuote(this.options.codexHome)}` : ""].filter(Boolean);
-    const textResult = await this.tmux.sendShellCommand(tmuxSessionName, this.options.seatLaunchEnvironment
-      ? await this.options.seatLaunchEnvironment.command(tmuxSessionName, cmd, { codexCwd: cwd, runtime: "codex" })
-      : launchEnv.length ? `env ${launchEnv.join(" ")} ${cmd}` : cmd);
+    const textTarget = this.options.seatLaunchEnvironment
+      ? await this.options.seatLaunchEnvironment.command(tmuxSessionName, cmd, { codexCwd: cwd, runtime: "codex", ...(ledgerGeneration !== undefined ? { generation: ledgerGeneration } : {}) })
+      : launchEnv.length ? `env ${launchEnv.join(" ")} ${cmd}` : cmd;
+    // Structured binding proof (R3-F2): only LEADING environment assignments count —
+    // a generation string inside command arguments proves nothing about the child env,
+    // and the composer's best-effort fallback carries none at all.
+    if (ledgerGeneration !== undefined && leadingEnvAssignments(textTarget).OPENRIG_OCCUPANT_GENERATION !== ledgerGeneration)
+      return { ok: false, code: "resume_failed", message: "continuation_generation_composition_unverified: refusing to launch without the ledger generation bound in the composed environment" };
+    const textResult = await this.tmux.sendShellCommand(tmuxSessionName, textTarget);
     if (!textResult.ok) {
       return { ok: false, code: "resume_failed", message: textResult.message };
     }

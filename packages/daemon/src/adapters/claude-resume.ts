@@ -1,5 +1,6 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import type { TmuxAdapter } from "./tmux.js";
+import type { TmuxAdapter, TmuxResult } from "./tmux.js";
+import { leadingEnvAssignments } from "./codex-resume.js";
 import type { SeatLaunchEnvironment } from "../domain/seat-launch-environment.js";
 import { shellQuote } from "./shell-quote.js";
 import { claudePostureFlag, claudeClassicRendererEnvPrefix } from "./yolo-mode.js";
@@ -59,6 +60,10 @@ export class ClaudeResumeAdapter {
     selectedPermissionMode?: string,
     nodeId?: string,
     effort?: string | null,
+    // S-A (ROOT-CODEX-GENERATION-ARCHITECTURE): ledger-owned generation for a
+    // continuation relaunch; overrides the session-environment copy handover leaves
+    // stale. Absent = byte-identical prior behavior.
+    ledgerGeneration?: string,
   ): Promise<ResumeResult> {
     if (!this.canResume(resumeType, resumeToken)) {
       return { ok: false, code: "no_resume", message: "Claude resume not available" };
@@ -81,10 +86,18 @@ export class ClaudeResumeAdapter {
     const cmd = managed ? managed.command(["--permission-mode", selectedPermissionMode!, ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []), "--resume", resumeToken!])
       : `${claudeClassicRendererEnvPrefix(process.env)}claude ${permissionMode}${modelArg}${effortArg} --resume ${shellQuote(resumeToken!)}`;
 
-    const textResult = managed ? await this.tmux.sendShellCommand(tmuxSessionName, cmd, managed.assertCurrent)
-      : this.options.seatLaunchEnvironment
-        ? await this.tmux.sendShellCommand(tmuxSessionName, await this.options.seatLaunchEnvironment.command(tmuxSessionName, cmd, { runtime: "claude-code", nodeId }), undefined, { sourceInPane: true })
-        : await this.tmux.sendText(tmuxSessionName, cmd);
+    let textResult: TmuxResult;
+    if (managed) textResult = await this.tmux.sendShellCommand(tmuxSessionName, cmd, managed.assertCurrent);
+    else if (this.options.seatLaunchEnvironment) {
+      // Managed Claude derives the same ledger generation independently (:131); the
+      // classic composer must obey the explicit decision verbatim. Structured proof
+      // (R3-F2): only LEADING environment assignments bind the child env — the
+      // best-effort fallback carries none, and argument-position text proves nothing.
+      const composed = await this.options.seatLaunchEnvironment.command(tmuxSessionName, cmd, { runtime: "claude-code", nodeId, ...(ledgerGeneration !== undefined ? { generation: ledgerGeneration } : {}) });
+      if (ledgerGeneration !== undefined && leadingEnvAssignments(composed).OPENRIG_OCCUPANT_GENERATION !== ledgerGeneration)
+        return { ok: false, code: "resume_failed", message: "continuation_generation_composition_unverified: refusing to launch without the ledger generation bound in the composed environment" };
+      textResult = await this.tmux.sendShellCommand(tmuxSessionName, composed, undefined, { sourceInPane: true });
+    } else textResult = await this.tmux.sendText(tmuxSessionName, cmd);
     if (!textResult.ok) {
       // sendText failed — nothing in the buffer, no cleanup needed
       return { ok: false, code: "resume_failed", message: textResult.message };

@@ -894,6 +894,14 @@ export class RestoreOrchestrator {
       }
     }
 
+    // S-B structured pre-launch native provenance (R3-F1): read from the LIVE ledger
+    // BEFORE this restore performs any lifecycle mutation, bound to
+    // node/session/tenure/type/token. The requested token repeated is NOT evidence.
+    const preLaunchRow = this.db.prepare("SELECT id,resume_type,resume_token FROM sessions WHERE node_id=? ORDER BY created_at DESC, id DESC LIMIT 1").get(nodeId) as { id: string; resume_type: string | null; resume_token: string | null } | undefined;
+    const preLaunchTenure = this.sessionRegistry.currentOccupantTenure(nodeId)?.generationUuid ?? null;
+    const continuationProvenance = preLaunchRow?.resume_token && preLaunchTenure
+      ? { nodeId, sessionId: preLaunchRow.id, tenureGeneration: preLaunchTenure, nativeType: preLaunchRow.resume_type ?? "", nativeToken: preLaunchRow.resume_token }
+      : null;
     // Attempt launch — compensate ONLY if launch itself fails
     const launchResult = await this.nodeLauncher.launchNode(rigId, node.logicalId, launchOpts);
     if (!launchResult.ok) {
@@ -915,7 +923,7 @@ export class RestoreOrchestrator {
       warnings?.push(...launchResult.warnings);
     }
 
-    return this.postLaunchRestore(entry, rigId, data, launchResult.sessionName, launchResult, opts, warnings, priorState);
+    return this.postLaunchRestore(entry, rigId, data, launchResult.sessionName, launchResult, opts, warnings, priorState, continuationProvenance);
   }
 
   /** OPR.0.3.4.2 (B) — roll a just-launched session back to ZERO sessions for
@@ -950,6 +958,9 @@ export class RestoreOrchestrator {
     opts?: { adapters?: Record<string, import("./runtime-adapter.js").RuntimeAdapter>; fsOps?: { exists(path: string): boolean }; freshLogicalIds?: string[] },
     warnings?: string[],
     priorState?: { binding: import("./types.js").Binding | null; sessions: { id: string; status: string }[] },
+    // Structured pre-launch native provenance captured before lifecycle mutation
+    // in restoreNodeWithCompensation; null when nothing was provable there.
+    continuationProvenance?: ContinuationNativeProvenance | null,
   ): Promise<RestoreNodeResult> {
     const node = entry.node;
     // OPR.0.5.7.1 D1 — the active occupant is RESOLVED, never inferred from
@@ -994,7 +1005,7 @@ export class RestoreOrchestrator {
         await this.rollbackToZeroSession(node.id, sessionName, launchResult?.session.id, priorState);
         return { nodeId: node.id, logicalId: node.logicalId, status: "awaiting-decision", error: `Original session unresumable: resume requested but no token available. No session is running. Re-run with --fresh ${node.logicalId} for a deliberate fresh-primed seat, or restore the original session manually.` };
       } else {
-        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", node.codexConfigProfile, node.model, this.resolveRestorePosture(node.id, rigId), node.effort);
+        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", node.codexConfigProfile, node.model, this.resolveRestorePosture(node.id, rigId), node.effort, continuationProvenance);
         if (resumeOutcome.kind === "resumed") {
           baseStatus = "resumed";
         } else if (resumeOutcome.kind === "attention_required") {
@@ -1438,6 +1449,10 @@ export class RestoreOrchestrator {
     // custom policies re-validated when readable). Absent = env decision.
     resolvedPosture?: "floor" | "full_bypass",
     effort?: string | null,
+    // Structured pre-launch native provenance captured from the live ledger before
+    // any lifecycle mutation of this restore (null when nothing was provable).
+    // Never the requested token echoed back.
+    continuationProvenance?: ContinuationNativeProvenance | null,
   ): Promise<
     | { kind: "resumed" }
     | { kind: "retry_fresh" }
@@ -1456,7 +1471,13 @@ export class RestoreOrchestrator {
       permissionMode = override.permissionMode;
     } catch (error) { return { kind: "failed", message: `Permission selection: ${(error as Error).message}` }; }
     if (this.claudeResume.canResume(resumeType, resumeToken)) {
-      const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId, ...(effort !== undefined ? [effort] : []));
+      const decision = continuationLedgerGeneration(this.db, nodeId, launchGeneration, resumeToken, resumeType, continuationProvenance);
+      if ("refusal" in decision) return decision.refusal;
+      const args: Parameters<ClaudeResumeAdapter["resume"]> = [sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId];
+      // Legacy call shape stays byte-exact unless a ledger generation is inherited (R4/R8).
+      if (decision.generation !== undefined) args.push(effort ?? null, decision.generation);
+      else if (effort !== undefined) args.push(effort);
+      const result = await this.claudeResume.resume(...args);
       if (result.ok) {
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
         return { kind: "resumed" };
@@ -1474,7 +1495,12 @@ export class RestoreOrchestrator {
     }
 
     if (this.codexResume.canResume(resumeType, resumeToken)) {
-      const result = await this.codexResume.resume(sessionName, resumeType, resumeToken, cwd, codexConfigProfile, resolvedPosture, model, ...(effort !== undefined ? [effort] : []));
+      const decision = continuationLedgerGeneration(this.db, nodeId, launchGeneration, resumeToken, resumeType, continuationProvenance);
+      if ("refusal" in decision) return decision.refusal;
+      const args: Parameters<CodexResumeAdapter["resume"]> = [sessionName, resumeType, resumeToken, cwd, codexConfigProfile, resolvedPosture, model];
+      if (decision.generation !== undefined) args.push(effort ?? null, decision.generation);
+      else if (effort !== undefined) args.push(effort);
+      const result = await this.codexResume.resume(...args);
       if (result.ok) {
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
         return { kind: "resumed" };
@@ -1728,4 +1754,57 @@ export class RestoreOrchestrator {
 
 interface PlanEntry {
   node: NodeWithBinding;
+}
+
+/** S-A/S-B continuation guard (ROOT-CODEX-GENERATION-ARCHITECTURE): the LEDGER owns
+ * the generation a resumed seat carries — the tmux session environment is an
+ * intentionally stale second copy that handover never updates and must never be the
+ * source. The ledger value is inherited ONLY when the resume token IS the node's
+ * CURRENT session row's recorded native conversation token (registry ordering
+ * created_at DESC, id DESC — the newest ROW decides; older rows never supply
+ * inheritable provenance). A CONFLICTING pair refuses before launch or mint with a
+ * typed reason pointing at the recorded handover path; so does unknown continuity
+ * (tenure exists, current row's native token absent or empty) — it can never fall
+ * back through a composer to the stale session environment. Legitimate positive
+ * continuity either records the token on the current row or, for a blank fresh row,
+ * travels as STRUCTURED pre-launch provenance (below), captured
+ * from the live ledger before lifecycle mutation and re-checked against it.
+ * A missing tenure retains the existing posture. Nothing here rewrites a live process, mints a
+ * tenure, or touches hook enablement/trust. */
+export type ContinuationGenerationDecision = { generation?: string } | { refusal: { kind: "attention_required"; message: string; evidence: string } };
+/** Source-bound evidence that a conversation belongs to the CURRENT tenure: exact
+ * node, pre-launch session row, tenure generation, native type AND token. Captured
+ * before lifecycle mutation; validated against the ledger afterwards. */
+export interface ContinuationNativeProvenance { nodeId: string; sessionId: string; tenureGeneration: string; nativeType: string; nativeToken: string }
+/** Supported native-type equivalence: name/id variants of the SAME runtime family
+ * satisfy each other (legitimate Claude name/id semantics); cross-runtime strings
+ * never match. Null on either side means unspecified: stays token-bound only. */
+function continuationTypesCompatible(stored: string | null | undefined, requested: string | null | undefined): boolean {
+  if (stored == null || requested == null || stored === requested) return true;
+  const fam = (t: string) => t.startsWith("claude_") ? "claude" : t.startsWith("codex_") ? "codex" : t;
+  return fam(stored) === fam(requested);
+}
+export function continuationLedgerGeneration(db: Database.Database, nodeId: string, launchGeneration: string | undefined, resumeToken: string | null, resumeType?: string | null, provenance?: ContinuationNativeProvenance | null): ContinuationGenerationDecision {
+  if (launchGeneration === undefined) return {};
+  const unproven = (): ContinuationGenerationDecision => ({ refusal: { kind: "attention_required", message: `continuation_identity_unproven: refusing to inherit the current tenure for ${nodeId} without ledger-provable native continuity; reconcile identity through the supported handover path`, evidence: "root-codex-generation-architecture.S-B" } });
+  const mismatch = (): ContinuationGenerationDecision => ({ refusal: { kind: "attention_required", message: `continuation_native_mismatch: refusing to resume ${nodeId} on a native conversation other than its current one; use the supported handover path`, evidence: "root-codex-generation-architecture.S-B" } });
+  // The CURRENT session row (registry ordering) decides first; older rows never
+  // supply inheritable tokens directly.
+  const current = db.prepare("SELECT id,resume_type,resume_token FROM sessions WHERE node_id=? ORDER BY created_at DESC, id DESC LIMIT 1").get(nodeId) as { id: string; resume_type: string | null; resume_token: string | null } | undefined;
+  if (!current) return unproven();
+  if (current.resume_token) return resumeToken ? (current.resume_token === resumeToken && continuationTypesCompatible(current.resume_type, resumeType) ? { generation: launchGeneration } : mismatch()) : unproven();
+  // Blank CURRENT row: inherit ONLY via ledger-rechecked structured lineage.
+  if (!provenance || !resumeToken) return unproven();
+  if (provenance.nodeId !== nodeId) return unproven();
+  if (provenance.nativeToken !== resumeToken) return mismatch();
+  // The claimed tenure must be part of THIS node's ledger history up to the current
+  // generation (a restore launch may legitimately mint the next one); an arbitrary or
+  // future/foreign generation never qualifies.
+  const tenureLineage = db.prepare("SELECT generation_ordinal AS o FROM occupant_tenures WHERE node_id=? AND generation_uuid=?").get(nodeId, provenance.tenureGeneration) as { o: number } | undefined;
+  const currentTenure = db.prepare("SELECT generation_ordinal AS o FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1").get(nodeId) as { o: number } | undefined;
+  if (!tenureLineage || !currentTenure || tenureLineage.o > currentTenure.o) return unproven();
+  // The provenance SESSION must be the immediate ledger predecessor of the current row.
+  const prior = db.prepare("SELECT id,resume_type,resume_token FROM sessions WHERE node_id=? AND id<>? ORDER BY created_at DESC, id DESC LIMIT 1").get(nodeId, current.id) as { id: string; resume_type: string | null; resume_token: string | null } | undefined;
+  if (!prior || prior.id !== provenance.sessionId || prior.resume_token !== provenance.nativeToken || (prior.resume_type ?? "") !== provenance.nativeType || !continuationTypesCompatible(prior.resume_type, resumeType)) return unproven();
+  return { generation: launchGeneration };
 }
