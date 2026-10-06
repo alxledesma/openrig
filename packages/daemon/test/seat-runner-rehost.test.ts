@@ -1334,3 +1334,111 @@ describe("pi proof observation diagnostics (F1/F2/F3)", () => {
     expect(text).not.toContain("pi-runner.js");
   });
 });
+
+// REPRODUCTION (pre-fix): a freshly resumed runner is observed ONCE, immediately
+// after resume. During startup the sidecar/prover pair is not yet consistent, so a
+// single early sample can disagree with the settled state. Two deterministic
+// fixtures express exactly that: mechanism A (unavailable proof on the first read)
+// and mechanism B (sidecar not yet ready on the first read).
+describe("post-proof transient observation (reproduction)", () => {
+  const SETTLED = { state: "present" as const, generation: GENERATION, launchId: LAUNCH_NEW, fingerprint: "{}" };
+  /** One seat and one attempt where the sidecar/prover pair disagrees on the first
+   *  POST-effect sample and settles on a later one. `proofLaunchAfterResume` and
+   *  `sidecarLaunchAfterResume` drive the two candidate startup shapes. */
+  function settlingHarness(opts: { proofGenerationAfterResume?: string[]; proofLaunchAfterResume: (string | null)[]; sidecarLaunchAfterResume: (PiRehostRunnerState | null)[] }) {
+    const h = harness();
+    seat(h);
+    let resumed = false, proofReads = 0, sidecarReads = 0;
+    const service = new SeatLifecycleService({
+      db: h.db, rigRepo: new RigRepository(h.db), sessionRegistry: new SessionRegistry(h.db), eventBus: new EventBus(h.db),
+      tmuxAdapter: { deliveryGuard: { lifecycle: async (_n: string[], fn: () => Promise<unknown>) => fn(), runnerRehost: async (_n: string, fn: () => Promise<unknown>) => fn(), protectionFacts: () => ({ code: "typing_guard_enabled", fingerprint: "{}" }), preference: () => ({ desired: true, effective: true }), set: async () => ({ desired: true, effective: true }) } } as unknown as TmuxAdapter,
+      listProcesses: () => h.processes,
+      piSessionFileExists: () => true,
+      piSessionFileDigestPrefix: () => "d1g3stpr3f1x0000",
+      piSessionTailEntryId: () => "tail-1",
+      paneRootPid: async () => 4000,
+      rehostPollMs: 1, rehostWaitMs: 200,
+      postProofSettleAttempts: 3,
+      postProofSettleGapMs: 1,
+      piRunnerState: () => {
+        if (!resumed) return h.sidecar.value;
+        const seq = opts.sidecarLaunchAfterResume;
+        const pick = seq[Math.min(sidecarReads, seq.length - 1)]!;
+        sidecarReads++;
+        return pick;
+      },
+      // Normal shutdown: the pi child exits with its runner, leaving only the pane shell.
+      killNativeProcess: (pid) => { h.killed.push(pid); h.processes = h.processes.filter(p => p.pid !== pid && p.ppid !== pid); },
+      piResume: { resume: async (session, type, token, cwd) => {
+        h.resumeCalls.push({ session, type, token, cwd });
+        h.processes = h.processes.map(p => ({ ...p, command: p.command.replace(LAUNCH_OLD, LAUNCH_NEW) }));
+        resumed = true;
+        return { ok: true };
+      } },
+      piProve: async () => {
+        // Pre-effect the sidecar still names the OLD launch, so the pre-effect plan must
+        // be proven against that same OLD launch or it would refuse before the resume.
+        if (!resumed) return { state: "present" as const, generation: GENERATION, launchId: LAUNCH_OLD, fingerprint: "{}" };
+        const seq = opts.proofLaunchAfterResume;
+        const launchId = seq[Math.min(proofReads, seq.length - 1)]!;
+        const generation = opts.proofGenerationAfterResume?.[Math.min(proofReads, opts.proofGenerationAfterResume.length - 1)] ?? GENERATION;
+        proofReads++;
+        return launchId === null ? null : { state: "present" as const, generation, launchId, fingerprint: "{}" };
+      },
+    });
+    return { h, service };
+  }
+  const NEW_SIDECAR: PiRehostRunnerState = { ready: true, launchId: LAUNCH_NEW, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: "tail-1" };
+  const UNREADY_SIDECAR: PiRehostRunnerState = { ready: false, launchId: LAUNCH_OLD, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: "tail-1" };
+
+  it("mechanism A: null proof on the first post-proof sample, then settles", async () => {
+    const { service } = settlingHarness({ proofLaunchAfterResume: [null, LAUNCH_NEW, LAUNCH_NEW], sidecarLaunchAfterResume: [NEW_SIDECAR, NEW_SIDECAR, NEW_SIDECAR] });
+    const out = await service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "repro A" });
+    // REPRODUCED BEFORE FIX as ok:false (rehost_post_proof_failed). After the bounded
+    // settling window the unavailable first sample is observed again and the rehost completes.
+    expect(out.ok).toBe(true);
+  });
+
+  it("mechanism B: sidecar is not yet ready on the first post-proof sample, then settles", async () => {
+    const { service } = settlingHarness({ proofLaunchAfterResume: [LAUNCH_NEW, LAUNCH_NEW, LAUNCH_NEW], sidecarLaunchAfterResume: [UNREADY_SIDECAR, NEW_SIDECAR, NEW_SIDECAR] });
+    const out = await service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "repro B" });
+    expect(out.ok).toBe(true);
+  });
+
+  it("a genuine contradiction still fails closed as post_proof_failed, never as unstable", async () => {
+    // Old launch still live on EVERY sample: a real contradiction, not a startup transient.
+    const { service } = settlingHarness({ proofLaunchAfterResume: [LAUNCH_OLD, LAUNCH_OLD, LAUNCH_OLD], sidecarLaunchAfterResume: [NEW_SIDECAR, NEW_SIDECAR, NEW_SIDECAR] });
+    const out = await service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "genuine old-launch-live" });
+    expect(out).toMatchObject({ ok: false, code: "rehost_post_proof_failed" });
+  });
+
+  it("a persistent non-settling disagreement is reported as the distinct unstable code", async () => {
+    // Never settles AND is not a proven contradiction: an unready sidecar throughout.
+    const { service } = settlingHarness({ proofLaunchAfterResume: [LAUNCH_NEW, LAUNCH_NEW, LAUNCH_NEW], sidecarLaunchAfterResume: [UNREADY_SIDECAR, UNREADY_SIDECAR, UNREADY_SIDECAR] });
+    const out = await service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "never settles" });
+    expect(out.ok).toBe(false);
+    if (out.ok === false) expect(out.code).toBe("rehost_post_proof_unstable");
+  });
+
+  it.each(["generation", "file", "old-launch"] as const)("positive %s contradiction cannot be laundered by a later valid sample", async (kind) => {
+    const { h, service } = settlingHarness({
+      proofLaunchAfterResume: [kind === "old-launch" ? LAUNCH_OLD : LAUNCH_NEW, LAUNCH_NEW, LAUNCH_NEW],
+      proofGenerationAfterResume: [kind === "generation" ? "different-generation" : GENERATION, GENERATION, GENERATION],
+      sidecarLaunchAfterResume: [kind === "file" ? { ...NEW_SIDECAR, sessionFile: "/wrong/session.jsonl" } : NEW_SIDECAR, NEW_SIDECAR, NEW_SIDECAR],
+    });
+    try {
+      const out = await service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "positive contradiction followed by agreement" });
+      expect(out).toMatchObject({ ok: false, code: "rehost_post_proof_failed" });
+      expect(h.resumeCalls).toHaveLength(1);
+      expect(h.killed.filter(p => p === RUNNER_PID)).toHaveLength(1);
+      expect(events(h, "seat.runner_rehost_completed")).toHaveLength(0);
+    } finally { h.db.close(); }
+  });
+
+  it("the observation window never repeats the stop or the resume", async () => {
+    const { h, service } = settlingHarness({ proofLaunchAfterResume: [null, LAUNCH_NEW, LAUNCH_NEW], sidecarLaunchAfterResume: [NEW_SIDECAR, NEW_SIDECAR, NEW_SIDECAR] });
+    await service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "single effect" });
+    expect(h.resumeCalls).toHaveLength(1);
+    expect(h.killed.filter(p => p === RUNNER_PID)).toHaveLength(1);
+  });
+});

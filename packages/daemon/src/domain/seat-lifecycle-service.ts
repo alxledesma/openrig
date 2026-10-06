@@ -82,6 +82,10 @@ export interface SeatLifecycleDeps {
   /** SIGTERM delivery to ONE verified runner pid. Never a terminal keystroke. */
   killNativeProcess?: (pid: number) => void;
   rehostPollMs?: number;
+  /** Bounded READ-ONLY settling window for the post-proof observation, taken AFTER
+   *  the single resume. Observation only: it never repeats the stop or the resume. */
+  postProofSettleAttempts?: number;
+  postProofSettleGapMs?: number;
   rehostWaitMs?: number;
   /** Up to two EXTRA full strict read-only pre-effect proof observations, spaced
    *  by rehostReobserveGapMs, inside the already-held guard lease. Bounded, never
@@ -194,7 +198,9 @@ export interface SeatRefusal {
     | "rehost_stop_unverified"
     | "rehost_resume_failed"
     | "rehost_custody_drift"
-    | "rehost_post_proof_failed" | "rehost_effect_unknown";
+    | "rehost_post_proof_failed"
+    | "rehost_post_proof_unstable"
+    | "rehost_effect_unknown";
   message: string;
   guidance?: string;
   /** Present on an outcome whose EFFECT already happened: never true, never retryable. */
@@ -332,6 +338,8 @@ export class SeatLifecycleService {
   private readonly piSessionTailEntryId?: (path: string) => string | null;
   private readonly killNativeProcess?: (pid: number) => void;
   private readonly rehostPollMs: number;
+  private readonly postProofSettleAttempts: number;
+  private readonly postProofSettleGapMs: number;
   private readonly rehostReobserveAttempts: number;
   private readonly rehostReobserveGapMs: number;
   private readonly rehostWaitMs: number;
@@ -365,6 +373,8 @@ export class SeatLifecycleService {
     this.piSessionTailEntryId = deps.piSessionTailEntryId;
     this.killNativeProcess = deps.killNativeProcess ?? ((pid) => { process.kill(pid, "SIGTERM"); });
     this.rehostPollMs = deps.rehostPollMs ?? 250;
+    this.postProofSettleAttempts = Math.max(1, Math.min(5, deps.postProofSettleAttempts ?? 3));
+    this.postProofSettleGapMs = Math.max(0, deps.postProofSettleGapMs ?? 250);
     this.rehostWaitMs = deps.rehostWaitMs ?? 20_000;
     this.rehostReobserveAttempts = Math.max(0, Math.min(2, deps.rehostReobserveAttempts ?? 2));
     this.rehostReobserveGapMs = Math.max(0, deps.rehostReobserveGapMs ?? 300);
@@ -1608,30 +1618,96 @@ export class SeatLifecycleService {
 
       // S4: post-proof. Process identity, launch scope, file equality, generation,
       // and a READ-ONLY custody comparison against the S1 snapshot.
-      const post = piRunnerState(sessionName);
-      const proof = await piProve(sessionName);
-      const launchIdAfter = post?.launchId ?? null;
-      const postProof =
-        !!post && post.ready && post.sessionFile === plan.sessionFile && !!launchIdAfter && launchIdAfter !== plan.launchId &&
-        proof?.state === "present" && proof.generation === plan.generation && proof.launchId === launchIdAfter;
+      //
+      // BOUNDED SETTLING WINDOW. A freshly resumed runner publishes its new launch id
+      // and ready state asynchronously, so ONE sample taken immediately after resume can
+      // transiently disagree with the settled state. We therefore sample the sidecar and
+      // the prover within a small bounded window and take the FIRST sample on which the
+      // sidecar launch id, the session-file identity and the prover launch id AGREE.
+      //
+      // This widens OBSERVATION only. It never repeats the stop or the resume, and the
+      // fences below are unchanged: wrong generation, wrong session file, a launch id
+      // that is not new, or the OLD launch still live all still fail closed.
+      type PostSample = { post: PiRehostRunnerState | null; proof: PiRehostProof | null; launchIdAfter: string | null; ok: boolean };
+      const samples: PostSample[] = [];
+      let settled: PostSample | null = null;
+      for (let attempt = 1; attempt <= this.postProofSettleAttempts; attempt++) {
+        if (attempt > 1) await new Promise<void>(resolve => setTimeout(resolve, this.postProofSettleGapMs));
+        const post = piRunnerState(sessionName);
+        const proof = await piProve(sessionName);
+        const launchIdAfter = post?.launchId ?? null;
+        // Agreement = the new launch is published and BOTH readers name the SAME launch
+        // id, the session file is the one we resumed, and the prover shows the exact plan
+        // generation. A null prover or an unready sidecar is simply not agreement yet.
+        const ok =
+          !!post && post.ready && post.sessionFile === plan.sessionFile &&
+          !!launchIdAfter && launchIdAfter !== plan.launchId &&
+          proof?.state === "present" && proof.generation === plan.generation && proof.launchId === launchIdAfter;
+        const sample: PostSample = { post, proof, launchIdAfter, ok };
+        samples.push(sample);
+        // Positive identity contradictions are terminal; later agreement cannot
+        // erase a wrong generation/file or a proof of the old launch still present.
+        if ((post?.sessionFile != null && post.sessionFile !== plan.sessionFile) ||
+            (proof != null && proof.generation !== plan.generation) ||
+            (proof?.state === "present" && proof.launchId === plan.launchId)) break;
+        if (ok) { settled = sample; break; }
+      }
+      const post = settled?.post ?? samples[samples.length - 1]?.post ?? null;
+      const proof = settled?.proof ?? samples[samples.length - 1]?.proof ?? null;
+      const launchIdAfter = settled?.launchIdAfter ?? samples[samples.length - 1]?.launchIdAfter ?? null;
+      // Every disagreement observed inside the window must name the SAME thing. If the
+      // disagreement CHANGES across samples it is not a settling startup artifact.
+      const disagreementShapes = new Set(samples.filter(s => !s.ok).map(s => JSON.stringify({
+        sidecarReady: s.post?.ready ?? null,
+        sidecarLaunchId: s.post?.launchId ?? null,
+        sidecarSessionFile: s.post?.sessionFile ?? null,
+        proofState: s.proof?.state ?? null,
+        proofGeneration: s.proof?.generation ?? null,
+        proofLaunchId: s.proof?.launchId ?? null,
+      })));
+      const disagreementStable = disagreementShapes.size <= 1;
+      // A GENUINE CONTRADICTION is a disagreement that is itself a real identity
+      // violation rather than an unsettled observation. These keep failing closed.
+      const genuineContradiction =
+        samples.some(s => s.post?.sessionFile != null && s.post.sessionFile !== plan.sessionFile) ||
+        samples.some(s => s.proof != null && s.proof.generation !== plan.generation) ||
+        samples.some(s => s.proof != null && s.proof.state === "present" && s.proof.launchId === plan.launchId) ||
+        (!!post && post.ready && !!launchIdAfter && launchIdAfter === plan.launchId);
+      const postProof = settled?.ok === true && !genuineContradiction;
       const after = this.rehostCustodySnapshot(resolved.nodeId, plan.sessionFile);
       const custodyUnchanged =
         after.tenantHash === before.tenantHash && after.resumeTokenHash === before.resumeTokenHash &&
         after.authorityHash === before.authorityHash && after.claimHash === before.claimHash &&
         after.unknownEffects.digest === before.unknownEffects.digest && after.unknownEffects.count === before.unknownEffects.count;
       if (!postProof || !custodyUnchanged) {
+        // A settling disagreement that never became a genuine contradiction gets its own
+        // TYPED code and carries the sampled values, so a startup transient is never
+        // indistinguishable from a real identity contradiction. The failed receipt is
+        // written exactly as before and is preserved; nothing is retried.
+        const unstable = !postProof && !genuineContradiction && samples.length > 0;
         this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
           stage: "post_proof", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId, launchIdAfter,
-          observed: { postProof, custodyUnchanged, proofState: proof?.state ?? null, proofGeneration: proof?.generation ?? null, proofLaunchId: proof?.launchId ?? null, sidecarReady: post?.ready ?? null, sidecarSessionFile: post?.sessionFile ?? null },
+          observed: {
+            postProof, custodyUnchanged, proofState: proof?.state ?? null, proofGeneration: proof?.generation ?? null,
+            proofLaunchId: proof?.launchId ?? null, sidecarReady: post?.ready ?? null, sidecarSessionFile: post?.sessionFile ?? null,
+            settlingSamples: samples.length, settlingAttempts: this.postProofSettleAttempts,
+            disagreementStable, genuineContradiction,
+            samples: samples.map(s => ({ sidecarReady: s.post?.ready ?? null, sidecarLaunchId: s.post?.launchId ?? null, proofState: s.proof?.state ?? null, proofGeneration: s.proof?.generation ?? null, proofLaunchId: s.proof?.launchId ?? null })),
+          },
           blindRetryAllowed: false, fallbackTaken: "none",
-          note: "Post-rehost proof or custody comparison failed; reported, never repaired by this operation.",
+          note: unstable
+            ? "Post-rehost observation did not settle inside the bounded read-only window and is not a proven identity contradiction; reported as unstable, never repaired and never retried."
+            : "Post-rehost proof or custody comparison failed; reported, never repaired by this operation.",
         });
         return {
           ok: false,
-          code: postProof ? "rehost_custody_drift" : "rehost_post_proof_failed",
+          code: postProof ? "rehost_custody_drift" : unstable ? "rehost_post_proof_unstable" : "rehost_post_proof_failed",
           message: postProof
             ? "Custody, generation or UNKNOWN-effect comparison failed after resume; reported only, never repaired."
-            : "Post-resume process proof failed (launch scope, session-file equality or same-generation proof). Reported only, never repaired.",
+            : unstable
+              ? `Post-resume observation did not settle within ${this.postProofSettleAttempts} read-only samples and shows no proven identity contradiction; reported as unstable only, never repaired and never retried.`
+              : "Post-resume process proof failed (launch scope, session-file equality or same-generation proof). Reported only, never repaired.",
+          observed: { settlingSamples: samples.length, disagreementStable, genuineContradiction },
         };
       }
 
