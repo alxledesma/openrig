@@ -570,8 +570,11 @@ export class CoordinatorAuthorityService {
    // owner NODE and the owner SESSION; comparing node_id to a session name missed real reservations.
    const live=this.db.prepare("SELECT reservation_id FROM seat_dispatch_reservations WHERE (node_id=? OR session_name=?) AND state IN ('reserved','started')").all(ownerNode,row.owner_session) as {reservation_id:string}[];
    if(live.length)reject("coordinator_dispatch_reserved","An outstanding dispatch reservation forbids this recovery");
-   const sending=this.db.prepare("SELECT outbox_id FROM outbox_entries WHERE delivery_state='pending' AND (sender_session=? OR destination_session=?)").all(row.owner_session,row.owner_session) as {outbox_id:string}[];
-   if(sending.length)reject("coordinator_send_in_flight","An undelivered send for the owner forbids this recovery");
+   // Only an ACTUALLY in-flight send forbids this recovery: OutboxHandler.beginSend writes 'sending'.
+   // 'pending' is a known unattempted row, and retained/indeterminate UNKNOWN effects are historical
+   // debt that must be preserved and never reclassified, so neither is treated as an active send.
+   const sending=this.db.prepare("SELECT outbox_id FROM outbox_entries WHERE delivery_state='sending' AND (sender_session=? OR destination_session=?)").all(row.owner_session,row.owner_session) as {outbox_id:string}[];
+   if(sending.length)reject("coordinator_send_in_flight","An in-flight send for the owner forbids this recovery");
    // The ORIGINAL spent recovery receipt must exist for this exact epoch. The incident anchor comes
    // from that stored receipt, not from the current epoch and not from any successor receipt.
    const spent=this.db.prepare("SELECT operation_id,receipt FROM coordinator_operations WHERE rig_id=? AND kind='reconciliation-recover' AND json_extract(receipt,'$.epoch')<=? ORDER BY rowid DESC LIMIT 1").get(input.rigId,row.epoch) as {operation_id:string;receipt:string}|undefined;

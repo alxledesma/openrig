@@ -677,19 +677,47 @@ describe("expired reconciling window bounded successor recovery",()=>{
   guardOn();expect((await call({operationId:"guard-on"})).epoch).toBe(2);
  });
 
- it("refuses a live reservation bound to the owner node or session, and an undelivered send",async()=>{
+ it("refuses a live reservation bound to the owner node or session",async()=>{
   await reserveConflict();ready();
   db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES('r1','op1','lead@xv','lead@xv','lead-g1','n1','operator-agent@kernel','operator-agent-g1','h','{}','{}','reserved','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z')").run();
   await expect(call({operationId:"node-reservation"})).rejects.toThrow(/outstanding dispatch reservation/);
   // The same reservation registered against the node while naming another session is still caught.
   db.prepare("UPDATE seat_dispatch_reservations SET session_name='someone-else'").run();
   await expect(call({operationId:"node-reservation-2"})).rejects.toThrow(/outstanding dispatch reservation/);
-  db.prepare("DELETE FROM seat_dispatch_reservations").run();
-  db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state) VALUES('w-pending','lead@xv','builder@xv','{}',?,'pending')").run(new Date().toISOString());
-  await expect(call({operationId:"send-in-flight"})).rejects.toThrow(/undelivered send/);
   expect(ops("expired-window-successor").n).toBe(0);
-  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
-  expect((await call({operationId:"send-clear"})).epoch).toBe(2);
+  db.prepare("DELETE FROM seat_dispatch_reservations").run();
+  expect((await call({operationId:"reservation-clear"})).epoch).toBe(2);
+ });
+
+ it("refuses only an actually in-flight send, and preserves pending and UNKNOWN rows",async()=>{
+  await reserveConflict();ready();
+  const stamp=new Date().toISOString();
+  const custodyBefore=svc.reconciliationDigest("xv");
+  for(const [why,state] of [["sending","sending"],["retained","retained"],["indeterminate","indeterminate"]] as const){
+   db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state) VALUES(?,?,?,?,?,?)").run(`w-${state}`,"lead@xv","builder@xv","{}",stamp,state);
+  }
+  // An ACTUALLY in-flight send, exactly as OutboxHandler.beginSend writes it, forbids the recovery.
+  await expect(call({operationId:"sending-refused"})).rejects.toThrow(/in-flight send for the owner/);
+  expect(ops("expired-window-successor").n).toBe(0);
+  expect(svc.get("xv")!.epoch).toBe(1);
+  // Clearing ONLY the in-flight row unblocks it: pending and retained/UNKNOWN debt are not sends.
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE outbox_id='w-sending'").run();
+  expect((await call({operationId:"pending-preserved"})).epoch).toBe(2);
+  // Custody, the pending row and both historical UNKNOWN rows are byte-preserved: nothing was
+  // reclassified, retried, released or relabelled by the recovery.
+  expect(svc.reconciliationDigest("xv")).toBe(custodyBefore);
+  expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id='w-retained'").get()).toEqual({delivery_state:"retained"});
+  expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id='w-indeterminate'").get()).toEqual({delivery_state:"indeterminate"});
+ });
+
+ it("a known unattempted pending send does not block the recovery",async()=>{
+  await reserveConflict();ready();
+  db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state) VALUES('w-pending','lead@xv','builder@xv','{}',?,'pending')").run(new Date().toISOString());
+  // 'pending' was never dispatched, so it is not an in-flight send and must not block recovery.
+  expect((await call({operationId:"pending-allowed"})).epoch).toBe(2);
+  // The pending row is preserved exactly, still pending and unattempted.
+  expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id='w-pending'").get()).toEqual({delivery_state:"pending"});
+  expect(ops("expired-window-successor").n).toBe(1);
  });
 
  it("refuses a non-Operator caller and a foreign owner generation",async()=>{
