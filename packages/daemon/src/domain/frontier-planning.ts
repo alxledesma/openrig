@@ -42,11 +42,17 @@ export const DEFAULT_STABILIZATION_MS = 300000;
 
 export type FrontierState = "ACTIVE"|"AWAITING-ACCEPTANCE"|"PROTECTED-HOLD"|"MATERIALIZABLE"|"EXHAUSTED";
 export interface FrontierPackageFact { packageKey:string; workClass:WorkClass; status:string; legacyClass:boolean }
+/** S1: an old unclassified package the genuine Operator attested as administrative or inquiry work.
+ *  It stays visible with its REAL status; only the planning flags ignore it. */
+export interface FrontierExcludedFact { packageKey:string; attestedClass:"administrative"|"inquiry"; status:string; queueId:string|null; protectedReason:string; classificationId:string }
+/** The exact assignment/claim the Operator observed when attesting. A null assignment is
+ *  an explicit observation too. Any change to it voids the attestation. */
+export interface LegacyObservation { queueId:string|null; claimedByGeneration:string|null; claimedAt:string|null }
 export interface FrontierStabilization { observations:number; since:number; requiredObservations:number; requiredMs:number; ready:boolean }
 export interface FrontierSnapshot {
   rigId:string; state:FrontierState; reason:string;
   frontierDigest:string; scopeSources:ScopeSource[]; scopeSourcesDigest:string;
-  packages:FrontierPackageFact[]; accepted:Array<{queueId:string;dispositionId:string;evidenceRef:string}>;
+  packages:FrontierPackageFact[]; excluded:FrontierExcludedFact[]; accepted:Array<{queueId:string;dispositionId:string;evidenceRef:string}>;
   stabilization:FrontierStabilization; holder:string; holderGeneration:string; epoch:number; operatorGeneration:string;
 }
 export type FrontierDisposition = "plan-proposal"|"frontier-complete"|"frontier-blocked";
@@ -67,6 +73,11 @@ export interface FrontierAdmissionReceipt {
 }
 export interface FrontierConfirmationReceipt { dutyQueueId:string; completionDigest:string; actor:string; generation:string; evidenceRef:string }
 export interface FrontierReopenReceipt { dutyQueueId:string; dispositionDigest:string; reopenDigest:string; frontierDigest:string; actor:string; generation:string; evidenceRef:string; boundary?:FrontierBoundary }
+
+export interface LegacyClassificationInput { rigId:string; packageKey:string; contractHash:string; workClass:string; evidenceRef:string; observed:LegacyObservation }
+export interface LegacyRevocationInput { rigId:string; packageKey:string; contractHash:string; classificationId:string; evidenceRef:string }
+export interface LegacyClassificationReceipt { operationId:string; rigId:string; packageKey:string; contractHash:string; workClass:"administrative"|"inquiry"; evidenceRef:string; observed:LegacyObservation; actor:string; generation:string; at:number; grantsAuthority:false }
+export interface LegacyRevocationReceipt { operationId:string; rigId:string; packageKey:string; contractHash:string; classificationId:string; evidenceRef:string; actor:string; generation:string; at:number; grantsAuthority:false }
 
 export type FrontierDutyKind = typeof PLANNING_DUTY_KIND|typeof ADMISSION_DUTY_KIND|typeof CONFIRMATION_DUTY_KIND;
 /** The whole D10 integration surface, in one structural type. Everything the
@@ -129,25 +140,37 @@ export class FrontierPlanning {
   const tasks=new Map(plan.tasks.map(t=>[t.packageKey,t]));
   const acceptedRows=db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordination-accept' ORDER BY operation_id").all(rigId) as Array<{receipt:string}>;
   const accepted=acceptedRows.map(row=>{const r=JSON.parse(row.receipt) as {queueId:string;dispositionId:string;evidenceRef:string};return {queueId:r.queueId,dispositionId:r.dispositionId,evidenceRef:r.evidenceRef};});
-  const rows=db.prepare(`SELECT p.package_key,p.contract,a.queue_id,a.disposition_id,a.destination,q.state,q.claimed_by_generation_uuid
+  const rows=db.prepare(`SELECT p.package_key,p.contract,p.contract_hash,a.queue_id,a.disposition_id,a.destination,q.state,q.claimed_by_generation_uuid,q.claimed_at
    FROM coordinator_packages p
    LEFT JOIN coordinator_assignments a ON a.rig_id=p.rig_id AND a.package_key=p.package_key
    LEFT JOIN queue_items q ON q.qitem_id=a.queue_id
-   WHERE p.rig_id=? ORDER BY p.package_key`).all(rigId) as Array<{package_key:string;contract:string;queue_id:string|null;disposition_id:string|null;destination:string|null;state:string|null;claimed_by_generation_uuid:string|null}>;
+   WHERE p.rig_id=? ORDER BY p.package_key`).all(rigId) as Array<{package_key:string;contract:string;contract_hash:string;queue_id:string|null;disposition_id:string|null;destination:string|null;state:string|null;claimed_by_generation_uuid:string|null;claimed_at:string|null}>;
+  const attestations=this.effectiveClassifications(rigId);
 
   const flags={ACTIVE:false,AWAITING_ACCEPTANCE:false,PROTECTED_HOLD:false,MATERIALIZABLE:false};
-  const packages:FrontierPackageFact[]=[];
+  const packages:FrontierPackageFact[]=[],excluded:FrontierExcludedFact[]=[],digestPackages:Array<{packageKey:string;workClass:WorkClass;status:string}>=[],classified:Array<{packageKey:string;workClass:string;classificationId:string}>=[];
   for(const row of rows){
    const task=tasks.get(row.package_key),contract=(JSON.parse(row.contract) as PackageContract&{workClass?:string}).workClass;
    const workClass:WorkClass=WORK_CLASSES.includes(contract as WorkClass)?contract as WorkClass:"product";
    const legacyClass=contract===undefined;
    // Non-product work is administrative. It never supports product classification.
-   const administrative=!legacyClass&&(workClass==="administrative"||workClass==="inquiry");
+   // S1: only an exact, still-matching Operator attestation for THIS stored contract and THIS
+   // observed assignment/claim lifts a legacy package out of the planning flags. Never a name.
+   const attested=legacyClass?attestations.get(row.package_key+':'+row.contract_hash):undefined;
+   const live=attested&&this.sameObservation(attested.observed,{queueId:row.queue_id,claimedByGeneration:row.claimed_by_generation_uuid,claimedAt:row.claimed_at})?attested:undefined;
+   const administrative=!!live||(!legacyClass&&(workClass==="administrative"||workClass==="inquiry"));
    // Recovery backups are dormant, not work: accepted target, no semantic
    // recovery requirement, and no assignment, stage, resource or live queue.
    const dormantBackup=!!task?.recoveryFor&&this.dormantBackup(rigId,task,plan);
    const status=this.packageStatus(rigId,row,task);
-   packages.push({packageKey:row.package_key,workClass,status,legacyClass});
+   packages.push({packageKey:row.package_key,workClass:live?live.workClass:workClass,status,legacyClass});
+   // S4: excluded administrative or dormant work is shown but never part of planning identity,
+   // so its status churn cannot mint a duty or reset stabilization.
+   if(live){
+    classified.push({packageKey:row.package_key,workClass:live.workClass,classificationId:live.operationId});
+    excluded.push({packageKey:row.package_key,attestedClass:live.workClass,status,queueId:row.queue_id,classificationId:live.operationId,protectedReason:this.protectedReason(status,row,task)});
+   }
+   if(!administrative&&!dormantBackup)digestPackages.push({packageKey:row.package_key,workClass,status});
    if(administrative||dormantBackup||status==="accepted")continue;
    if(status==="picked-up"||status==="pending-pickup"){flags.ACTIVE=true;continue;}
    if(status==="awaiting-acceptance"){flags.AWAITING_ACCEPTANCE=true;continue;}
@@ -166,10 +189,10 @@ export class FrontierPlanning {
   const state:FrontierState=flags.ACTIVE?"ACTIVE":flags.AWAITING_ACCEPTANCE?"AWAITING-ACCEPTANCE":flags.PROTECTED_HOLD?"PROTECTED-HOLD":flags.MATERIALIZABLE?"MATERIALIZABLE":"EXHAUSTED";
   const reason=state==="ACTIVE"?"admitted-product-work-in-flight":state==="AWAITING-ACCEPTANCE"?"typed-return-awaits-acceptance":state==="PROTECTED-HOLD"?"product-work-held-by-protection":state==="MATERIALIZABLE"?"registered-product-package-awaiting-materialization":"no-authorized-product-frontier-remains";
   const sources=this.scopeSources(plan),sourcesDigest=scopeSourcesDigest(sources);
-  const frontierDigest=digest(canonical({rigId,packages:packages.map(p=>({packageKey:p.packageKey,workClass:p.workClass,status:p.status})),accepted:accepted.map(a=>[a.queueId,a.dispositionId]),scopeSourcesDigest:sourcesDigest}));
+  const frontierDigest=digest(canonical({rigId,packages:digestPackages,...(classified.length?{classified}:{}),accepted:accepted.map(a=>[a.queueId,a.dispositionId]),scopeSourcesDigest:sourcesDigest}));
   const run=this.observationRun(rigId,frontierDigest,authority.epoch,state);
   const limits=this.stabilization(plan);
-  return {rigId,state,reason,frontierDigest,scopeSources:sources,scopeSourcesDigest:sourcesDigest,packages,accepted,
+  return {rigId,state,reason,frontierDigest,scopeSources:sources,scopeSourcesDigest:sourcesDigest,packages,excluded,accepted,
    stabilization:{observations:run.observations,since:run.since,requiredObservations:limits.requiredObservations,requiredMs:limits.requiredMs,ready:run.observations>=limits.requiredObservations&&this.seam.now()-run.since>=limits.requiredMs},
    holder:authority.owner_session,holderGeneration:authority.owner_generation,epoch:authority.epoch,operatorGeneration:plan.operatorGeneration};
  }
@@ -180,6 +203,9 @@ export class FrontierPlanning {
   if(['failed','denied','canceled'].includes(row.state!))return task&&task.boundary?"held":"awaiting-acceptance";
   if(!row.disposition_id&&['done','handed-off','failed','denied','canceled'].includes(row.state!))return this.taskProtected(rigId,task)?"held":"awaiting-acceptance";
   if(['pending','in-progress','blocked'].includes(row.state!)){
+   // A blocked assignment that no current plan task owns has no dispatch path and no per-task
+   // protection: it is an honest local hold, never a fictitious pending pickup.
+   if(!task&&row.state==='blocked')return "held";
    if(this.taskProtected(rigId,task))return "held";
    if(row.state==='in-progress'&&row.claimed_by_generation_uuid&&this.seam.generation(row.destination??'')===row.claimed_by_generation_uuid)return "picked-up";
    if(row.state==='in-progress'&&!row.claimed_by_generation_uuid)return "held";
@@ -196,6 +222,47 @@ export class FrontierPlanning {
   if(this.seam.dispatchScopeHold(this.seam.plan(rigId)!,task))return true;
   if(!this.seam.admittedNow(task))return true;
   return this.seam.effectDebt(task.owner);
+ }
+
+ /** The local reason an excluded package is still protected. Report only; nothing repairs or retires. */
+ private protectedReason(status:string,row:{queue_id:string|null;state:string|null},task:CoordinationTask|undefined):string {
+  if(row.queue_id&&!task&&row.state==='blocked')return 'protected-no-plan-task';
+  if(status==='held')return task?.boundary?'owner-boundary':'held-by-local-protection';
+  if(status==='awaiting-acceptance')return 'typed-return-awaits-acceptance';
+  if(status==='picked-up'||status==='pending-pickup')return 'assignment-in-flight';
+  if(status==='unplanned')return 'registered-without-assignment';
+  return status;
+ }
+
+ private sameObservation(a:LegacyObservation,b:LegacyObservation):boolean {
+  return a.queueId===b.queueId&&a.claimedByGeneration===b.claimedByGeneration&&a.claimedAt===b.claimedAt;
+ }
+
+ /** The assignment and claim incarnation as they are right now. A package with no assignment
+  *  observes `{null,null,null}`; that is an explicit observation, not an absent one. */
+ private currentObservation(rigId:string,packageKey:string):LegacyObservation {
+  const r=this.seam.db.prepare("SELECT a.queue_id,q.claimed_by_generation_uuid,q.claimed_at FROM coordinator_assignments a LEFT JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=?").get(rigId,packageKey) as {queue_id:string;claimed_by_generation_uuid:string|null;claimed_at:string|null}|undefined;
+  return r?{queueId:r.queue_id,claimedByGeneration:r.claimed_by_generation_uuid??null,claimedAt:r.claimed_at??null}:{queueId:null,claimedByGeneration:null,claimedAt:null};
+ }
+
+ /** Append-only history for one (package, stored contract hash): classifications in write order and
+  *  the revocations that name them. The active attestation is the latest classification that no
+  *  revocation names. */
+ private classificationHistory(rigId:string,packageKey?:string,contractHash?:string):{classes:LegacyClassificationReceipt[];revoked:Map<string,LegacyRevocationReceipt>} {
+  const db=this.seam.db,parse=<T>(rows:Array<{receipt:string}>):T[]=>rows.flatMap(r=>{try{return [JSON.parse(r.receipt) as T];}catch{return [];}});
+  const classes=parse<LegacyClassificationReceipt>(db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='frontier-legacy-classification' ORDER BY rowid").all(rigId) as Array<{receipt:string}>).filter(c=>(!packageKey||c.packageKey===packageKey)&&(!contractHash||c.contractHash===contractHash));
+  const revoked=new Map<string,LegacyRevocationReceipt>();
+  for(const r of parse<LegacyRevocationReceipt>(db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='frontier-legacy-classification-revocation' ORDER BY rowid").all(rigId) as Array<{receipt:string}>))revoked.set(r.classificationId,r);
+  return {classes,revoked};
+ }
+
+ /** Active attestations keyed `packageKey:contractHash`. Matching the CURRENT observation is the
+  *  caller's job (frontier() compares it per row), so a drifted assignment simply stops applying. */
+ private effectiveClassifications(rigId:string):Map<string,LegacyClassificationReceipt&{observed:LegacyObservation}> {
+  const {classes,revoked}=this.classificationHistory(rigId),active=new Map<string,LegacyClassificationReceipt>();
+  for(const c of classes)active.set(c.packageKey+':'+c.contractHash,c);
+  for(const [key,c] of [...active])if(revoked.has(c.operationId))active.delete(key);
+  return active as Map<string,LegacyClassificationReceipt&{observed:LegacyObservation}>;
  }
 
  /** `dormantRecoveryHistory` expressed over the same durable rows: an accepted
@@ -271,7 +338,7 @@ export class FrontierPlanning {
   const recipient=snapshot.holder,recipientGeneration=snapshot.holderGeneration;
   const details:Record<string,unknown>={
    frontierDigest:snapshot.frontierDigest,scopeSources:snapshot.scopeSources,scopeSourcesDigest:snapshot.scopeSourcesDigest,
-   frontierState:snapshot.state,epoch:snapshot.epoch,grantsAuthority:false,...(reopenDigest?{reopenDigest}:{}),
+   frontierState:snapshot.state,epoch:snapshot.epoch,grantsAuthority:false,...(reopenDigest?{reopenDigest}:{}),...(snapshot.excluded.length?{excludedProtected:snapshot.excluded}:{}),
    planningContract:{
     dispositions:["plan-proposal","frontier-complete","frontier-blocked"],
     recordOperation:"coordination-frontier-plan",
@@ -285,7 +352,7 @@ export class FrontierPlanning {
    const operatorGeneration=this.seam.generation('operator-agent@kernel');
    if(!operatorGeneration)return {key:'frontier-admission',state:'held',reason:'frontier-operator-absent',deadline:this.seam.now()};
    return this.seam.issueLifecycleDuty({rigId:snapshot.rigId,kind:ADMISSION_DUTY_KIND,packageKey:ADMISSION_DUTY_PACKAGE_KEY,recipient:'operator-agent@kernel',recipientGeneration:operatorGeneration,semanticKey:receipt.proposal!.proposalDigest,
-    details:{proposalDigest:receipt.proposal!.proposalDigest,frontierDigest:receipt.frontierDigest,planningQueueId:receipt.dutyQueueId,proposal:receipt.proposal!.packages,
+    details:{proposalDigest:receipt.proposal!.proposalDigest,frontierDigest:receipt.frontierDigest,planningQueueId:receipt.dutyQueueId,proposal:receipt.proposal!.packages,...(snapshot.excluded.length?{excludedProtected:snapshot.excluded}:{}),
      admissionContract:{recordOperation:"coordination-frontier-admit",body:{rigId:snapshot.rigId,proposalDigest:receipt.proposal!.proposalDigest,dutyQueueId:'<this exact duty queue item ID>',admitted:'<every proposed packageKey with its exact admitted contract>',declined:'<only when not admitting>'}}}});
  }
 
@@ -313,6 +380,11 @@ export class FrontierPlanning {
    if(result[0]?.reason==='frontier-boundary-declined'){this.recordBoundaryIntake(rigId,'declined',disposition.dutyQueueId,undefined,`attributed refusal: ${String(result[0]!.activityEvidence?.declineReason??'unspecified')}. Genuine current Operator records a fresh proposal disposition.`);result[0]!.subject=this.subjectOf(ADMISSION_DUTY_PACKAGE_KEY,'operator-agent@kernel',disposition.proposal!.proposalDigest);}
    return result;
   }
+  // A recorded proposal for this accepted scope that has no admission outcome yet is still THE
+  // obligation, even when the frontier digest has genuinely moved since it was recorded. A second
+  // planning duty here would invite a second live proposal for the same work.
+  const pending=this.openProposals(rigId,snapshot.scopeSourcesDigest)[0];
+  if(pending)return this.admissionResult(snapshot,pending);
   if(!snapshot.stabilization.ready)return [{key:'frontier',state:'stabilizing',reason:'frontier-stabilization-pending',deadline:this.seam.now(),activityEvidence:{frontierDigest:snapshot.frontierDigest,observations:snapshot.stabilization.observations,requiredObservations:snapshot.stabilization.requiredObservations,elapsedMs:this.seam.now()-snapshot.stabilization.since,requiredMs:snapshot.stabilization.requiredMs}}];
   const duty=this.planningDutyResult(snapshot,this.reopenByDigest(rigId,snapshot.frontierDigest)?.reopenDigest);
   if(duty.state==='held'&&duty.reason==='lifecycle-duty-exhausted')return [{key:'frontier',state:'held',queueId:duty.queueId,reason:'frontier-planning-duty-exhausted',deadline:duty.deadline,activityEvidence:{accountableBoundary:'operator-agent@kernel',escalation:'frontier-planning-exhausted',frontierDigest:snapshot.frontierDigest},subject:this.subjectOf(PLANNING_DUTY_PACKAGE_KEY,snapshot.holder,snapshot.frontierDigest)}];
@@ -386,7 +458,38 @@ export class FrontierPlanning {
   return [{...duty,key:'frontier',subject:this.subjectOf(ADMISSION_DUTY_PACKAGE_KEY,'operator-agent@kernel',receipt.proposal!.proposalDigest)}];
  }
 
- /** Duties are found by their frozen digest, never by predicting the shared
+ /** Recorded, unreopened plan proposals whose admission has no recorded outcome, newest first.
+  *  Found from durable receipts only; nothing is issued here. */
+ private openProposals(rigId:string,scopeSourcesDigestValue?:string):FrontierPlanReceipt[] {
+  const rows=this.seam.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='frontier-plan-disposition' ORDER BY rowid DESC").all(rigId) as Array<{receipt:string}>;
+  const open:FrontierPlanReceipt[]=[];
+  for(const row of rows){
+   let r:FrontierPlanReceipt;try{r=JSON.parse(row.receipt) as FrontierPlanReceipt;}catch{continue;}
+   if(r.disposition!=='plan-proposal'||!r.proposal)continue;
+   if(scopeSourcesDigestValue!==undefined&&r.scopeSourcesDigest!==scopeSourcesDigestValue)continue;
+   if(this.reopenByDisposition(rigId,r.dispositionDigest)||this.reopenByDisposition(rigId,r.proposal.proposalDigest))continue;
+   if(this.admissionOutcomeRecorded(rigId,r.proposal.proposalDigest))continue;
+   open.push(r);
+  }
+  return open;
+ }
+
+ /** Any admission duty for this exact proposal that already has an admitted or declined disposition. */
+ private admissionOutcomeRecorded(rigId:string,proposalDigest:string):boolean {
+  const duties=this.seam.db.prepare("SELECT operation_id FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='frontier-admission' AND json_extract(receipt,'$.proposalDigest')=?").all(rigId,proposalDigest) as Array<{operation_id:string}>;
+  return duties.some(d=>!!this.admissionDisposition(rigId,d.operation_id));
+ }
+
+ /** A new proposal may introduce only keys nobody has registered, planned or already proposed. */
+ private proposalKeysAvailable(rigId:string,dutyQueueId:string,packages:ProposedPackage[]):void {
+  const db=this.seam.db,plan=this.seam.plan(rigId);
+  const pendingKeys=new Set(this.openProposals(rigId).filter(r=>r.dutyQueueId!==dutyQueueId).flatMap(r=>r.proposal!.packages.map(p=>p.packageKey)));
+  for(const p of packages){
+   if(db.prepare("SELECT 1 FROM coordinator_packages WHERE rig_id=? AND package_key=?").get(rigId,p.packageKey)||plan?.tasks.some(t=>t.packageKey===p.packageKey))fail('frontier_proposal_package_exists','A new proposal may not reuse an already registered or planned package key');
+   if(pendingKeys.has(p.packageKey))fail('frontier_proposal_package_pending','Another recorded proposal still awaiting admission already names this package key');
+  }
+ }
+
  /** Duties are found by their frozen digest, never by predicting the shared
   *  mechanism's queue id. A successor duty without its own disposition never
   *  hides the disposition recorded on an earlier duty for the same digest. */
@@ -494,6 +597,9 @@ export class FrontierPlanning {
    const receipt=this.buildPlanReceipt(input.rigId,duty,actor,generation,input);
    // An exact replay is idempotent: it mints nothing and extends no expired authority.
    if(prior){if(prior.receipt!==JSON.stringify(receipt))fail('frontier_disposition_conflict','Frozen planning disposition cannot change');return JSON.parse(prior.receipt) as FrontierPlanReceipt;}
+   // Only a NEW disposition is checked: an exact replay above returns its frozen receipt even after
+   // its own packages were admitted.
+   if(receipt.proposal)this.proposalKeysAvailable(input.rigId,input.dutyQueueId,receipt.proposal.packages);
    this.dutyCustody(input.rigId,input.dutyQueueId,duty,actor,generation);
    if(!this.seam.actAllowed(input.dutyQueueId,actor,generation))fail('frontier_act_not_allowed','Shared duty act facet refuses this disposition');
    db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-plan-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
@@ -533,6 +639,8 @@ export class FrontierPlanning {
   if(!Array.isArray(value))fail('frontier_proposal_required','Typed candidate package list required');
   const candidates=value as unknown[];
   if(!candidates.length)fail('frontier_proposal_required','Typed candidate package list required');
+  const keys=candidates.map(raw=>(raw as Record<string,unknown>|null)?.packageKey);
+  if(new Set(keys.map(k=>String(k))).size!==keys.length)fail('frontier_proposal_duplicate','A proposal may name each package key once');
   return candidates.map(raw=>{
    const p=raw as Record<string,unknown>,rc=p.returnContract as {destination?:unknown;evidenceRequired?:unknown}|undefined;
    if(!text(p.packageKey)||!Array.isArray(p.citations)||!p.citations.length||!Array.isArray(p.resources)||new Set(p.resources).size!==p.resources.length||p.resources.some(r=>!text(r)))fail('frontier_proposal_invalid','Exact package key, scope citations and unique resources required');
@@ -680,5 +788,77 @@ export class FrontierPlanning {
    db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-reopen',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
    return receipt;
   }).immediate();
+ }
+
+ // ------------------------------------------------- S1 legacy classification
+
+ /** The genuine current Operator attests that ONE exact old unclassified package is administrative or
+  *  inquiry work. Append-only, evidence-bound, and bound to the exact assignment and claim the
+  *  Operator observed. It rewrites no contract and accepts, retires, releases or dispatches nothing;
+  *  it only lets the planning flags stop counting that package. Protected facts stay visible. */
+ recordFrontierLegacyClassification(actor:string,generation:string,input:LegacyClassificationInput):LegacyClassificationReceipt {
+  return this.seam.db.transaction(()=>{
+   const db=this.seam.db;
+   this.legacyOperator(actor,generation,input.rigId);
+   if(!text(input.packageKey)||typeof input.contractHash!=='string'||!SHA256.test(input.contractHash))fail('frontier_classification_invalid','Exact package key and stored contract hash required');
+   if(input.workClass!=='administrative'&&input.workClass!=='inquiry')fail('frontier_classification_invalid_class','Only administrative or inquiry may be attested');
+   if(!text(input.evidenceRef))fail('frontier_classification_evidence_required','Explicit non-empty evidence reference required');
+   const observed=this.typedObservation(input.observed);
+   const pkg=db.prepare("SELECT contract_hash,contract FROM coordinator_packages WHERE rig_id=? AND package_key=?").get(input.rigId,input.packageKey) as {contract_hash:string;contract:string}|undefined;
+   if(!pkg)fail('frontier_classification_package_unknown','No such registered package');
+   if(pkg.contract_hash!==input.contractHash)fail('frontier_classification_hash_mismatch','Contract hash differs from the stored immutable contract');
+   if((JSON.parse(pkg.contract) as PackageContract&{workClass?:string}).workClass!==undefined)fail('frontier_classification_not_legacy','Only a package whose frozen contract has no work class is eligible');
+   // Compare-and-set against the assignment and claim as they are in this transaction.
+   if(!this.sameObservation(observed,this.currentObservation(input.rigId,input.packageKey)))fail('frontier_classification_observation_drift','Observed assignment or claim no longer matches; observe again');
+   const {classes,revoked}=this.classificationHistory(input.rigId,input.packageKey,input.contractHash),latest=classes[classes.length-1];
+   // An attestation whose observed assignment/claim has since changed is already void (frontier() stops
+   // applying it), so a fresh attestation for the NEW observation supersedes nothing that was in force.
+   if(latest&&!revoked.has(latest.operationId)&&this.sameObservation(latest.observed,observed)){
+    // The attestation in force may be replayed exactly; any other change needs an explicit revocation first.
+    if(latest.workClass===input.workClass&&latest.evidenceRef===input.evidenceRef)return latest;
+    fail('frontier_classification_conflict','An active attestation exists; revoke it explicitly before attesting differently');
+   }
+   const operationId=`frontier-legacy-class:${input.packageKey}:${input.contractHash}:${classes.length+1}`;
+   const receipt:LegacyClassificationReceipt={operationId,rigId:input.rigId,packageKey:input.packageKey,contractHash:input.contractHash,workClass:input.workClass,evidenceRef:String(input.evidenceRef),observed,actor,generation,at:this.seam.now(),grantsAuthority:false};
+   db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,operationId,'frontier-legacy-classification',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   return receipt;
+  }).immediate();
+ }
+
+ /** Explicit supersession: revoke the active attestation, then (optionally) attest again. History is never overwritten. */
+ revokeFrontierLegacyClassification(actor:string,generation:string,input:LegacyRevocationInput):LegacyRevocationReceipt {
+  return this.seam.db.transaction(()=>{
+   const db=this.seam.db;
+   this.legacyOperator(actor,generation,input.rigId);
+   if(!text(input.packageKey)||typeof input.contractHash!=='string'||!SHA256.test(input.contractHash))fail('frontier_classification_invalid','Exact package key and stored contract hash required');
+   if(!text(input.evidenceRef))fail('frontier_classification_evidence_required','Explicit non-empty evidence reference required');
+   if(!text(input.classificationId))fail('frontier_classification_id_required','The exact attestation id to revoke is required');
+   const {classes,revoked}=this.classificationHistory(input.rigId,input.packageKey,input.contractHash),target=classes.find(c=>c.operationId===input.classificationId),latest=classes[classes.length-1];
+   if(!target)fail('frontier_classification_not_active','No such attestation for this package and contract');
+   // The revoke is bound to the exact attestation the Operator named, so a delayed replay can never
+   // reach across to a successor written after it.
+   const prior=revoked.get(target!.operationId);
+   if(prior){
+    if(prior.evidenceRef===input.evidenceRef)return prior;
+    fail('frontier_classification_conflict','This attestation was already revoked with different evidence');
+   }
+   if(target!==latest)fail('frontier_classification_stale','A newer attestation supersedes the named one; it cannot be revoked now and no successor is touched');
+   const operationId='frontier-legacy-class-revoke:'+target!.operationId;
+   const receipt:LegacyRevocationReceipt={operationId,rigId:input.rigId,packageKey:input.packageKey,contractHash:input.contractHash,classificationId:target!.operationId,evidenceRef:String(input.evidenceRef),actor,generation,at:this.seam.now(),grantsAuthority:false};
+   db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,operationId,'frontier-legacy-classification-revocation',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   return receipt;
+  }).immediate();
+ }
+
+ /** The live Operator generation must match the generation the current plan was configured under. */
+ private legacyOperator(actor:string,generation:string,rigId:string):void {
+  const plan=this.seam.plan(rigId);
+  if(actor!=='operator-agent@kernel'||!generation||this.seam.generation(actor)!==generation||!plan||plan.operatorGeneration!==generation||!this.seam.authorityRecord(rigId))fail('frontier_classification_operator_required','Current genuine Operator whose generation matches the configured plan is required');
+ }
+
+ private typedObservation(value:unknown):LegacyObservation {
+  const o=value as Record<string,unknown>|null|undefined,field=(k:string)=>o&&typeof o==='object'&&k in o&&(o[k]===null||typeof o[k]==='string'&&String(o[k]).length>0);
+  if(!field('queueId')||!field('claimedByGeneration')||!field('claimedAt'))fail('frontier_classification_observation_required','Exact observed assignment queueId, claim generation and claimedAt are required; use null for an observed absence');
+  return {queueId:o!.queueId as string|null,claimedByGeneration:o!.claimedByGeneration as string|null,claimedAt:o!.claimedAt as string|null};
  }
 }

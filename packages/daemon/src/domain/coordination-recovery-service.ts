@@ -2,7 +2,7 @@ import { rotationLocalAddresses } from "./rotation-local-custody.js";
 import type { QueueRepository } from "./queue-repository.js";
 import { CoordinatorFenceError, digest, type CoordinatorToken } from "./coordinator-authority-service.js";
 import type { ActivityEvidence, ArbitratedSeatState } from "./activity-taxonomy.js";
-import { ADMISSION_DUTY_KIND, CONFIRMATION_DUTY_KIND, FrontierPlanning, PLANNING_DUTY_KIND, type FrontierAdmissionReceipt, type FrontierConfirmationReceipt, type FrontierPlanReceipt, type FrontierReopenReceipt, type FrontierSnapshot, type ScopeSource } from "./frontier-planning.js";
+import { ADMISSION_DUTY_KIND, CONFIRMATION_DUTY_KIND, FrontierPlanning, PLANNING_DUTY_KIND, type FrontierAdmissionReceipt, type FrontierConfirmationReceipt, type FrontierPlanReceipt, type FrontierReopenReceipt, type FrontierSnapshot, type LegacyClassificationInput, type LegacyClassificationReceipt, type LegacyRevocationInput, type LegacyRevocationReceipt, type ScopeSource } from "./frontier-planning.js";
 
 /** The frontier kinds are next-work planning obligations, not administrative refresh:
  *  admission and confirmation deliberately keep the strict effect-debt gate because
@@ -1074,6 +1074,10 @@ private dutyProtection(rigId:string,r:any):boolean {
  recordFrontierConfirmation(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;completionDigest:string;evidenceRef:string}):FrontierConfirmationReceipt {return this.frontierPlanning().recordFrontierConfirmation(actor,generation,input);}
  /** Genuine current Operator records that a recorded blocked or declined disposition is discharged. */
  recordFrontierReopen(actor:string,generation:string,input:{rigId:string;dutyQueueId:string;dispositionDigest:string;evidenceRef:string}):FrontierReopenReceipt {return this.frontierPlanning().recordFrontierReopen(actor,generation,input);}
+ /** Genuine current Operator attests ONE exact legacy package as administrative or inquiry work (S1). */
+ recordFrontierLegacyClassification(actor:string,generation:string,input:LegacyClassificationInput):LegacyClassificationReceipt {return this.frontierPlanning().recordFrontierLegacyClassification(actor,generation,input);}
+ /** Explicit supersession of an attestation; history is append-only. */
+ revokeFrontierLegacyClassification(actor:string,generation:string,input:LegacyRevocationInput):LegacyRevocationReceipt {return this.frontierPlanning().revokeFrontierLegacyClassification(actor,generation,input);}
  /** Read-only frontier census for the current Operator. Never a finding of completeness. */
  frontierProjection(rigId:string):FrontierSnapshot|null {return this.frontierPlanning().frontier(rigId);}
  reconcile(actor:string,generation:string,rigId:string):CoordinationResult[] {
