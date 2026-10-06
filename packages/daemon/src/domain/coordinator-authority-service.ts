@@ -267,14 +267,35 @@ export class CoordinatorAuthorityService {
    if(!op||!receipt||receipt.kind!=='historical-quarantine'||receipt.rigId!==h.rig_id||receipt.operationId!==h.operation_id||receipt.actor!=='operator-agent@kernel'||typeof receipt.generation!=='string'||typeof receipt.lead!=='string'||typeof receipt.leadGeneration!=='string'||receipt.deliveryConclusion!=='unknown'||receipt.outboxMutations!==0||!Array.isArray(receipt.effects)||!receipt.effects.includes(row.outbox_id)||receipt.admittedUntil!==h.admitted_until)return null;
    return {outboxId:String(row.outbox_id),rowHash:digest(canonical(row)),custodyHash:digest(canonical(this.historyCustody(row))),quarantineHash:digest(canonical(h)),operationHash:digest(canonical(op))};
  }
- /** Static containment permits ordinary dispatch; finite recovery still gates takeover. */
- isAdoptedHistoryContained(rigId:string,row:Record<string,unknown>):boolean {
-   const adopted=this.db.prepare('SELECT * FROM coordinator_held_history WHERE rig_id=? AND outbox_id=?').get(rigId,row.outbox_id) as Record<string,unknown>|undefined;
-   const held=adopted?this.containedHistory(row):null;
-   if(!held||adopted!.original_row_hash!==held.rowHash||adopted!.quarantine_hash!==held.quarantineHash||adopted!.quarantine_operation_hash!==held.operationHash||adopted!.post_custody_hash!==held.custodyHash)return false;
-   let receipt:any;try{receipt=JSON.parse(String(adopted!.receipt));}catch{return false;}
-   return !!receipt&&receipt.kind==='coordinator-held-history-adoption.v1'&&receipt.actor==='operator-agent@kernel'&&typeof receipt.generation==='string'&&receipt.deliveryConclusion==='unknown'&&receipt.originalMutations===0&&receipt.pre?.outboxId===row.outbox_id&&receipt.pre?.rowHash===held.rowHash&&receipt.pre?.quarantineHash===held.quarantineHash&&receipt.pre?.operationHash===held.operationHash&&receipt.postCustody!==null&&typeof receipt.postCustody==='object'&&digest(canonical(receipt.postCustody))===adopted!.post_custody_hash;
- }
+/** Static containment permits ordinary dispatch; finite recovery still gates takeover. */
+  isAdoptedHistoryContained(rigId:string,row:Record<string,unknown>):boolean {
+    const adopted=this.db.prepare('SELECT * FROM coordinator_held_history WHERE rig_id=? AND outbox_id=?').get(rigId,row.outbox_id) as Record<string,unknown>|undefined;
+    const held=adopted?this.containedHistory(row):null;
+    if(!held||adopted!.original_row_hash!==held.rowHash||adopted!.quarantine_hash!==held.quarantineHash||adopted!.quarantine_operation_hash!==held.operationHash)return false;
+    let receipt:any;try{receipt=JSON.parse(String(adopted!.receipt));}catch{return false;}
+    if(!receipt||receipt.kind!=='coordinator-held-history-adoption.v1'||receipt.actor!=='operator-agent@kernel'||typeof receipt.generation!=='string'||receipt.deliveryConclusion!=='unknown'||receipt.originalMutations!==0||receipt.pre?.outboxId!==row.outbox_id||receipt.pre?.rowHash!==held.rowHash||receipt.pre?.quarantineHash!==held.quarantineHash||receipt.pre?.operationHash!==held.operationHash)return false;
+    // The frozen reference is the receipt, hashed at adoption; current bytes are only read through it.
+    const original=receipt.postCustody;
+    if(original===null||typeof original!=='object'||Array.isArray(original))return false;
+    const frozen=original as Record<string,unknown>;
+    if(digest(canonical(frozen))!==adopted!.post_custody_hash)return false;
+    return canonical(this.compatibleAdoptedCustody(this.historyCustody(row) as Record<string,unknown>,frozen))===canonical(frozen);
+  }
+  /** Queue columns added after an adoption receipt was frozen. Migrations 090 (reply_to) and 091
+   * (human_questions, human_answers) are nullable and purely additive, so an originally absent
+   * column that is currently exactly null is the same custody that was adopted. Nothing else about
+   * the comparison changes: any non-null value, any originally present column, any other added
+   * column, and the whole assignment/resource pair stay compared exactly, and a null or non-object
+   * queue is compared as-is. No hash, receipt or global canonical rule is redefined here. */
+  private static readonly lateNullableQueueColumns=["reply_to","human_questions","human_answers"];
+  private compatibleAdoptedCustody(current:Record<string,unknown>,original:Record<string,unknown>):Record<string,unknown> {
+    const frozen=original.queue,live=current.queue;
+    if(frozen===null||typeof frozen!=='object'||Array.isArray(frozen)||live===null||typeof live!=='object'||Array.isArray(live))return current;
+    const queue={...(live as Record<string,unknown>)};
+    for(const column of CoordinatorAuthorityService.lateNullableQueueColumns)
+      if(!Object.prototype.hasOwnProperty.call(frozen,column)&&queue[column]===null)delete queue[column];
+    return {...current,queue};
+  }
  /** Exact immutable adopted cohort for a current Lead's administrative authoring duty.
   * This is evidence, never a live recovery binding or delivery conclusion. */
  heldHistoryAuthoringSnapshot(rigId:string):HeldHistoryRef[] {

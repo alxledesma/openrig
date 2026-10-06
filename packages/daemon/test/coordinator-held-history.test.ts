@@ -204,6 +204,103 @@ it('current enabled epoch adoption refuses custody identity authority and unknow
   if(kind==='actor')caller='lead@xv';if(kind==='generation')callerGeneration='retired';if(kind==='epoch')request={...input,expected:{...input.expected,epoch:2}};
   if(kind==='holder-generation')db.prepare("UPDATE occupant_tenures SET generation_uuid='replacement' WHERE node_id='lead@xv'").run();if(kind==='lease')db.prepare("UPDATE coordinator_authority SET lease_until=1").run();if(kind==='baton')db.prepare("UPDATE queue_items SET claimed_by_generation_uuid='retired' WHERE qitem_id='baton'").run();if(kind==='baton-native'||kind==='recovery-native')db.prepare("UPDATE queue_transitions SET identity_provenance=NULL WHERE qitem_id=? AND transition_note='claimed'").run(kind==='baton-native'?'baton':'current-recovery');
   if(kind==='recovery-claim')db.prepare("UPDATE queue_items SET state='pending' WHERE qitem_id='current-recovery'").run();if(kind==='recovery-expiry')db.prepare("UPDATE queue_items SET expires_at='2000-01-01T00:00:00Z' WHERE qitem_id='current-recovery'").run();if(kind==='row')db.prepare("UPDATE outbox_entries SET body='changed' WHERE outbox_id='current-diagnostic'").run();if(kind==='quarantine')db.prepare("UPDATE outbox_historical_quarantines SET state='disposed' WHERE outbox_id='current-diagnostic'").run();if(kind==='operation')db.prepare("UPDATE outbox_historical_operations SET receipt='{}' WHERE operation_id='current-hold'").run();if(kind==='custody')db.prepare("UPDATE queue_items SET summary='changed custody' WHERE qitem_id='work'").run();if(kind==='foreign')db.prepare("UPDATE outbox_historical_quarantines SET rig_id='other' WHERE outbox_id='current-diagnostic'").run();if(kind==='new-operation')request={...input,operationId:'different-purpose'};
-  const preserved=original(),authority=svc().get('xv');expect(()=>svc().adoptHeldHistory(caller,callerGeneration,request)).toThrow();expect(original()).toEqual(preserved);expect(svc().get('xv')).toEqual(authority);expect(db.prepare("SELECT count(*) n FROM coordinator_held_history WHERE outbox_id='current-diagnostic'").get()).toEqual({n:0});expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='held-history-adoption'").get()).toEqual({n:0});db.exec('ROLLBACK TO refusal');db.exec('RELEASE refusal');
- }
+const preserved=original(),authority=svc().get('xv');expect(()=>svc().adoptHeldHistory(caller,callerGeneration,request)).toThrow();expect(original()).toEqual(preserved);expect(svc().get('xv')).toEqual(authority);expect(db.prepare("SELECT count(*) n FROM coordinator_held_history WHERE outbox_id='current-diagnostic'").get()).toEqual({n:0});expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='held-history-adoption'").get()).toEqual({n:0});db.exec('ROLLBACK TO refusal');db.exec('RELEASE refusal');
+  }
+});
+
+// Queue columns migration 090 and 091 appended after an adoption receipt was already frozen.
+const lateNullableColumns=['reply_to','human_questions','human_answers'];
+/** Test-side canonical form. The first case proves it is the service's own, so a digest built with
+ *  it refutes exactly what the service would compute. */
+const custodyDigest=(value:unknown):string=>{const c=(v:unknown):string=>Array.isArray(v)?`[${v.map(c).join(',')}]`:v!==null&&typeof v==='object'?`{${Object.keys(v as Record<string,unknown>).sort().map(k=>`${JSON.stringify(k)}:${c((v as Record<string,unknown>)[k])}`).join(',')}}`:JSON.stringify(v);return digest(c(value));};
+/** Refreezes only the adopted custody reference. Every immutable outbox, quarantine and operation
+ *  hash and every other ledger column is left exactly as adoption wrote it. */
+function refreezeAdoptionCustody(rigId:string,outboxId:string,transform:(custody:Record<string,any>)=>Record<string,any>):Record<string,any>{
+  const live=(svc() as any).historyCustody(db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(outboxId)) as Record<string,any>;
+  const frozen=transform(JSON.parse(JSON.stringify(live)));
+  const held=db.prepare('SELECT receipt FROM coordinator_held_history WHERE rig_id=? AND outbox_id=?').get(rigId,outboxId) as {receipt:string};
+  const receipt=JSON.parse(held.receipt);receipt.postCustody=frozen;
+  db.exec('DROP TRIGGER IF EXISTS coordinator_held_no_update');
+  db.prepare('UPDATE coordinator_held_history SET post_custody_hash=?,receipt=? WHERE rig_id=? AND outbox_id=?').run(custodyDigest(frozen),JSON.stringify(receipt),rigId,outboxId);
+  return frozen;
+}
+/** The custody as it stood before 090/091: those columns were absent, not null. */
+const freezeBeforeNullableColumns=(rigId:string,outboxId:string)=>refreezeAdoptionCustody(rigId,outboxId,c=>{for(const column of lateNullableColumns){expect(Object.prototype.hasOwnProperty.call(c.queue,column)).toBe(true);expect(c.queue[column]).toBeNull();delete c.queue[column];}return c;});
+
+it('custody adopted before migrations 090/091 stays contained for exactly null additive columns and for nothing else',async()=>{
+  expect(custodyDigest({b:[1,null],a:'x'})).toBe(legacyProposalDigest({b:[1,null],a:'x'} as any));
+  const p=await packet();await authorize(p);migrate(p);
+  const row=db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='wake-intent-old'").get() as any;
+  const ledger=()=>db.prepare("SELECT * FROM coordinator_held_history WHERE rig_id='xv' AND outbox_id='wake-intent-old'").get() as any;
+  const effect=db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='wake-intent-old'").get(),quarantines=db.prepare("SELECT * FROM outbox_historical_quarantines ORDER BY outbox_id").all(),operations=db.prepare("SELECT * FROM coordinator_operations ORDER BY rig_id,operation_id").all(),adopted=ledger();
+  expect(svc().isAdoptedHistoryContained('xv',row)).toBe(true);
+
+  db.exec('SAVEPOINT before090');
+  const frozen=freezeBeforeNullableColumns('xv','wake-intent-old'),old=ledger();
+  // Schema evolution only. The effect, its hold and every operation receipt are byte identical,
+  // and the frozen reference is intact; only the custody hash moved with the schema.
+  expect(frozen.queue).not.toHaveProperty('reply_to');expect(frozen.queue).not.toHaveProperty('human_questions');expect(frozen.queue).not.toHaveProperty('human_answers');
+  expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='wake-intent-old'").get()).toEqual(effect);
+  expect(db.prepare("SELECT * FROM outbox_historical_quarantines ORDER BY outbox_id").all()).toEqual(quarantines);
+  expect(db.prepare("SELECT * FROM coordinator_operations ORDER BY rig_id,operation_id").all()).toEqual(operations);
+  expect([old.original_row_hash,old.quarantine_hash,old.quarantine_operation_hash,old.pre_custody_hash]).toEqual([adopted.original_row_hash,adopted.quarantine_hash,adopted.quarantine_operation_hash,adopted.pre_custody_hash]);
+  expect(old.post_custody_hash).not.toBe(adopted.post_custody_hash);
+  expect(custodyDigest(JSON.parse(old.receipt).postCustody)).toBe(old.post_custody_hash);
+  // Current custody genuinely fails exact byte equality against that reference; only the three
+  // additive null columns stand between them.
+  expect(custodyDigest((svc() as any).historyCustody(row))).not.toBe(old.post_custody_hash);
+  // Contained, so ordinary dispatch is permitted; delivery stays UNKNOWN and unexecutable.
+  expect(svc().isAdoptedHistoryContained('xv',row)).toBe(true);
+  expect(svc().heldHistoryAuthoringSnapshot('xv').map(h=>h.outboxId)).toEqual(['wake-intent-old']);
+  expect(outbox.getById('wake-intent-old')?.deliveryState).toBe('pending');
+  expect(outbox.isHistoricalQuarantined('wake-intent-old')).toBe(true);
+  expect(outbox.claimForDelivery('wake-intent-old')).toBe(false);
+
+  const refusals:Array<[string,()=>void]>=[
+   // The same three columns carrying content are custody, not schema.
+   ['nonnull-reply-to',()=>db.prepare("UPDATE queue_items SET reply_to='q-7' WHERE qitem_id='work'").run()],
+   ['nonnull-human-questions',()=>db.prepare("UPDATE queue_items SET human_questions='[1]' WHERE qitem_id='work'").run()],
+   ['nonnull-human-answers',()=>db.prepare("UPDATE queue_items SET human_answers='answered' WHERE qitem_id='work'").run()],
+   // Body, state and claim are compared exactly.
+   ['body',()=>db.prepare("UPDATE queue_items SET body='changed' WHERE qitem_id='work'").run()],
+   ['state',()=>db.prepare("UPDATE queue_items SET state='done' WHERE qitem_id='work'").run()],
+   ['claim',()=>db.prepare("UPDATE queue_items SET claimed_by_generation_uuid='retired' WHERE qitem_id='work'").run()],
+   ['summary',()=>db.prepare("UPDATE queue_items SET summary='changed' WHERE qitem_id='work'").run()],
+   // An added column outside those three is not invisible.
+   ['unknown-added-column',()=>db.exec('ALTER TABLE queue_items ADD COLUMN ledger_probe TEXT')],
+   // Assignment and resource custody are compared exactly.
+   ['assignment',()=>db.prepare("DELETE FROM coordinator_assignments WHERE queue_id='work'").run()],
+   ['resource',()=>db.prepare("DELETE FROM coordinator_resources WHERE rig_id='xv' AND resource_key='source/a'").run()],
+  ];
+  for(const [kind,mutate] of refusals){db.exec('SAVEPOINT refusal');const preserved=ledger();mutate();
+   expect(svc().isAdoptedHistoryContained('xv',row),kind).toBe(false);
+   expect([preserved.post_custody_hash,preserved.receipt],kind).toEqual([ledger().post_custody_hash,ledger().receipt]);
+   db.exec('ROLLBACK TO refusal');db.exec('RELEASE refusal');}
+  expect(svc().isAdoptedHistoryContained('xv',row)).toBe(true);
+
+  // A receipt that already carried the columns is unaffected while they agree, and refused once they drift.
+  db.exec('SAVEPOINT alreadyPresent');refreezeAdoptionCustody('xv','wake-intent-old',c=>(c.queue.human_answers=null,c));
+  expect(Object.prototype.hasOwnProperty.call(JSON.parse(ledger().receipt).postCustody.queue,'human_answers')).toBe(true);
+  expect(svc().isAdoptedHistoryContained('xv',row)).toBe(true);
+  db.prepare("UPDATE queue_items SET human_answers='drifted' WHERE qitem_id='work'").run();
+  expect(svc().isAdoptedHistoryContained('xv',row)).toBe(false);
+  db.exec('ROLLBACK TO alreadyPresent');db.exec('RELEASE alreadyPresent');
+
+  // A frozen value that is currently null is drift, not schema evolution.
+  db.exec('SAVEPOINT frozenValue');refreezeAdoptionCustody('xv','wake-intent-old',c=>(c.queue.reply_to='q-frozen',c));
+  expect(svc().isAdoptedHistoryContained('xv',row)).toBe(false);
+  db.exec('ROLLBACK TO frozenValue');db.exec('RELEASE frozenValue');
+
+  // Tampering with the frozen reference itself is still refused.
+  db.exec('SAVEPOINT tamperedReference');db.exec('DROP TRIGGER IF EXISTS coordinator_held_no_update');
+  db.prepare("UPDATE coordinator_held_history SET post_custody_hash=? WHERE rig_id='xv' AND outbox_id='wake-intent-old'").run(custodyDigest({queue:null,assignment:[],resources:[]}));
+  expect(svc().isAdoptedHistoryContained('xv',row)).toBe(false);
+  db.exec('ROLLBACK TO tamperedReference');db.exec('RELEASE tamperedReference');
+
+  // Nothing above was persisted: the immutable effect, hold and operation receipts are untouched.
+  expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='wake-intent-old'").get()).toEqual(effect);
+  expect(db.prepare("SELECT * FROM outbox_historical_quarantines ORDER BY outbox_id").all()).toEqual(quarantines);
+  expect(db.prepare("SELECT * FROM coordinator_operations ORDER BY rig_id,operation_id").all()).toEqual(operations);
+  db.exec('ROLLBACK TO before090');db.exec('RELEASE before090');
+  expect(svc().isAdoptedHistoryContained('xv',row)).toBe(true);
 });
