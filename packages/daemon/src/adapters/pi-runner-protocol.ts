@@ -1,3 +1,4 @@
+import { parseNativeModelWindow, parseNativeModelCatalog, type NativeModelWindow } from "../domain/model-window.js";
 // OPR.0.4.6.PI1 — the shared, PURE contract between the Pi runtime adapter,
 // the Pi resume adapter, and the pane-hosted pi-runner process.
 //
@@ -84,6 +85,15 @@ export interface PiRunnerState {
    *     compaction continue after it while isStreaming is still true, so
    *     only an explicit agent_settled or a successful get_state may set it. */
   quiescence?: PiQuiescenceEvidence;
+  /** Current model window metadata from native get_state — provider, id,
+   *  contextWindow (tokens), maxTokens. Evidence only — no authority,
+   *  recovery, queue or send semantics. Absent means UNKNOWN. */
+  model?: NativeModelWindow | null;
+  /** Available models from native get_available_models — provider/id with
+   *  contextWindow (tokens) and maxTokens. Evidence only — no authority,
+   *  recovery, queue or send semantics. Absent means the runner has not yet
+   *  published the list. */
+  models?: NativeModelWindow[] | null;
 }
 
 /** Bounded native quiescence evidence. `settled` is a positive native claim,
@@ -128,7 +138,7 @@ export function parsePiRunnerState(raw: string): PiRunnerState | null {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
     const state = parsed as Record<string, unknown>;
     if (typeof state.ready !== "boolean" || typeof state.updatedAt !== "string") return null;
-    return parsed as unknown as PiRunnerState;
+    return { ...parsed, model: parseNativeModelWindow(state.model), models: parseNativeModelCatalog(state.models) } as PiRunnerState;
   } catch {
     return null;
   }

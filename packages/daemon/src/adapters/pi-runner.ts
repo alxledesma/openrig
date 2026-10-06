@@ -35,6 +35,7 @@ import {
   PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, PI_RUNNER_ERROR_MARKER,
   type PiRunnerState, type RunnerRuntime, type PiQuiescenceEvidence,
 } from "./pi-runner-protocol.js";
+import { parseNativeModelWindow, parseNativeModelCatalog, type NativeModelWindow } from "../domain/model-window.js";
 
 // ── Submitted input boundaries ─────────────────────────────────────────────
 // Canonical TTY buffers can overflow before Node sees even the paste terminator.
@@ -355,6 +356,9 @@ export class RunnerCore {
   /** Set once the daemon confirms it persisted the resume token. */
   private identityPersisted = false;
   private identityInFlight = false;
+  private modelsFetched = false;
+  private model: NativeModelWindow | null = null;
+  private models: NativeModelWindow[] | null = null;
 
   constructor(
     private io: RunnerIo,
@@ -452,6 +456,7 @@ export class RunnerCore {
         command = { type: "set_model", provider: match[1], modelId: match[2] };
       } else command = { type: "compact", ...(block === "/compact" ? {} : { customInstructions: block.slice(9) }) };
       this.controlPending = true;
+      this.model = null;
       this.invalidateRefresh();
       this.settledProven = false;
       this.writeQuiescence();
@@ -554,6 +559,7 @@ export class RunnerCore {
       return;
     }
     if (this.runtime === "pi" && record.id === CONTROL_STATE_ID) {
+      this.model = record.success === true ? parseNativeModelWindow((record.data as Record<string, unknown> | undefined)?.model) : null;
       this.invalidateRefresh();
       this.processing = record.success !== true || piProcessing((record.data ?? {}) as Record<string, unknown>);
       // A failed or missing control-state read proves NOTHING: it leaves the
@@ -576,6 +582,7 @@ export class RunnerCore {
       const message = typeof record.error === "string" ? record.error : "request failed";
       if (record.id === GET_STATE_ID) {
         this.ready = false;
+        this.model = null;
         this.writeSidecar({});
         this.io.mirrorLine(this.runtime === "omp" ? `[omp-runner] ERROR rpc get_state: ${message}` : `${PI_RUNNER_ERROR_MARKER} rpc: ${message}`);
         // OMP cannot provide a resume token without get_state; stop it so the
@@ -606,6 +613,9 @@ export class RunnerCore {
         this.io.stopChild?.();
         return;
       }
+      // Extract model window metadata from native get_state using shared parser.
+      // Returns null for invalid/missing/NaN/Infinity/negative limits.
+      this.model = parseNativeModelWindow(data.model);
       // Fork quiescence settlement, scoped to Pi ONLY: OMP publishes no native
       // quiescence evidence and must never be read as Pi-proven idle.
       if (this.runtime === "pi") {
@@ -619,6 +629,21 @@ export class RunnerCore {
       }
       this.io.mirrorLine(`${this.runtime === "omp" ? "[omp-runner] READY" : PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
       this.postSessionIdentity();
+      this.writeSidecar({});
+      // One-time get_available_models after ready — publishes allowlisted
+      // provider/id list to the sidecar for both Pi and OMP runtimes.
+      if (!this.modelsFetched) {
+        this.modelsFetched = true;
+        this.io.sendRpc({ type: "get_available_models", id: "pi-runner-models" });
+      }
+      return;
+    }
+    if (record.id === "pi-runner-models") {
+      // Handle get_available_models response — parse models with provider/id,
+      // contextWindow and maxTokens using shared parser. Both Pi and OMP runtimes.
+      const modelsData = (record.data as { models?: unknown } | undefined)?.models;
+      this.models = parseNativeModelCatalog(modelsData);
+      this.writeSidecar({});
       return;
     }
     if (record.id === CURSOR_REFRESH_ID || record.id === CATCH_UP_ID) {
@@ -814,6 +839,9 @@ export class RunnerCore {
       // always current by construction: it is derived from the same flags the
       // rest of this write publishes.
       ...(this.runtime === "pi" ? { quiescence: this.quiescenceEvidence() } : {}),
+      // Publish model window metadata to sidecar for daemon consumption.
+      model: this.model,
+      models: this.models,
     });
   }
 

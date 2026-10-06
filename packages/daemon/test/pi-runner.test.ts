@@ -11,7 +11,7 @@ import {
   prepareRunnerSidecar,
   type RunnerIo,
 } from "../src/adapters/pi-runner.js";
-import { PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, type PiRunnerState } from "../src/adapters/pi-runner-protocol.js";
+import { PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, parsePiRunnerState, type PiRunnerState } from "../src/adapters/pi-runner-protocol.js";
 
 const SESSION = "devpi-a@some-rig";
 const SESSION_FILE = "/state/pi/devpi-a@some-rig/sessions/2026_0197.jsonl";
@@ -994,4 +994,52 @@ describe("Pi repair R2 refresh request lifecycle", () => {
     f.io.now=()=>"2026-07-06T10:00:30Z";f.core.handlePiLine(JSON.stringify({type:"response",id:"pi-runner-cursor-refresh",success:true,data:{entries:[{id:"later-entry"}]}}));
     expect(f.sidecars.at(-1)!.quiescence!.observedAt).toBe(observed);
   });
+});
+
+
+describe("native model-window metadata", () => {
+  it.each(["pi", "omp"] as const)("publishes allowlisted %s metadata and requests catalog once", runtime => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, nodeId: "node-1", launchId: "launch-model" }, { runtime });
+    core.start();
+    const model = { provider: "openrouter", id: "test", contextWindow: 262144, maxTokens: 8192 };
+    const state = { type: "response", id: "pi-runner-get-state", success: true, data: { sessionFile: SESSION_FILE, sessionId: "0197", isStreaming: false, model: { ...model, secret: "excluded" } } };
+    core.handlePiLine(JSON.stringify(state));
+    core.handlePiLine(JSON.stringify(state));
+    expect(f.rpc.filter(r => r.id === "pi-runner-models")).toHaveLength(1);
+    expect(f.lines.some(l => l.includes("READY"))).toBe(true);
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-models", success: true, data: { models: [{ ...model, secret: "excluded" }, { ...model, contextWindow: -1 }] } }));
+    expect(f.sidecars.at(-1)?.model).toEqual(model);
+    expect(f.sidecars.at(-1)?.models).toEqual([model]);
+    if (runtime === "omp") expect(f.sidecars.at(-1)?.quiescence).toBeUndefined();
+  });
+  it("keeps malformed native windows unknown", () => {
+    const f = fakeIo(); const { core } = readyCore(f);
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-models", success: true, data: { models: [{ provider: "p", id: "m", contextWindow: 0 }] } }));
+    expect(f.sidecars.at(-1)?.model).toBeNull();
+    expect(f.sidecars.at(-1)?.models).toBeNull();
+  });
+});
+
+ describe("model-window control freshness", () => {
+  it("invalidates old serving window and only restores successful native metadata", () => {
+    const f = readyCore();
+    const model = { provider: "p", id: "large", contextWindow: 1000000 };
+    f.core.handlePiLine(JSON.stringify({type:"response",id:"pi-runner-get-state",success:true,data:{sessionFile:SESSION_FILE,sessionId:"0197a2f0",isStreaming:false,isCompacting:false,pendingMessageCount:0,model}}));
+    expect(f.sidecars.at(-1)!.model).toEqual(model);
+    f.core.handleUserBlock("/model p/small");
+    expect(f.sidecars.at(-1)!.model).toBeNull();
+    f.core.handlePiLine(JSON.stringify({type:"response",id:"pi-runner-native-control",success:true}));
+    const small = {...model,id:"small",contextWindow:32000};
+    f.core.handlePiLine(JSON.stringify({type:"response",id:"pi-runner-control-state",success:true,data:{isStreaming:false,isCompacting:false,pendingMessageCount:0,model:small}}));
+    expect(f.sidecars.at(-1)!.model).toEqual(small);
+    f.core.handlePiLine(JSON.stringify({type:"response",id:"pi-runner-control-state",success:false}));
+    expect(f.sidecars.at(-1)!.model).toBeNull();
+  });
+});
+
+it("sidecar reads reproject untrusted native model fields", () => {
+ const m={provider:"p",id:"m",contextWindow:32000};
+ const parsed=parsePiRunnerState(JSON.stringify({ready:true,updatedAt:"now",model:{...m,secret:"excluded"},models:[{...m,secret:"excluded"},{...m,contextWindow:0}]}));
+ expect(parsed!.model).toEqual(m);expect(parsed!.models).toEqual([m]);
 });
