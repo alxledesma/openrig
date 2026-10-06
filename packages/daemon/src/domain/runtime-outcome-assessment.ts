@@ -57,6 +57,8 @@ export class RuntimeOutcomeAssessment {
    if(!q||Object.keys(q).sort().join(',')!=='providerConfigDigest,ref,validUntil'||typeof q.ref!=='string'||!q.ref.trim()||q.ref===current.qualification.ref||q.providerConfigDigest!==p.qualification.providerConfigDigest||q.providerConfigDigest!==digest(JSON.stringify(p.adapterConfig))||!Number.isSafeInteger(input.qualifiedAt)||input.qualifiedAt<this.now()-180000||input.qualifiedAt>this.now()||!Number.isSafeInteger(q.validUntil)||q.validUntil<=this.now()||q.validUntil>input.qualifiedAt+3600000)reject('runtime_outcome_qualification_required','Fresh dated exact provider proof and finite qualification of at most one hour required');
    const receipt={policyRevision:p.revision,policyDigest:input.policyDigest,operatorGeneration:generation,dutyQueueId:input.dutyQueueId,qualifiedAt:input.qualifiedAt,qualification:q,grantsAuthority:false};
    this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,id,'runtime-outcome-qualification',JSON.stringify(receipt),request);
+   // Freeze completion in the same authorized transaction, before a delayed watchdog can miss the deadline.
+   this.authority.coordinationRecovery!.observeLifecycleCompletion(input.dutyQueueId);
   }).immediate();
  }
  /** Only the exact persisted expired-qualification duty for this unchanged policy,

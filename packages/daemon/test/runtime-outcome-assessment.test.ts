@@ -96,6 +96,17 @@ describe('runtime outcome enforcement',()=>{
    repo.update({qitemId:dutyId,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});expect(repo.getById(dutyId)?.state).toBe('done');
    clock=issued.deadline+1;vi.setSystemTime(clock);expect(svc.dutyFacts(dutyId)).toMatchObject({complete:true});expect(repo.getById(dutyId)?.expiresAt).toBe(new Date(issued.deadline).toISOString());
   });
+  it('atomically records qualification completion before a delayed observer crosses the duty deadline',()=>{
+   configure(normal());const r=outcome(reply()),p=r.policy('xv')!;
+   clock=p.qualification.validUntil+1;vi.setSystemTime(clock);
+   const id=r.stagePolicyBoundary('xv')!,duty=svc.lifecycleControlReceipt(id)!;
+   repo.claim({qitemId:id,destinationSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1'});
+   r.refreshQualification('operator-agent@kernel','operator-agent-g1',qualificationRefresh(p,id));
+   clock=duty.deadline+1;vi.setSystemTime(clock);
+   expect(svc.dutyFacts(id)).toMatchObject({complete:true,close:true,act:false,expired:true});
+   repo.update({qitemId:id,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+   expect(repo.getById(id)?.state).toBe('done');
+  });
   function operatorDirectEffect(body:string){const handler=new OutboxHandler(db);handler.recordDirectAttempt({senderSession:'lead@xv',destinationSession:'operator-agent@kernel',body,tags:['report']},'indeterminate');return (db.prepare("SELECT outbox_id FROM outbox_entries WHERE destination_session='operator-agent@kernel' ORDER BY rowid DESC LIMIT 1").get() as {outbox_id:string}).outbox_id;}
   it('administrative qualification boundary tolerates one acknowledged UNKNOWN direct effect for the Operator seat',()=>{
    configure(normal());const r=outcome(reply());const p=r.policy('xv')!;clock=p.qualification.validUntil+1;vi.setSystemTime(clock);
