@@ -102,11 +102,23 @@ export function makePiNativeProver(db: Database.Database, exec: (command: string
     const q = state?.quiescence;
     const unknownQuiescence: PiQuiescenceProof = { settled: null, observedAt: null };
     if (!q || typeof q !== "object") return unknownQuiescence;
-    if (typeof q.settled !== "boolean" || typeof q.observedAt !== "string") return unknownQuiescence;
-    if (q.launchId === undefined || q.launchId !== launchFlag) return unknownQuiescence;
-    if (q.generation !== undefined && q.generation !== generation) return unknownQuiescence;
+    if (typeof q.settled !== "boolean") return unknownQuiescence;
+    // Every binding is REQUIRED for idle credit, not merely checked when
+    // present: a record missing its launch, generation, native session file or
+    // cursor is unattributable, so it cannot be credited to this seat.
+    if (q.launchId !== launchFlag) return unknownQuiescence;
+    if (q.generation !== generation) return unknownQuiescence;
     if (q.sessionFile !== resumeToken) return unknownQuiescence;
     if ((q.lastEntryId ?? undefined) !== (state.lastEntryId ?? undefined)) return unknownQuiescence;
+    // A timestamp alone proves nothing, and an unusable one is not evidence at
+    //  all: require a parseable, well-formed, real-calendar instant. Date.parse
+    //  silently normalises impossible dates (Feb 30 becomes Mar 2) rather than
+    //  rejecting them, so the calendar triple is checked separately.
+    if (typeof q.observedAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(q.observedAt)) return unknownQuiescence;
+    const calendar = q.observedAt.slice(0, 10).split("-").map(Number) as [number, number, number];
+    const canonical = new Date(Date.UTC(calendar[0], calendar[1] - 1, calendar[2]));
+    if (canonical.getUTCFullYear() !== calendar[0] || canonical.getUTCMonth() !== calendar[1] - 1 || canonical.getUTCDate() !== calendar[2]) return unknownQuiescence;
+    if (!Number.isFinite(Date.parse(q.observedAt))) return unknownQuiescence;
     return { settled: q.settled, observedAt: q.observedAt };
   };
   return async (session: string): Promise<PiNativeProof | null> => {

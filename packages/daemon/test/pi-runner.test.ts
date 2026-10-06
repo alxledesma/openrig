@@ -37,7 +37,9 @@ function readyCore(f = fakeIo()) {
   const core = new RunnerCore(f.io, { sessionName: SESSION, nodeId: "node-1", launchId: "launch-77" });
   core.start();
   core.handlePiLine(JSON.stringify({
-    type: "response", id: "pi-runner-get-state",
+    // success is explicit: idle credit requires a positively successful
+    // get_state, never merely an absent failure flag.
+    type: "response", id: "pi-runner-get-state", success: true,
     data: { sessionFile: SESSION_FILE, sessionId: "0197a2f0", isStreaming: false, isCompacting: false, pendingMessageCount: 0 },
   }));
   return { core, ...f };
@@ -672,15 +674,13 @@ describe("RunnerCore native quiescence projection", () => {
     expect(q(f)).toMatchObject({ launchId: "launch-77", sessionFile: SESSION_FILE, settled: true });
   });
 
-  it("an actual agent_start is persisted busy BEFORE any later state write", () => {
+  it("agent_start and compaction_start are persisted busy", () => {
     const f = readyCore();
     expect(q(f)!.settled).toBe(true);
-    core_reset(f);
     f.core.handlePiLine(JSON.stringify({ type: "agent_start" }));
     expect(q(f)!.settled).toBe(false);
     f.core.handlePiLine(JSON.stringify({ type: "compaction_start" }));
     expect(q(f)!.settled).toBe(false);
-    function core_reset(ff: ReturnType<typeof readyCore>) { /* keep the same core */ void ff; }
   });
 
   it("agent_end never settles — retries and compaction continue after it", () => {
@@ -749,5 +749,65 @@ describe("RunnerCore native quiescence projection", () => {
     expect(f.sidecars.length).toBeGreaterThan(2);
     for (const s of f.sidecars) expect(s.quiescence).toMatchObject({ launchId: "launch-77", settled: expect.any(Boolean) });
     expect(JSON.stringify(f.sidecars.at(-1)!.quiescence)).not.toMatch(/idle|quiet|free/i);
+  });
+});
+
+// ── R2 review findings: every sidecar write republishes bound evidence ─────
+
+describe("quiescence evidence survives every projection write", () => {
+  const q = (f: { sidecars: PiRunnerState[] }) => f.sidecars.at(-1)!.quiescence;
+
+  it("a get_entries catch-up cursor write retains the current bound evidence", () => {
+    const f = readyCore();
+    const before = q(f)!;
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-catch-up", data: { entries: [{ id: "e-42" }] } }));
+    const after = q(f)!;
+    expect(after).toBeDefined();
+    expect(after).toMatchObject({ launchId: "launch-77", sessionFile: SESSION_FILE, settled: before.settled, lastEntryId: "e-42" });
+  });
+
+  it("a session-entry cursor write on an event retains the current bound evidence", () => {
+    const f = readyCore();
+    f.core.handlePiLine(JSON.stringify({ type: "message_start", message: { role: "assistant" }, entryId: "e-77" }));
+    expect(q(f)).toMatchObject({ launchId: "launch-77", sessionFile: SESSION_FILE, lastEntryId: "e-77" });
+    expect(q(f)!.settled).toBe(false);
+  });
+
+  it("no sidecar write anywhere drops the evidence", () => {
+    const f = readyCore();
+    f.core.handleUserBlock("hello");
+    f.core.handlePiLine(JSON.stringify({ type: "agent_settled" }));
+    f.core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-cursor-refresh", data: { entries: [{ id: "e-99" }] } }));
+    f.core.handlePiExit(0);
+    expect(f.sidecars.length).toBeGreaterThan(4);
+    for (const s of f.sidecars) {
+      expect(s.quiescence).toBeDefined();
+      expect(s.quiescence).toMatchObject({ launchId: "launch-77", observedAt: expect.any(String) });
+      expect(typeof s.quiescence!.settled).toBe("boolean");
+    }
+    expect(q(f)!.settled).toBe(false);
+  });
+
+  it.each([
+    ["success absent", { type: "response", id: "pi-runner-get-state", data: { sessionFile: SESSION_FILE, isStreaming: false, isCompacting: false, pendingMessageCount: 0 } }],
+    ["success false", { type: "response", id: "pi-runner-get-state", success: false, data: { sessionFile: SESSION_FILE, isStreaming: false, isCompacting: false, pendingMessageCount: 0 } }],
+    ["success true but busy", { type: "response", id: "pi-runner-get-state", success: true, data: { sessionFile: SESSION_FILE, isStreaming: true, isCompacting: false, pendingMessageCount: 0 } }],
+  ])("a get_state with %s never proves idle", (_label, record) => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, launchId: "launch-77" });
+    core.start();
+    core.handlePiLine(JSON.stringify(record));
+    expect(q(f)!.settled).toBe(false);
+  });
+
+  it("an explicitly successful quiet get_state is the only initial idle credit", () => {
+    const f = fakeIo();
+    const core = new RunnerCore(f.io, { sessionName: SESSION, launchId: "launch-77" });
+    core.start();
+    // The adapter pre-writes the pending sidecar, so the runner itself has not
+    // yet published anything: absent evidence, not idle.
+    expect(f.sidecars).toHaveLength(0);
+    core.handlePiLine(JSON.stringify({ type: "response", id: "pi-runner-get-state", success: true, data: { sessionFile: SESSION_FILE, isStreaming: false, isCompacting: false, pendingMessageCount: 0 } }));
+    expect(q(f)!.settled).toBe(true);
   });
 });

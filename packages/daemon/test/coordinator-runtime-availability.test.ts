@@ -282,3 +282,77 @@ describe("pi prover native quiescence credit", () => {
     expect(JSON.stringify(await p("lead@xv"))).not.toMatch(/pi-coding-agent|OPENRIG_OCCUPANT_GENERATION/);
   });
 });
+
+// ── R2 review findings: required bindings and a valid timestamp ─────────────
+
+describe("pi prover requires complete bindings and a valid instant", () => {
+  const row = { nodeId: "n", runtime: "pi", tmux_pane: "%4", tmux_session: null, generation_uuid: "lead-g1", resume_token: "/state/pi/lead@xv/sessions/s.json" };
+  const runnerLine = "101 100 node /d/adapters/pi-runner.js --session-name lead@xv --launch-id L-77 --state-root /state/pi";
+  const childLine = "102 101 /opt/homebrew/bin/node /x/@earendil-works/pi-coding-agent/dist/bundle/cli.js --mode rpc --session-dir /state/pi/lead@xv/sessions --name lead@xv --approve";
+  const census = () => `100 1 /bin/zsh -l\n${runnerLine}\n${childLine}`;
+  const env = () => `101 node pi-runner SECRET=never-logged OPENRIG_OCCUPANT_GENERATION=lead-g1\n102 node cli.js OTHER=x OPENRIG_OCCUPANT_GENERATION=lead-g1`;
+  const observedAt = "2026-10-05T11:59:59.000Z";
+  const bound = (over: Record<string, unknown> = {}) => JSON.stringify({
+    ready: true, launchId: "L-77", sessionFile: row.resume_token, lastEntryId: "e-9", updatedAt: "2026-01-01T00:00:00.000Z",
+    quiescence: { launchId: "L-77", generation: "lead-g1", sessionFile: row.resume_token, lastEntryId: "e-9", settled: true, observedAt, ...over },
+  });
+  function prover(sidecar: string) {
+    const rows = [row];
+    const db = { prepare: () => ({ all: () => rows }) } as never;
+    return makePiNativeProver(db, async () => "%4|100|0", {
+      fs: { readFile: () => sidecar }, piStateRoot: "/state/pi", procArgs: async () => new Map(),
+      argvCensus: async () => census(), envProbe: async () => env(), now: () => Date.parse("2026-10-05T12:00:00Z"),
+    });
+  }
+
+  it.each([
+    ["generation absent", { generation: undefined }],
+    ["generation empty", { generation: "" }],
+    ["generation wrong", { generation: "lead-g2" }],
+    ["launchId absent", { launchId: undefined }],
+    ["sessionFile absent", { sessionFile: undefined }],
+  ])("a %s record earns no idle credit even with settled true", async (_label, over) => {
+    const proof = await prover(bound(over))("lead@xv");
+    expect(proof).toMatchObject({ state: "present", quiescence: { settled: null, observedAt: null } });
+  });
+
+  it.each([
+    ["not a timestamp", "yesterday"],
+    ["date only", "2026-10-05"],
+    ["empty", ""],
+    ["non-string", 1757000000000],
+    ["month 13", "2026-13-05T11:59:59.000Z"],
+    ["impossible day", "2026-02-30T11:59:59.000Z"],
+  ])("an invalid observedAt (%s) yields UNKNOWN, never idle", async (_label, bad) => {
+    const proof = await prover(bound({ observedAt: bad }))("lead@xv");
+    expect(proof).toMatchObject({ state: "present", quiescence: { settled: null, observedAt: null } });
+  });
+
+  it.each([
+    ["UTC Z", "2026-10-05T11:59:59.000Z"],
+    ["no fractional seconds", "2026-10-05T11:59:59Z"],
+    ["explicit offset", "2026-10-05T21:59:59+10:00"],
+  ])("a valid instant (%s) keeps its idle credit", async (_label, good) => {
+    const proof = await prover(bound({ observedAt: good }))("lead@xv");
+    expect(proof).toMatchObject({ state: "present", quiescence: { settled: true, observedAt: good } });
+  });
+
+  it("a fully bound current record still earns idle credit after the tightening", async () => {
+    expect(await prover(bound())("lead@xv")).toMatchObject({ state: "present", generation: "lead-g1", quiescence: { settled: true } });
+  });
+
+  it("tightened bindings never turn a proof into an UNKNOWN exit or a reason", async () => {
+    const reasons: Array<unknown> = [];
+    const rows = [row];
+    const db = { prepare: () => ({ all: () => rows }) } as never;
+    const p = makePiNativeProver(db, async () => "%4|100|0", {
+      fs: { readFile: () => bound({ generation: "lead-g2" }) }, piStateRoot: "/state/pi", procArgs: async () => new Map(),
+      argvCensus: async () => census(), envProbe: async () => env(), now: () => Date.parse("2026-10-05T12:00:00Z"),
+      diagnose: r => reasons.push(...r),
+    });
+    const proof = await p("lead@xv");
+    expect(proof).toMatchObject({ state: "present", launchId: "L-77" });
+    expect(proof!.quiescence!.settled).toBeNull();
+    expect(reasons).toHaveLength(0);
+  });
+});

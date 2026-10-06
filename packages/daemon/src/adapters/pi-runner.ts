@@ -29,7 +29,7 @@ import { stripVTControlCharacters } from "node:util";
 import {
   piSeatPaths, buildPiChildArgs, buildPiChildEnv, buildPendingRunnerState, parsePiRunnerState,
   PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, PI_RUNNER_ERROR_MARKER,
-  type PiRunnerState,
+  type PiRunnerState, type PiQuiescenceEvidence,
 } from "./pi-runner-protocol.js";
 
 // ── Submitted input boundaries ─────────────────────────────────────────────
@@ -418,9 +418,11 @@ export class RunnerCore {
       this.sessionId = sessionId ?? this.sessionId;
       this.ready = true;
       this.processing = piProcessing(data);
-      // A successful get_state is the second positive settlement source: it
-      // directly proves no streaming, no compaction and no pending messages.
-      this.settledProven = record.success !== false && !this.processing;
+      // A get_state is the second positive settlement source, but ONLY an
+      // explicitly successful response qualifies. An absent, malformed or
+      // failed success flag leaves the seat busy-by-default: absence of a
+      // failure must never be read as proof that pi reported a quiet state.
+      this.settledProven = record.success === true && !this.processing;
       this.writeQuiescence();
       this.io.mirrorLine(`${PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
       this.io.postActivity({
@@ -477,6 +479,11 @@ export class RunnerCore {
     const message = event.message as Record<string, unknown> | undefined;
     if (event.type === "agent_start" || (event.type === "message_start" && message?.role === "assistant")) {
       this.assistantErrorShown = false;
+      // An assistant message_start is native output in flight, so it is
+      // positive busy evidence in its own right. Without this, a resumed or
+      // followed-up turn that emits assistant output without a fresh
+      // agent_start would leave a stale idle claim on disk.
+      this.markBusy();
     }
     // Only an explicit session-entry ID is durable. Generic event IDs include
     // extension UI request UUIDs (notify/status/dialog), never JSONL entries.
@@ -535,33 +542,49 @@ export class RunnerCore {
       lastEntryId: this.lastEntryId,
       updatedAt: this.io.now(),
       ...patch,
+      // EVERY write republishes the current bound quiescence evidence, not
+      // just the state-transition writes. A bare cursor write (get_entries
+      // catch-up, or a session-entry ID arriving on an event) reconstructs the
+      // whole projection, so omitting this field there would silently ERASE the
+      // evidence and force an honest observer back to UNKNOWN. The record is
+      // always current by construction: it is derived from the same flags the
+      // rest of this write publishes.
+      quiescence: this.quiescenceEvidence(),
     });
   }
 
-  /** Persist the current native busy/idle state, bound to this launch,
-   *  generation, native session file and durable cursor.
+  /** The current native busy/idle record, bound to this launch, generation,
+   *  native session file and durable cursor.
    *
    *  `settled` is only ever true from a POSITIVE observation — a real
    *  agent_settled, or a successful get_state proving no streaming, no
    *  compaction and no pending messages. A control in flight counts as busy
    *  (controlPending participates), and a fresh native turn or control effect
-   *  marks busy BEFORE it is issued, so no observer can read a stale idle
-   *  projection and act on it.
+   *  marks busy BEFORE it is issued, so no concurrent observer can read a
+   *  stale idle projection and act on it.
+   *
+   *  `generation` and the bindings are published from this launch's own
+   *  identity, so a seat launched without a known generation publishes no
+   *  credible idle claim — the prover treats a missing binding as UNKNOWN.
    *
    *  This is evidence only: no authority, recovery, queue, guard,
-   *  qualification or send decision reads it. Absent metadata means UNKNOWN. */
+   *  qualification or send decision reads it. */
+  private quiescenceEvidence(): PiQuiescenceEvidence {
+    return {
+      launchId: this.identity.launchId,
+      generation: this.identity.generation,
+      sessionFile: this.sessionFile,
+      lastEntryId: this.lastEntryId,
+      settled: this.settledProven && !this.processing && !this.controlPending,
+      observedAt: this.io.now(),
+    };
+  }
+
+  /** Persist a state transition together with the current quiescence
+   *  evidence. writeSidecar already republishes that evidence on every write,
+   *  so this exists only to make the transition sites self-documenting. */
   private writeQuiescence(patch: Partial<PiRunnerState> = {}): void {
-    this.writeSidecar({
-      ...patch,
-      quiescence: {
-        launchId: this.identity.launchId,
-        generation: this.identity.generation,
-        sessionFile: this.sessionFile,
-        lastEntryId: this.lastEntryId,
-        settled: this.settledProven && !this.processing && !this.controlPending,
-        observedAt: this.io.now(),
-      },
-    });
+    this.writeSidecar(patch);
   }
 
   /** Mark the seat busy ahead of a native turn or control effect and persist
