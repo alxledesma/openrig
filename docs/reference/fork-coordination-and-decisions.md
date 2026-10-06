@@ -32,6 +32,15 @@ CLI coordinator control commands send the existing terminal bearer and current
 caller generation. This remains the trusted local seat transport boundary, not
 an OS sandbox or protection against a hostile process with the same credentials.
 
+An owner whose lease is still live but whose reconciliation is unacknowledged
+continues with `rig coordinator resume-owned <rigId>`. The daemon derives the
+caller's own token and the current obligations digest from immutable seat
+identity, so no digest or epoch is supplied by hand; acknowledgment and renewal
+land in one transaction behind the canonical baton claim, and an active owner may
+renew here under the same fences. The operation id is generated fresh unless one
+is passed explicitly to replay deliberately, and a lapsed lease always refuses
+here: expired authority is recovered only by the explicit expiry-recovery path.
+
 Additional source changes cover managed cmux sizing, generation-bound native
 session receipts, audited existing-seat profile/cwd selection and exact outbox
 attempt/recipient reconciliation. Queue intent, transport acknowledgment,

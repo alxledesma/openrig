@@ -56,6 +56,11 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
        const b=await c.req.json();if(b.token?.generation!==generation)throw new CoordinatorFenceError("coordinator_generation_mismatch","Token and immutable caller generation differ");
        return c.json(svc.acknowledge(actor,b.token,b));
      }
+     if(operation==="resume-owned"){
+      // No token and no digest in the body by design: both are derived from the authenticated
+      // caller and the live authority row inside the service.
+      return c.json(svc.resumeOwned(actor,generation,await c.req.json()));
+     }
      if(operation==="active-expiry-recover"){const b=await c.req.json();await svc.refreshRuntimeAvailability(b.token?.rigId);return c.json(svc.recoverExpiredActive(actor,generation,b));}
      if(operation==="reconciliation-recover")return c.json(svc.recoverReconciliation(actor,generation,await c.req.json()));
      if(operation==="renew"){

@@ -39,6 +39,9 @@ beforeEach(() => {
     renew: (a: string, t: { generation: string }) => {
       calls.push({ operation: "renew", actor: a, generation: t.generation }); return { ok: true };
     },
+    resumeOwned: (a: string, g: string, b: unknown) => {
+      calls.push({ operation: "resume-owned", actor: a, generation: g, body: b }); return { rigId: (b as { rigId: string }).rigId, state: "active", lease_until: 130000 };
+    },
   };
   for (const [method, operation] of [["enable", "enable"], ["transfer", "transfer"], ["admit", "admit"], ["dispose", "dispose"], ["recordOutage", "recover"], ["migrateLegacy", "migrate-legacy"]]) {
     svc[method!] = (a: string, g: string, b: unknown) => {
@@ -63,6 +66,49 @@ function contractFile(overrides: Record<string, unknown> = {}): string {
   fs.writeFileSync(file, JSON.stringify({ rigId: "test-rig", expected: { rigId: "test-rig" }, token: { generation }, authorizationId: "fixture-authorization", ...overrides }));
   return file;
 }
+
+describe("resume-owned command contract", () => {
+  it("generates a fresh exact operation id by default and prints the id actually used", async () => {
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+    const log = vi.mocked(console.log);
+    await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig"]);
+    expect(post.mock.calls[0]?.[0]).toBe("/api/coordinator/resume-owned");
+    expect(post.mock.calls[0]?.[2]).toEqual({ headers: { Authorization: `Bearer ${token}` } });
+    const body = post.mock.calls[0]?.[1] as { rigId: string; leaseMs: number; operationId: string };
+    expect(body.rigId).toBe("test-rig");
+    expect(body.leaseMs).toBe(1200000);
+    // A fresh generated id: never a reuse of the operator's earlier attempt.
+    expect(body.operationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    // The printed receipt reports the exact id used, so it can be replayed deliberately.
+    const printed = JSON.parse(String((log.mock.calls.at(-1)?.[0] as string)));
+    expect(printed.operationId).toBe(body.operationId);
+    expect(printed.operationIdSource).toBe("generated");
+    expect(printed.state).toBe("active");
+    // Identity derives from the seat environment; a body claim could not win.
+    expect(calls[0]?.actor).toBe(actor);
+    expect(calls[0]?.generation).toBe(generation);
+    expect(process.exitCode).toBeUndefined();
+  });
+  it("replays a controlled exact id when supplied and never auto-retries", async () => {
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+    await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig", "--operation-id", "controlled-replay-1", "--lease-ms", "60000"]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.body).toEqual({ rigId: "test-rig", leaseMs: 60000, operationId: "controlled-replay-1" });
+    const printed = JSON.parse(String((vi.mocked(console.log).mock.calls.at(-1)?.[0] as string)));
+    expect(printed.operationId).toBe("controlled-replay-1");
+    expect(printed.operationIdSource).toBe("supplied");
+    // No automatic mutation retry: exactly one call for one invocation.
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+  it("sends no caller epoch or generation and refuses an out-of-range lease before any call", async () => {
+    const post = vi.spyOn(DaemonClient.prototype, "post");
+    await coordinatorCommand().parseAsync(["node", "rig", "resume-owned", "test-rig", "--lease-ms", "999"]);
+    expect(post).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+    expect(process.exitCode).toBe(1);
+    expect(vi.mocked(console.log).mock.calls).toHaveLength(0);
+  });
+});
 
 describe("coordinator terminal authentication", () => {
   it("show supplies real token-file headers and preserves rig escaping", async () => {

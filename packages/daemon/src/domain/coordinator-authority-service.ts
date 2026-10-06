@@ -427,6 +427,66 @@ export class CoordinatorAuthorityService {
      const out=this.get(token.rigId)!; this.log(token.rigId,evidence.operationId,"acknowledge",out,{token,evidence}); return out;
    }).immediate();
  }
+ /** Shared native owner continuation. Atomically acknowledges a LIVE reconciling owner and
+  *  renews it in ONE transaction, deriving the caller's own token and the CURRENT obligations
+  *  digest so an operator Lead never has to invent either.
+  *
+  *  It removes the observed procedural failure of a hand-assembled digest or a reused
+  *  operation id. It NEVER recovers expired authority: a lapsed lease refuses and is only
+  *  recoverable through the explicit expiry-recovery path. An already ACTIVE owner may renew
+  *  here with equivalent fences. No admissions, qualifications, product acceptance, model
+  *  change or UNKNOWN handling occurs, and nothing is retried automatically. */
+ resumeOwned(actor:string, callerGeneration:string, input:{rigId:string;leaseMs:number;operationId:string}): Authority {
+  return this.db.transaction(() => {
+   const found=this.get(input.rigId);
+   if(!found)reject("coordinator_not_enabled","Rig authority is not enabled");
+   // Narrow once after the rejection: every later read is inside this transaction, so the row
+   // cannot vanish, and the refusal above still happens before any mutation.
+   const row=found!;
+   // Immutable authenticated caller identity: only the genuine recorded owner, at the exact
+   // recorded generation. A foreign or stale generation refuses before anything else.
+   if(row.owner_session!==actor)reject("coordinator_retired","Only the genuine recorded owner may resume its own authority");
+   if(row.owner_generation!==callerGeneration)reject("coordinator_generation_mismatch","Immutable caller generation differs from the recorded owner generation");
+   this.caller(actor,callerGeneration);
+   this.validLease(input.leaseMs);
+   // Derived BEFORE the replay check and never supplied by the caller, so the replay request
+   // hash is byte-identical to the request that is logged on a fresh call.
+   const token:CoordinatorToken={rigId:input.rigId,epoch:row.epoch,generation:callerGeneration};
+   const obligationsDigest=digest(canonical(this.obligations(input.rigId)));
+   let acknowledged=row.state!=="active";
+   // `acknowledged` is deliberately NOT part of the hashed request: it flips once the mutation
+   // lands, which would make an exact replay hash-differ and self-conflict. It is observable
+   // from the receipt (reconciling -> active) instead.
+   const request={actor,callerGeneration,input,token,obligationsDigest};
+   // Exact operation-ID replay returns the durable receipt; a changed payload under the same
+   // id refuses. Checked before the lease gate so a genuine replay stays replayable.
+   const replay=this.replay(input.rigId,input.operationId,"resume-owned",request);if(replay)return replay as Authority;
+   // An expired lease NEVER resumes. Resume continues a LIVE window; recovery is separate.
+   if(row.lease_until<=this.now())reject("coordinator_lease_expired","An expired lease is recovered only by the explicit expiry-recovery path, never by resume-owned");
+   if(row.state==="active"){
+    // An ACTIVE owner renewing here faces the SAME fence as assertOwner/renew: the exact
+    // canonical baton must be in-progress and claimed by THIS current native generation.
+    // A coordinator-assignment match cannot substitute for the baton claim.
+    const baton=this.db.prepare("SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?").get(row.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string}|undefined;
+    if(!baton||baton.destination_session!==actor||baton.state!=="in-progress"||baton.claimed_by_generation_uuid!==token.generation)reject("coordinator_baton_mismatch","Active authority requires its exact canonical baton claim");
+   }
+   if(row.state!=="active"){
+    const baton=this.db.prepare("SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?").get(row.baton_id) as {destination_session:string;state:string;claimed_by_generation_uuid:string|null}|undefined;
+    if(!baton||baton.destination_session!==actor||!["pending","in-progress"].includes(baton.state)||(baton.claimed_by_generation_uuid!==null&&baton.claimed_by_generation_uuid!==token.generation))reject("coordinator_baton_mismatch","Cannot acknowledge another incarnation's baton");
+    const ts=new Date(this.now()).toISOString();
+    this.db.prepare("UPDATE queue_items SET state='in-progress',claimed_at=COALESCE(claimed_at,?),claimed_by_generation_uuid=?,ts_updated=? WHERE qitem_id=?").run(ts,token.generation,ts,row.baton_id);
+    this.transitions?.append({qitemId:row.baton_id,state:"in-progress",actorSession:actor,transitionNote:`coordinator epoch ${token.epoch} acknowledged and reconciled`,identityProvenance:"transport:v1"});
+    this.bus?.persistWithinTransaction({type:"queue.updated",qitemId:row.baton_id,fromState:baton!.state,toState:"in-progress",closureReason:null,closureTarget:null,actorSession:actor,summary:null});
+    this.db.prepare("UPDATE coordinator_authority SET state='active',operation_id=? WHERE rig_id=?").run(input.operationId,input.rigId);
+    acknowledged=true;
+   }
+   // Renewal happens in the SAME transaction, so any failure here rolls the acknowledgment back.
+   this.db.prepare("UPDATE coordinator_authority SET lease_until=?,operation_id=? WHERE rig_id=?").run(this.now()+input.leaseMs,input.operationId,input.rigId);
+   const out=this.get(input.rigId)!;
+   this.log(input.rigId,input.operationId,"resume-owned",out,request);
+   return out;
+  }).immediate();
+ }
  transfer(actor:string, callerGeneration:string, input:{expected:CoordinatorToken;oldOwner:string;recipient:string;recipientGeneration:string;operationId:string;leaseMs:number;recoveryEvidenceId?:string}): Authority {
    return this.db.transaction(() => {
      const old=this.get(input.expected.rigId); if (!old) reject("coordinator_not_enabled","Rig is not enabled");

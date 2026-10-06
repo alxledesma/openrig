@@ -59,6 +59,36 @@ describe("real managed queue/transport boundary",()=>{
   const res=await call("/api/coordinator/admit",{rigId:"xv",packageKey:"other",contract:{}},caller);expect(res.status).toBe(401);
   const spoof=await call("/api/coordinator/admit",{rigId:"xv",packageKey:"other",contract:{}},{...caller,Authorization:"Bearer test-token"});expect(spoof.status).toBe(409);expect((await spoof.json()).error).toBe("coordinator_operator_required");
  });
+ it("resume-owned derives the caller token and digest from immutable auth headers, never the body",async()=>{
+  // Put the rig in the reconciling-but-LIVE state this command exists to continue. This route
+  // fixture uses the real production clock, so the lease is live against Date.now().
+  const live=Date.now()+60000;
+  db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=?,operation_id='custody' WHERE rig_id='xv'").run(live);
+  // The real CLI sends the installed native bearer plus seat identity headers.
+  const native={...caller,Authorization:"Bearer test-token"};
+  const forged={rigId:"xv",leaseMs:120000,operationId:"http-resume-1",token:{rigId:"other",epoch:9999,generation:"attacker-gen"},obligationsDigest:"attacker-digest",actorSession:"attacker@elsewhere"};
+  const ok=await call("/api/coordinator/resume-owned",forged,native);
+  expect(ok.status).toBe(200);
+  const receipt=await ok.json() as any;
+  // Acknowledged, renewed, and every body claim ignored.
+  expect(receipt.state).toBe("active");
+  expect(receipt.rig_id).toBe("xv");
+  expect(receipt.owner_session).toBe("lead@xv");
+  expect(receipt.owner_generation).toBe("lead-g1");
+  expect(receipt.operation_id).toBe("http-resume-1");
+  expect(receipt.lease_until).toBeGreaterThan(Date.now());
+  const logged=db.prepare("SELECT request_hash FROM coordinator_operations WHERE operation_id='http-resume-1'").get() as any;
+  expect(logged.request_hash).toMatch(/^[0-9a-f]{64}$/);
+  // A foreign generation header cannot resume the owner's authority.
+  db.prepare("UPDATE coordinator_authority SET state='reconciling',lease_until=? WHERE rig_id='xv'").run(live);
+  const foreign=await call("/api/coordinator/resume-owned",{rigId:"xv",leaseMs:120000,operationId:"http-resume-2"},{...native,"X-OpenRig-Occupant-Generation":"rotated-gen"});
+  expect(foreign.status).toBe(409);
+  expect((await foreign.json()).error).toBe("coordinator_generation_mismatch");
+  // A missing identity header is refused at the boundary and never reaches authority.
+  const anonymous=await call("/api/coordinator/resume-owned",{rigId:"xv",leaseMs:120000,operationId:"http-resume-3"},{Authorization:"Bearer test-token"});
+  expect(anonymous.status).toBe(403);
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE operation_id LIKE 'http-resume-%'").get()).toEqual({n:1});
+ });
  it("registered native identity mapping does not assume logical-id equals session stem",async()=>{
   db.prepare("UPDATE nodes SET logical_id='orch1.lead' WHERE id='lead@xv'").run();
   const result=await call("/api/queue/create",{destinationSession:"builder@xv",body:"build",dispatch:{token,packageKey:"p"},nudge:false},caller);expect(result.status).toBe(201);
