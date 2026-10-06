@@ -3298,6 +3298,9 @@ export class QueueRepository {
       // (park-time summary included) so surfaces refresh without a fetch.
       summary: effectiveSummary ?? null,
     });
+    // A recipient's native failed/canceled report of a lifecycle duty target completes its report-only retirement duty:
+    // freeze that completion in this transaction, for this exact target only (indexed target lookup).
+    if (input.state === "failed" || input.state === "canceled") this.coordinatorAuthority.coordinationRecovery?.captureNativeRetirementTerminal(input.qitemId);
     return { persistedEvent, persistedEvents: [...dependentEvents, persistedEvent] };
   }
 

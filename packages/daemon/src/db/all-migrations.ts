@@ -5,7 +5,7 @@ import { reservationAttemptLocksSchema } from "./migrations/093_reservation_atte
 import { seatDispatchReservationsSchema } from "./migrations/091_seat_dispatch_reservations.js";
 import { reservedClaimReleaseSchema } from "./migrations/092_reserved_claim_release.js";
 import { coordinatorAuthoritySchema } from "./migrations/090_coordinator_authority.js";
-// The canonical ordered migration list (001 → 099). SINGLE SOURCE: the daemon boot path
+// The canonical ordered migration list (001 → 100). SINGLE SOURCE: the daemon boot path
 // (startup.ts) and any test/tool that needs a schema-faithful DB both migrate from THIS array,
 // so a reader DB is never seeded from a stale hand-copied subset (the perf-fixture-migration-parity
 // trap). Append new migrations to the END, in order.
@@ -102,6 +102,7 @@ import { classificationIdentityProvenanceSchema } from "./migrations/089_classif
 import { liveProjectionRecoveryLedgerSchema } from "./migrations/097_live_projection_recovery_ledger.js";
 import { coordinatorOperationLookupIndexSchema } from "./migrations/098_coordinator_operation_lookup_index.js";
 import { lifecycleTargetLookupIndexSchema } from "./migrations/099_lifecycle_target_lookup_index.js";
+import { lifecycleRootLookupIndexSchema } from "./migrations/100_lifecycle_root_lookup_index.js";
 // Upstream 0.6.5 additive migrations. NUMERIC PREFIXES COLLIDE with the fork's
 // 090/091/092/094 series but identity is the `name` field (e.g.
 // "090_human_reply_to.sql"), which is unique across both series, and the loader
@@ -215,6 +216,7 @@ export const ALL_MIGRATIONS: Migration[] = [
   liveProjectionRecoveryLedgerSchema,
   coordinatorOperationLookupIndexSchema,
   lifecycleTargetLookupIndexSchema,
+  lifecycleRootLookupIndexSchema,
   humanReplyToSchema,
   humanQuestionsSchema,
   nodeEffortSchema,

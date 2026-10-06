@@ -475,7 +475,9 @@ export class CoordinatorAuthorityService {
      const source=(this.db.prepare('SELECT source_session FROM queue_items WHERE qitem_id=?').get(input.recovery.queueId) as {source_session:string}|undefined)?.source_session;
      const binding=source==='watchdog@system'?this.validateUnavailableHeldRecovery(actor,generation,input,refs):this.validateHeldRecovery(actor,generation,{rigId:input.rigId,operationId:input.operationId,owner:a!.owner_session,ownerGeneration:a!.owner_generation,heldHistoryRecovery:input.recovery} as LegacyEnrollment,refs);
      const request={actor,generation,input};const prior=this.replay(input.rigId,input.operationId,'held-history-recovery-binding',request);if(prior){this.assertHeldRecoveryCurrent((prior as any).binding);return prior;}
-     const receipt={kind:'coordinator-held-history-recovery-binding.v1',actor,generation,effects:refs.map(h=>h.outboxId),binding,originalMutations:0};this.log(input.rigId,input.operationId,'held-history-recovery-binding',receipt,request);return receipt;
+     const receipt={kind:'coordinator-held-history-recovery-binding.v1',actor,generation,effects:refs.map(h=>h.outboxId),binding,originalMutations:0};this.log(input.rigId,input.operationId,'held-history-recovery-binding',receipt,request);
+     // The binding is the fact that completes the authoring and pickup duties: freeze it here, in this transaction.
+     this.coordinationRecovery?.captureHeldHistoryBinding(input.rigId,input.operationId);return receipt;
    }).immediate();
  }
 

@@ -195,7 +195,7 @@ let previousQueueId:string|undefined;if(prior){const r=JSON.parse(prior.receipt)
   this.db.transaction(()=>{if(!this.dutyBinding(rigId,r)||!this.dutyProtection(rigId,r)||this.repo.getById(queueId))return;this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:r.recipient,body,expiresAt:new Date(r.deadline).toISOString(),identityProvenance:'system:operator-authorized-coordination',nudge:false});const id=this.repo.stageHeldHistoryAuthoringWake(queueId,r.recipient,generation),notice=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(id) as any;this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,queueId,'coordinator-lifecycle-control',JSON.stringify({...r,bodyHash:digest(body),noticeBodyHash:digest(notice.body)}),digest(body));})();return this.repo.getById(queueId)?queueId:undefined;
  }
  private lifecycleDuty(rigId:string,kind:'acceptance'|'recovery'|'materialization'|'outcome-qualification-refresh'|'admission-refresh'|'frontier-planning'|'frontier-admission'|'frontier-confirmation',packageKey:string,recipient:string,recipientGeneration:string,semanticKey:string,details:Record<string,unknown>):CoordinationResult {
-  const a=this.authority.get(rigId)!,plan=this.plan(rigId)!,rootId='qitem-coordination-lifecycle-'+digest(rigId+':'+kind+':'+semanticKey).slice(0,24);
+  const a=this.authority.get(rigId)!,plan=this.plan(rigId)!,rootId=this.dutyRootId(rigId,kind,semanticKey);
   const rows=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')=? AND json_extract(receipt,'$.packageKey')=? ORDER BY rowid DESC").all(rigId,kind,packageKey) as any[];
   const prior=rows.map(v=>JSON.parse(v.receipt)).find(r=>r.semanticKey===semanticKey||(r.semanticKey===undefined&&(kind==='materialization'?r.contractHash===details.contractHash:r.originalQueueId===details.originalQueueId&&r.dispositionId===details.dispositionId)));
 let queueId=rootId,previousQueueId:string|undefined,expiredUnclaimed=false;
@@ -207,7 +207,7 @@ let queueId=rootId,previousQueueId:string|undefined,expiredUnclaimed=false;
     // own unresolved wake, and an accountable intake instead of a silent dead end.
     if(!facts.superseded&&(!facts.retired||(expiredUnclaimed&&!this.dutyNoticeContained(rigId,prior)))){const retirementQueueId=this.stageDutyRetirement(rigId,prior);return {key:kind+':'+packageKey,state:'held',queueId:prior.queueId,reason:facts.retired?'lifecycle-recipient-protected':'lifecycle-duty-exhausted',deadline:prior.deadline,...(retirementQueueId?{activityEvidence:{retirementQueueId}}:{})};}
     if(!this.dutySubjectReady(rigId,prior))return {key:kind+':'+packageKey,state:'held',queueId:prior.queueId,reason:'lifecycle-return-contract-drift',deadline:prior.deadline};
-    previousQueueId=prior.queueId;const bindingVersion=kind==='materialization'||kind==='outcome-qualification-refresh'||kind==='admission-refresh'?recipientGeneration:recipientGeneration+':'+a.epoch;queueId='qitem-coordination-lifecycle-'+digest(rootId+':successor:'+prior.queueId+':'+bindingVersion).slice(0,24);
+    previousQueueId=prior.queueId;const bindingVersion=this.dutyBindingVersion(kind,recipientGeneration,a.epoch);queueId=this.dutySuccessorId(rootId,prior.queueId,bindingVersion);
    }
    const existing=this.repo.getById(queueId),deadline=existing?.expiresAt?Date.parse(existing.expiresAt):this.now()+1200000;if(existing)return {key:kind+':'+packageKey,state:'pending-native-'+kind,queueId,deadline};
    if(!this.lifecycleRecipientReady(rigId,recipient,packageKey,undefined,this.administrativeDuty(kind)))return {key:kind+':'+packageKey,state:'held',queueId:prior?.queueId,reason:'lifecycle-recipient-protected',deadline,subject:{packageKey,owner:recipient,identity:semanticKey}};
@@ -238,6 +238,13 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
  }
  /** WHY the current admission is stale, from LIVE facts only. Never from the prior
   *  admission itself, which is what makes it evidence rather than a restatement. */
+ /** The identity of the admission-refresh duty for this task bytes, owner generation and live configuration. */
+ private admissionRefreshSemanticKey(t:CoordinationTask):string|null {
+  const ownerGeneration=this.authority.generation(t.owner),liveConfigurationDigest=this.configurationDigest(t.owner);
+  if(!ownerGeneration||!liveConfigurationDigest)return null;
+  // digest() takes a string in this codebase; the object literal is serialized explicitly.
+  return digest(JSON.stringify({packageKey:t.packageKey,taskIntentDigest:this.admissionTaskIntentDigest(t),ownerGeneration,liveConfigurationDigest,priorValidUntil:t.admission.validUntil}));
+ }
  private admissionStaleReason(t:CoordinationTask):'expired'|'generation_changed'|'configuration_changed'|null {
   const liveGen=this.authority.generation(t.owner),liveCfg=this.configurationDigest(t.owner),ad=t.admission;
   if(liveGen!==ad.generation)return 'generation_changed';
@@ -256,10 +263,9 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
   if(!ownerGeneration||!liveConfigurationDigest)return undefined;
   const staleReason=this.admissionStaleReason(t);
   if(!staleReason)return undefined;
-  const taskIntentDigest=this.admissionTaskIntentDigest(t),priorValidUntil=t.admission.validUntil;
-  // digest() takes a string in this codebase (see stageOutcomeQualificationDuty and every
-  // other semanticKey site). The design's object literal is serialized explicitly.
-  const semanticKey=digest(JSON.stringify({packageKey:t.packageKey,taskIntentDigest,ownerGeneration,liveConfigurationDigest,priorValidUntil}));
+  const taskIntentDigest=this.admissionTaskIntentDigest(t);
+  // One formula for issuing the duty and for finding it again when its completion commits.
+  const semanticKey=this.admissionRefreshSemanticKey(t)!;
   return this.lifecycleDuty(rigId,'admission-refresh',t.packageKey,'operator-agent@kernel',operatorGeneration,semanticKey,{
    taskKey:t.key,packageKey:t.packageKey,owner:t.owner,ownerGeneration,liveConfigurationDigest,
    staleReason,priorAdmission:{validUntil:t.admission.validUntil,generation:t.admission.generation,configurationDigest:t.admission.configurationDigest,qualificationRef:t.admission.qualificationRef,capacityRef:t.admission.capacityRef,effortRef:t.admission.effortRef},
@@ -597,8 +603,29 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
   const body=JSON.stringify({action:'claim-and-bind-exact-held-history-record',rigId,queueId,claimCommand:'rig queue claim '+queueId,recordQueueId:r.recordQueueId,recordClaimCommand:'rig queue claim '+r.recordQueueId,authoringQueueId:parent.queueId,operatorIntakeId:r.operatorIntakeId,deadline:r.deadline,recipientGeneration:r.recipientGeneration,grantsAuthority:false,bindingContract:{rigId,operationId:r.bindingOperationId,effects:r.effects,recovery:{queueId:r.recordQueueId,rowHash:'<actual full queue row hash after genuine Operator claim>'}},required:'Read the actual current Lead-authored record, genuinely claim this duty and that exact record under your own current native identity. Derive its actual row hash and use rig coordinator held-history-recovery-bind <bindingContractFile>. Completion requires the exact supported binding receipt; prose is insufficient. Do not extend expiry, replay UNKNOWN notices, retire original effects, execute product work or infer acceptance.'});
   this.db.transaction(()=>{if(!this.heldHistoryPickupReady(rigId,r)||this.repo.getById(queueId))return;this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:r.recipient,expiresAt:new Date(r.deadline).toISOString(),body,identityProvenance:'system:operator-authorized-coordination',nudge:false});const noticeId=this.repo.stageHeldHistoryAuthoringWake(queueId,r.recipient,r.recipientGeneration),notice=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(noticeId) as any;this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,queueId,'coordinator-lifecycle-control',JSON.stringify({...r,bodyHash:digest(body),noticeBodyHash:digest(notice.body)}),digest(body));})();
  }
+ /** Historical recovery for a state-changing duty whose success committed but whose close was never frozen before its
+  *  deadline (complete, expired, claimed, not closable). It does NOT rescue the late success, back-date anything or
+  *  reapply the effect: it stages the existing accountable failure-only retirement so the original native claimant can
+  *  report its own administrative duty item failed. Targeting is the live claimed lifecycle duty items only (an indexed
+  *  range over duty queue ids), never the operations history. */
+ private retirementCursor=new Map<string,string>();
+ private retireCompleteUnclosableDuties(rigId:string):CoordinationResult[] {
+  const kinds=['outcome-qualification-refresh','admission-refresh','acceptance','recovery','materialization','frontier-planning','frontier-admission','frontier-confirmation'],out:CoordinationResult[]=[];
+  // Rig scope is part of the indexed query (the duty's own control row, by primary key), so another rig's items can never
+  // fill the page; a per-rig cursor walks the live items fairly across passes and wraps when it reaches the end.
+  const cursor=this.retirementCursor.get(rigId)??'',limit=100;
+  const rows=this.db.prepare("SELECT q.qitem_id FROM queue_items q INDEXED BY idx_queue_items_state JOIN coordinator_operations o ON o.rig_id=? AND o.operation_id=q.qitem_id AND o.kind='coordinator-lifecycle-control' WHERE q.state IN ('in-progress','blocked') AND q.qitem_id>? AND q.qitem_id>='qitem-coordination-lifecycle-' AND q.qitem_id<'qitem-coordination-lifecycle.' AND q.source_session='watchdog@system' AND q.claimed_at IS NOT NULL AND q.expires_at IS NOT NULL AND q.expires_at<=? ORDER BY q.qitem_id LIMIT ?").all(rigId,cursor,new Date(this.now()).toISOString(),limit) as Array<{qitem_id:string}>;
+  this.retirementCursor.set(rigId,rows.length<limit?'':rows[rows.length-1]!.qitem_id);
+  for(const {qitem_id} of rows){
+   const control=this.lifecycleControl(qitem_id);if(!control||control.rigId!==rigId||!kinds.includes(control.receipt.kind))continue;
+   const f=this.dutyFacts(qitem_id);if(!(f.complete&&f.expired&&!f.close&&!f.retired&&!f.failedByRecipient))continue;
+   const retirement=this.stageDutyRetirement(rigId,control.receipt,qitem_id);
+   if(!retirement)out.push({key:'duty-retirement:'+control.receipt.kind+':'+control.receipt.packageKey,state:'held',reason:'lifecycle-recipient-protected',deadline:this.now()+1200000,subject:{packageKey:control.receipt.packageKey,owner:control.receipt.recipient,identity:qitem_id}});
+  }
+  return out;
+ }
  private centralLifecyclePass(rigId:string):CoordinationResult[] {
-  const a=this.authority.get(rigId)!,plan=this.plan(rigId)!,result:CoordinationResult[]=[];
+  const a=this.authority.get(rigId)!,plan=this.plan(rigId)!,result:CoordinationResult[]=[...this.retireCompleteUnclosableDuties(rigId)];
   const returned=this.db.prepare("SELECT a.*,q.body,q.state,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.disposition_id IS NOT NULL AND q.state IN ('done','handed-off','failed','denied','canceled')").all(rigId) as any[];
   for(const row of returned){
    const kind=successfulReturn(row.state,row.disposition_id)?'acceptance':'recovery';
@@ -695,13 +722,89 @@ private dutyProtection(rigId:string,r:any):boolean {
   const retired=frozen&&(failedByRecipient||(complete&&(!q?.claimedAt||close))||expiredUnclaimedObserved);
   return {queueId,claim,send,act,complete,close,retired,failedByRecipient,superseded,expired,...(!frozen?{reason:'duty-immutable-proof-drift'}:!binding?{reason:'duty-binding-superseded'}:!protection?{reason:'duty-recipient-protected'}:{})};
  }
+ /** Freeze that a duty is complete, only while it is complete AND not yet expired, stamped now. Never back-dated. */
+ private recordCompletionObservation(op:{rigId:string;receipt:any},queueId:string,f:DutyFacts):void {
+  if(f.complete&&!f.expired){const r={queueId,bodyHash:op.receipt.bodyHash,at:this.now(),outcomeOnly:true};this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(op.rigId,'duty-completion:'+queueId,'duty-completion-observation',JSON.stringify(r),digest(JSON.stringify(r)));}
+ }
  private observeDuty(queueId:string):void {
   const op=this.lifecycleControl(queueId);if(!op)return;const f=this.dutyFacts(queueId),q=this.repo.getById(queueId),notice=this.db.prepare('SELECT delivery_state FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+queueId) as any;
-  if(f.complete&&!f.expired){const r={queueId,bodyHash:op.receipt.bodyHash,at:this.now(),outcomeOnly:true};this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(op.rigId,'duty-completion:'+queueId,'duty-completion-observation',JSON.stringify(r),digest(JSON.stringify(r)));}
+  this.recordCompletionObservation(op,queueId,f);
   if(f.expired&&!q?.claimedAt){const r={queueId,bodyHash:op.receipt.bodyHash,subjectComplete:f.complete,noticeState:notice?.delivery_state??null,claimedAt:null,at:this.now(),grantsAuthority:false};this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(op.rigId,'duty-expiry-observation:'+queueId,'duty-expiry-observation',JSON.stringify(r),digest(JSON.stringify(r)));}
  }
- /** Internal apply-time observation; callers retain mutation authority and transaction. */
- observeLifecycleCompletion(queueId:string):void {this.observeDuty(queueId);}
+ /** Apply-time completion capture. Call ONLY inside the authorized transaction that has just written the fact
+  *  completing this duty, after that write and before commit; the caller keeps all authority. It records the
+  *  completion branch only (never the expiry branch), exactly one duty, and only while the duty is not expired. */
+ observeLifecycleCompletion(queueId:string):void {
+  const op=this.lifecycleControl(queueId);if(!op)return;
+  this.recordCompletionObservation(op,queueId,this.dutyFacts(queueId));
+ }
+ private dutyRootId(rigId:string,kind:string,semanticKey:string):string {return 'qitem-coordination-lifecycle-'+digest(rigId+':'+kind+':'+semanticKey).slice(0,24);}
+ private dutySuccessorId(rootId:string,priorQueueId:string,bindingVersion:string):string {return 'qitem-coordination-lifecycle-'+digest(rootId+':successor:'+priorQueueId+':'+bindingVersion).slice(0,24);}
+ private dutyBindingVersion(kind:string,recipientGeneration:string,epoch:number):string {return kind==='materialization'||kind==='outcome-qualification-refresh'||kind==='admission-refresh'?recipientGeneration:recipientGeneration+':'+epoch;}
+ /** The live link of a duty, by indexed exact subject: every link of one subject carries the same deterministic rootId in
+  *  its control receipt (idx_coordinator_lifecycle_root), the most recently issued link is the live one, and it is
+  *  found whatever generation or epoch each link was bound to. The selected control is validated against the exact
+  *  immutable subject (kind, semanticKey, rootId, own queue id) before it is used. */
+ private liveDutyLink(rigId:string,kind:string,semanticKey:string):string|null {
+  const root=this.dutyRootId(rigId,kind,semanticKey);
+  const row=this.db.prepare("SELECT operation_id,receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.rootId')=? ORDER BY rowid DESC LIMIT 1").get(rigId,root) as {operation_id:string;receipt:string}|undefined;
+  if(!row)return null;
+  let r:any;try{r=JSON.parse(row.receipt);}catch{return null;}
+  return r&&r.kind===kind&&r.semanticKey===semanticKey&&r.rootId===root&&r.queueId===row.operation_id?row.operation_id:null;
+ }
+ private captureDutyCompletion(rigId:string,kind:string,semanticKey:string):void {
+  const id=this.liveDutyLink(rigId,kind,semanticKey);if(!id)return;
+  const op=this.lifecycleControl(id);if(!op||op.rigId!==rigId)return;
+  const f=this.dutyFacts(id);
+  if(f.superseded)return;                  // a link bound to a retired holder or operator is not the live duty
+  this.recordCompletionObservation(op,id,f);
+ }
+ /** Admission-refresh duties are selected by their RECORDED subject (package, task key, owner, task intent and the stale
+  *  admission's expiry), newest first, never by re-deriving the issuance-time live generation or configuration, which may
+  *  have moved since the duty was issued. Which duty a refresh actually completes is decided by the unchanged postcondition
+  *  (it must match the duty's recorded generation and configuration AND the live ones), so no authority is relaxed:
+  *  a duty issued under a configuration that has since moved simply stays incomplete and is not captured. */
+ private captureAdmissionRefreshCompletion(rigId:string,prior:CoordinationTask):void {
+  const intent=this.admissionTaskIntentDigest(prior);
+  const rows=this.db.prepare("SELECT operation_id,receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='admission-refresh' AND json_extract(receipt,'$.packageKey')=? AND json_extract(receipt,'$.taskKey')=? AND json_extract(receipt,'$.owner')=? AND json_extract(receipt,'$.taskIntentDigest')=? AND json_extract(receipt,'$.priorAdmission.validUntil')=? ORDER BY rowid DESC LIMIT 16").all(rigId,prior.packageKey,prior.key,prior.owner,intent,prior.admission.validUntil) as Array<{operation_id:string;receipt:string}>;
+  // The exact immutable subject is part of the query, so the page can only contain duties for this subject: other
+  // historical subjects of the package can never hide the completing duty. The checks below are defense in depth.
+  for(const row of rows){
+   let c:any;try{c=JSON.parse(row.receipt);}catch{continue;}
+   if(!c||c.queueId!==row.operation_id||c.taskKey!==prior.key||c.owner!==prior.owner||c.taskIntentDigest!==intent||c.priorAdmission?.validUntil!==prior.admission.validUntil)continue;
+   const op=this.lifecycleControl(row.operation_id);if(!op||op.rigId!==rigId)continue;
+   const f=this.dutyFacts(row.operation_id);if(f.superseded)continue;
+   this.recordCompletionObservation(op,row.operation_id,f);
+  }
+ }
+ /** Apply-time capture for held-history authoring and pickup duties: the Operator's recovery-binding operation completes
+  *  them. The binding operation id is 'held-authoring:' + the authoring duty id and the pickup duty id is derived from the
+  *  authoring id, so both are found by primary key. Only duties naming exactly this binding operation are observed. */
+ captureHeldHistoryBinding(rigId:string,bindingOperationId:string):void {
+  if(typeof bindingOperationId!=='string'||!bindingOperationId.startsWith('held-authoring:'))return;
+  const authoringId=bindingOperationId.slice('held-authoring:'.length),pickupId='qitem-coordination-lifecycle-'+digest(authoringId+':operator-record-pickup').slice(0,24);
+  for(const id of [authoringId,pickupId]){
+   const op=this.lifecycleControl(id);
+   if(op&&op.rigId===rigId&&['held-history-authoring','held-history-pickup'].includes(op.receipt.kind)&&op.receipt.bindingOperationId===bindingOperationId)this.observeLifecycleCompletion(id);
+  }
+ }
+ /** Apply-time capture for report-only retirement duties: the recipient's native failed/canceled report of the TARGET
+  *  completes them. Found by the indexed (targetQueueId, kind) lookup the retirement staging already uses (099). */
+ captureNativeRetirementTerminal(targetQueueId:string):void {
+  const rows=this.db.prepare("SELECT operation_id FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.targetQueueId')=? AND json_extract(receipt,'$.kind') IN ('held-history-retirement','lifecycle-retirement')").all(targetQueueId) as Array<{operation_id:string}>;
+  for(const r of rows)this.observeLifecycleCompletion(r.operation_id);
+ }
+ /** Targeted capture for the duties a plan revision can complete: a package's materialization duty when its task is
+  *  new or its admission changed, and an admission-refresh duty when a task's admission bytes were replaced. */
+ private captureConfigureCompletions(plan:CoordinationPlan,prior:CoordinationPlan|null):void {
+  const before=new Map((prior?.tasks??[]).map(t=>[t.key,t]));
+  for(const t of plan.tasks){
+   const old=before.get(t.key);if(old&&JSON.stringify(old.admission)===JSON.stringify(t.admission))continue;
+   const pkg=this.db.prepare('SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(plan.rigId,t.packageKey) as {contract_hash:string}|undefined;
+   if(pkg)this.captureDutyCompletion(plan.rigId,'materialization',t.packageKey+':'+pkg.contract_hash);
+   if(old)this.captureAdmissionRefreshCompletion(plan.rigId,old);
+  }
+ }
  lifecycleControlCompleted(queueId:string):boolean {return this.dutyFacts(queueId).close;}
  lifecycleControlClaimAllowed(queueId:string,actor:string,generation:string|null|undefined,provenance:string|null|undefined):boolean {const op=this.lifecycleControl(queueId);return !!op&&actor===op.receipt.recipient&&generation===op.receipt.recipientGeneration&&this.authority.generation(actor)===generation&&provenance==='transport:v1'&&this.dutyFacts(queueId).claim;}
  lifecycleControlActAllowed(queueId:string,actor:string,generation:string|null|undefined,provenance:string|null|undefined):boolean {const op=this.lifecycleControl(queueId),q=this.repo.getById(queueId),claimed=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(queueId) as {claimed_by_generation_uuid:string|null}|undefined;return !!op&&actor===op.receipt.recipient&&generation===op.receipt.recipientGeneration&&this.authority.generation(actor)===generation&&provenance==='transport:v1'&&!!q?.claimedAt&&['in-progress','blocked'].includes(q.state)&&claimed?.claimed_by_generation_uuid===generation&&this.dutyFacts(queueId).act;}
@@ -719,6 +822,7 @@ private dutyProtection(rigId:string,r:any):boolean {
    const id='lifecycle-recovery:'+input.dutyQueueId,prior=this.db.prepare('SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(input.rigId,id) as {receipt:string}|undefined;
    if(prior){if(prior.receipt!==JSON.stringify(receipt))fail('coordination_lifecycle_recovery_conflict','Frozen recovery disposition differs');return;}
    this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,id,'coordinator-lifecycle-recovery',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   this.observeLifecycleCompletion(input.dutyQueueId);
   }).immediate();
  }
  /** A genuine recipient claim is its own native reading action, not proof of
@@ -1047,7 +1151,8 @@ private dutyProtection(rigId:string,r:any):boolean {
      this.repo.stageWakeIntent(queueId,actor,r.session,'system:operator-authorized-coordination',true,r.generation);
     }
    }
-   for(const row of this.db.prepare("SELECT operation_id FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control'").all(plan.rigId) as Array<{operation_id:string}>)this.observeDuty(row.operation_id);
+   // Exact keyed capture only. Every completing path now freezes its own duty at apply time, so the rig-wide history scan is gone.
+   this.captureConfigureCompletions(plan,prior);
    this.recordProgress(plan.rigId);
    return plan;
   }).immediate();
@@ -1060,7 +1165,7 @@ private dutyProtection(rigId:string,r:any):boolean {
   * `frontier-planning.ts`; this adapter only binds it to the shared facets. */
  private frontierPlanner?:FrontierPlanning;
  frontierPlanning():FrontierPlanning {
-  if(!this.frontierPlanner)this.frontierPlanner=new FrontierPlanning({db:this.db,now:()=>this.now(),generation:s=>this.authority.generation(s),authorityRecord:rigId=>this.authority.get(rigId)??null,plan:rigId=>this.plan(rigId),lifecycleControlCompleted:queueId=>this.lifecycleControlCompleted(queueId),actAllowed:(queueId,actor,generation)=>this.frontierDutyActAllowed(queueId,actor,generation),issueLifecycleDuty:input=>this.lifecycleDuty(input.rigId,input.kind,input.packageKey,input.recipient,input.recipientGeneration,input.semanticKey,input.details),admittedNow:t=>this.admittedNow(t),dispatchScopeHold:(plan,t)=>this.dispatchScopeHold(plan,t),effectDebt:session=>this.workerEffectDebt(session),requiresRecovery:(rigId,packageKey)=>this.authority.runtimeOutcomeAssessment?.requiresRecovery(rigId,packageKey)??false,admitPackage:(actor,generation,rigId,packageKey,contract)=>this.authority.admit(actor,generation,rigId,packageKey,contract)});
+  if(!this.frontierPlanner)this.frontierPlanner=new FrontierPlanning({db:this.db,now:()=>this.now(),generation:s=>this.authority.generation(s),authorityRecord:rigId=>this.authority.get(rigId)??null,plan:rigId=>this.plan(rigId),lifecycleControlCompleted:queueId=>this.lifecycleControlCompleted(queueId),actAllowed:(queueId,actor,generation)=>this.frontierDutyActAllowed(queueId,actor,generation),issueLifecycleDuty:input=>this.lifecycleDuty(input.rigId,input.kind,input.packageKey,input.recipient,input.recipientGeneration,input.semanticKey,input.details),admittedNow:t=>this.admittedNow(t),dispatchScopeHold:(plan,t)=>this.dispatchScopeHold(plan,t),effectDebt:session=>this.workerEffectDebt(session),requiresRecovery:(rigId,packageKey)=>this.authority.runtimeOutcomeAssessment?.requiresRecovery(rigId,packageKey)??false,admitPackage:(actor,generation,rigId,packageKey,contract)=>this.authority.admit(actor,generation,rigId,packageKey,contract),observeCompletion:queueId=>this.observeLifecycleCompletion(queueId)});
   return this.frontierPlanner;
  }
  /** The shared Act facet itself: exact recipient identity and generation, a genuine
@@ -1246,6 +1351,8 @@ if(!effectRig)return true;
    const prior=this.db.prepare('SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(rigId,id) as {receipt:string}|undefined;
    if(prior){if(JSON.parse(prior.receipt).dispositionId!==dispositionId)fail('coordination_acceptance_conflict','Accepted result cannot change');return;}
    this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,id,'coordination-accept',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   // reconcile never revisits an accepted return, so freeze the acceptance duty's completion here, now, before the deadline.
+   this.captureDutyCompletion(rigId,'acceptance',row!.queue_id+':'+dispositionId);
    this.recordProgress(rigId);
    const plan=this.plan(rigId);if(plan&&plan.operatorGeneration===this.authority.generation('operator-agent@kernel'))this.reconcile(actor,generation,rigId);
   }).immediate();

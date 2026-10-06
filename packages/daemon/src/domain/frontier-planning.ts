@@ -100,6 +100,8 @@ export interface FrontierPlanningSeam {
   effectDebt(session:string):boolean;
   requiresRecovery(rigId:string,packageKey:string):boolean;
   admitPackage(actor:string,generation:string,rigId:string,packageKey:string,contract:PackageContract&{workClass?:WorkClass;scopeCitations?:ScopeSource[]}):void;
+  /** Apply-time completion capture: called only inside the transaction that just wrote the completing disposition. */
+  observeCompletion?(queueId:string):void;
 }
 
 const fail:(code:string,message:string)=>never=(code,message)=>{throw new CoordinatorFenceError(code,message);};
@@ -603,6 +605,7 @@ export class FrontierPlanning {
    this.dutyCustody(input.rigId,input.dutyQueueId,duty,actor,generation);
    if(!this.seam.actAllowed(input.dutyQueueId,actor,generation))fail('frontier_act_not_allowed','Shared duty act facet refuses this disposition');
    db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-plan-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   this.seam.observeCompletion?.(input.dutyQueueId);
    return receipt;
   }).immediate();
  }
@@ -707,6 +710,7 @@ export class FrontierPlanning {
    for(const entry of decision.admitted)this.seam.admitPackage(actor,generation,input.rigId,entry.packageKey,entry.contract as unknown as PackageContract&{workClass?:WorkClass;scopeCitations?:ScopeSource[]});
    const receipt=this.admissionReceipt(input.rigId,duty,actor,generation,decision);
    db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-admission-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   this.seam.observeCompletion?.(input.dutyQueueId);
    return receipt;
   }).immediate();
  }
@@ -763,6 +767,7 @@ export class FrontierPlanning {
    if(input.completionDigest!==duty.completionDigest)fail('frontier_completion_drift','Confirmation must bind this duty\'s frozen completion digest');
    const receipt:FrontierConfirmationReceipt={dutyQueueId:input.dutyQueueId,completionDigest:input.completionDigest,actor,generation,evidenceRef:String(input.evidenceRef)};
    db.prepare("INSERT INTO coordinator_operations VALUES (?,?,?,?,?)").run(input.rigId,id,'frontier-confirmation-disposition',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   this.seam.observeCompletion?.(input.dutyQueueId);
    return receipt;
   }).immediate();
  }
