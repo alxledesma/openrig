@@ -36,9 +36,13 @@ export interface StarterSpecLoadResult {
   loaded: Array<{ name: string; version: string; sourcePath: string }>;
   /** Specs that were already cached (operator override or prior startup). */
   skipped: Array<{ name: string; version: string; sourcePathInCache: string }>;
+  /** Specs that were relocated from a stale install path to the new install root. */
+  relocated: Array<{ name: string; version: string; oldSourcePath: string; newSourcePath: string }>;
   /** Specs that failed to parse / load — surfaced for diagnostic logging. */
   errors: Array<{ sourcePath: string; code: string; message: string }>;
 }
+
+const SPEC_FILE_EXTENSIONS = new Set([".yaml", ".yml"]);
 
 export interface StarterSpecLoaderOpts {
   /** Phase D's workflow-spec-cache (already constructed in startup.ts). */
@@ -47,7 +51,27 @@ export interface StarterSpecLoaderOpts {
   builtinDir: string;
 }
 
-const SPEC_FILE_EXTENSIONS = new Set([".yaml", ".yml"]);
+/**
+ * Determines if a cached source_path is a stale builtin from another install root.
+ * A stale builtin is identified by:
+ * - The cached path contains the segment "/builtins/workflow-specs/"
+ * - The cached path is NOT under the current builtinDir
+ * - The basename matches the current file's basename (same filename)
+ */
+function isStaleBuiltin(cachedPath: string, currentBuiltinDir: string, currentBasename: string): boolean {
+  if (!cachedPath.includes("/builtins/workflow-specs/")) {
+    return false;
+  }
+  // Check if the cached path is under the current builtinDir
+  const currentBuiltinDirResolved = path.resolve(currentBuiltinDir);
+  const cachedPathResolved = path.resolve(cachedPath);
+  if (cachedPathResolved.startsWith(currentBuiltinDirResolved + path.sep) || cachedPathResolved === currentBuiltinDirResolved) {
+    return false;
+  }
+  // Check if the basename matches
+  const cachedBasename = path.basename(cachedPath);
+  return cachedBasename === currentBasename;
+}
 
 /**
  * Walks the builtinDir and seeds each spec file into the cache, skipping
@@ -59,7 +83,7 @@ const SPEC_FILE_EXTENSIONS = new Set([".yaml", ".yml"]);
  * a daemon shipped without bundled starter specs is a valid configuration.
  */
 export function loadStarterWorkflowSpecs(opts: StarterSpecLoaderOpts): StarterSpecLoadResult {
-  const result: StarterSpecLoadResult = { loaded: [], skipped: [], errors: [] };
+  const result: StarterSpecLoadResult = { loaded: [], skipped: [], relocated: [], errors: [] };
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(opts.builtinDir, { withFileTypes: true });
@@ -111,6 +135,23 @@ export function loadStarterWorkflowSpecs(opts: StarterSpecLoaderOpts): StarterSp
     // startup's seed) wins.
     const existing = opts.cache.getByNameVersion(parsedName, parsedVersion);
     if (existing) {
+      // Check if the existing row is a stale builtin from another install root
+      // that should be relocated to the current install root.
+      const currentBasename = path.basename(absPath);
+      if (isStaleBuiltin(existing.sourcePath, opts.builtinDir, currentBasename)) {
+        // Relocate the stale builtin to the new install root
+        const relocated = opts.cache.relocateBuiltinSource(existing.specId, absPath);
+        if (relocated) {
+          result.relocated.push({
+            name: parsedName,
+            version: parsedVersion,
+            oldSourcePath: existing.sourcePath,
+            newSourcePath: relocated.sourcePath,
+          });
+          continue;
+        }
+      }
+
       result.skipped.push({
         name: parsedName,
         version: parsedVersion,

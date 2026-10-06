@@ -901,6 +901,66 @@ export class WorkflowSpecCache {
    * number of rows removed (0 when no row exists for that path).
    */
   /**
+   * Relocate a stale builtin spec row to the new install root.
+   * Called when a builtin spec row exists at a stale install path (old install root)
+   * but the same (name, version) is now being loaded from the new install root.
+   * Updates the row's source_path, source_hash, spec_json, and all content columns
+   * to match the new file, preserving spec_id, name, and version.
+   */
+  relocateBuiltinSource(specId: string, newSourcePath: string): WorkflowSpecRow | null {
+    const existing = this.db.prepare("SELECT * FROM workflow_specs WHERE spec_id = ?").get(specId) as SpecRow | undefined;
+    if (!existing || (this.hasDiagnosticColumns && existing.status !== "valid")) return null;
+    if (!existsSync(newSourcePath)) {
+      throw new WorkflowSpecError(
+        "spec_file_missing",
+        `workflow spec file not found at ${newSourcePath}`,
+        { newSourcePath },
+      );
+    }
+    const raw = readFileSync(newSourcePath, "utf-8");
+    const sourceHash = createHash("sha256").update(raw).digest("hex");
+    const spec = parseWorkflowSpec(raw, newSourcePath);
+    if (spec.id !== existing.name || spec.version !== existing.version) {
+      throw new WorkflowSpecError("spec_identity_changed", "Builtin identity changed during relocation", { newSourcePath });
+    }
+    const cachedAt = this.now().toISOString();
+    const purpose = spec.objective ?? null;
+    const targetRig = spec.target?.rig ?? null;
+    const rolesJson = JSON.stringify(spec.roles);
+    const stepsJson = JSON.stringify(spec.steps);
+    const coordinationTerminalTurnRule = spec.coordination_terminal_turn_rule ?? "hot_potato";
+
+    const specJsonSet = this.hasSpecJsonColumn ? ", spec_json = ?" : "";
+    const diagnosticSet = this.hasDiagnosticColumns ? ", status = 'valid', error_message = NULL" : "";
+    const updateParams: unknown[] = [
+      spec.id,
+      spec.version,
+      purpose,
+      targetRig,
+      rolesJson,
+      stepsJson,
+      coordinationTerminalTurnRule,
+      newSourcePath,
+      sourceHash,
+      cachedAt,
+    ];
+    if (this.hasSpecJsonColumn) updateParams.push(JSON.stringify(spec));
+    updateParams.push(specId);
+    const update = this.db
+      .prepare(
+        `UPDATE workflow_specs SET
+           name = ?, version = ?,
+           purpose = ?, target_rig = ?, roles_json = ?, steps_json = ?,
+           coordination_terminal_turn_rule = ?, source_path = ?,
+           source_hash = ?, cached_at = ?${specJsonSet}${diagnosticSet}
+         WHERE spec_id = ?${this.hasDiagnosticColumns ? " AND status = 'valid'" : ""}`,
+      )
+      .run(...(updateParams as never[]));
+
+    return update.changes === 1 ? this.getByIdOrThrow(specId) : null;
+  }
+
+  /**
    * #511 — an unfinished workflow instance (active, waiting, or failed and still resumable) reads
    * its pinned spec by name and version. Such a version outlives its source file until that work
    * ends. A missing instances table (older harnesses) pins nothing.
