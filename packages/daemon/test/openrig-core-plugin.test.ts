@@ -17,6 +17,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as nodePath from "node:path";
 import { pathToFileURL } from "node:url";
+import { resolveAddress } from "../src/domain/markdown-address.js";
 
 const PLUGIN_ROOT = nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core");
 
@@ -83,7 +84,7 @@ describe("openrig-core plugin — manifest shape (HG-2.2)", () => {
     const manifest = JSON.parse(content) as Record<string, unknown>;
     // Required fields per Claude plugin spec
     expect(manifest["name"]).toBe("openrig-core");
-    expect(manifest["version"]).toBe("0.1.1");
+    expect(manifest["version"]).toBe("0.1.3");
     expect(typeof manifest["description"]).toBe("string");
     expect((manifest["description"] as string).length).toBeLessThanOrEqual(1024);
     // Hook + skills wiring
@@ -98,7 +99,7 @@ describe("openrig-core plugin — manifest shape (HG-2.2)", () => {
     const manifest = JSON.parse(content) as Record<string, unknown>;
     // Codex requires name + version + description (per IMPL-PRD §2.3)
     expect(manifest["name"]).toBe("openrig-core");
-    expect(manifest["version"]).toBe("0.1.1");
+    expect(manifest["version"]).toBe("0.1.3");
     expect(typeof manifest["description"]).toBe("string");
     expect(manifest["hooks"]).toBe("./hooks/codex.json");
     expect(manifest["skills"]).toBe("./skills");
@@ -221,6 +222,27 @@ describe("openrig-core plugin — skills (HG-2.1 skill content per agentskills.i
 
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout).toBe("## Intent\nLoaded.\n");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["```", "~~~"])("keeps %s fenced examples inside the complete shipped Markdown address", (marker) => {
+    const root = fs.mkdtempSync(nodePath.join(fs.realpathSync("/tmp"), "openrig-loader-fence-"));
+    const script = nodePath.join(PLUGIN_ROOT, "skills", "loading-addressable-markdown", "scripts", "resolve-markdown.mjs");
+    const text = [
+      "## Instructions", "real before", `${marker}md`, `${marker}not-a-closer`,
+      "## Example Only", "fictional text", marker, "real after", "## Next", "followup", "",
+    ].join("\n");
+    try {
+      fs.writeFileSync(nodePath.join(root, "guide.md"), text);
+      const result = spawnSync(process.execPath, [script, "--root", root, "guide.md#instructions"], { encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe(resolveAddress(text, ["instructions"]).text);
+      expect(result.stdout).toContain("real after");
+      const next = spawnSync(process.execPath, [script, "--root", root, "guide.md#next"], { encoding: "utf8" });
+      expect(next.status, next.stderr).toBe(0);
+      expect(next.stdout).toBe(resolveAddress(text, ["next"]).text);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

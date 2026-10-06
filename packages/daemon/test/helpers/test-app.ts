@@ -2,7 +2,7 @@ import { mockShellCommand } from "./shell-command-mock.js";
 import { vi } from "vitest";
 import type Database from "better-sqlite3";
 import { createDb } from "../../src/db/connection.js";
-import { migrate } from "../../src/db/migrate.js";
+import { migrate, type Migration } from "../../src/db/migrate.js";
 import { coreSchema } from "../../src/db/migrations/001_core_schema.js";
 import { bindingsSessionsSchema } from "../../src/db/migrations/002_bindings_sessions.js";
 import { eventsSchema } from "../../src/db/migrations/003_events.js";
@@ -54,6 +54,9 @@ import { reviewReadIndexesSchema } from "../../src/db/migrations/083_review_read
 import { inventoryEventIndexesSchema } from "../../src/db/migrations/084_inventory_event_indexes.js";
 import { rigClaudeManagedBlockFileSchema } from "../../src/db/migrations/085_rig_claude_managed_block_file.js";
 import { nodePermissionSelectionsSchema } from "../../src/db/migrations/088_node_permission_selections.js";
+import { humanReplyToSchema } from "../../src/db/migrations/090_human_reply_to.js";
+import { humanQuestionsSchema } from "../../src/db/migrations/091_human_questions.js";
+import { nodeEffortSchema } from "../../src/db/migrations/092_node_effort.js";
 import { rigPolicySchema } from "../../src/db/migrations/041_rig_policy.js";
 import { rigArchiveSchema } from "../../src/db/migrations/042_rig_archive.js";
 import { resumeProvenanceSchema } from "../../src/db/migrations/043_resume_provenance.js";
@@ -111,12 +114,12 @@ import { PodBundleSourceResolver } from "../../src/domain/bundle-source-resolver
 import { NodeCmuxService } from "../../src/domain/node-cmux-service.js";
 import { AgentActivityStore } from "../../src/domain/agent-activity-store.js";
 import { SeatAttentionReconciler } from "../../src/domain/seat-attention-reconciler.js";
-import { createApp } from "../../src/server.js";
+import { createApp, createAppWithWebSocket } from "../../src/server.js";
 import fs from "node:fs";
 
 /** Seam B R6: the canonical full-fixture migration list, exported so file-backed
  *  DB-reopen tests migrate IDENTICALLY to createFullTestDb. */
-export const migrationsForFullTestDb = [coreSchema, bindingsSessionsSchema, eventsSchema, snapshotsSchema, checkpointsSchema, resumeMetadataSchema, nodeSpecFieldsSchema, packagesSchema, installJournalSchema, journalSeqSchema, bootstrapSchema, discoverySchema, discoveryFkFix, agentspecRebootSchema, startupContextSchema, chatMessagesSchema, podNamespaceSchema, contextUsageSchema, externalCliAttachmentSchema, rigServicesSchema, seatHandoverObservabilitySchema, nodeCodexConfigProfileSchema, nodePermissionPolicySchema, rigPermissionPolicySchema, nodePolicyProvenanceSchema, rigPolicyProvenanceSchema, streamItemsSchema, queueItemsSchema, queueTransitionsSchema, rigPolicySchema, rigArchiveSchema, resumeProvenanceSchema, resumeVerificationSchema, seatIdentityVerdictsSchema, selfHostIdentitySchema, occupantTenuresSchema, daemonLifecycleSchema, watchdogJobsSchema, occupantGenerationStampsSchema, projectionManifestSchema, watchdogTargetGenerationSchema, appliedLaunchObservationsSchema, appliedLaunchObservationInvalidationsSchema, threadSeatMapSchema, queueTransitionWakesSchema, nodeSessionSourceSchema, scopedOperatingPostureSchema, humanNotificationIntentSchema, reviewReadIndexesSchema, inventoryEventIndexesSchema, rigClaudeManagedBlockFileSchema, nodePermissionSelectionsSchema];
+export const migrationsForFullTestDb = [coreSchema, bindingsSessionsSchema, eventsSchema, snapshotsSchema, checkpointsSchema, resumeMetadataSchema, nodeSpecFieldsSchema, packagesSchema, installJournalSchema, journalSeqSchema, bootstrapSchema, discoverySchema, discoveryFkFix, agentspecRebootSchema, startupContextSchema, chatMessagesSchema, podNamespaceSchema, contextUsageSchema, externalCliAttachmentSchema, rigServicesSchema, seatHandoverObservabilitySchema, nodeCodexConfigProfileSchema, nodePermissionPolicySchema, rigPermissionPolicySchema, nodePolicyProvenanceSchema, rigPolicyProvenanceSchema, streamItemsSchema, queueItemsSchema, queueTransitionsSchema, rigPolicySchema, rigArchiveSchema, resumeProvenanceSchema, resumeVerificationSchema, seatIdentityVerdictsSchema, selfHostIdentitySchema, occupantTenuresSchema, daemonLifecycleSchema, watchdogJobsSchema, occupantGenerationStampsSchema, projectionManifestSchema, watchdogTargetGenerationSchema, appliedLaunchObservationsSchema, appliedLaunchObservationInvalidationsSchema, threadSeatMapSchema, queueTransitionWakesSchema, nodeSessionSourceSchema, scopedOperatingPostureSchema, humanNotificationIntentSchema, reviewReadIndexesSchema, inventoryEventIndexesSchema, rigClaudeManagedBlockFileSchema, nodePermissionSelectionsSchema, humanReplyToSchema, humanQuestionsSchema, nodeEffortSchema];
 
 /**
  * P24 — the DECLARED exclusions for {@link migrationsForFullTestDb}. That list is deliberately a
@@ -161,6 +164,7 @@ export const migrationsForFullTestDbExclusions: Record<string, string> = {
   "053_sessions_node_id_index.sql": "sessions perf index — index/perf suites add it inline; the core edge uses the base sessions table.",
   "054_queue_transitions_archive.sql": "queue-retention EXTENSION table — queue-retention suites migrate it inline.",
   "062_usage_samples.sql": "usage-metering subsystem table — usage suites migrate it inline.",
+  "094_usage_samples_latest_indexes.sql": "indexes usage_samples (062 is excluded); usage index tests migrate the canonical full schema.",
   "065_identity_provenance.sql": "P21 additive era-stamp column on 037_mission_control_actions (itself excluded) — mission-control / review-freeze / scope suites migrate it inline where they assert provenance.",
   "067_i3_identity_provenance.sql": "P21 additive era-stamp columns; it ALTERs inbox_entries + outbox_entries (both excluded from the core edge) alongside queue_transitions/stream_items, so it cannot ride the core-edge list — queue / inbox / outbox / stream suites asserting provenance migrate it inline.",
   "068_enforcer_decisions.sql": "W4 compaction-enforcement decision table — the suite was unbuilt and 071 drops the table forward; 068 stays as applied history. No consumer reads it, and 071 is IF EXISTS so it is a no-op on this fixture.",
@@ -172,13 +176,22 @@ export const migrationsForFullTestDbExclusions: Record<string, string> = {
   "079_workflow_lifecycle_parallel.sql": "workflow lifecycle identity, frontier, and failure tables — workflow suites migrate the canonical workflow schema inline; the shared core fixture does not read them.",
   "090_coordinator_authority.sql": "Coordinator authority and resource tables are exercised by canonical full-migration fixtures; the shared core fixture does not enter coordinator control routes.",
   "091_seat_dispatch_reservations.sql": "Rotation reservation and queue-admission triggers are exercised by canonical full-migration fixtures; the shared core fixture does not reserve or rotate seats.",
+  "094_historical_effect_dispositions.sql": "outbox effect-quarantine tables FK outbox_entries (027 is excluded here), so they cannot ride the core edge; the outbox-recovery suites migrate the canonical full list inline (helpers/coordinator-fixture seed).",
+  "095_coordinator_held_history.sql": "extends 094's quarantine tables (and outbox_entries, both excluded) with immutability triggers; coordinator-recovery suites migrate the canonical full list inline via helpers/coordinator-fixture seed.",
+  "096_outbox_origin_index.sql": "events direct-origin INDEX only (mirrors 047_events_node_type_index); it grants no table or column, and the index-perf consumers migrate the canonical full list inline.",
+  "097_live_projection_recovery_ledger.sql": "live-projection recovery receipt ledger — a plain audit table with no FKs; only the recovery suites read it and they migrate the canonical full list inline via helpers/coordinator-fixture seed.",
   "092_reserved_claim_release.sql": "Extends 091 with exact retiring-generation release records and queue trigger exception; canonical full-migration rotation fixtures exercise it, while this shared core fixture has no reservation tables.",
   "093_reservation_attempt_locks.sql": "Cross-process cutover/recovery exclusion references 091 reservations, absent from this shared core fixture; reservation suites use full migrations.",
 };
 
-export function createFullTestDb(): Database.Database {
+/**
+ * The shared core-edge fixture. `extra` is the documented inline-list seam (see the P24 note on
+ * migrationsForFullTestDbExclusions): a suite whose subsystem needs a migration the lean core edge
+ * omits migrates exactly that one here instead of widening the shared fixture for every consumer.
+ */
+export function createFullTestDb(extra: Migration[] = []): Database.Database {
   const db = createDb();
-  migrate(db, migrationsForFullTestDb);
+  migrate(db, [...migrationsForFullTestDb, ...extra]);
   return db;
 }
 
@@ -264,6 +277,10 @@ export function createTestApp(
     /** Wire the ready runtime adapters into the routes' `runtimeAdapters`, as startup does, so a
      *  route launch can start harnesses. Off by default: existing tests keep no route adapters. */
     wireRuntimeAdapters?: boolean;
+    /** Extra or overriding createApp deps (browser-boundary route tests inject inert spies). */
+    appDeps?: Partial<import("../../src/server.js").AppDeps>;
+    /** Build through createAppWithWebSocket (production upgrade path) and return injectWebSocket. */
+    withWebSocket?: boolean;
     /**
      * Agent Starter v1 vertical M2 R2: optionally expose the in-test
      * StartupOrchestrator + PodRigInstantiator so callers can spy on
@@ -402,7 +419,7 @@ export function createTestApp(
   };
   const upRouter = new UpCommandRouter({ fsOps: upRouterFs });
 
-  const app = createApp({
+  const testAppDeps = {
     rigRepo, sessionRegistry, eventBus, nodeLauncher, startupOrchestrator, tmuxAdapter: tmux, cmuxAdapter: cmux,
     snapshotCapture, snapshotRepo, restoreOrchestrator,
     rigSpecExporter, rigSpecPreflight, rigInstantiator,
@@ -432,10 +449,19 @@ export function createTestApp(
     // across the suite). Tests for the observer itself construct it directly
     // and pass it here explicitly.
     permissionDriftObserver: opts?.permissionDriftObserver ?? { diagnose: () => null },
-    runtimeAdapters: opts?.wireRuntimeAdapters ? adapters : undefined,
-  });
+    // Caller-supplied adapters always reach route handlers; the always-ready
+    // instantiator stubs only when explicitly wired, since they would make
+    // restore routes report resumes.
+    runtimeAdapters: opts?.wireRuntimeAdapters ? adapters : opts?.adapters as Record<string, RuntimeAdapter> | undefined,
+    ...opts?.appDeps,
+  };
+  // withWebSocket: the production createAppWithWebSocket path, returning its injectWebSocket.
+  const built = opts?.withWebSocket
+    ? createAppWithWebSocket(testAppDeps as never)
+    : { app: createApp(testAppDeps as never), injectWebSocket: undefined };
+  const app = built.app;
   return {
-    app, rigRepo, sessionRegistry, eventBus, nodeLauncher, snapshotRepo,
+    app, injectWebSocket: built.injectWebSocket, rigRepo, sessionRegistry, eventBus, nodeLauncher, snapshotRepo,
     snapshotCapture, checkpointStore, restoreOrchestrator,
     rigSpecExporter, rigSpecPreflight, rigInstantiator,
     packageRepo, installRepo, installEngine, installVerifier,

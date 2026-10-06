@@ -30,7 +30,7 @@ async function defaultPromptYesNo(question: string): Promise<boolean> {
 // inside the daemon install root without importing the daemon package.
 function isPathInsideRoot(candidate: string, root: string): boolean {
   const relative = nodePath.relative(nodePath.resolve(root), nodePath.resolve(candidate));
-  return relative === "" || (!relative.startsWith("..") && !nodePath.isAbsolute(relative));
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${nodePath.sep}`) && !nodePath.isAbsolute(relative));
 }
 
 // OPR.0.4.4.11 (arch return R11-2) — pre-dispatch detection of a topology
@@ -126,7 +126,7 @@ Examples:
         } else if (result.ok) {
           console.log(JSON.stringify(result.data, null, 2));
         } else {
-          console.error(`Error on host ${opts.host}: ${result.error}`);
+          for (const line of formatRemoteUpFailure(opts.host, result)) console.error(line);
           process.exitCode = 1;
         }
         return;
@@ -193,8 +193,6 @@ Examples:
             db: resolvedConfig?.db.path,
             transcriptsEnabled: resolvedConfig?.transcripts.enabled,
             transcriptsPath: resolvedConfig?.transcripts.path,
-            transcriptsLines: resolvedConfig?.transcripts.lines,
-            transcriptsPollIntervalSeconds: resolvedConfig?.transcripts.pollIntervalSeconds,
             workspaceRoot: resolvedConfig?.workspace.root,
             contextRoot: resolvedConfig?.context.root,
             skillsRoot: resolvedConfig?.skills.root,
@@ -451,6 +449,10 @@ Examples:
           for (const node of nodes ?? []) {
             console.error(`  ${node.logicalId}${node.sessionName ? ` (${node.sessionName})` : ""}: ${node.reason}`);
           }
+          // #141: the rig is kept on this path, so its warnings (e.g. the archived earlier generation) still apply.
+          for (const w of (res.data["warnings"] as string[]) ?? []) {
+            console.error(`  warning: ${w}`);
+          }
         } else if (code === "cycle_error") {
           console.error("Cycle detected in rig topology. Check edge definitions for circular dependencies.");
         } else if (code === "validation_failed") {
@@ -464,11 +466,12 @@ Examples:
         } else if (code === "invalid_topology_manifest") {
           const errors = (res.data["errors"] as string[]) ?? [];
           console.error(`Topology manifest invalid:\n${errors.map((e) => `  ${e}`).join("\n")}\nFix: the manifest key set is CLOSED — rigs[]{source, host?} plus optional concurrency.`);
-        } else if (code === "rig_name_running") {
+        } else if (code === "rig_name_running" || code === "generation_unconfirmed") {
           // S5b final-fix F1 (OPR.0.5.4.11): the guard's teaching refusal is
           // self-describing (running rig identity, what was checked,
           // nothing-created, alternatives) — render it verbatim, never the
-          // generic unknown-error/validate-your-spec fallback.
+          // generic unknown-error/validate-your-spec fallback. #141's
+          // generation_unconfirmed refusal is self-describing the same way.
           const teaching = String(res.data["error"] ?? ((res.data["errors"] as string[]) ?? [])[0] ?? "A rig with this name is already running.");
           console.error(teaching);
         } else {
@@ -637,6 +640,77 @@ Examples:
     });
 
   return cmd;
+}
+
+/** Render a failed remote `rig up` response without stringifying an unknown
+ *  body as `[object Object]`. JSON mode keeps the complete RemoteOpResult;
+ *  human mode shows known daemon guidance and safely falls back for older or
+ *  partial error bodies. */
+export function formatRemoteUpFailure(
+  hostId: string,
+  result: { error?: string; data?: unknown },
+): string[] {
+  const lines = [`Error on host ${hostId}${result.error ? `: ${result.error}` : ""}`];
+  const payload = result.data !== null && typeof result.data === "object" && !Array.isArray(result.data)
+    ? result.data as Record<string, unknown>
+    : undefined;
+  const error = payload?.["error"];
+  let detailAdded = false;
+
+  if (typeof error === "string" && error.trim()) {
+    lines.push(error.trim());
+    detailAdded = true;
+  } else if (error !== null && typeof error === "object" && !Array.isArray(error)) {
+    const body = error as Record<string, unknown>;
+    const fact = typeof body["fact"] === "string" ? body["fact"] : undefined;
+    const consequence = typeof body["consequence"] === "string" ? body["consequence"] : undefined;
+    const action = typeof body["action"] === "string" ? body["action"] : undefined;
+    const message = typeof body["message"] === "string" ? body["message"].trim() : undefined;
+    if (fact && consequence && action) {
+      lines.push(...formatThreePart({ fact, consequence, action }));
+      detailAdded = true;
+    } else {
+      if (fact) lines.push(`Error: ${fact}`);
+      if (consequence) lines.push(consequence);
+      if (action) lines.push(action);
+      if (message) lines.push(message);
+      detailAdded = Boolean(fact || consequence || action || message);
+    }
+  }
+
+  if (!detailAdded && typeof payload?.["message"] === "string" && payload["message"].trim()) {
+    lines.push(payload["message"].trim());
+    detailAdded = true;
+  }
+  if (!detailAdded && Array.isArray(payload?.["errors"])) {
+    const errors = payload["errors"].filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0);
+    if (errors.length > 0) {
+      lines.push(...errors.map((entry) => `  ${entry.trim()}`));
+      detailAdded = true;
+    }
+  }
+  if (typeof payload?.["code"] === "string" && payload["code"].trim()) {
+    lines.push(`Code: ${payload["code"].trim()}`);
+  }
+  for (const node of Array.isArray(payload?.["attentionNodes"]) ? payload["attentionNodes"] : []) {
+    if (node === null || typeof node !== "object" || Array.isArray(node)) continue;
+    const entry = node as Record<string, unknown>;
+    if (typeof entry["logicalId"] !== "string" || typeof entry["reason"] !== "string") continue;
+    const session = typeof entry["sessionName"] === "string" ? ` (${entry["sessionName"]})` : "";
+    lines.push(`  ${entry["logicalId"]}${session}: ${entry["reason"]}`);
+    detailAdded = true;
+  }
+  if (Array.isArray(payload?.["warnings"])) {
+    for (const warning of payload["warnings"]) {
+      if (typeof warning === "string" && warning.trim()) lines.push(`  warning: ${warning.trim()}`);
+    }
+  }
+  if (!detailAdded && typeof result.data === "string" && result.data.trim()) {
+    lines.push(result.data.trim());
+    detailAdded = true;
+  }
+  if (!detailAdded) lines.push("Remote daemon did not return a recognized error message.");
+  return lines;
 }
 
 interface RestoreBlocker {

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomBytes } from "node:crypto";
 import { Command } from "commander";
 import { DaemonClient, DaemonConnectionError, DaemonTimeoutError, DaemonResponseError, terminalAuthHeaders } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
@@ -39,6 +40,8 @@ export interface VerifiedDeliveryResult {
   connectorAccepted: boolean | null;
   /** A connector receipt can never prove that a person read the message. */
   humanReadership: "unknown";
+  /** #96: present for a --reply-to update once posted; false = it posted top-level instead. */
+  threaded?: boolean;
   detail?: string;
   nextAction: string | null;
 }
@@ -59,7 +62,17 @@ export async function waitForDeliveryOutcome(
       if (response.status !== 200) throw new Error(`receipt lookup returned HTTP ${response.status}`);
       const outcome = response.data.deliveryOutcome;
       if (outcome === "posted") {
-        return { outcome, connectorAccepted: true, humanReadership: "unknown", nextAction: null };
+        // #96: a --reply-to update reports whether it joined the earlier item's thread.
+        const replyTo = typeof response.data.replyTo === "string" ? response.data.replyTo : null;
+        const fallback = typeof response.data.replyToFallback === "string" ? response.data.replyToFallback : null;
+        return {
+          outcome,
+          connectorAccepted: true,
+          humanReadership: "unknown",
+          ...(replyTo ? { threaded: fallback === null } : {}),
+          ...(replyTo && fallback ? { detail: `posted as a new top-level message, not in ${replyTo}'s thread: ${fallback}` } : {}),
+          nextAction: null,
+        };
       }
       if (outcome === "transport-failed" || outcome === "never-posted") {
         return {
@@ -137,12 +150,44 @@ async function withClient<T>(
 }
 
 function printResult(json: boolean, body: unknown, status: number): void {
+  if (status >= 400 && body && typeof body === "object"
+    && (body as { error?: unknown }).error === "remote_queue_write_failed"
+    && (body as { outcome?: unknown }).outcome === "indeterminate") {
+    console.error("The write outcome is INDETERMINATE if the request may have reached a daemon — reconcile by ID before any retry.");
+  }
   if (json) {
     console.log(JSON.stringify(body));
   } else {
     console.log(JSON.stringify(body, null, 2));
   }
   if (status >= 400) process.exitCode = status >= 500 ? 2 : 1;
+}
+
+// Recovery belongs to the selected daemon's reply; never infer a host from an ID.
+async function printQueueItemResult(
+  client: DaemonClient,
+  qitemId: string,
+  json: boolean,
+  body: unknown,
+  status: number,
+): Promise<void> {
+  if (status >= 400 && body && typeof body === "object"
+    && (body as { error?: unknown }).error === "qitem_not_found") {
+    let selfHostId: string | undefined;
+    try {
+      const health = await client.get<{ selfHostId?: unknown }>("/healthz", { timeoutMs: 1_000 });
+      if (health.status === 200 && typeof health.data?.selfHostId === "string" && health.data.selfHostId.trim()) {
+        selfHostId = health.data.selfHostId;
+      }
+    } catch { /* Identity enrichment must not replace the original queue failure. */ }
+    const daemon = selfHostId ? `daemon ${JSON.stringify(selfHostId)}` : "the selected daemon (host ID unavailable)";
+    body = {
+      ...body,
+      hint: `Queue item ${JSON.stringify(qitemId)} was not found on ${daemon}.\n`
+        + `If it came from another host, run rig host list; replace <daemon-url> with its registered daemon URL and run: OPENRIG_URL='<daemon-url>' rig queue show ${shellQuote(qitemId)} --full --json`,
+    };
+  }
+  printResult(json, body, status);
 }
 
 // OPR.0.4.3.03 — `rig queue show` body preview.
@@ -397,7 +442,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
   cmd
     .command("create")
     .description("Create a new qitem")
-    .option("--source <session>", "(deprecated, ignored) the source is derived from the seat env (X-OpenRig-Session); P21 I3 made the create route derive it from the transport header")
+    .option("--source <session>", "Declared source outside a managed seat (recorded as claimed:v1); the managed seat env takes precedence")
     .requiredOption("--destination <session>", "Destination session (the seat that owns the work)")
     .option("--body <text>", "Qitem body inline (use - to read from stdin; mutually exclusive with --body-file)")
     .option("--body-file <path>", "Read qitem body from a file path (use - for stdin; mutually exclusive with --body). Kills the backtick-shell-corruption class for multiline bodies.")
@@ -409,11 +454,13 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--tier <tier>", "Tier (e.g. fast, routine, deep, critical) — drives SLA")
     .option("--tags <tags>", "Comma-separated tags (composes with --mission and --slice)")
     .option("--expires-at <iso>", "ISO timestamp at which the qitem expires")
-    .option("--id <qitemId>", "Idempotent qitem_id (skip if not provided)")
+    .option("--id <qitemId>", "Retry identity: reuse for the same create after an unknown outcome; otherwise generated and printed before sending")
     .option("--target-repo <name>", "PL-007: typed repo scope (must match a repo in the source rig's RigSpec.workspace.repos[])")
     .option("--summary <text>", "Short human-readable subject, shown in the needs-you view. For a human destination, --body-file is the complete decision brief or update; keep technical continuation in the owning agent row and evidence.")
     .option("--human-intent <intent>", "decision (default) or update: a quiet informational delivery, never an approval request")
     .option("--human-detail-file <path>", "One explicitly authored supplemental thread reply; keep the complete action/options in --body-file")
+    .option("--reply-to <qitemId>", "Post this update into an earlier qitem's Slack thread (requires --human-intent update; posts as a new top-level message instead if that thread can't be used, e.g. it is missing or still has an open human decision; --verify reports why)")
+    .option("--human-questions-file <path>", "#193: JSON array of 1-4 questions for a decision, each {id, question, options: [{id, label, recommended?}]} with 2-4 options; Slack shows them as buttons")
     .option("--evidence-ref <path>", "OPR.0.4.4.19 FR-5: pointer to the durable artifact a human judges (e.g. a PROOF.md path). Required by the daemon when the item is human-routed; optional otherwise.")
     .option("--host <id>", QUEUE_HOST_OPTION_HELP)
     .option("--no-nudge", "Suppress the default destination nudge (cold-queue)")
@@ -438,6 +485,8 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       targetRepo?: string;
       humanIntent?: string;
       humanDetailFile?: string;
+      replyTo?: string;
+      humanQuestionsFile?: string;
       summary?: string;
       evidenceRef?: string;
       host?: string;
@@ -472,6 +521,35 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           return;
         }
       }
+      // #96: a thread root routes replies to the item that opened it, so only an update
+      // (which never takes a reply) may join another item's thread. Fail before the daemon.
+      if (opts.replyTo !== undefined && opts.humanIntent !== "update") {
+        const message = "reply_to_requires_update: --reply-to is accepted only with --human-intent update; a decision keeps its own thread so its reply stays unambiguous.";
+        if (opts.json) console.error(JSON.stringify({ error: "reply_to_requires_update", message }));
+        else console.error(message);
+        process.exitCode = 1;
+        return;
+      }
+      // #193 — read and parse the questions locally too; the daemon validates their shape.
+      let humanQuestions: unknown;
+      if (opts.humanQuestionsFile) {
+        let text: string;
+        try {
+          text = await resolveQueueBody({ bodyFile: opts.humanQuestionsFile });
+        } catch (err) {
+          emitBodyResolveError(err as Error & { fact?: string; consequence?: string; action?: string }, opts.json ?? false);
+          return;
+        }
+        try {
+          humanQuestions = JSON.parse(text);
+        } catch (err) {
+          emitBodyResolveError(Object.assign(new Error(`--human-questions-file ${opts.humanQuestionsFile} is not valid JSON: ${(err as Error).message}`), {
+            consequence: "The queue command did not run; the daemon was not contacted.",
+            action: "Pass a JSON array of questions, each {id, question, options: [{id, label, recommended?}]}.",
+          }), opts.json ?? false);
+          return;
+        }
+      }
       // OPR.0.4.1.18 (FR-7, warn-then-require grace): a summary SHOULD accompany
       // every new qitem (it feeds the Story node + helps humans skim). Warn — to
       // stderr so --json stdout stays clean — but do NOT hard-break existing
@@ -481,9 +559,11 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           "warning: rig queue create called without --summary. Pass --summary <text> to set the new qitem's short human-readable summary; without it, the Story node falls back to a bounded body preview. A good summary is 1-2 plain sentences a human skims in the needs-you view — what the work is and why it needs this seat, not the agent-speak --body. Proceeding (pre-18 callers exempt).\n"
         );
       }
-      // P21 I3 reconcile: the source is DERIVED from the seat env (X-OpenRig-Session) — --source
-      // deprecated + ignored, no body sourceSession. Verify the env or the daemon returns 400 actor_required (no seat identity to record; P18 retired the 401 refusal).
-      if (!resolveCurrentSession(undefined, "source")) return;
+      // A managed seat keeps transport-derived identity; an external caller can
+      // name the existing claimed:v1 body actor without forging a transport header.
+      const managedSource = readOpenRigEnv("OPENRIG_SESSION_NAME", "RIGGED_SESSION_NAME");
+      const source = resolveCurrentSession(managedSource ?? opts.source, "source");
+      if (!source) return;
       const deps = getDeps();
       // OPR.0.3.2.21.FR-4(b) — first-class --mission / --slice flags
       // translate to canonical mission:<id> / slice:<id> tags. Composes
@@ -519,13 +599,30 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
             return;
           }
         }
+        // Allocate before the write: a timeout/abort cannot tell us whether the
+        // daemon committed. The existing primary-key absorb makes a retry with
+        // THIS id safe; a negative read is not permission to mint another one.
+        // Keep timestamp-based fallback consumers, with 64 random bits so an
+        // accidental collision is not mistaken for an intentional retry.
+        const qitemId = opts.id ?? `qitem-${new Date().toISOString().replace(/\D/g, "").slice(0, 14)}-${randomBytes(8).toString("hex")}`;
+        const show = `rig queue show ${shellQuote(qitemId)} --full --json`;
+        const reconcile = hostResolved.hostId && hostResolved.hostId !== "local"
+          ? `For destination host ${shellQuote(hostResolved.hostId)}, replace <destination-daemon-url> with its registered daemon URL and run: OPENRIG_URL='<destination-daemon-url>' ${show}.`
+          : `At the same endpoint and OPENRIG_HOME, run: ${show}.`;
+        const recovery = `${reconcile} If retrying, repeat the same create with --id ${shellQuote(qitemId)} and unchanged source, destination, body and options. A missing row does not rule out a pending commit; retrying without this ID creates new work.`;
+        // stderr survives an interrupted wait without adding a second JSON
+        // document to stdout. This is a request identity, NOT a commit receipt.
+        console.error(`Queue create request ID: ${qitemId} (not proof of persistence). ${recovery}`);
         const res = await client.post<Record<string, unknown>>("/api/queue/create", {
           ...(opts.dispatchFile ? {dispatch: JSON.parse(fs.readFileSync(opts.dispatchFile,"utf8"))} : {}),
-          qitemId: opts.id,
+          ...(managedSource === undefined ? { sourceSession: source } : {}),
+          qitemId,
           destinationSession: hostResolved.destination,
           body: resolvedBody,
           humanIntent: opts.humanIntent,
           humanDetail: opts.humanDetailFile ? await resolveQueueBody({ bodyFile: opts.humanDetailFile }) : undefined,
+          replyTo: opts.replyTo,
+          humanQuestions,
           summary: opts.summary,
           evidenceRef: opts.evidenceRef,
           priority: opts.priority,
@@ -537,7 +634,27 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           // OPR.0.4.6.MH3 FR-1: the out-of-band host envelope (omitted for
           // plain local writes — the local path stays byte-identical).
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
+        }).catch((error: unknown) => {
+          // A pre-header disconnect can follow a committed create. Preserve the
+          // typed error, but do not let the shared renderer assert nondelivery.
+          if (error instanceof DaemonConnectionError) error.writeOutcome = "unknown";
+          if (error instanceof DaemonConnectionError || error instanceof DaemonResponseError) {
+            // Keep the shared typed error/exit path, including --json, while
+            // supplying the identity missing from an unreadable/late response.
+            error.message += ` ${recovery}`;
+          }
+          throw error;
         });
+        if (res.status >= 400 && res.data?.outcome === "indeterminate") {
+          // Forwarded writes may return a structured unknown outcome rather
+          // than throw. Preserve that failure and expose the same recovery ID.
+          printResult(opts.json ?? false, { ...res.data, qitemId, recovery }, res.status);
+          return;
+        }
+        const createWarning = res.data?.createWarning as { code?: unknown; message?: unknown } | undefined;
+        if (res.status < 400 && createWarning?.code === "qitem_body_not_saved" && typeof createWarning.message === "string") {
+          console.error(`Warning: ${createWarning.message}`);
+        }
         if (opts.verify && res.status < 400) {
           const created = res.data;
           const qitemId = typeof created.qitemId === "string" ? created.qitemId : null;
@@ -569,7 +686,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/claim`, {});
-        printResult(opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });
     });
 
@@ -588,7 +705,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
         const res = await client.post<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/unclaim`, {
           reason: opts.reason,
         });
-        printResult(opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });
     });
 
@@ -639,7 +756,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
           evidenceRef: opts.evidenceRef,
           transitionNote: opts.note,
         });
-        printResult(opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });
     });
 
@@ -695,7 +812,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           wakeAfterSeconds: opts.wakeAfter,
           transitionNote: opts.continuation ? `continuation: ${opts.continuation}` : (opts.note ?? `parked on ${opts.on}`),
         });
-        printResult(opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });
     });
 
@@ -738,7 +855,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           },
           bearer ? { headers: { Authorization: `Bearer ${bearer}` } } : undefined,
         );
-        printResult(opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });
     });
 
@@ -834,7 +951,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
         });
-        printResult(opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });
     });
 
@@ -930,7 +1047,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           nudge: opts.nudge,
           ...(hostResolved.hostId !== undefined ? { hostId: hostResolved.hostId } : {}),
         });
-        printResult(opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });
     });
 
@@ -967,7 +1084,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           fallbackDestination: opts.destination,
           reason: opts.reason,
         });
-        printResult(opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });
     });
 
@@ -1001,7 +1118,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
         // passthrough on error responses / non-object payloads, where there is
         // no string body to preview.
         if (opts.full || res.status >= 400 || !isRecordWithStringBody(item)) {
-          printResult(json, item, res.status);
+          await printQueueItemResult(client, qitemId, json, item, res.status);
           return;
         }
         const { preview, bodyBytes, bodyTruncated } = previewBody(item.body);
@@ -1025,7 +1142,7 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
       const deps = getDeps();
       await withClient(deps, async (client) => {
         const res = await client.get<unknown>(`/api/queue/${encodeURIComponent(qitemId)}/transitions`);
-        printResult(opts.json ?? false, res.data, res.status);
+        await printQueueItemResult(client, qitemId, opts.json ?? false, res.data, res.status);
       });
     });
 

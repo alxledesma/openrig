@@ -1,3 +1,5 @@
+import type { StartupSubmissionDiagnostic } from "./startup-submission-evidence.js";
+
 export interface Rig {
   id: string;
   name: string;
@@ -31,6 +33,7 @@ export interface Node {
   role: string | null;
   runtime: string | null;
   model: string | null;
+  effort?: string | null;
   codexConfigProfile?: string | null;
   /** OPR.0.4.8.3 Seam B: attached permission_policy REF (builtin:<name> or spec-relative custom
    *  path), or null when none is attached (= the floor). */
@@ -140,8 +143,8 @@ export type RigEvent =
   | { type: "session.cleaned"; rigId: string; nodeId: string; sessionName: string | null; reason: string; operator: string | null; actions: { sessionsExited: string[]; bindingCleared: boolean } }
   | { type: "node.launched"; rigId: string; nodeId: string; logicalId: string; sessionName: string }
   | { type: "topology.roster_recorded"; rigId: string; intendedNodeIds: string[]; source: "materialized_topology" }
-  | { type: "seat.fresh_launched"; rigId: string; nodeId: string; logicalId: string; sessionName: string; sessionId: string; supersededSessionIds: string[]; retiringGeneration: string | null; newGeneration: string; nativeSessionId: string | null; nativeSessionIdReason?: string; model: string | null; startupPolicyHash: string; reason: string; operator: string | null; status: "ready" | "attention_required" }
-  | { type: "seat.fresh_launch_failed"; rigId: string; nodeId: string; logicalId: string; sessionName: string; sessionId: string; supersededSessionIds: string[]; retiringGeneration: string | null; newGeneration: string | null; model: string | null; startupPolicyHash: string; reason: string; operator: string | null; errors: string[] }
+  | { type: "seat.fresh_launched"; rigId: string; nodeId: string; logicalId: string; sessionName: string; sessionId: string; supersededSessionIds: string[]; retiringGeneration: string | null; newGeneration: string; nativeSessionId: string | null; nativeSessionIdReason?: string; model: string | null; effort?: string | null; startupPolicyHash: string; reason: string; operator: string | null; status: "ready" | "attention_required" }
+  | { type: "seat.fresh_launch_failed"; rigId: string; nodeId: string; logicalId: string; sessionName: string; sessionId: string; supersededSessionIds: string[]; retiringGeneration: string | null; newGeneration: string | null; model: string | null; effort?: string | null; startupPolicyHash: string; reason: string; operator: string | null; errors: string[] }
   | { type: "snapshot.created"; rigId: string; snapshotId: string; kind: string }
   | { type: "restore.started"; rigId: string; snapshotId: string; snapshotSelection?: RestoreSnapshotSelection; intendedRoster?: Array<{ nodeId: string; logicalId: string }>; excludedNodes?: RestoreExcludedNode[] }
   | { type: "restore.completed"; rigId: string; snapshotId: string; result: RestoreResult }
@@ -178,7 +181,7 @@ export type RigEvent =
   // token value is intentionally omitted; this is observability, NOT a
   // secret-boundary control — resume tokens are not treated as secret per the
   // 2026-07-02 founder ruling).
-  | { type: "session.resume_token_captured"; rigId: string; nodeId: string; sessionName: string; sessionId: string; runtime: string; outcome: "captured" | "preserved" | "skipped"; resumeType?: string; provenance?: "adoption"; reason?: "missing_sidecar" | "parse_error" | "probe_timeout" | "invalid_token" | "higher_rank_present"; redacted: true }
+  | { type: "session.resume_token_captured"; rigId: string; nodeId: string; sessionName: string; sessionId: string; runtime: string; outcome: "captured" | "preserved" | "skipped"; resumeType?: string; provenance?: "adoption"; reason?: "missing_sidecar" | "parse_error" | "probe_timeout" | "invalid_token" | "stale_sidecar" | "higher_rank_present"; redacted: true }
   | { type: "seat.attention_cleared"; rigId: string; nodeId: string; sessionName: string; from: string; to: "ready"; clearedBy: "evidence" | "operator_attestation"; evidence?: { kind: string; state?: string; reason?: string }; reason?: string; previousError: string | null }
   | { type: "rig.imported"; rigId: string; specName: string; specVersion: string }
   // Package events (cross-rig, no rigId)
@@ -219,8 +222,8 @@ export type RigEvent =
   | { type: "pod.created"; rigId: string; podId: string; namespace: string; label: string }
   | { type: "pod.deleted"; rigId: string; podId: string }
   | { type: "node.startup_pending"; rigId: string; nodeId: string; startupProof?: StartupProofSelection }
-  | { type: "node.startup_ready"; rigId: string; nodeId: string }
-  | { type: "node.startup_failed"; rigId: string; nodeId: string; error: string; sessionId?: string; freshContextPending?: boolean }
+  | { type: "node.startup_ready"; rigId: string; nodeId: string; submission?: { status: "unverified" | "staged"; reasons: string[]; warning?: string; diagnostics?: StartupSubmissionDiagnostic[] } }
+  | { type: "node.startup_failed"; rigId: string; nodeId: string; error: string; sessionId?: string; freshContextPending?: boolean; submissionDiagnostics?: StartupSubmissionDiagnostic[] }
   // OPR.0.4.3.06 — startup proof (challenge-verified orientation). Append-only.
   // `node.startup_challenged` freezes this launch's challenge ground truth
   // (challengeId + contractHash; the expected answer is recomputed, never
@@ -308,12 +311,9 @@ export type RigEvent =
   // file disappears + audit-log entry. Clean Library + traceable.").
   | { type: "workflow_spec.removed"; sourcePath: string; specId: string | null; specName: string | null; specVersion: string | null; reason: "file_disappeared" }
   // PL-005 Phase A: Mission Control / Queue Observability events.
-  // Action audit + cross-CLI-version drift detection. view_refreshed
-  // is emitted when a Mission Control view is recomputed (SSE
-  // consumers can choose whether to re-fetch).
+  // Action audit + cross-CLI-version drift detection.
   | { type: "mission_control.action_executed"; actionId: string; actionVerb: string; qitemId: string | null; actorSession: string }
   | { type: "mission_control.cli_drift_detected"; rigName: string; missingField: string; observedAt: string }
-  | { type: "mission_control.view_refreshed"; viewName: string; cause: string }
   // PL-005 Phase B: notification dispatch events. Best-effort delivery;
   // failure does NOT interrupt the underlying action being notified about.
   | { type: "mission_control.notification_sent"; mechanism: string; target: string; qitemId: string | null; sentAt: string }
@@ -851,6 +851,8 @@ export interface ImportSpec {
 }
 
 export interface StartupFile {
+  /** Explicit per-seat role orientation; never inferred from the filename. */
+  orientation?: "role";
   /** Startup artifacts are files; context packs are composed separately. */
   kind?: "file";
   path: string;
@@ -917,7 +919,7 @@ export interface AgentResources {
 
 export interface ProfileSpec {
   summary?: string;
-  preferences?: { runtime?: string; model?: string };
+  preferences?: { runtime?: string; model?: string; effort?: string };
   startup?: StartupBlock;
   lifecycle?: LifecycleDefaults;
   uses: {
@@ -947,6 +949,7 @@ export interface AgentSpec {
   defaults?: {
     runtime?: string;
     model?: string;
+    effort?: string;
     lifecycle?: LifecycleDefaults;
   };
   startup: StartupBlock;
@@ -970,6 +973,7 @@ export interface LegacyRigSpecNode {
   runtime: string;
   role?: string;
   model?: string;
+  effort?: string;
   cwd?: string;
   surfaceHint?: string;
   workspace?: string;
@@ -1076,6 +1080,7 @@ export interface RigSpecPodMember {
   runtime: string;
   codexConfigProfile?: string;
   model?: string;
+  effort?: string;
   /**
    * OPR.0.4.6.FAC1: optional seat-side role declaration (writes the
    * existing `nodes.role` column via createMemberNode → addNode). The
@@ -1289,6 +1294,9 @@ export type InstantiateOutcome =
   // teaches the running rig's identity and the supported alternatives.
   // (Additive variant per orch-lead territory ruling on row r054-s5b-build.)
   | { ok: false; code: "rig_name_running"; message: string; runningRig: { id: string; name: string; runningSessionCount: number } }
+  // #141: an unarchived same-name rig exists but could not be confirmed stopped, so the YAML import
+  // neither archives it nor creates another same-name generation beside it.
+  | { ok: false; code: "generation_unconfirmed"; message: string }
   // OPR.0.3.2.CT (conveyor-trust-minimal-fix):
   // When every launched node reaches a recoverable attention_required
   // state (e.g., workspace-trust prompt), do NOT tear the rig down.
@@ -1302,6 +1310,8 @@ export type InstantiateOutcome =
       message: string;
       rigId: string;
       attentionNodes: AttentionNode[];
+      /** #141: notices that must reach the user even though the import stopped for attention. */
+      warnings?: string[];
     };
 
 export interface AttentionNode {

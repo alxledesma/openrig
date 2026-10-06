@@ -2,9 +2,11 @@ import { Command } from "commander";
 import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, accessSync, constants, mkdirSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseDocument } from "yaml";
 import { runDoctorChecks, type DoctorDeps } from "./doctor.js";
 import { resolveDaemonPath } from "../daemon-lifecycle.js";
+import { formatDaemonHostForUrl } from "../client.js";
 import { ConfigStore } from "../config-store.js";
 import {
   CMUX_SETTINGS_DISCLOSURE_PATH,
@@ -14,6 +16,8 @@ import {
   upsertCmuxSocketControlMode,
 } from "../cmux-config.js";
 import { buildTmuxControlFailure, probeTmuxControl } from "../tmux-health.js";
+import { parse as parseToml } from "smol-toml";
+import { resolveCodexHome } from "../lib/codex-auth.js";
 
 export interface SetupStep {
   id: string;
@@ -56,6 +60,43 @@ export interface SetupDeps {
   exists: (path: string) => boolean;
   mkdirp?: (path: string) => void;
   platform?: NodeJS.Platform;
+  /** Environment for CODEX_HOME and provider credential checks (default process.env). */
+  env?: NodeJS.ProcessEnv;
+}
+
+/** Issue #194 — how the Codex provider selected in `$CODEX_HOME/config.toml`
+ *  authenticates. Only an explicit provider entry with
+ *  `requires_openai_auth = false` and an `env_key` uses its credential
+ *  variable; every unresolved case keeps the OpenAI login check. Other Codex
+ *  config layers are not resolved here. The daemon's kernel probe
+ *  (`selectCodexProviderAuth` in kernel-boot.ts) carries the same rule. */
+export type CodexProviderAuth =
+  | { kind: "openai-login"; unresolved?: string }
+  | { kind: "env-key"; providerId: string; envKey: string };
+
+export function selectCodexProviderAuth(configToml: string | null): CodexProviderAuth {
+  if (configToml === null) return { kind: "openai-login" };
+  let config: Record<string, unknown>;
+  try {
+    config = parseToml(configToml) as Record<string, unknown>;
+  } catch {
+    return { kind: "openai-login", unresolved: "config.toml could not be parsed" };
+  }
+  if (Object.hasOwn(config, "profile")) {
+    return { kind: "openai-login", unresolved: "config.toml selects a legacy profile, which is not resolved here" };
+  }
+  const providerId = config["model_provider"];
+  const providers = config["model_providers"];
+  if (typeof providerId !== "string" || !providers || typeof providers !== "object" || !Object.hasOwn(providers, providerId)) {
+    return { kind: "openai-login" };
+  }
+  const entry = (providers as Record<string, unknown>)[providerId];
+  if (!entry || typeof entry !== "object") return { kind: "openai-login" };
+  const { requires_openai_auth: requiresOpenAiAuth, env_key: envKey } = entry as Record<string, unknown>;
+  if (requiresOpenAiAuth !== false || typeof envKey !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(envKey)) {
+    return { kind: "openai-login" };
+  }
+  return { kind: "env-key", providerId, envKey };
 }
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
@@ -81,8 +122,8 @@ const BASE_RUNTIME_CONFIG_DISCLOSURE: RuntimeConfigDisclosure[] = [
   {
     scope: "global",
     runtime: "claude-code",
-    path: "~/.claude.json",
-    purpose: "Pre-trust managed workspaces and mark Claude onboarding complete.",
+    path: "~/.claude.json or <CLAUDE_CONFIG_DIR>/.claude.json",
+    purpose: "Pre-trust managed workspaces and mark Claude onboarding complete. Explicit permission modes use the launch-selected HOME/config; classic startup uses the daemon home.",
   },
   {
     scope: "project",
@@ -100,7 +141,7 @@ const BASE_RUNTIME_CONFIG_DISCLOSURE: RuntimeConfigDisclosure[] = [
   {
     scope: "global",
     runtime: "codex",
-    path: "~/.codex/config.toml",
+    path: "$CODEX_HOME/config.toml (default: ~/.codex/config.toml)",
     purpose: "Pre-trust managed workspaces and apply selected Codex config runtime-resource fragments.",
   },
 ];
@@ -202,14 +243,14 @@ async function probeDaemonCmuxStatus(doctorDeps?: DoctorDeps): Promise<"availabl
   const port = config.daemon.port;
 
   try {
-    const healthRes = await fetchFn(`http://${host}:${port}/healthz`);
+    const healthRes = await fetchFn(`http://${formatDaemonHostForUrl(host)}:${port}/healthz`);
     if (!healthRes.ok) return "skipped";
   } catch {
     return "skipped";
   }
 
   try {
-    const cmuxRes = await fetchFn(`http://${host}:${port}/api/adapters/cmux/status`);
+    const cmuxRes = await fetchFn(`http://${formatDaemonHostForUrl(host)}:${port}/api/adapters/cmux/status`);
     if (!cmuxRes.ok || !cmuxRes.json) return "unavailable";
     const data = (await cmuxRes.json()) as { available?: boolean };
     return data.available ? "available" : "unavailable";
@@ -562,17 +603,38 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
   }
 
   if (codexInstalled) {
-    try {
-      deps.exec("codex login status");
-      steps.push({ id: "codex_auth", status: "pass", message: "Codex authentication available." });
-    } catch (err) {
-      steps.push({
-        id: "codex_auth",
-        status: "fail",
-        message: `Codex is installed but not ready to launch: ${(err as Error).message}`,
-        reason: "Codex seats cannot launch until the Codex CLI is logged in and usable.",
-        fixHint: "Run `codex login` and complete authentication, then rerun `rig setup` or `rig doctor`.",
-      });
+    const env = deps.env ?? process.env;
+    const codexAuth = selectCodexProviderAuth(deps.readFile(path.join(resolveCodexHome(env).codexHome, "config.toml")));
+    if (codexAuth.kind === "env-key") {
+      if (env[codexAuth.envKey]?.trim()) {
+        steps.push({
+          id: "codex_auth",
+          status: "pass",
+          message: `Codex provider "${codexAuth.providerId}" does not use an OpenAI login, and its credential variable ${codexAuth.envKey} is set. This confirms a local credential is available, not that the provider accepts it or that managed seats receive it.`,
+        });
+      } else {
+        steps.push({
+          id: "codex_auth",
+          status: "fail",
+          message: `Codex provider "${codexAuth.providerId}" needs ${codexAuth.envKey}, which is not set in this environment.`,
+          reason: "Codex seats using this provider cannot authenticate without that variable.",
+          fixHint: `Export ${codexAuth.envKey} in the environment that runs rig setup and the OpenRig daemon, then rerun \`rig setup\`.`,
+        });
+      }
+    } else {
+      try {
+        deps.exec("codex login status");
+        steps.push({ id: "codex_auth", status: "pass", message: "Codex authentication available." });
+      } catch (err) {
+        const unresolved = codexAuth.unresolved ? ` (${codexAuth.unresolved}, so the OpenAI login was checked)` : "";
+        steps.push({
+          id: "codex_auth",
+          status: "fail",
+          message: `Codex is installed but not ready to launch${unresolved}: ${(err as Error).message}`,
+          reason: "Codex seats cannot launch until the Codex CLI is logged in and usable.",
+          fixHint: "Run `codex login` and complete authentication, then rerun `rig setup` or `rig doctor`.",
+        });
+      }
     }
   } else {
     steps.push({
@@ -677,7 +739,7 @@ export async function runSetup(deps: SetupDeps, opts: { dryRun?: boolean; full?:
 
 function buildDefaultDoctorDeps(setupDeps: SetupDeps): DoctorDeps {
   const platform = setupDeps.platform ?? process.platform;
-  const baseDir = path.dirname(path.dirname(new URL(import.meta.url).pathname));
+  const baseDir = path.dirname(path.dirname(fileURLToPath(new URL(import.meta.url))));
   return {
     exists: setupDeps.exists,
     baseDir,

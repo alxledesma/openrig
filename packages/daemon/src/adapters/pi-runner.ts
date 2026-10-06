@@ -23,13 +23,17 @@ import nodePath from "node:path";
 import readline from "node:readline";
 import { PassThrough } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
-import { spawn } from "node:child_process";
+// Upstream's execFileSync is retained for OMP argv probing; fileURLToPath is
+// retained by the fork because the bounded-compaction asset path is resolved
+// from import.meta.url and must work under the Pi runtime only.
+import { execFileSync, spawn } from "node:child_process";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
+import { formatDaemonHostForUrl } from "./daemon-url.js";
 import {
   piSeatPaths, buildPiChildArgs, buildPiChildEnv, buildPendingRunnerState, parsePiRunnerState,
   PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, PI_RUNNER_ERROR_MARKER,
-  type PiRunnerState, type PiQuiescenceEvidence,
+  type PiRunnerState, type RunnerRuntime, type PiQuiescenceEvidence,
 } from "./pi-runner-protocol.js";
 
 // ── Submitted input boundaries ─────────────────────────────────────────────
@@ -162,22 +166,42 @@ export interface MirrorAndActivity {
   errorNotice?: string;
 }
 
-function errorNotice(detail: unknown): string {
+function errorNotice(detail: unknown, runtime: RunnerRuntime): string {
   const text = typeof detail === "string"
     ? stripVTControlCharacters(detail).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ").replace(/\s+/g, " ").trim()
     : "";
-  return `${PI_RUNNER_ERROR_MARKER} ${text.slice(0, 400) || "request failed"}`;
+  const marker = runtime === "omp" ? "[omp-runner] ERROR" : PI_RUNNER_ERROR_MARKER;
+  return `${marker} ${text.slice(0, 400) || "request failed"}`;
 }
 
-export function mapPiEvent(event: Record<string, unknown>): MirrorAndActivity {
+/** The one model-failure detector for both runtimes. Pi and OMP report a
+ *  provider/auth failure on the assistant message itself and still end the
+ *  turn normally; OMP repeats the message on turn_end, and either runtime can
+ *  announce it again when automatic retries exhaust. The core coalesces the
+ *  repeats into one notice per failure. */
+function modelErrorNotice(event: Record<string, unknown>, runtime: RunnerRuntime): { errorNotice?: string } {
+  if (event.type === "auto_retry_end") {
+    return event.success === false ? { errorNotice: errorNotice(event.finalError, runtime) } : {};
+  }
+  const message = event.message as Record<string, unknown> | undefined;
+  return message?.role === "assistant" && message.stopReason === "error"
+    ? { errorNotice: errorNotice(message.errorMessage, runtime) } : {};
+}
+
+export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntime = "pi"): MirrorAndActivity {
   const type = typeof event.type === "string" ? event.type : "";
   switch (type) {
     case "agent_start":
       return { mirrorLines: [], activity: { hookEvent: "active", subtype: "agent_start" }, streaming: true };
     case "agent_end":
-      return { mirrorLines: [""], activity: { hookEvent: "Stop", subtype: "agent_end" }, streaming: false };
-    case "turn_start":
+      return runtime === "omp" && event.isTerminal === false
+        ? { mirrorLines: [], streaming: true }
+        : { mirrorLines: [""], activity: { hookEvent: "Stop", subtype: "agent_end" }, streaming: false };
     case "turn_end":
+      // OMP repeats an assistant failure on turn_end (sometimes only there).
+      // Pi keeps main's mapping: turn_end carries no notice.
+      return runtime === "omp" ? { mirrorLines: [], ...modelErrorNotice(event, runtime) } : { mirrorLines: [] };
+    case "turn_start":
     case "message_start":
       return { mirrorLines: [] };
     case "message_update": {
@@ -191,18 +215,12 @@ export function mapPiEvent(event: Record<string, unknown>): MirrorAndActivity {
       const delta = update?.type === "text_delta" && typeof update.delta === "string" ? update.delta : "";
       return delta ? { mirrorLines: [], mirrorAppend: delta } : { mirrorLines: [] };
     }
-    case "message_end": {
+    case "message_end":
       // The message text already streamed via message_update appends; this
       // terminates the line. (mapPiEvent is stateless, so a hypothetical
       // updates-carried-nothing case is a VM-calibration follow-up, not
       // silently guessed here.)
-      const message = event.message as Record<string, unknown> | undefined;
-      return {
-        mirrorLines: [""],
-        ...(message?.role === "assistant" && message.stopReason === "error"
-          ? { errorNotice: errorNotice(message.errorMessage) } : {}),
-      };
-    }
+      return { mirrorLines: [""], ...modelErrorNotice(event, runtime) };
     case "tool_execution_start": {
       const tool = typeof event.toolName === "string" ? event.toolName : (typeof event.name === "string" ? event.name : "tool");
       return { mirrorLines: [`  ⚙ ${tool} …`], activity: { hookEvent: "PreToolUse", subtype: tool } };
@@ -215,17 +233,30 @@ export function mapPiEvent(event: Record<string, unknown>): MirrorAndActivity {
     case "queue_update":
       return { mirrorLines: [] };
     case "compaction_start":
-      return { mirrorLines: ["[pi] compacting context…"], activity: { hookEvent: "active", subtype: "compaction" } };
+      return { mirrorLines: [`[${runtime}] compacting context…`], activity: { hookEvent: "active", subtype: "compaction" } };
     case "compaction_end":
-      if (event.aborted === true) return { mirrorLines: ["[pi] compaction aborted"] };
-      if (event.errorMessage != null) return { mirrorLines: ["[pi] compaction failed"], errorNotice: errorNotice(event.errorMessage) };
-      return { mirrorLines: [event.result != null ? "[pi] compaction done" : "[pi] compaction ended without a result"] };
+      if (runtime === "pi") {
+        // Retained fork honesty: an aborted or failed Pi compaction is never
+        // reported as completed. OMP keeps upstream's generic mapping below.
+        if (event.aborted === true) return { mirrorLines: ["[pi] compaction aborted"] };
+        if (event.errorMessage != null) return { mirrorLines: ["[pi] compaction failed"], errorNotice: errorNotice(event.errorMessage, runtime) };
+        return { mirrorLines: [event.result != null ? "[pi] compaction done" : "[pi] compaction ended without a result"] };
+      }
+      return { mirrorLines: [`[${runtime}] compaction done`] };
+    // OMP names its automatic compaction separately. Pi keeps main's mapping
+    // (unmapped), so an idle Pi seat never reads as running after one.
+    case "auto_compaction_start":
+      return runtime === "omp"
+        ? { mirrorLines: ["[omp] compacting context…"], activity: { hookEvent: "active", subtype: "compaction" } }
+        : { mirrorLines: [] };
+    case "auto_compaction_end":
+      return runtime === "omp" ? { mirrorLines: ["[omp] compaction done"] } : { mirrorLines: [] };
     case "auto_retry_start":
       return { mirrorLines: ["[pi] transient error — retrying"], activity: { hookEvent: "active", subtype: "auto_retry" } };
-    case "auto_retry_end":
-      return event.success === false
-        ? { mirrorLines: [""], errorNotice: errorNotice(event.finalError) }
-        : { mirrorLines: [] };
+    case "auto_retry_end": {
+      const notice = modelErrorNotice(event, runtime);
+      return notice.errorNotice ? { mirrorLines: [""], ...notice } : { mirrorLines: [] };
+    }
     case "extension_error": {
       const message = typeof event.message === "string" ? event.message : "extension error";
       return { mirrorLines: [`${PI_RUNNER_ERROR_MARKER} extension: ${message}`] };
@@ -244,21 +275,30 @@ export interface RunnerIo {
   mirrorLine(line: string): void;
   /** Append raw text to the current pane line (streamed deltas). */
   mirrorAppend(text: string): void;
-  /** Fire-and-forget POST to the daemon activity endpoint. */
-  postActivity(payload: Record<string, unknown>): void;
+  /** POST to the daemon activity endpoint. May resolve to the parsed JSON
+   *  response (null on transport failure) so identity delivery can retry. */
+  postActivity(payload: Record<string, unknown>): void | Promise<Record<string, unknown> | null>;
   /** Persist the runner-state sidecar. */
   writeSidecar(state: PiRunnerState): void;
+  /** OMP can announce a path before a session file exists. */
+  sessionFileExists?(path: string): boolean;
+  /** Terminate OMP when get_state cannot establish a resumable seat. */
+  stopChild?(): void;
   now(): string;
 }
 
 const GET_STATE_ID = "pi-runner-get-state";
 const CATCH_UP_ID = "pi-runner-catch-up";
 const CURSOR_REFRESH_ID = "pi-runner-cursor-refresh";
+// Retained fork: Pi native-control ids and the busy-state reader.
 const CONTROL_STATE_ID = "pi-runner-control-state";
 
 function piProcessing(data: Record<string, unknown>): boolean {
   return data.isStreaming !== false || data.isCompacting !== false || data.pendingMessageCount !== 0;
 }
+/** RPC commands that carry operator input. Their failure means the seat
+ *  cannot do the requested work; other command failures are not attention. */
+const INPUT_COMMANDS: Record<string, true> = { prompt: true, steer: true, follow_up: true };
 
 export class RunnerCore {
   private streaming = false;
@@ -269,25 +309,45 @@ export class RunnerCore {
   private lastEntryId: string | undefined;
   private ready = false;
   private assistantErrorShown = false;
+  // Retained fork quiescence evidence plus upstream's OMP attention/lifecycle
+  // fields. These are disjoint: none overrides another.
   /** Whether `processing`/`controlPending` currently reflect a POSITIVE native
    *  observation (a real agent_settled, or a successful get_state proving no
    *  streaming/compacting/pending messages). Defaults false: before any such
    *  observation the seat is busy-by-default and evidence stays UNKNOWN. */
   private settledProven = false;
+  private started = false;
+  /** OMP attention (runtime_error | permission_prompt) that must survive the
+   *  end of the turn; cleared by the next agent_start. */
+  private attention: "runtime_error" | "permission_prompt" | null = null;
+  /** Whether the last activity posted is that attention. Later activity in
+   *  the same turn (a tool call after a denied approval) replaces it. */
+  private attentionIsLatest = false;
+  /** Set once the daemon confirms it persisted the resume token. */
+  private identityPersisted = false;
+  private identityInFlight = false;
 
   constructor(
     private io: RunnerIo,
     private identity: { sessionName: string; nodeId?: string; launchId?: string; generation?: string },
-    private opts: { catchUpSince?: string } = {},
+    private opts: { catchUpSince?: string; runtime?: RunnerRuntime } = {},
   ) {
     // The durable cursor seeds from the carried-over value (FR-5) so this
     // instance's own sidecar writes never regress it to undefined before a
     // newer entry supersedes it.
     this.lastEntryId = opts.catchUpSince;
   }
+  /** Runner readiness is the sidecar's acknowledged get_state, not RPC transport ready. */
+  isReady(): boolean { return this.ready; }
 
   /** Kick off identity capture. Called once pi's RPC stream is up. */
   start(): void {
+    // OMP's start is driven by the transport `ready` frame and must run once;
+    // Pi keeps main's unconditional start.
+    if (this.runtime === "omp") {
+      if (this.started) return;
+      this.started = true;
+    }
     this.io.sendRpc({ type: "get_state", id: GET_STATE_ID });
     if (this.opts.catchUpSince) {
       // Durable catch-up cursor (FR-5): replay session entries the previous
@@ -319,9 +379,12 @@ export class RunnerCore {
     this.handleEvent(record);
   }
 
+  private get runtime(): RunnerRuntime { return this.opts.runtime ?? "pi"; }
+
   /** One aggregated paste block from pane stdin. */
   handleUserBlock(block: string): void {
-    if (block === "/model" || block.startsWith("/model ") || block === "/compact" || block.startsWith("/compact ")) {
+    const isPi = this.runtime === "pi";
+    if (isPi && (block === "/model" || block.startsWith("/model ") || block === "/compact" || block.startsWith("/compact "))) {
       if (!this.ready || this.processing || this.controlPending) {
         this.io.mirrorLine("[pi-runner] control refused: wait for Pi to settle before changing model or compacting.");
         return;
@@ -340,14 +403,14 @@ export class RunnerCore {
       return;
     }
     if (block === "/abort") {
-      this.markBusy();
+      if (isPi) this.markBusy();
       this.io.sendRpc({ type: "abort" });
       this.io.mirrorLine("[pi-runner] abort sent");
       return;
     }
     if (block.startsWith("/followup ")) {
       const message = block.slice("/followup ".length);
-      this.markBusy();
+      if (isPi) this.markBusy();
       this.io.sendRpc({ type: "follow_up", message });
       this.io.mirrorLine(`you (follow-up) ▸ ${message}`);
       return;
@@ -355,7 +418,7 @@ export class RunnerCore {
     if (this.streaming) {
       // Mid-stream: steer delivers after the current turn's tool calls,
       // before the next model call (Pi's documented semantics).
-      this.markBusy();
+      if (isPi) this.markBusy();
       this.io.sendRpc({ type: "steer", message: block });
       this.io.mirrorLine(`you (steer) ▸ ${block}`);
       return;
@@ -369,23 +432,28 @@ export class RunnerCore {
     // keeps both cases correct on one RPC: idle → ignored, starts normally;
     // busy-but-not-mirrored-streaming → queued and delivered when the agent
     // stops. No retry, no duplicate replay.
-    this.markBusy();
-    this.io.sendRpc({ type: "prompt", message: block, streamingBehavior: "followUp" });
+    if (isPi) this.markBusy();
+    this.io.sendRpc({ type: "prompt", message: block, ...(isPi ? { streamingBehavior: "followUp" } : {}) });
     this.io.mirrorLine(`you ▸ ${block}`);
   }
 
-  /** Pi process exit — honest, loud, durable. */
+  /** Child process exit — honest, loud, durable. */
   handlePiExit(code: number | null): void {
     this.ready = false;
-    this.io.mirrorLine(`${PI_RUNNER_EXIT_MARKER} pi exited (code ${code ?? "unknown"})`);
-    // An exited seat is honestly non-running: never a settled one.
+    // Runtime-aware exit marker (upstream). An exited seat is honestly
+    // non-running: never a settled one (fork), and the projection is written
+    // so the exit is durable and launch-scoped like every other write.
+    this.io.mirrorLine(`${PI_RUNNER_EXIT_MARKER} ${this.runtime} exited (code ${code ?? "unknown"})`);
     this.settledProven = false;
-    this.writeQuiescence({ exited: { code, at: this.io.now() } });
-    this.io.postActivity(this.activityPayload("Stop", "pi_exited"));
+    if (this.runtime === "pi") this.writeQuiescence({ exited: { code, at: this.io.now() } });
+    else this.writeSidecar({ exited: { code, at: this.io.now() } });
+    this.io.postActivity(this.activityPayload("Stop", `${this.runtime}_exited`));
   }
 
   private handleResponse(record: Record<string, unknown>): void {
-    if (record.id === "pi-runner-native-control") {
+    // Retained fork native controls, handled BEFORE the generic failure gate so
+    // a control refusal still refreshes the cursor from native history.
+    if (this.runtime === "pi" && record.id === "pi-runner-native-control") {
       this.controlPending = false;
       const data = record.data as { models?: Array<{ provider?: string; id?: string }> } | undefined;
       this.io.mirrorLine(record.success === true
@@ -402,12 +470,41 @@ export class RunnerCore {
       this.io.sendRpc({ type: "get_state", id: CONTROL_STATE_ID });
       return;
     }
-    if (record.id === CONTROL_STATE_ID) {
+    if (this.runtime === "pi" && record.id === CONTROL_STATE_ID) {
       this.processing = record.success !== true || piProcessing((record.data ?? {}) as Record<string, unknown>);
       // A failed or missing control-state read proves NOTHING: it leaves the
       // seat busy and the evidence non-proven rather than guessing idle.
       this.settledProven = record.success === true && !piProcessing((record.data ?? {}) as Record<string, unknown>);
       this.writeQuiescence();
+      return;
+    }
+    // Upstream's generic failure gate, retained after the fork's control paths.
+    if (record.success === false || record.error != null) {
+      if (record.success === false && (record.id === CURSOR_REFRESH_ID || record.id === CATCH_UP_ID)) {
+        // Only this exact missing-entry failure can poison a historical cursor.
+        // Recover once with a full, read-only cursor refresh; never replay input.
+        if (record.id === CATCH_UP_ID && record.command === "get_entries"
+          && record.error === `Entry not found: ${this.opts.catchUpSince}`) {
+          this.io.sendRpc({ type: "get_entries", id: CURSOR_REFRESH_ID });
+        }
+        return;
+      }
+      const message = typeof record.error === "string" ? record.error : "request failed";
+      if (record.id === GET_STATE_ID) {
+        this.ready = false;
+        this.writeSidecar({});
+        this.io.mirrorLine(this.runtime === "omp" ? `[omp-runner] ERROR rpc get_state: ${message}` : `${PI_RUNNER_ERROR_MARKER} rpc: ${message}`);
+        // OMP cannot provide a resume token without get_state; stop it so the
+        // launch fails now instead of waiting out readiness.
+        if (this.runtime === "omp") this.io.stopChild?.();
+        return;
+      }
+      this.io.mirrorLine(`[${this.runtime}-runner] ERROR rpc: ${message}`);
+      // Only a rejected input means the seat cannot do the requested work.
+      // A mistimed /abort (or any control command) leaves the seat idle.
+      if (this.runtime === "omp" && typeof record.command === "string" && Object.hasOwn(INPUT_COMMANDS, record.command)) {
+        this.raiseAttention("runtime_error");
+      }
       return;
     }
     if (record.id === GET_STATE_ID) {
@@ -416,39 +513,30 @@ export class RunnerCore {
       const sessionId = typeof data.sessionId === "string" ? data.sessionId : undefined;
       this.sessionFile = sessionFile ?? this.sessionFile;
       this.sessionId = sessionId ?? this.sessionId;
-      this.ready = true;
-      this.processing = piProcessing(data);
-      // A get_state is the second positive settlement source, but ONLY an
-      // explicitly successful response qualifies. An absent, malformed or
-      // failed success flag leaves the seat busy-by-default: absence of a
-      // failure must never be read as proof that pi reported a quiet state.
-      this.settledProven = record.success === true && !this.processing;
-      this.writeQuiescence();
-      this.io.mirrorLine(`${PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
-      this.io.postActivity({
-        eventFamily: "session_identity",
-        sessionName: this.identity.sessionName,
-        nodeId: this.identity.nodeId ?? null,
-        generation: this.identity.generation ?? null,
-        runtime: "pi",
-        hookEvent: "SessionStart",
-        sessionId: this.sessionId ?? "unknown",
-        sessionFile: this.sessionFile ?? null,
-        occurredAt: this.io.now(),
-      });
+      // Upstream's readiness rule retained: Pi is ready on a successful
+      // get_state, OMP additionally requires a real session file.
+      this.ready = this.runtime === "pi" || !!this.sessionFile;
+      if (!this.ready) {
+        this.io.mirrorLine("[omp-runner] ERROR rpc get_state returned no session file; cannot provide a resume token");
+        this.io.stopChild?.();
+        return;
+      }
+      // Fork quiescence settlement, scoped to Pi ONLY: OMP publishes no native
+      // quiescence evidence and must never be read as Pi-proven idle.
+      if (this.runtime === "pi") {
+        this.processing = piProcessing(data);
+        // A get_state is the second positive settlement source, but ONLY an
+        // explicitly successful response qualifies. An absent, malformed or
+        // failed success flag leaves the seat busy-by-default: absence of a
+        // failure must never be read as proof that pi reported a quiet state.
+        this.settledProven = record.success === true && !this.processing;
+        this.writeQuiescence();
+      }
+      this.io.mirrorLine(`${this.runtime === "omp" ? "[omp-runner] READY" : PI_RUNNER_READY_MARKER} session=${this.sessionFile ?? "unknown"}`);
+      this.postSessionIdentity();
       return;
     }
     if (record.id === CURSOR_REFRESH_ID || record.id === CATCH_UP_ID) {
-      if (record.success === false) {
-        // A historical UI UUID may have poisoned catchUpSince. The exact
-        // missing-entry response permits one read-only full cursor refresh;
-        // never repeat prompts/controls or overwrite from a failed response.
-        if (record.id === CATCH_UP_ID && record.command === "get_entries"
-          && record.error === `Entry not found: ${this.opts.catchUpSince}`) {
-          this.io.sendRpc({ type: "get_entries", id: CURSOR_REFRESH_ID });
-        }
-        return;
-      }
       const data = (record.data ?? record) as Record<string, unknown>;
       const entries = Array.isArray(data.entries) ? data.entries : (Array.isArray(record.entries) ? record.entries : []);
       const last = entries.at(-1);
@@ -461,21 +549,53 @@ export class RunnerCore {
       }
       return;
     }
-    // Other responses (prompt accepted, …) — surface errors.
-    if (record.success === false || record.error != null) {
-      const message = typeof record.error === "string" ? record.error : "request failed";
-      this.io.mirrorLine(`${PI_RUNNER_ERROR_MARKER} rpc: ${message}`);
-    }
+  }
+
+  private raiseAttention(subtype: "runtime_error" | "permission_prompt"): void {
+    // Runtime failures outrank denied approvals. Only emit when the visible
+    // attention changes or intervening activity replaced it.
+    const next = this.attention === "runtime_error" ? this.attention : subtype;
+    if (this.attention === next && this.attentionIsLatest) return;
+    this.attention = next;
+    this.attentionIsLatest = true;
+    this.io.postActivity(this.activityPayload("Notification", next));
+  }
+
+  private clearAttention(): void {
+    this.attention = null;
+    this.attentionIsLatest = false;
   }
 
   private handleEvent(event: Record<string, unknown>): void {
-    if (event.type === "agent_start" || event.type === "compaction_start") { this.processing = true; this.settledProven = false; this.writeQuiescence(); }
-    // agent_settled is the ONLY event that settles. agent_end deliberately does
-    // not: retries, before-settle continuations and automatic compaction all
-    // continue after it while isStreaming is still true (see the /followup note
-    // in handleUserBlock), so treating agent_end as idle would claim a settled
-    // seat that is still working.
-    if (event.type === "agent_settled") { this.processing = false; this.settledProven = true; this.writeQuiescence(); }
+    if (this.runtime === "omp" && event.type === "extension_ui_request") {
+      const method = event.method;
+      // RPC does not mount an interactive UI. Reply at once; otherwise the
+      // child can wait forever for approval that cannot be given in the pane.
+      if (typeof event.id === "string") {
+        this.io.sendRpc({ type: "extension_ui_response", id: event.id, cancelled: true });
+      }
+      if (method === "select" || method === "confirm" || method === "input" || method === "editor") {
+        this.io.mirrorLine("[omp-runner] Approval/input requested; cancelled because the managed RPC pane cannot answer it. Operator action required: review the denied action and re-send a safe instruction, or change the seat permission policy explicitly.");
+        this.raiseAttention("permission_prompt");
+      }
+      return;
+    }
+    if (this.runtime === "pi") {
+      if (event.type === "agent_start" || event.type === "compaction_start") {
+        this.processing = true;
+        this.settledProven = false;
+        this.writeQuiescence();
+      }
+      // agent_settled is the ONLY event that settles. agent_end deliberately does
+      // not: retries, before-settle continuations and automatic compaction all
+      // continue after it while isStreaming is still true (see /followup above),
+      // so treating agent_end as idle would claim a working Pi seat is settled.
+      if (event.type === "agent_settled") {
+        this.processing = false;
+        this.settledProven = true;
+        this.writeQuiescence();
+      }
+    }
     const message = event.message as Record<string, unknown> | undefined;
     if (event.type === "agent_start" || (event.type === "message_start" && message?.role === "assistant")) {
       this.assistantErrorShown = false;
@@ -493,8 +613,18 @@ export class RunnerCore {
       this.writeSidecar({});
     }
 
-    const mapped = mapPiEvent(event);
+    if (this.runtime === "omp") {
+      if (event.type === "agent_start") this.clearAttention();
+      // A successful automatic retry supersedes the failed attempt.
+      if (event.type === "auto_retry_start" && this.attention === "runtime_error") this.clearAttention();
+      // Some paths omit agent_start; turn_start still opens a new turn.
+      if (event.type === "turn_start") this.assistantErrorShown = false;
+    }
+    const mapped = mapPiEvent(event, this.runtime);
     if (mapped.streaming !== undefined) this.streaming = mapped.streaming;
+    // OMP writes its JSONL lazily; re-announce identity after each turn until
+    // the daemon confirms the token. Pi's get_state identity is final.
+    if (event.type === "agent_end" && this.runtime === "omp") this.postSessionIdentity();
     if (event.type === "agent_end") {
       // QA RED fold (qitem-20260707020922): live events do not reliably carry
       // session-entry ids, so the durable cursor starved (lastEntryId stayed
@@ -506,17 +636,56 @@ export class RunnerCore {
     if (mapped.mirrorAppend) this.io.mirrorAppend(mapped.mirrorAppend);
     for (const line of mapped.mirrorLines) this.io.mirrorLine(line);
     if (mapped.errorNotice) {
-      // Pi can announce the same failed message again when retries exhaust.
-      // Keep the first useful detail even if finalError is absent, then reset
-      // at the next assistant message/agent turn, not at agent_end.
-      if (event.type !== "auto_retry_end" || !this.assistantErrorShown) {
+      // Pi can announce the same failed message again when retries exhaust,
+      // and OMP repeats it on turn_end. Keep the first useful detail even if
+      // the repeat lacks it, then reset at the next assistant message/agent
+      // turn, not at agent_end.
+      if (event.type === "message_end" || !this.assistantErrorShown) {
         this.io.mirrorLine(mapped.errorNotice);
       }
       this.assistantErrorShown = true;
+      // OMP still ends the turn normally after a model failure; the operator
+      // has to act, so the seat shows attention rather than idle.
+      if (this.runtime === "omp") this.raiseAttention("runtime_error");
     }
-    if (mapped.activity) {
+    if (!mapped.activity) return;
+    if (mapped.activity.hookEvent === "Stop" && this.attention) {
+      // The turn ended, but the operator still has to act. Drop the Stop; if
+      // later activity replaced the attention, restore it as the final state.
+      if (!this.attentionIsLatest) this.raiseAttention(this.attention);
+    } else {
+      this.attentionIsLatest = false;
       this.io.postActivity(this.activityPayload(mapped.activity.hookEvent, mapped.activity.subtype));
     }
+  }
+
+  /** Re-deliver OMP identity until the daemon confirms the resume token.
+   *  Called from a timer so a daemon restart during the first turn cannot
+   *  leave a seat with history but no restorable token. */
+  retrySessionIdentity(): void {
+    if (this.runtime === "omp" && this.ready) this.postSessionIdentity();
+  }
+
+  private postSessionIdentity(): void {
+    if (this.runtime === "omp" && (!this.sessionFile || !this.io.sessionFileExists?.(this.sessionFile))) return;
+    if (this.runtime === "omp" && (this.identityPersisted || this.identityInFlight)) return;
+    const result = this.io.postActivity({
+      eventFamily: "session_identity",
+      sessionName: this.identity.sessionName,
+      nodeId: this.identity.nodeId ?? null,
+      runtime: this.runtime,
+      generation: this.identity.generation ?? null,
+      hookEvent: "SessionStart",
+      sessionId: this.sessionId ?? "unknown",
+      sessionFile: this.sessionFile ?? null,
+      occurredAt: this.io.now(),
+    });
+    if (this.runtime !== "omp" || !result) return;
+    this.identityInFlight = true;
+    void result.then(
+      (body) => { if (body?.tokenPersisted === true) this.identityPersisted = true; },
+      () => { /* unacknowledged; the next agent_end or retry tick re-posts */ },
+    ).finally(() => { this.identityInFlight = false; });
   }
 
   private activityPayload(hookEvent: string, subtype: string | null): Record<string, unknown> {
@@ -524,7 +693,7 @@ export class RunnerCore {
       sessionName: this.identity.sessionName,
       nodeId: this.identity.nodeId ?? null,
       generation: this.identity.generation ?? null,
-      runtime: "pi",
+      runtime: this.runtime,
       hookEvent,
       subtype,
       occurredAt: this.io.now(),
@@ -549,7 +718,7 @@ export class RunnerCore {
       // evidence and force an honest observer back to UNKNOWN. The record is
       // always current by construction: it is derived from the same flags the
       // rest of this write publishes.
-      quiescence: this.quiescenceEvidence(),
+      ...(this.runtime === "pi" ? { quiescence: this.quiescenceEvidence() } : {}),
     });
   }
 
@@ -584,12 +753,14 @@ export class RunnerCore {
    *  evidence. writeSidecar already republishes that evidence on every write,
    *  so this exists only to make the transition sites self-documenting. */
   private writeQuiescence(patch: Partial<PiRunnerState> = {}): void {
+    if (this.runtime !== "pi") return;
     this.writeSidecar(patch);
   }
 
   /** Mark the seat busy ahead of a native turn or control effect and persist
    *  that immediately, so a concurrent reader never sees a stale idle claim. */
   private markBusy(): void {
+    if (this.runtime !== "pi") return;
     this.processing = true;
     this.settledProven = false;
     this.writeQuiescence();
@@ -599,6 +770,7 @@ export class RunnerCore {
 // ── CLI entry ────────────────────────────────────────────────────────────────
 
 interface RunnerArgs {
+  runtime?: RunnerRuntime;
   sessionName: string;
   stateRoot: string;
   cwd: string;
@@ -620,6 +792,12 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
     };
     switch (flag) {
       case "--session-name": args.sessionName = next(); break;
+      case "--runtime": {
+        const runtime = next();
+        if (runtime !== "pi" && runtime !== "omp") throw new Error(`unsupported runtime: ${runtime}`);
+        args.runtime = runtime;
+        break;
+      }
       case "--state-root": args.stateRoot = next(); break;
       case "--cwd": args.cwd = next(); break;
       case "--launch-id": args.launchId = next(); break;
@@ -628,6 +806,12 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
       case "--fork": args.forkRef = next(); break;
       case "--approve": args.trust = "approve"; break;
       case "--no-approve": args.trust = "no-approve"; break;
+      case "--approval-mode": {
+        const mode = next();
+        if (mode !== "yolo" && mode !== "always-ask") throw new Error(`unsupported OMP approval mode: ${mode}`);
+        args.trust = mode === "yolo" ? "approve" : "no-approve";
+        break;
+      }
       default: throw new Error(`unknown flag: ${flag}`);
     }
   }
@@ -635,7 +819,13 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
   if (!args.stateRoot) throw new Error("--state-root is required");
   if (!args.cwd) throw new Error("--cwd is required");
   if (!args.launchId) throw new Error("--launch-id is required (launch-attempt scoping)");
-  if (!args.trust) throw new Error("an explicit trust flag is required: --approve or --no-approve");
+  if (args.runtime === "omp") {
+    if (!argv.includes("--approval-mode") || argv.some((flag) => flag === "--approve" || flag === "--no-approve")) {
+      throw new Error("OMP requires --approval-mode yolo or always-ask, not Pi trust flags");
+    }
+  } else if (!args.trust || argv.includes("--approval-mode")) {
+    throw new Error("an explicit trust flag is required: --approve or --no-approve");
+  }
   if (args.sessionFile && args.forkRef) throw new Error("--session and --fork are mutually exclusive");
   return args as RunnerArgs;
 }
@@ -644,7 +834,8 @@ function resolveActivityEndpoint(env: NodeJS.ProcessEnv): { baseUrl: string; tok
   let baseUrl = env.OPENRIG_URL?.trim() || null;
   let token = env.OPENRIG_ACTIVITY_HOOK_TOKEN?.trim() || null;
   if (!baseUrl && env.OPENRIG_PORT) {
-    baseUrl = `http://${env.OPENRIG_HOST?.trim() || "127.0.0.1"}:${env.OPENRIG_PORT.trim()}`;
+    const rawHost = env.OPENRIG_HOST?.trim() || "127.0.0.1";
+    baseUrl = `http://${formatDaemonHostForUrl(rawHost)}:${env.OPENRIG_PORT.trim()}`;
   }
   if (!baseUrl || !token) {
     try {
@@ -682,6 +873,67 @@ export function prepareRunnerSidecar(
   return { catchUpSince: resuming ? prior?.lastEntryId : undefined };
 }
 
+/** How often an OMP runner re-delivers an unconfirmed session identity. */
+const IDENTITY_RETRY_MS = 30_000;
+
+export interface ExecutableResolverOps {
+  isExecutable(path: string): boolean;
+  realpath(path: string): string;
+  /** Run a launcher (argv, no shell) and return its trimmed stdout. */
+  run(file: string, args: string[], env: NodeJS.ProcessEnv): string;
+}
+
+const nodeResolverOps: ExecutableResolverOps = {
+  isExecutable: (path) => {
+    try {
+      fs.accessSync(path, fs.constants.X_OK);
+      return fs.statSync(path).isFile();
+    } catch {
+      return false;
+    }
+  },
+  realpath: (path) => fs.realpathSync(path),
+  run: (file, args, env) => execFileSync(file, args, { env, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] }).trim(),
+};
+
+/** Resolve `name` to the absolute path of the real binary, using the
+ *  runner's own environment. The child later runs under a per-seat HOME, and
+ *  version-manager shims (mise) find their target through HOME, so the shim
+ *  itself must never be what the child executes. */
+export function resolveRuntimeExecutable(
+  name: string,
+  env: NodeJS.ProcessEnv,
+  ops: ExecutableResolverOps = nodeResolverOps,
+): { ok: true; path: string } | { ok: false; error: string } {
+  const onPath = (env.PATH ?? "").split(nodePath.delimiter)
+    .filter((dir) => nodePath.isAbsolute(dir))
+    .map((dir) => nodePath.join(dir, name))
+    .find((candidate) => ops.isExecutable(candidate));
+  if (!onPath) return { ok: false, error: `'${name}' was not found on PATH (${env.PATH ?? ""})` };
+  let real: string;
+  try {
+    real = ops.realpath(onPath);
+  } catch (err) {
+    return { ok: false, error: `could not resolve ${onPath}: ${(err as Error).message}` };
+  }
+  if (nodePath.basename(real) !== "mise") return { ok: true, path: real };
+  // A mise shim is a symlink to mise itself; ask mise for the tool it maps to.
+  let target: string;
+  try {
+    target = ops.run(real, ["which", name], env);
+  } catch (err) {
+    return { ok: false, error: `${onPath} is a mise shim and 'mise which ${name}' failed: ${(err as Error).message}` };
+  }
+  if (!nodePath.isAbsolute(target) || !ops.isExecutable(target)) {
+    return { ok: false, error: `${onPath} is a mise shim but 'mise which ${name}' returned no executable (${target || "empty"})` };
+  }
+  try {
+    return { ok: true, path: ops.realpath(target) };
+  } catch (err) {
+    return { ok: false, error: `could not resolve ${target}: ${(err as Error).message}` };
+  }
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   let args: RunnerArgs;
   try {
@@ -692,6 +944,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
 
+  const runtime = args.runtime ?? "pi";
   const paths = piSeatPaths(args.stateRoot, args.sessionName);
   fs.mkdirSync(paths.agentDir, { recursive: true });
   fs.mkdirSync(paths.sessionsDir, { recursive: true });
@@ -713,6 +966,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     agentDir: paths.agentDir,
     sessionsDir: paths.sessionsDir,
     model: args.model,
+    runtime,
+    sessionName: args.sessionName,
+    nodeId: process.env.OPENRIG_NODE_ID,
+    openrigHome: process.env.OPENRIG_HOME,
+    openrigUrl: endpoint?.baseUrl ?? process.env.OPENRIG_URL,
   });
   const childArgs = buildPiChildArgs({
     sessionsDir: paths.sessionsDir,
@@ -721,16 +979,41 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     trust: args.trust,
     sessionFile: args.sessionFile,
     forkRef: args.forkRef,
+    runtime,
   });
 
-  const boundedCompactionExtension = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), "pi-bounded-compaction-extension.ts");
-  if (!fs.existsSync(boundedCompactionExtension)) throw new Error("Bounded Pi compaction extension missing from package");
-  childArgs.push("--extension", boundedCompactionExtension);
+  if (runtime === "pi") {
+    const boundedCompactionExtension = nodePath.join(nodePath.dirname(fileURLToPath(import.meta.url)), "pi-bounded-compaction-extension.ts");
+    if (!fs.existsSync(boundedCompactionExtension)) throw new Error("Bounded Pi compaction extension missing from package");
+    childArgs.push("--extension", boundedCompactionExtension);
+  }
 
-  console.log(`[pi-runner] starting pi --mode rpc (seat ${args.sessionName})`);
-  console.log(`[pi-runner] send text normally; prefixes: "/followup <text>" queues after the turn, "/abort" cancels`);
+  console.log(`[${runtime}-runner] starting ${runtime} --mode rpc (seat ${args.sessionName})`);
+  console.log(`[${runtime}-runner] send text normally; prefixes: "/followup <text>" queues after the turn, "/abort" cancels`);
 
-  const child = spawn("pi", childArgs, {
+  // OMP runs under a per-seat HOME. A HOME-dependent launcher on PATH (a mise
+  // shim) cannot find its target there, so resolve the real binary first,
+  // with the runner's own environment.
+  let command: string = runtime;
+  if (runtime === "omp") {
+    const resolved = resolveRuntimeExecutable("omp", process.env);
+    if (!resolved.ok) {
+      console.error(`[omp-runner] ERROR launch: ${resolved.error}`);
+      // Record the exit for this launch so the adapter fails it now instead
+      // of waiting out its readiness timeout. The durable cursor survives.
+      const at = new Date().toISOString();
+      try {
+        const pending = parsePiRunnerState(fs.readFileSync(paths.runnerStatePath, "utf8"));
+        const exitedState: PiRunnerState = { ready: false, launchId: args.launchId, lastEntryId: pending?.lastEntryId, updatedAt: at, exited: { code: 127, at } };
+        fs.writeFileSync(paths.runnerStatePath, JSON.stringify(exitedState));
+      } catch { /* the pane ERROR marker still fails readiness */ }
+      process.exitCode = 127;
+      return;
+    }
+    command = resolved.path;
+  }
+
+  const child = spawn(command, childArgs, {
     cwd: args.cwd,
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
@@ -746,12 +1029,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       if (!endpoint || typeof fetch !== "function") return;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 1500);
-      fetch(new URL("/api/activity/hooks", endpoint.baseUrl).toString(), {
+      const request = fetch(new URL("/api/activity/hooks", endpoint.baseUrl).toString(), {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${endpoint.token}` },
         body: JSON.stringify(payload),
         signal: controller.signal,
-      }).catch(() => { /* best-effort — never blocks the loop */ }).finally(() => clearTimeout(timeout));
+      });
+      if (runtime !== "omp") {
+        request.catch(() => { /* best-effort — never blocks the loop */ }).finally(() => clearTimeout(timeout));
+        return;
+      }
+      // OMP reads the acknowledgement so identity delivery can retry; null
+      // (transport failure or a non-OK reply) means "not yet persisted".
+      return request
+        .then(async (response) => response.ok ? await response.json() as Record<string, unknown> : null)
+        .catch(() => null)
+        .finally(() => clearTimeout(timeout));
     },
     writeSidecar: (state) => {
       try {
@@ -759,33 +1052,74 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       } catch { /* best-effort; adapter falls back to pane markers */ }
     },
     now: () => new Date().toISOString(),
+    stopChild: () => { child.kill(); },
+    sessionFileExists: (path) => fs.existsSync(path),
   };
 
   const core = new RunnerCore(io, {
     sessionName: args.sessionName, nodeId: process.env.OPENRIG_NODE_ID, launchId: args.launchId,
     // Carry the emitting tenure; never infer it from a later daemon read or Pi event.
     generation: process.env.OPENRIG_OCCUPANT_GENERATION,
-  }, { catchUpSince });
+  }, { catchUpSince, runtime });
 
-  readline.createInterface({ input: child.stdout }).on("line", (line) => core.handlePiLine(line));
+  let transportUp = runtime === "pi";
+  readline.createInterface({ input: child.stdout }).on("line", (line) => {
+    if (runtime === "omp" && !core.isReady()) {
+      try {
+        const frame = JSON.parse(line) as { type?: string };
+        if (frame.type === "ready") {
+          transportUp = true;
+          core.start();
+        }
+      } catch { /* surface non-JSON stdout through the core */ }
+    }
+    core.handlePiLine(line);
+  });
+  // Re-deliver OMP identity until the daemon confirms the resume token.
+  const identityRetry = runtime === "omp" ? setInterval(() => core.retrySessionIdentity(), IDENTITY_RETRY_MS) : undefined;
+  identityRetry?.unref();
   readline.createInterface({ input: child.stderr }).on("line", (line) => {
-    if (line.trim()) process.stdout.write(`[pi:err] ${line}\n`);
+    if (line.trim()) process.stdout.write(`[${runtime}:err] ${line}\n`);
   });
   const input = createRunnerInput(process.stdin, process.stdout, (block) => core.handleUserBlock(block));
 
-  child.on("error", (err) => {
-    console.error(`${PI_RUNNER_ERROR_MARKER} failed to spawn pi: ${err.message}`);
-    core.handlePiExit(null);
-    input.close();
-    process.exitCode = 1;
-  });
-  child.on("exit", (code) => {
+  if (runtime === "pi") {
+    child.on("error", (err) => {
+      console.error(`${PI_RUNNER_ERROR_MARKER} failed to spawn pi: ${err.message}`);
+      core.handlePiExit(null);
+      input.close();
+      process.exitCode = 1;
+    });
+    child.on("exit", (code) => {
+      core.handlePiExit(code);
+      input.close();
+      process.exitCode = code ?? 1;
+    });
+    core.start();
+    return;
+  }
+
+  // OMP: one exit record per launch, with a launch-vs-credential diagnosis
+  // when the RPC session never became resumable.
+  let exited = false;
+  const recordExit = (code: number | null): void => {
+    if (exited) return;
+    exited = true;
+    clearInterval(identityRetry);
+    if (!core.isReady()) {
+      console.error(transportUp
+        ? "[omp-runner] ERROR OMP did not establish a resumable RPC session. Authenticate this isolated seat using HOME=<seat-root> PI_CODING_AGENT_DIR=<seat-root>/agent omp and /login, or provide its declared model provider key in the OpenRig daemon environment. Default OMP credentials are not shared."
+        : `[omp-runner] ERROR OMP exited before its RPC transport started (${command}, code ${code ?? "unknown"}). This is a launch failure, not a credential problem; see the output above.`);
+    }
     core.handlePiExit(code);
     input.close();
     process.exitCode = code ?? 1;
+  };
+  child.on("error", (err) => {
+    console.error(`[omp-runner] ERROR failed to spawn omp: ${err.message}`);
+    recordExit(null);
   });
-
-  core.start();
+  child.on("exit", recordExit);
 }
 
 // Compiled-entry guard: run main() only when executed directly (not imported

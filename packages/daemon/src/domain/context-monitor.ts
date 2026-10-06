@@ -86,6 +86,7 @@ export class ContextMonitor {
   }
 
   private async runPoll(): Promise<void> {
+    this.compactionEnforcer?.reconcilePreparations?.();
     const sessions = this.getEligibleSessions();
     for (const session of sessions) {
       let observed: ContextUsage | null = null;
@@ -152,7 +153,7 @@ export class ContextMonitor {
     usage: ContextUsage | null,
   ): Promise<void> {
     if (!this.compactionEnforcer) return;
-    if (!usage || usage.availability !== "known") return;
+    if (!usage || usage.availability !== "known" || !usage.fresh) return;
     try {
       await this.compactionEnforcer.maybeAutoCompact({
         sessionName: session.session_name,

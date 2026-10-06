@@ -10,6 +10,7 @@ import type { SessionRegistry } from "../domain/session-registry.js";
 import type { DiscoveryRepository } from "../domain/discovery-repository.js";
 import type { EventBus } from "../domain/event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
+import { observeClaudePaneStartedAt } from "../domain/native-process-lineage.js";
 import { SeatStatusService } from "../domain/seat-status-service.js";
 import { SeatHandoverService } from "../domain/seat-handover-service.js";
 import { SeatSwitchClientService } from "../domain/seat-switch-client-service.js";
@@ -132,6 +133,7 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     eventBus: c.get("eventBus" as never) as EventBus,
     tmuxAdapter: c.get("tmuxAdapter" as never) as TmuxAdapter,
     sessionEnv: (c.get("sessionEnv" as never) as Record<string, string | undefined> | undefined) ?? undefined,
+    runtimeSessionEnv: (c.get("runtimeSessionEnv" as never) as Record<string, Record<string, string | undefined>> | undefined) ?? undefined,
     // B1 — launch a fresh successor into a live agent via the runtime adapters.
     runtimeAdapters: (c.get("runtimeAdapters" as never) as Record<string, import("../domain/runtime-adapter.js").RuntimeAdapter> | undefined) ?? undefined,
     // OPR.0.4.6.02 S1 — the shared tmux option-defaults applier, so a FRESH
@@ -141,6 +143,8 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     // B2 — discovered-mode resume-token capture derive-helper deps.
     contextUsageStore: (c.get("contextUsageStore" as never) as import("../domain/resume-token-capture.js").ResumeTokenCaptureDeps["contextUsageStore"]) ?? undefined,
     resumeTokenCapturer: (c.get("resumeMetadataRefresher" as never) as import("../domain/resume-token-capture.js").ResumeTokenCaptureDeps["resumeTokenCapturer"]) ?? undefined,
+    // #421 — the pane's current Claude process start time, so capture skips an older sidecar.
+    claudeProcessStartedAt: (sessionName: string) => observeClaudePaneStartedAt({ target: sessionName, tmux: c.get("tmuxAdapter" as never) as TmuxAdapter }),
     // Wire the predecessor-recap resolver so the successor boot packet fires
     // with a bounded from-record recap. Reuses the full ContextUsageStore from context (readAndNormalize
     // = claude transcript_path; readCodexAndNormalize = codex rollout_path) + a resume-token lookup for
@@ -190,6 +194,13 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
       const pi = adapters?.["pi"] as { readSessionFile?: (sessionName: string) => { ok: true; sessionFile: string } | { ok: false; reason: string } } | undefined;
       return typeof pi?.readSessionFile === "function"
         ? { readSessionFile: pi.readSessionFile.bind(pi) as (sessionName: string) => { ok: true; sessionFile: string } | { ok: false; reason: string } }
+        : undefined;
+    })(),
+    ompRunnerStateStore: (() => {
+      const adapters = c.get("runtimeAdapters" as never) as Record<string, unknown> | undefined;
+      const omp = adapters?.["omp"] as { readSessionFile?: (sessionName: string) => { ok: true; sessionFile: string } | { ok: false; reason: string } } | undefined;
+      return typeof omp?.readSessionFile === "function"
+        ? { readSessionFile: omp.readSessionFile.bind(omp) }
         : undefined;
     })(),
     // GHOST-STAGE (e/Class-B) — the canonical OccupantInvalidator so commit()'s re-key call fires

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import BetterSqlite3, { type Database } from "better-sqlite3";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
@@ -9,6 +9,9 @@ import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { ContextUsageStore } from "../src/domain/context-usage-store.js";
 import { ContextMonitor } from "../src/domain/context-monitor.js";
+import { ClaudeCompactionEnforcer } from "../src/domain/claude-compaction-enforcer.js";
+import { SettingsStore } from "../src/domain/user-settings/settings-store.js";
+import type { SessionTransport } from "../src/domain/session-transport.js";
 import type { ReadinessResult } from "../src/domain/runtime-adapter.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 
@@ -43,6 +46,7 @@ describe("ContextMonitor", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     monitor.stop();
     db.close();
     rmSync(tmpDir, { recursive: true, force: true });
@@ -143,6 +147,68 @@ describe("ContextMonitor", () => {
     transcript_path: "/tmp/test.log",
     sampled_at: new Date().toISOString(),
   };
+
+  function installRealCompactionEnforcer() {
+    const settings = new SettingsStore(join(tmpDir, "settings.json"));
+    settings.set("policies.claude_compaction.enabled", "true");
+    settings.set("policies.claude_compaction.threshold_percent", "80");
+    const send = vi.fn(async (_session: string, text: string) => {
+      const marker = text.match(/<!-- openrig-compaction-complete .*? -->/)?.[0];
+      const target = text.match(/atomically rename it to ("(?:[^"\\]|\\.)*")/);
+      if (marker && target) {
+        const file = JSON.parse(target[1]!); mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file + ".tmp", "# Completed fixture map\n" + marker + "\n"); renameSync(file + ".tmp", file);
+      }
+      return { ok: true };
+    });
+    const transport = { send } as unknown as SessionTransport;
+    const enforcer = new ClaudeCompactionEnforcer(settings, transport, { openrigHome: tmpDir, resolveOccupantGeneration: () => "fixture-generation" });
+    monitor = new ContextMonitor(db, store, undefined, enforcer);
+    return send;
+  }
+
+  it.each([-600_001, 1])("does not compact a high-usage sample with timestamp offset %s", async (offset) => {
+    const now = Date.parse("2026-10-02T12:00:00Z");
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const { node, sessionName } = seedClaudeNode();
+    const send = installRealCompactionEnforcer();
+    writeSidecar(sessionName, {
+      ...VALID_SIDECAR,
+      sampled_at: new Date(now + offset).toISOString(),
+      context_window: { ...VALID_SIDECAR.context_window, used_percentage: 90, remaining_percentage: 10 },
+    });
+    await monitor.pollOnce();
+    expect(store.getForNode(node.id, sessionName).fresh).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("prepares then compacts fresh usage, pauses pending restore on stale usage, and resumes on fresh usage", async () => {
+    const now = Date.parse("2026-10-02T12:00:00Z");
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const { sessionName } = seedClaudeNode();
+    const send = installRealCompactionEnforcer();
+    const writeUsage = (percentage: number, sampledAt: number) => writeSidecar(sessionName, {
+      ...VALID_SIDECAR,
+      sampled_at: new Date(sampledAt).toISOString(),
+      context_window: { ...VALID_SIDECAR.context_window, used_percentage: percentage, remaining_percentage: 100 - percentage },
+    });
+    writeUsage(80, now);
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0]?.[1]).toContain("OpenRig automatic compaction preparation is now required");
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]?.[1]).toContain("/compact");
+    writeUsage(30, now - 600_001);
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(2);
+    writeUsage(30, now);
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(3);
+    await monitor.pollOnce();
+    expect(send).toHaveBeenCalledTimes(4);
+    expect(send.mock.calls[3]?.[1]).toContain("restoring this Claude session after compaction");
+  });
 
   // T1: pollOnce discovers running Claude sessions and persists usage
   it("pollOnce discovers running Claude sessions and persists context usage", async () => {

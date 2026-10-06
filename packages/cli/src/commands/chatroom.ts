@@ -115,6 +115,13 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
 
       if (opts.json) {
         console.log(JSON.stringify(res.data));
+        if (res.status >= 400) process.exitCode = 1;
+        return;
+      }
+
+      if (res.status >= 400) {
+        console.error((res.data as { error?: string })?.error ?? `Failed (HTTP ${res.status})`);
+        process.exitCode = 1;
         return;
       }
 
@@ -259,6 +266,16 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
     .option("--timeout <seconds>", "Timeout in seconds", "120")
     .option("--json", "JSON output")
     .action(async (rig: string, opts: { after?: string; topic?: string; sender?: string; timeout: string; json?: boolean }) => {
+      // A NaN timeout would never expire and would poll with a ~1ms sleep.
+      // Preserve numeric forms and legacy numeric prefixes (e.g. 30s) without truncating fractions.
+      const numericTimeout = Number(opts.timeout);
+      const timeoutSeconds = Number.isNaN(numericTimeout) ? Number.parseFloat(opts.timeout) : numericTimeout;
+      if (opts.timeout.trim() === "" || !Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) {
+        console.error(`--timeout must be a non-negative number of seconds; got '${opts.timeout}'`);
+        process.exitCode = 1;
+        return;
+      }
+
       const client = await getClient();
       if (!client) return;
 
@@ -271,7 +288,7 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
         return;
       }
 
-      const timeoutMs = parseInt(opts.timeout, 10) * 1000;
+      const timeoutMs = timeoutSeconds * 1000;
       const pollIntervalMs = 3000;
 
       // Bootstrap cursor: use --after if provided, otherwise generate a ULID at start time
@@ -298,6 +315,12 @@ export function chatroomCommand(depsOverride?: StatusDeps): Command {
         const res = await client.get<Array<Record<string, unknown>>>(
           `/api/rigs/${encodeURIComponent(rigId)}/chat/history?${params}`,
         );
+
+        if (res.status >= 400) {
+          console.error((res.data as { error?: string })?.error ?? `Failed (HTTP ${res.status})`);
+          process.exitCode = 1;
+          return;
+        }
 
         if (res.data && res.data.length > 0) {
           if (opts.json) {

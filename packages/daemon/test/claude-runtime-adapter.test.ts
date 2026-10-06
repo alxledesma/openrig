@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import nodePath from "node:path";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { ClaudeCodeAdapter, type ClaudeAdapterFsOps } from "../src/adapters/claude-code-adapter.js";
 import type { NodeBinding, ResolvedStartupFile } from "../src/domain/runtime-adapter.js";
@@ -98,6 +101,52 @@ describe("launchHarness — per-agent --model reaches the claude launch (51-07 A
     expect(noModel).toContain(POSTURE);
     expect(withMdl).toContain(POSTURE);
     expect(withMdl.replace(` --model '${MODEL}'`, "")).toBe(noModel);
+  });
+});
+
+describe("launchHarness — per-agent --effort reaches the claude launch (#75)", () => {
+  const EFFORT = "high";
+  const POSTURE = claudePostureFlag(process.env, undefined);
+
+  const withEffort = (effort?: string, model?: string): NodeBinding => ({ ...makeBinding(), effort, model } as NodeBinding);
+  const adapterWith = (tmux: TmuxAdapter) => new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {} });
+  const lastCmd = (tmux: TmuxAdapter): string => {
+    const calls = (tmux.sendText as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    return (calls[calls.length - 1]?.[1] as string) ?? "";
+  };
+
+  it("FRESH launch emits --effort when the binding declares one", async () => {
+    const tmux = mockTmux();
+    await adapterWith(tmux).launchHarness(withEffort(EFFORT), { name: "seat" });
+    expect(lastCmd(tmux)).toContain(`--effort '${EFFORT}'`);
+  });
+
+  it("RESUME launch emits --effort", async () => {
+    const tmux = mockTmux();
+    await adapterWith(tmux).launchHarness(withEffort(EFFORT), { name: "seat", resumeToken: "tok-123" });
+    expect(lastCmd(tmux)).toContain(`--effort '${EFFORT}'`);
+  });
+
+  it("FORK launch emits --effort", async () => {
+    const tmux = mockTmux();
+    await adapterWith(tmux).launchHarness(withEffort(EFFORT), { name: "seat", forkSource: { kind: "native_id", value: "parent-xyz" } });
+    expect(lastCmd(tmux)).toContain(`--effort '${EFFORT}'`);
+  });
+
+  it("emits both --model and --effort when both declared", async () => {
+    const tmux = mockTmux();
+    await adapterWith(tmux).launchHarness(withEffort(EFFORT, "claude-haiku-4-5"), { name: "seat", resumeToken: "tok-123" });
+    expect(lastCmd(tmux)).toContain(`--model 'claude-haiku-4-5'`);
+    expect(lastCmd(tmux)).toContain(`--effort '${EFFORT}'`);
+  });
+
+  it("absent effort → command byte-identical", async () => {
+    const tmuxNo = mockTmux(); await adapterWith(tmuxNo).launchHarness(withEffort(undefined), { name: "seat", resumeToken: "T" });
+    const tmuxYes = mockTmux(); await adapterWith(tmuxYes).launchHarness(withEffort(EFFORT), { name: "seat", resumeToken: "T" });
+    const noEffort = lastCmd(tmuxNo), withEff = lastCmd(tmuxYes);
+    expect(noEffort).toContain(POSTURE);
+    expect(withEff).toContain(POSTURE);
+    expect(withEff.replace(` --effort '${EFFORT}'`, "")).toBe(noEffort);
   });
 });
 
@@ -260,14 +309,14 @@ describe("Claude Code runtime adapter", () => {
     };
     await adapter.deliverStartup([file], makeBinding());
     expect(tmux.sendText).toHaveBeenCalledWith("r01-impl", "echo hello");
-    expect(tmux.sendKeys).toHaveBeenCalledWith("r01-impl", ["C-m"]);
+    expect(tmux.sendKeys).toHaveBeenCalledWith("r01-impl", ["Enter"]);
   });
 
   // OPR.0.3.3.16 - a >100KB send_text startup pack must still travel through the
-  // sendText -> sleep -> sendKeys(["C-m"]) sequence unchanged. The large-payload
+  // sendText -> sleep -> sendKeys(["Enter"]) sequence unchanged. The large-payload
   // buffer mechanics live in TmuxAdapter; the adapter's job is to hand the full
   // content to sendText and fire the single trailing submit.
-  it("delivers a large (>100KB) send_text startup file via sendText then submits with C-m", async () => {
+  it("delivers a large (>100KB) send_text startup file via sendText then submits with Enter", async () => {
     const tmux = mockTmux();
     const big = "L".repeat(120 * 1024);
     const fs = mockFs({ "/rig/startup/big-pack.md": big });
@@ -284,7 +333,7 @@ describe("Claude Code runtime adapter", () => {
     // The full payload is handed to sendText (TmuxAdapter routes it to the buffer path).
     expect(tmux.sendText).toHaveBeenCalledWith("r01-impl", big);
     // Single trailing submit preserved.
-    expect(tmux.sendKeys).toHaveBeenCalledWith("r01-impl", ["C-m"]);
+    expect(tmux.sendKeys).toHaveBeenCalledWith("r01-impl", ["Enter"]);
   });
 
   // T6: duplicate delivery is idempotent
@@ -334,6 +383,43 @@ describe("Claude Code runtime adapter", () => {
     await adapter.project(plan, makeBinding());
     const store = (fs as unknown as { _store: Record<string, string> })._store;
     expect(store["/project/.claude/agents/reviewer.yaml"]).toBe("name: reviewer");
+  });
+
+  // T9c: file-shaped subagent under PRODUCTION listFiles semantics. The in-memory
+  // mockFs above returns [] for a file path, but production wires listFiles to a
+  // recursive fs.readdirSync walk (startup.ts), which throws ENOTDIR on a file —
+  // an unguarded probe lands the entry in ProjectionResult.failed and it is never
+  // projected. This drives project() through a real-fs-backed listFiles.
+  it("projects file-shaped subagent when listFiles throws ENOTDIR (production readdirSync semantics)", async () => {
+    const tempRoot = fs.mkdtempSync(nodePath.join(os.tmpdir(), "openrig-claude-projection-"));
+    const srcFile = nodePath.join(tempRoot, "agents", "base", "subagents", "reviewer.yaml");
+    fs.mkdirSync(nodePath.dirname(srcFile), { recursive: true });
+    fs.writeFileSync(srcFile, "name: reviewer");
+    const cwd = nodePath.join(tempRoot, "project");
+    fs.mkdirSync(cwd, { recursive: true });
+
+    const adapter = new ClaudeCodeAdapter({
+      tmux: mockTmux(),
+      fsOps: {
+        readFile: (p: string) => fs.readFileSync(p, "utf-8"),
+        writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"),
+        exists: (p: string) => fs.existsSync(p),
+        mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }),
+        copyFile: (src: string, dest: string) => fs.copyFileSync(src, dest),
+        listFiles: (dir: string) => fs.readdirSync(dir),
+      },
+    });
+    const plan: ProjectionPlan = {
+      runtime: "claude-code", cwd,
+      entries: [makeEntry({ category: "subagent", effectiveId: "reviewer", absolutePath: srcFile, resourcePath: "subagents/reviewer.yaml" })],
+      startup: { files: [], actions: [] }, conflicts: [], noOps: [], diagnostics: [],
+    };
+
+    const result = await adapter.project(plan, makeBinding(cwd));
+
+    expect(result.failed).toEqual([]);
+    expect(result.projected).toEqual(["reviewer"]);
+    expect(fs.readFileSync(nodePath.join(cwd, ".claude", "agents", "reviewer.yaml"), "utf-8")).toBe("name: reviewer");
   });
 
   it("applies claude_settings_fragment runtime resources to project-local Claude settings", async () => {
@@ -557,30 +643,36 @@ describe("Claude Code runtime adapter", () => {
     });
   });
 
-  it("launchHarness captures resume token from session file", async () => {
+  it.each<[string, string[]]>([
+    ["the only same-name file matches", ["assigned.json"]],
+    ["another same-name seat is first", ["other.json", "assigned.json"]],
+    ["only another same-name seat has written its file", ["other.json"]],
+  ])("fresh launch retains its assigned ID when %s", async (_case, files) => {
     const tmux = mockTmux();
-    const sessionData = JSON.stringify({ pid: 12345, sessionId: "abc-session-id", name: "dev-impl@test-rig" });
+    const assignedId = "11111111-1111-4111-8111-111111111111";
+    const otherId = "22222222-2222-4222-8222-222222222222";
+    const sessionData: Record<string, string> = {
+      "assigned.json": JSON.stringify({ pid: 12345, sessionId: assignedId, name: "dev-impl@test-rig" }),
+      "other.json": JSON.stringify({ pid: 67890, sessionId: otherId, name: "dev-impl@test-rig" }),
+    };
     const fs = mockFs({});
-    // Add readdir + homedir capabilities
     const fsWithDir = {
       ...fs,
-      readdir: (dir: string) => dir.includes("sessions") ? ["12345.json"] : [],
+      readdir: (dir: string) => dir.includes("sessions") ? files : [],
       homedir: "/mock-home",
       readFile: (p: string) => {
-        if (p.includes("12345.json")) return sessionData;
+        const data = sessionData[nodePath.basename(p)];
+        if (data) return data;
         return fs.readFile(p);
       },
       exists: (p: string) => p.includes("sessions") || fs.exists(p),
     };
-    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: fsWithDir });
+    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: fsWithDir, sessionIdFactory: () => assignedId });
 
     const result = await adapter.launchHarness(makeBinding(), { name: "dev-impl@test-rig" });
 
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.resumeToken).toBe("abc-session-id");
-      expect(result.resumeType).toBe("claude_id");
-    }
+    expect(tmux.sendText).toHaveBeenCalledWith("r01-impl", expect.stringContaining(`--session-id ${assignedId}`));
+    expect(result).toMatchObject({ ok: true, resumeToken: assignedId, resumeType: "claude_id" });
   });
 
   it("launchHarness returns error when no tmux session bound", async () => {

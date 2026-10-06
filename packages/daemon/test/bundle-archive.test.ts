@@ -64,6 +64,17 @@ describe("Bundle archive", () => {
     return staging;
   }
 
+  it("pack creates parent directory if it does not exist", async () => {
+    const staging = createStaging();
+    const nestedOut = path.join(tmpDir, "missing", "sub", "test.rigbundle");
+
+    const hash = await pack(staging, nestedOut);
+
+    expect(fs.existsSync(nestedOut)).toBe(true);
+    expect(fs.existsSync(`${nestedOut}.sha256`)).toBe(true);
+    expect(hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
   // T1: Pack creates valid tar.gz
   it("pack creates valid tar.gz file", async () => {
     const staging = createStaging();
@@ -74,6 +85,27 @@ describe("Bundle archive", () => {
     expect(fs.existsSync(outputPath)).toBe(true);
     expect(hash).toMatch(/^[a-f0-9]{64}$/);
     expect(fs.statSync(outputPath).size).toBeGreaterThan(0);
+  });
+
+  it.skipIf(process.platform === "win32")("preserves executable file modes through pack and unpack", async () => {
+    const staging = createStaging();
+    const scriptPath = path.join(staging, "packages/pkg/bin/hello.sh");
+    fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+    fs.writeFileSync(scriptPath, "#!/bin/sh\necho hello\n", { mode: 0o755 });
+    fs.chmodSync(scriptPath, 0o755);
+    writeIntegrity(staging, computeIntegrity(staging, realIntegrityFsOps()), realIntegrityFsOps());
+
+    const archivePath = path.join(tmpDir, "executable.rigbundle");
+    await pack(staging, archivePath);
+    let archivedMode: number | undefined;
+    await tar.list({ file: archivePath, onReadEntry: (entry) => {
+      if (entry.path === "packages/pkg/bin/hello.sh") archivedMode = entry.mode;
+    } });
+    expect((archivedMode ?? 0) & 0o111).toBeGreaterThan(0);
+
+    const extractDir = path.join(tmpDir, "executable-extracted");
+    await unpack(archivePath, extractDir);
+    expect(fs.statSync(path.join(extractDir, "packages/pkg/bin/hello.sh")).mode & 0o111).toBeGreaterThan(0);
   });
 
   // T2: Unpack extracts to correct structure
@@ -124,6 +156,42 @@ describe("Bundle archive", () => {
 
     await expect(unpack(malArchive, path.join(tmpDir, "out")))
       .rejects.toThrow(/Unsafe archive entry|path traversal/i);
+  });
+
+  it("backslash path traversal in archive entry rejected during extraction", async () => {
+    const malDir = path.join(tmpDir, "mal-win-staging");
+    fs.mkdirSync(malDir, { recursive: true });
+    fs.writeFileSync(path.join(malDir, "evil.txt"), "escape!");
+
+    const malArchive = path.join(tmpDir, "mal-win.rigbundle");
+    await tar.create(
+      { gzip: true, file: malArchive, cwd: malDir, prefix: "..\\escape" },
+      ["evil.txt"],
+    );
+
+    const archiveHash = createHash("sha256").update(fs.readFileSync(malArchive)).digest("hex");
+    fs.writeFileSync(`${malArchive}.sha256`, archiveHash);
+
+    await expect(unpack(malArchive, path.join(tmpDir, "out")))
+      .rejects.toThrow(/Unsafe archive entry|path traversal/i);
+  });
+
+  it("windows drive letter in archive entry rejected during extraction", async () => {
+    const malDir = path.join(tmpDir, "mal-drive-staging");
+    fs.mkdirSync(malDir, { recursive: true });
+    fs.writeFileSync(path.join(malDir, "evil.txt"), "escape!");
+
+    const malArchive = path.join(tmpDir, "mal-drive.rigbundle");
+    await tar.create(
+      { gzip: true, file: malArchive, cwd: malDir, prefix: "C:\\windows\\temp" },
+      ["evil.txt"],
+    );
+
+    const archiveHash = createHash("sha256").update(fs.readFileSync(malArchive)).digest("hex");
+    fs.writeFileSync(`${malArchive}.sha256`, archiveHash);
+
+    await expect(unpack(malArchive, path.join(tmpDir, "out")))
+      .rejects.toThrow(/Unsafe archive entry|absolute path/i);
   });
 
   // T4b: Symlink entry rejection

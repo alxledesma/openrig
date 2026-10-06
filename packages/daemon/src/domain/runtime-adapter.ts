@@ -8,6 +8,7 @@ import type { ProjectionPlan } from "./projection-planner.js";
 export interface NodeBinding extends Binding {
   cwd: string;
   model?: string;
+  effort?: string;
   codexConfigProfile?: string;
   /** OPR.0.4.8.3 Seam B: the seat's RESOLVED launch posture from its permission_policy
    * attachment (member > rig precedence, resolved by the core resolver at materialize /
@@ -25,6 +26,8 @@ export interface NodeBinding extends Binding {
 // -- Resolved startup file with source-root provenance --
 
 export interface ResolvedStartupFile {
+  /** Explicit per-seat role orientation; never inferred from the filename. */
+  orientation?: "role";
   path: string;
   absolutePath: string;
   ownerRoot: string;
@@ -132,6 +135,10 @@ export interface RuntimeAdapter {
   /** Claude's managed capability/launch seam, shared with seat selection. */
   readonly claudeManagedLaunch?: import("./claude-managed-launch.js").ClaudeManagedLaunch;
   readonly runtime: string;
+  /** The file an adapter's project() writes for a skill when it lives outside
+   *  the Claude project tree, for "already in place" detection. Absent = the
+   *  instantiator's default target. */
+  skillTargetPath?(tmuxSession: string | null, effectiveId: string): string | null;
 
   /** List currently installed/projected resources for a node. */
   listInstalled(binding: NodeBinding): Promise<InstalledResource[]>;

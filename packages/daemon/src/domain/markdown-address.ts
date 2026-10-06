@@ -116,13 +116,14 @@ function scanHeaders(lines: string[]): HeaderScan {
       const length = fenceMatch[1]!.length;
       if (!fence) {
         fence = { marker, length, line: i };
-      } else if (fence.marker === marker && length >= fence.length) {
+      } else if (fence.marker === marker && length >= fence.length
+        && /^[ \t\r]*$/.test(line.slice(fenceMatch[0].length))) {
         fence = null;
       }
       continue;
     }
     if (fence) continue;
-    const header = line.match(/^(#{1,6})\s+(.*\S)\s*$/);
+    const header = line.match(/^ {0,3}(#{1,6})\s+(.*\S)\s*$/);
     if (header) hits.push({ level: header[1]!.length, title: header[2]!, line: i });
   }
   return { hits, unterminatedFenceLine: fence?.line ?? null };

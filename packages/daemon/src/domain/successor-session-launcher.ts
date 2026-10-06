@@ -50,6 +50,8 @@ export interface SuccessorNode {
    *  running topology drift from the founder-designed one. Populated by the caller from node provenance;
    *  absent → the adapter emits no model flag (unchanged for legacy/unpinned seats). */
   model?: string | null;
+  /** #75: the seat's configured effort (nodes.effort). Carried to successor launch. */
+  effort?: string | null;
   /** 0.5.2-07 A4-profile: the seat's SPEC-pinned codex config profile (nodes.codex_config_profile).
    *  Same continuity rationale as model — populated by the caller from node provenance; absent → the
    *  adapter emits no -p flag (unchanged for legacy/unpinned seats). */
@@ -86,6 +88,7 @@ export class SuccessorSessionLauncher {
   private tmuxAdapter: TmuxAdapter;
   private discoveryRepo: DiscoveryRepository;
   private sessionEnv: Record<string, string | undefined>;
+  private runtimeSessionEnv: Record<string, Record<string, string | undefined>>;
   private newId: () => string;
   private runtimeAdapters: Record<string, RuntimeAdapter>;
   private readinessTimeoutMs: number;
@@ -99,6 +102,8 @@ export class SuccessorSessionLauncher {
     discoveryRepo: DiscoveryRepository,
     opts: {
       sessionEnv?: Record<string, string | undefined>;
+      /** Extra env for one runtime only, merged over sessionEnv (see NodeLauncher). */
+      runtimeSessionEnv?: Record<string, Record<string, string | undefined>>;
       newId?: () => string;
       /** Runtime adapters keyed by runtime, used to launch + ready-probe the
        *  successor agent. Absent → a fresh successor cannot be launched. */
@@ -122,6 +127,7 @@ export class SuccessorSessionLauncher {
     this.tmuxAdapter = tmuxAdapter;
     this.discoveryRepo = discoveryRepo;
     this.sessionEnv = opts.sessionEnv ?? {};
+    this.runtimeSessionEnv = opts.runtimeSessionEnv ?? {};
     this.newId = opts.newId ?? ulid;
     this.runtimeAdapters = opts.runtimeAdapters ?? {};
     this.readinessTimeoutMs = opts.readinessTimeoutMs ?? 30_000;
@@ -165,6 +171,7 @@ export class SuccessorSessionLauncher {
       OPENRIG_SESSION_NAME: departingSession,
       OPENRIG_RUNTIME: input.node.runtime ?? undefined,
       ...this.sessionEnv,
+      ...(input.node.runtime ? this.runtimeSessionEnv[input.node.runtime] : undefined),
       OPENRIG_OCCUPANT_GENERATION: input.occupantGeneration ?? undefined,
     });
     const cwd = input.node.cwd ?? undefined;
@@ -321,6 +328,8 @@ export class SuccessorSessionLauncher {
       ...(node.permissionMode ? { permissionMode: node.permissionMode } : {}),
       // 0.5.2-07: the successor reads the seat's SPEC-pinned model (adapter emits -m/--model).
       model: node.model ?? undefined,
+      // #75: the successor reads the seat's configured effort.
+      effort: node.effort ?? undefined,
       // 0.5.2-07 A4-profile: the successor reads the seat's SPEC-pinned codex config profile (adapter emits -p).
       codexConfigProfile: node.codexConfigProfile ?? undefined,
     };
@@ -387,14 +396,12 @@ export class SuccessorSessionLauncher {
       if (result.ready) return result;
       if (isAttentionRequiredReadinessCode(result.code)) return result;
 
-      const elapsed = Date.now() - startTime;
-      if (elapsed + delay > this.readinessTimeoutMs) {
-        const finalResult = await adapter.checkReady(binding);
-        if (finalResult.ready) return finalResult;
+      const remaining = this.readinessTimeoutMs - (Date.now() - startTime);
+      if (remaining <= 0) {
         return { ready: false, reason: result.reason ?? "readiness timeout" };
       }
 
-      await this.sleep(delay);
+      await this.sleep(Math.min(delay, remaining));
       delay = Math.min(delay * 2, maxDelay);
     }
   }

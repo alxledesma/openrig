@@ -23,7 +23,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { assertSafeInstallRef, assertTreeHasNoSymlinks, assertDestinationNamespaceContained, validateContextPackManifestForInstall } from "../lib/context-install.js";
 import { addGitContext, inspectGitContext, updateGitContext } from "../lib/context-git.js";
@@ -377,7 +377,7 @@ Examples:
     .description("Walk the topology tree for one chain filename (instance -> rig -> optional pod -> optional seat), keyed off topology.root")
     .requiredOption("--rig <rig>", "Rig name (the rigs/<rig> altitude)")
     .option("--pod <pod>", "Pod id (the pods/<pod> altitude); omit when no pod context is selected")
-    .option("--seat <seat>", "Seat id (the seats/<seat> altitude); omit for a rig-level trace")
+    .option("--seat <seat>", "Seat folder name (<pod>-<member>, e.g. dev1-qa); omit for a rig-level trace")
     .requiredOption("--name <file>", "Chain filename, identical at every altitude (e.g. LEARNED.md, CULTURE.md)")
     .option("--json", "JSON output for agents")
     .action(async (opts: { rig: string; pod?: string; seat?: string; name: string; json?: boolean }) => {
@@ -466,6 +466,7 @@ Examples:
       try {
         const client = await getClient();
         const res = await client.get<ContextPackEntryWire[]>("/api/context-packs/library");
+        if (res.status !== 200) throw new Error(`Daemon returned HTTP ${res.status}`);
         const entries = res.data ?? [];
         if (opts.json) {
           console.log(JSON.stringify(entries, null, 2));
@@ -671,9 +672,10 @@ Examples:
         const res = await client.get<{
           profileId?: string;
           phases?: Array<{ id: string; kind: string; sources?: string[]; estimatedTokens: number }>;
-          pieces?: Array<{ atomId: string; address: string; sourceKind: string; text: string; estimatedTokens: number }>;
+          pieces?: Array<{ atomId: string; address: string; sourceKind: string; text: string; estimatedTokens: number; writtenAt?: string }>;
           totalEstimatedTokens?: number;
           budget?: { limitTokens: number; overageTokens: number; dropCandidates: Array<{ atomId: string; priority: string; estimatedTokens: number }> };
+          warnings?: string[];
           provenanceWarnings?: string[];
           message?: string;
           error?: string;
@@ -695,6 +697,7 @@ Examples:
         }
         // Warnings and the budget report ride stderr so stdout is exactly the
         // composed walk an agent consumes.
+        for (const w of profile.warnings ?? []) console.error(`WARNING ${w}`);
         for (const w of profile.provenanceWarnings ?? []) console.error(`PROVENANCE ${w}`);
         if (profile.budget) {
           console.error(
@@ -708,7 +711,8 @@ Examples:
           // outside its root — self-describing payload, zero composed bytes
           // touched.
           const escaped = (p as { provenance?: { escapesRoot?: boolean } }).provenance?.escapesRoot ? " !ESCAPED-ROOT" : "";
-          console.log(`=== ${p.atomId} [${p.sourceKind}${escaped}] ${p.address} (~${p.estimatedTokens} tokens)`);
+          const written = p.writtenAt ? ` written ${p.writtenAt}` : "";
+          console.log(`=== ${p.atomId} [${p.sourceKind}${escaped}] ${p.address} (~${p.estimatedTokens} tokens)${written}`);
           console.log(p.text);
           console.log("");
         }
@@ -818,15 +822,8 @@ Examples:
             throw new Error(`Source directory must contain manifest.yaml: ${source}`);
           }
           validateContextPackManifestForInstall(manifestPath);
-          const installName = opts.name ?? (() => {
-            try {
-              const raw = readFileSync(manifestPath, "utf-8");
-              const m = raw.match(/^name:\s*['"]?([^'"\n]+)['"]?\s*$/m);
-              return m?.[1]?.trim() || basename(source);
-            } catch {
-              return basename(source);
-            }
-          })();
+          const manifest = parseYaml(readFileSync(manifestPath, "utf-8")) as { name: string };
+          const installName = opts.name ?? manifest.name;
           assertSafeInstallRef(installName);
           assertTreeHasNoSymlinks(source);
           mkdirSync(targetRoot, { recursive: true });
@@ -842,7 +839,14 @@ Examples:
           if (targetExists) {
             throw new Error(`A context pack named '${installName}' already exists at ${targetDir}. Remove it first or use --name to install under a different name.`);
           }
-          cpSync(source, targetDir, { recursive: true });
+          const staging = mkdtempSync(join(targetRoot, ".tmp-add-"));
+          try {
+            cpSync(source, staging, { recursive: true });
+            mkdirSync(dirname(targetDir), { recursive: true });
+            renameSync(staging, targetDir);
+          } finally {
+            rmSync(staging, { recursive: true, force: true });
+          }
         }
         // Sync the daemon library so the new pack appears immediately.
         const client = await getClient();

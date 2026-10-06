@@ -268,7 +268,7 @@ rigsRoutes.get("/:id/status", (c) => {
   let recovery: RecoveryPlan | null = null;
   try {
     recovery = createRestoreCheckService(repo, snapshotRepo)
-      .check({ rig: rig.rig.name, noQueue: true, noHooks: true })
+      .check({ rig: rig.rig.name, noQueue: true, noHooks: true, recoveryOnly: true })
       .recovery;
   } catch {
     recovery = null;
@@ -575,7 +575,7 @@ rigsRoutes.post("/:id/attach-self", async (c) => {
   const tmuxPane = typeof body["tmuxPane"] === "string" ? body["tmuxPane"].trim() : "";
 
   const hasNodeTarget = logicalId.length > 0;
-  const hasPodFields = podNamespace.length > 0 || memberName.length > 0 || runtime.length > 0;
+  const hasPodFields = podNamespace.length > 0 || memberName.length > 0;
 
   if (hasNodeTarget && hasPodFields) {
     return c.json({ error: "Specify either logicalId or podNamespace + memberName + runtime" }, 400);

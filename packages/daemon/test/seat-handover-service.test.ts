@@ -17,11 +17,14 @@ import { AgentActivityStore } from "../src/domain/agent-activity-store.js";
 import { watchdogHistorySchema } from "../src/db/migrations/032_watchdog_history.js";
 import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
 import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_guard.js";
+import { coordinatorAuthoritySchema } from "../src/db/migrations/090_coordinator_authority.js";
 import { SeatDeliveryGuard } from "../src/domain/seat-delivery-guard.js";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import { observeCodexSandbox } from "../src/domain/permission-drift.js";
 import { AppliedLaunchObservationStore } from "../src/domain/applied-launch-observation-store.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
+import { DefaultOccupantInvalidator, type OccupantInvalidator } from "../src/domain/occupant-invalidator.js";
 
 describe("SeatHandoverService", () => {
   let db: Database.Database;
@@ -44,6 +47,7 @@ describe("SeatHandoverService", () => {
   let checkReady: ReturnType<typeof vi.fn>;
   let readSidecar: ReturnType<typeof vi.fn>;
   let captureCodexThreadId: ReturnType<typeof vi.fn>;
+  let claudeProcessStartedAt: ((sessionName: string) => Promise<string | null>) | undefined;
   let invalidateRetiringOccupant: ReturnType<typeof vi.fn>;
   let declareOccupantSwap: ReturnType<typeof vi.fn>;
   let resolvePredecessorRecap: ReturnType<typeof vi.fn>;
@@ -52,7 +56,9 @@ describe("SeatHandoverService", () => {
   let service: SeatHandoverService;
 
   beforeEach(() => {
-    db = createFullTestDb();
+    // 090 rides the inline list (not the shared core edge): the REAL invalidator path below reads
+    // coordinator_operations through QueueRepository's queue-admission write path.
+    db = createFullTestDb([coordinatorAuthoritySchema]);
     rigRepo = new RigRepository(db);
     sessionRegistry = new SessionRegistry(db);
     discoveryRepo = new DiscoveryRepository(db);
@@ -80,6 +86,7 @@ describe("SeatHandoverService", () => {
     // B2 — discovered-mode derive-helper deps (Codex thread-id capturer by default).
     readSidecar = vi.fn(() => ({ ok: true, data: { session_id: "claude-sid-123" } }));
     captureCodexThreadId = vi.fn(async () => "codex-discovered-tok");
+    claudeProcessStartedAt = undefined;
     invalidateRetiringOccupant = vi.fn();
     declareOccupantSwap = vi.fn();
     resolvePredecessorRecap = vi.fn(() => ({ unavailableReason: "test default: no record" }));
@@ -101,7 +108,7 @@ describe("SeatHandoverService", () => {
     return { runtime: "codex", launchHarness, checkReady } as unknown as RuntimeAdapter;
   }
 
-  function newService(adapter: TmuxAdapter = tmux(), rotationPrecondition?: (seat:string,expected:Record<string,unknown>)=>Promise<void>): SeatHandoverService {
+  function newService(adapter: TmuxAdapter = tmux(), occupantInvalidator: OccupantInvalidator = { invalidateRetiringOccupant }, rotationPrecondition?: (seat:string,expected:Record<string,unknown>)=>Promise<void>): SeatHandoverService {
     return new SeatHandoverService({
       db,
       rigRepo,
@@ -118,7 +125,8 @@ describe("SeatHandoverService", () => {
       runtimeAdapters: { codex: codexAdapter() },
       contextUsageStore: { readSidecar } as never,
       resumeTokenCapturer: { captureCodexThreadId } as never,
-      occupantInvalidator: { invalidateRetiringOccupant },
+      ...(claudeProcessStartedAt ? { claudeProcessStartedAt } : {}),
+      occupantInvalidator,
       activityOracle: { declareOccupantSwap },
       predecessorRecapResolver: resolvePredecessorRecap as never,
       readinessTimeoutMs: 50,
@@ -126,9 +134,9 @@ describe("SeatHandoverService", () => {
     });
   }
 
-  function seedSeat(opts?: { runtime?: string; withSession?: boolean; model?: string; codexConfigProfile?: string }) {
+  function seedSeat(opts?: { runtime?: string; withSession?: boolean; model?: string; codexConfigProfile?: string; effort?: string }) {
     const rig = rigRepo.createRig("seat-rig");
-    const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: opts?.runtime ?? "codex", cwd: "/project", model: opts?.model, codexConfigProfile: opts?.codexConfigProfile });
+    const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: opts?.runtime ?? "codex", cwd: "/project", model: opts?.model, codexConfigProfile: opts?.codexConfigProfile, effort: opts?.effort });
     let sessionId: string | null = null;
     if (opts?.withSession !== false) {
       const session = sessionRegistry.registerSession(node.id, "dev-impl@seat-rig");
@@ -539,7 +547,7 @@ describe("SeatHandoverService", () => {
     db.exec(outboxEntriesSchema.sql); db.exec(seatDeliveryGuardSchema.sql);
     adapter.deliveryGuard=new SeatDeliveryGuard(db,()=>({nodeId:node.id,session:"dev-impl@seat-rig",occupant:"old",pane:"%0"}));
     let calls=0;
-    service=newService(adapter,async()=>{
+    service=newService(adapter,undefined,async()=>{
       expect(adapter.deliveryGuard!.ownsLifecycle(node.id)).toBe(true);
       calls++;
       if(calls===2)throw new Error("Seat became busy during capture");
@@ -551,14 +559,14 @@ describe("SeatHandoverService", () => {
   it("automatic rotation refuses a projected floor launch that would downgrade native bypass", async()=>{
     const {node}=seedSeat();const adapter=tmux();db.exec(outboxEntriesSchema.sql);db.exec(seatDeliveryGuardSchema.sql);
     adapter.deliveryGuard=new SeatDeliveryGuard(db,()=>({nodeId:node.id,session:"dev-impl@seat-rig",occupant:"old",pane:"%0"}));
-    service=newService(adapter,async()=>{});
+    service=newService(adapter,undefined,async()=>{});
     await expect(service.handover({seatRef:"dev-impl@seat-rig",source:"fresh",reason:"rotation",rotationExpected:{runtimeContract:{permissions:{sandbox:{type:"danger-full-access"},approval:"never"}}}})).rejects.toThrow("would change native permissions");
     expect(signalPaneProcess).not.toHaveBeenCalled();expect(respawnPane).not.toHaveBeenCalled();expect(launchHarness).not.toHaveBeenCalled();
   });
   it("automatic rotation with matching native floor reaches launcher with floor posture",async()=>{
     const {node}=seedSeat();const adapter=tmux();db.exec(outboxEntriesSchema.sql);db.exec(seatDeliveryGuardSchema.sql);
     adapter.deliveryGuard=new SeatDeliveryGuard(db,()=>({nodeId:node.id,session:"dev-impl@seat-rig",occupant:"old",pane:"%0"}));
-    const verify=vi.fn(async()=>{});service=newService(adapter,verify);
+    const verify=vi.fn(async()=>{});service=newService(adapter,undefined,verify);
     const result=await service.handover({seatRef:"dev-impl@seat-rig",source:"fresh",reason:"rotation",rotationExpected:{runtimeContract:{permissions:{sandbox:{type:"workspace-write"},approval:"never"}}}});
     expect(result.ok).toBe(true);expect(verify).toHaveBeenCalledTimes(2);expect(launchHarness).toHaveBeenCalled();
     expect(launchHarness.mock.calls[0]![0].launchPosture).toBe("floor");
@@ -617,7 +625,7 @@ describe("SeatHandoverService", () => {
     expect(target).toBe("dev-impl@seat-rig");
     expect(packet).toContain("OpenRig seat handover");
     expect(packet).toContain("predecessor screen tail");
-    expect(sendKeys).toHaveBeenCalledWith("dev-impl@seat-rig", ["C-m"]);
+    expect(sendKeys).toHaveBeenCalledWith("dev-impl@seat-rig", ["Enter"]);
     expect(sendText.mock.invocationCallOrder[0]!).toBeLessThan(hasSession.mock.invocationCallOrder[0]!);
 
     // B1: the successor was launched into a LIVE agent (launchHarness +
@@ -811,7 +819,7 @@ describe("SeatHandoverService", () => {
     expect(packet).toContain("predecessor screen tail");
   });
 
-  it("B16 rework: packet delivery uses the shared paste-then-submit sequencing — a settle sleep BETWEEN send_text and C-m (r2 live: without it the packet sat staged-unsent 46s)", async () => {
+  it("B16 rework: packet delivery uses the shared paste-then-submit sequencing — a settle sleep BETWEEN send_text and Enter (r2 live: without it the packet sat staged-unsent 46s)", async () => {
     seedSeat({ runtime: "codex" });
     const sleeps: number[] = [];
     const orderedCalls: string[] = [];
@@ -914,6 +922,33 @@ describe("SeatHandoverService", () => {
     const payload = JSON.parse(captureEvent!.payload);
     expect(payload).toMatchObject({ outcome: "captured", provenance: "adoption", redacted: true });
     expect(JSON.stringify(payload)).not.toContain("codex-discovered-tok");
+  });
+
+  // #421: the discovered successor's own sample is taken after its process started; a sidecar
+  // sampled before that can only come from an earlier process.
+  it.each([
+    ["captures the successor's own sample", 60_000, { resume_token: "claude-sid-123", outcome: "captured" }],
+    ["skips a sample from an earlier process", -3_600_000, { resume_token: null, outcome: "skipped", reason: "stale_sidecar" }],
+  ])("B2 (claude-code): %s", async (_label, offsetMs, expected) => {
+    const processStart = "Fri Oct  2 11:00:00 2026";
+    readSidecar.mockReturnValue({ ok: true, data: { session_id: "claude-sid-123", sampled_at: new Date(Date.parse(processStart) + offsetMs).toISOString() } });
+    const startedAt = vi.fn(async () => processStart);
+    claudeProcessStartedAt = startedAt;
+    service = newService();
+    const { node } = seedSeat({ runtime: "claude-code" });
+    const discovered = seedDiscovery({ runtimeHint: "claude-code" });
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "mvp-proof", source: `discovered:${discovered.id}` });
+
+    expect(result.ok).toBe(true);
+    const newSession = db.prepare(
+      "SELECT resume_token FROM sessions WHERE node_id = ? AND session_name = ?"
+    ).get(node.id, "successor-session") as Record<string, string | null>;
+    expect(newSession.resume_token).toBe(expected.resume_token);
+    const event = db.prepare("SELECT payload FROM events WHERE type = 'session.resume_token_captured' ORDER BY seq DESC LIMIT 1").get() as { payload: string };
+    const { resume_token: _token, ...payload } = expected;
+    expect(JSON.parse(event.payload)).toMatchObject(payload);
+    expect(startedAt).toHaveBeenCalledWith("successor-session");
   });
 
   it("B2: honest redacted skip when the discovered token cannot be derived", async () => {
@@ -1196,6 +1231,77 @@ describe("SeatHandoverService", () => {
     expect(durableRows()).toBe(before);
   });
 
+  // #141: a YAML re-import archives the stopped earlier generation, which keeps its binding to the seat's
+  // canonical session name. A composer-launched successor reuses that name, so the archived shadow must not
+  // reject the live seat's handover after the successor has already replaced the process.
+  function seedArchivedGeneration(): void {
+    const old = rigRepo.createRig("seat-rig");
+    const oldNode = rigRepo.addNode(old.id, "dev.impl", { runtime: "codex", cwd: "/project" });
+    sessionRegistry.updateStatus(sessionRegistry.registerSession(oldNode.id, "dev-impl@seat-rig").id, "exited");
+    sessionRegistry.updateBinding(oldNode.id, { tmuxSession: "dev-impl@seat-rig", tmuxPane: "%0" });
+    rigRepo.archiveRig(old.id);
+  }
+
+  it.each(["fresh", "rebuild"] as const)("#141: an archived earlier generation's binding does not block a %s handover of the live seat", async (source) => {
+    seedArchivedGeneration();
+    const { node } = seedSeat();
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(respawnPane).toHaveBeenCalledTimes(1);
+    expect(killSession).not.toHaveBeenCalled();
+    expect(sessionRegistry.getBindingForNode(node.id)?.tmuxSession).toBe("dev-impl@seat-rig");
+    const nodeRow = db.prepare("SELECT handover_result FROM nodes WHERE id = ?").get(node.id) as { handover_result: string | null };
+    expect(nodeRow.handover_result).toBe("complete");
+  });
+
+  it("#141 control: another UNARCHIVED rig's binding to the seat's session name still blocks a fresh handover", async () => {
+    seedSeat();
+    const otherRig = rigRepo.createRig("other-rig");
+    const otherNode = rigRepo.addNode(otherRig.id, "dev.other", { runtime: "codex" });
+    sessionRegistry.updateBinding(otherNode.id, { tmuxSession: "dev-impl@seat-rig" });
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fresh" });
+
+    expect(result).toMatchObject({ ok: false, code: "successor_already_managed" });
+  });
+
+  it("#141 control: an archived rig's binding still blocks a DISCOVERED successor of that name", async () => {
+    seedSeat();
+    const discovered = seedDiscovery();
+    const archivedRig = rigRepo.createRig("archived-rig");
+    const archivedNode = rigRepo.addNode(archivedRig.id, "dev.other", { runtime: "codex" });
+    sessionRegistry.updateBinding(archivedNode.id, { tmuxSession: "successor-session" });
+    rigRepo.archiveRig(archivedRig.id);
+    const before = durableRows();
+
+    const result = await service.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: `discovered:${discovered.id}` });
+
+    expect(result).toMatchObject({ ok: false, code: "successor_already_managed" });
+    expect(durableRows()).toBe(before);
+  });
+
+  it("a successful fresh handover keeps the seat's blocked row's park timer live (real invalidator and repositories)", async () => {
+    seedSeat();
+    const gen = (session: string) => sessionRegistry.currentOccupantGenerationForSession(session);
+    const queue = new QueueRepository(db, eventBus, { validateRig: () => true, resolveOccupantGeneration: gen });
+    const jobs = new WatchdogJobsRepository(db, undefined, gen);
+    queue.attachWatchdogJobsRepository(jobs);
+    const row = await queue.create({ sourceSession: "orch-lead@seat-rig", destinationSession: "dev-impl@seat-rig", body: "work" } as never);
+    queue.update({ qitemId: row.qitemId, actorSession: "dev-impl@seat-rig", state: "blocked", blockedOn: "external:ci", transitionNote: "continuation: check CI", wakeAfterSeconds: 1800 } as never);
+    const timer = (queue.getParkWakeStatus(row.qitemId) as { ref: string }).ref;
+    const handover = newService(tmux(), new DefaultOccupantInvalidator({
+      enforcer: { invalidateOccupant() {} }, contextUsage: { invalidateOccupantSidecar() {} }, watchdog: jobs, queue,
+    }));
+
+    const result = await handover.handover({ seatRef: "dev-impl@seat-rig", reason: "context-wall", source: "fresh" });
+
+    expect(result.ok).toBe(true);
+    expect(jobs.getById(timer)?.state).toBe("active");
+    expect((queue.getParkWakeStatus(row.qitemId) as { live: boolean }).live).toBe(true);
+  });
+
   it("fails before mutation when the seat has no current occupant", async () => {
     seedSeat({ withSession: false });
     const discovered = seedDiscovery();
@@ -1247,5 +1353,19 @@ describe("SeatHandoverService", () => {
       currentOccupant: "route-successor",
       currentStatus: { handoverResult: "complete" },
     });
+  });
+
+  it("#75: an effort-pinned seat's handover launches the successor with that effort — the REAL lookupNode→createSuccessor→launchHarness path", async () => {
+    seedSeat({ runtime: "codex", effort: "high" });
+    const result = await service.handover({
+      seatRef: "dev-impl@seat-rig",
+      reason: "context-wall",
+      source: "fresh",
+      operator: "orch-lead@seat-rig",
+    });
+    expect(result.ok).toBe(true);
+    expect(launchHarness).toHaveBeenCalledTimes(1);
+    const successorBinding = launchHarness.mock.calls[0]![0] as { effort?: string };
+    expect(successorBinding.effort).toBe("high");
   });
 });

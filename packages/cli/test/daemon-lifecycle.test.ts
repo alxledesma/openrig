@@ -175,6 +175,172 @@ describe("Daemon Lifecycle", () => {
     expect(state.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
+  it("start: health answering slower than 250ms is a true positive, not a timeout", async () => {
+    // The required outcome: a daemon whose /healthz takes 600ms to answer is HEALTHY. Under the old
+    // 250ms wrapper timeout this was reported as "not responding" and the healthy child was killed.
+    vi.useFakeTimers();
+    let spawned = false;
+    const deps = mockDeps({ fetch: vi.fn(async () => {
+      if (!spawned) throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      return startupHealth();
+    }) });
+    const spawn = deps.spawn;
+    deps.spawn = vi.fn((...args: unknown[]) => { spawned = true; return spawn(...(args as [])); });
+    try {
+      const starting = startDaemon({ port: 8000, db: "test.sqlite" }, deps);
+      await vi.runAllTimersAsync();
+      expect((await starting).pid).toBe(12345);
+      expect(deps.kill).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("start: a probe cancelled by timeout is aborted and settled, never left in flight", async () => {
+    vi.useFakeTimers();
+    let spawned = false;
+    let inFlight = 0;
+    let peakInFlight = 0;
+    const deps = mockDeps({ fetch: vi.fn(async (_url: string, options?: { signal?: AbortSignal }) => {
+      if (!spawned) throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+      inFlight++; peakInFlight = Math.max(peakInFlight, inFlight);
+      try {
+        // Never answers on its own; only cancellation can end it.
+        await new Promise((_, reject) => {
+          const timer = setTimeout(() => reject(Object.assign(new Error("healthz not responding"), { code: "ECONNREFUSED" })), 5_000);
+          options?.signal?.addEventListener("abort", () => { clearTimeout(timer); reject(Object.assign(new Error("aborted"), { name: "AbortError" })); });
+        });
+        throw Object.assign(new Error("unreachable"), { code: "ECONNREFUSED" });
+      } finally { inFlight--; }
+    }) });
+    const spawn = deps.spawn;
+    deps.spawn = vi.fn((...args: unknown[]) => { spawned = true; return spawn(...(args as [])); });
+    try {
+      const t0 = Date.now();
+      const starting = startDaemon({ port: 8000, db: "test.sqlite" }, deps);
+      const settled = starting.then(() => "resolved", () => "rejected");
+      await vi.runAllTimersAsync();
+      expect(await settled).toBe("rejected");
+      // Bounded overall deadline even though no probe ever answers.
+      expect(Date.now() - t0).toBeGreaterThan(0);
+      expect(Date.now() - t0).toBeLessThanOrEqual(90_000 + 1_500 + 250);
+      // The real finding: consecutive cancelled probes never overlap.
+      expect(peakInFlight).toBe(1);
+      expect(inFlight).toBe(0);
+      // Cleanup still targets only this launch's own child.
+      expect(deps.kill).toHaveBeenCalledTimes(1);
+      expect(deps.kill).toHaveBeenCalledWith(12345, "SIGTERM");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("start: a child that never answers still fails within the finite startup deadline", async () => {
+    vi.useFakeTimers();
+    let spawned = false;
+    const deps = mockDeps({ fetch: vi.fn(async () => {
+      if (!spawned) throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+      throw Object.assign(new Error("healthz not responding"), { code: "ECONNREFUSED" });
+    }) });
+    const spawn = deps.spawn;
+    deps.spawn = vi.fn((...args: unknown[]) => { spawned = true; return spawn(...(args as [])); });
+    try {
+      const starting = startDaemon({ port: 8000, db: "test.sqlite" }, deps);
+      const settled = starting.then(() => "resolved", () => "rejected");
+      await vi.runAllTimersAsync();
+      expect(await settled).toBe("rejected");
+      await expect(starting).rejects.toThrow(/startup health verification/);
+      expect((deps.writeFile as ReturnType<typeof vi.fn>).mock.calls.some((c: unknown[]) => (c[0] as string).endsWith("daemon.json"))).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("start: wrong child PID stays refused even with a slow but positive answer", async () => {
+    // Latency tolerance must not weaken identity: a healthz that answers 200 in 600ms reporting a
+    // DIFFERENT pid is still refused.
+    vi.useFakeTimers();
+    let spawned = false;
+    const deps = mockDeps({ fetch: vi.fn(async () => {
+      if (!spawned) throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      return { ok: true, json: async () => ({ pid: 99999, bind: { mode: "explicit", hosts: ["127.0.0.1"], tailscaleDetected: false } }) };
+    }) });
+    const spawn = deps.spawn;
+    deps.spawn = vi.fn((...args: unknown[]) => { spawned = true; return spawn(...(args as [])); });
+    try {
+      const starting = startDaemon({ port: 8000, db: "test.sqlite" }, deps);
+      const settled = starting.then(() => "resolved", () => "rejected");
+      await vi.runAllTimersAsync();
+      expect(await settled).toBe("rejected");
+      await expect(starting).rejects.toThrow(/identity mismatch/);
+      expect(deps.kill).toHaveBeenCalledWith(12345, "SIGTERM");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("start: transient health without bind identity is still refused inside the deadline", async () => {
+    let spawned = false;
+    const deps = startableDeps({ fetch: vi.fn(async () => {
+      if (!spawned) throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+      return { ok: true, json: async () => ({ pid: 12345 }) };
+    }) });
+    const spawn = deps.spawn;
+    deps.spawn = vi.fn((...args: unknown[]) => { spawned = true; return spawn(...(args as [])); });
+    await expect(startDaemon({ port: 8000, db: "test.sqlite" }, deps)).rejects.toThrow(/listener identity unavailable/);
+    expect(deps.kill).toHaveBeenCalledWith(12345, "SIGTERM");
+  });
+
+  it("real adapter forwards an owned startup abort signal and cancels the real request", async () => {
+    // Evidence for the PRODUCTION path, not an artificial abort mock: the real realDeps.fetch is
+    // driven directly, and an abort must reach globalThis.fetch AND actually cancel it. This is what
+    // makes the fail-closed settle check hold for a real dependency.
+    const { realDeps } = await import("../src/commands/daemon.js");
+    const original = globalThis.fetch;
+    let received: AbortSignal | undefined;
+    let cancelled = false;
+    globalThis.fetch = ((_url: string, init?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+      received = init?.signal;
+      init?.signal?.addEventListener("abort", () => { cancelled = true; reject(Object.assign(new Error("aborted"), { name: "AbortError" })); });
+    })) as unknown as typeof globalThis.fetch;
+    try {
+      const deps = realDeps();
+      const controller = new AbortController();
+      const pending = deps.fetch("http://127.0.0.1:8000/healthz", { signal: controller.signal });
+      expect(received).toBeDefined();
+      controller.abort();
+      await expect(pending).rejects.toThrow(/aborted/);
+      // The signal was not merely passed along: it cancelled the underlying request.
+      expect(cancelled).toBe(true);
+      // An ordinary caller that supplies no signal keeps its prior behaviour: no signal forwarded.
+      received = undefined;
+      globalThis.fetch = (async () => new Response("{}", { status: 200 })) as unknown as typeof globalThis.fetch;
+      await expect(deps.fetch("http://127.0.0.1:8000/healthz")).resolves.toBeTruthy();
+      expect(received).toBeUndefined();
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("start: an unsettleable cancelled probe fails this owned launch instead of overlapping another", async () => {
+    // A dependency that ignores the abort signal must not let the next probe start over a request
+    // that is still outstanding: the owned startup fails closed and cleans up only its own child.
+    vi.useFakeTimers();
+    let spawned = false;
+    const deps = mockDeps({ fetch: vi.fn(async () => {
+      if (!spawned) throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" });
+      // Ignores the signal and never settles.
+      return new Promise<{ ok: boolean }>(() => {});
+    }) });
+    const spawn = deps.spawn;
+    deps.spawn = vi.fn((...args: unknown[]) => { spawned = true; return spawn(...(args as [])); });
+    try {
+      const starting = startDaemon({ port: 8000, db: "test.sqlite" }, deps);
+      const settled = starting.then(() => "resolved", () => "rejected");
+      await vi.runAllTimersAsync();
+      expect(await settled).toBe("rejected");
+      await expect(starting).rejects.toThrow(/did not cancel after abort/);
+      // It failed at the FIRST cancelled probe rather than continuing to probe.
+      expect((deps.fetch as ReturnType<typeof vi.fn>).mock.calls.length).toBe(2);
+      expect(deps.kill).toHaveBeenCalledTimes(1);
+      expect(deps.kill).toHaveBeenCalledWith(12345, "SIGTERM");
+    } finally { vi.useRealTimers(); }
+  });
+
   // Test 4: start already running -> error
   it("start: already running -> throws error", async () => {
     const deps = mockDeps({
@@ -1010,6 +1176,41 @@ describe("Daemon Lifecycle", () => {
       readProcessState: () => "S",
     });
 
+    expect(isAlive(123)).toBe(true);
+  });
+
+  it("readProcessState reads the ps state column on POSIX", async () => {
+    const { readProcessState } = await import("../src/commands/daemon.js");
+    const calls: Array<{ file: string; args: string[] }> = [];
+    const state = readProcessState(123, "linux", (file, args) => {
+      calls.push({ file, args });
+      return "S\n";
+    });
+
+    expect(state).toBe("S\n");
+    expect(calls).toEqual([{ file: "ps", args: ["-o", "state=", "-p", "123"] }]);
+  });
+
+  it("readProcessState returns null on POSIX when ps fails", async () => {
+    const { readProcessState } = await import("../src/commands/daemon.js");
+    const state = readProcessState(123, "darwin", () => {
+      throw new Error("no such process");
+    });
+
+    expect(state).toBeNull();
+  });
+
+  it("readProcessState does not shell out to ps on Windows", async () => {
+    const { readProcessState, createIsProcessAlive } = await import("../src/commands/daemon.js");
+    const run = () => {
+      throw new Error("ps must not run on win32");
+    };
+
+    expect(readProcessState(123, "win32", run)).toBe("R");
+    const isAlive = createIsProcessAlive({
+      signalCheck: () => true,
+      readProcessState: (pid) => readProcessState(pid, "win32", run),
+    });
     expect(isAlive(123)).toBe(true);
   });
 });

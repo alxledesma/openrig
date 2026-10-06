@@ -5,7 +5,7 @@ import { reservationAttemptLocksSchema } from "./migrations/093_reservation_atte
 import { seatDispatchReservationsSchema } from "./migrations/091_seat_dispatch_reservations.js";
 import { reservedClaimReleaseSchema } from "./migrations/092_reserved_claim_release.js";
 import { coordinatorAuthoritySchema } from "./migrations/090_coordinator_authority.js";
-// The canonical ordered migration list (001 → 095). SINGLE SOURCE: the daemon boot path
+// The canonical ordered migration list (001 → 097). SINGLE SOURCE: the daemon boot path
 // (startup.ts) and any test/tool that needs a schema-faithful DB both migrate from THIS array,
 // so a reader DB is never seeded from a stale hand-copied subset (the perf-fixture-migration-parity
 // trap). Append new migrations to the END, in order.
@@ -100,9 +100,19 @@ import { seatDeliveryGuardSchema } from "./migrations/087_seat_delivery_guard.js
 import { nodePermissionSelectionsSchema } from "./migrations/088_node_permission_selections.js";
 import { classificationIdentityProvenanceSchema } from "./migrations/089_classification_identity_provenance.js";
 import { liveProjectionRecoveryLedgerSchema } from "./migrations/097_live_projection_recovery_ledger.js";
+// Upstream 0.6.5 additive migrations. NUMERIC PREFIXES COLLIDE with the fork's
+// 090/091/092/094 series but identity is the `name` field (e.g.
+// "090_human_reply_to.sql"), which is unique across both series, and the loader
+// records applied migrations by that name. migrate() sorts full names, so array
+// append order does not control execution. Both series retain their original
+// stamps; upstream dependencies (queue_items, nodes, usage_samples) precede them.
+import { humanReplyToSchema } from "./migrations/090_human_reply_to.js";
+import { humanQuestionsSchema } from "./migrations/091_human_questions.js";
+import { nodeEffortSchema } from "./migrations/092_node_effort.js";
+import { usageSamplesLatestIndexesSchema } from "./migrations/094_usage_samples_latest_indexes.js";
 import type { Migration } from "./migrate.js";
 
-/** Ordered 001→089 (S02 086/089, S09 087, S03 088). */
+/** Ordered migrations; numbers may be reserved by independent changes. */
 export const ALL_MIGRATIONS: Migration[] = [
   coreSchema,
   bindingsSessionsSchema,
@@ -201,4 +211,8 @@ export const ALL_MIGRATIONS: Migration[] = [
   coordinatorHeldHistorySchema,
   outboxOriginIndexSchema,
   liveProjectionRecoveryLedgerSchema,
+  humanReplyToSchema,
+  humanQuestionsSchema,
+  nodeEffortSchema,
+  usageSamplesLatestIndexesSchema,
 ];

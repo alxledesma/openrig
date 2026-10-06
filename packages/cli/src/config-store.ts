@@ -1,5 +1,6 @@
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
+import { writeTextAtomically } from "./atomic-text-write.js";
+import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import {
   getDefaultOpenRigPath,
@@ -76,6 +77,8 @@ export interface RiggedConfig {
   // Preview Terminal v0 (PL-018) — UI-side preferences for the live
   // terminal preview pane.
   ui: {
+    /** Serve the web UI and its terminal WebSocket. Off by default; the daemon reads it at start. */
+    enabled: boolean;
     timezone: string;
     preview: {
       refreshIntervalSeconds: number;
@@ -239,6 +242,7 @@ const DEFAULTS = {
   files: { allowlist: "" },
   progress: { scanRoots: "" },
   ui: {
+    enabled: false,
     timezone: "America/Los_Angeles",
     preview: {
       refreshIntervalSeconds: 3,
@@ -377,6 +381,7 @@ export const VALID_KEYS = [
   "ui.preview.max_pins",
   "ui.preview.default_lines",
   "ui.timezone",
+  "ui.enabled",
   "recovery.auto_drive_provider_prompts",
   "recovery.provider_auth_env_allowlist",
   // V1 Phase 4 SC-29 exception — allowlist-only additions.
@@ -471,6 +476,7 @@ export const ENV_MAP: Record<ValidKey, { primary: string; legacy?: string }> = {
   "ui.preview.refresh_interval_seconds": { primary: "OPENRIG_UI_PREVIEW_REFRESH_INTERVAL_SECONDS" },
   "ui.preview.max_pins": { primary: "OPENRIG_UI_PREVIEW_MAX_PINS" },
   "ui.timezone": { primary: "OPENRIG_UI_TIMEZONE" },
+  "ui.enabled": { primary: "OPENRIG_UI_ENABLED" },
   "ui.preview.default_lines": { primary: "OPENRIG_UI_PREVIEW_DEFAULT_LINES" },
   "recovery.auto_drive_provider_prompts": { primary: "OPENRIG_RECOVERY_AUTO_DRIVE_PROVIDER_PROMPTS" },
   "recovery.provider_auth_env_allowlist": { primary: "OPENRIG_RECOVERY_PROVIDER_AUTH_ENV_ALLOWLIST" },
@@ -551,6 +557,7 @@ const KEY_TO_PATH: Record<ValidKey, string[]> = {
   "ui.preview.refresh_interval_seconds": ["ui", "preview", "refreshIntervalSeconds"],
   "ui.preview.max_pins": ["ui", "preview", "maxPins"],
   "ui.timezone": ["ui", "timezone"],
+  "ui.enabled": ["ui", "enabled"],
   "ui.preview.default_lines": ["ui", "preview", "defaultLines"],
   "recovery.auto_drive_provider_prompts": ["recovery", "autoDriveProviderPrompts"],
   "recovery.provider_auth_env_allowlist": ["recovery", "providerAuthEnvAllowlist"],
@@ -764,6 +771,16 @@ function percentageConstraint(key: string) {
 }
 
 const KEY_CONSTRAINTS: Partial<Record<ValidKey, (raw: string, coerced: string | number | boolean) => void>> = {
+  "transcripts.lines": (raw, value) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 1_000_000) {
+      throw new Error("Invalid transcripts.lines: must be an integer in [1, 1000000]");
+    }
+  },
+  "transcripts.poll_interval_seconds": (raw, value) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > 3600) {
+      throw new Error("Invalid transcripts.poll_interval_seconds: must be an integer in [1, 3600]");
+    }
+  },
   "ui.timezone": (_raw, value) => {
     try {
       if (typeof value !== "string" || !value || /^[+-]/.test(value)) throw new Error();
@@ -915,6 +932,11 @@ export class ConfigStore {
   // resolves the legacy ~/.rigged sidecar), so a persisted read here IS proof the daemon sees it.
   // A read-back MISMATCH means the write silently did not take — we REFUSE loudly rather than report
   // a phantom success (the accept-and-drop / config-set-success-without-persist class).
+  /** Publish a complete config without truncating the previous usable file. */
+  private writeConfig(content: string): void {
+    writeTextAtomically(this.configPath, content, "config");
+  }
+
   private verifyPersisted(keyPath: string[], expected: unknown): void {
     let reread: Record<string, unknown>;
     try {
@@ -999,6 +1021,7 @@ export class ConfigStore {
         scanRoots: v("progress.scan_roots") as string,
       },
       ui: {
+        enabled: v("ui.enabled") as boolean,
         timezone: v("ui.timezone") as string,
         preview: {
           refreshIntervalSeconds: v("ui.preview.refresh_interval_seconds") as number,
@@ -1192,7 +1215,7 @@ export class ConfigStore {
       const fcDyn = this.readConfigFile();
       setNestedValue(fcDyn, ["feed", "subscriptions", feedHost.hostId, "enabled"], coercedDyn);
       mkdirSync(dirname(this.configPath), { recursive: true });
-      writeFileSync(this.configPath, JSON.stringify(fcDyn, null, 2) + "\n", "utf-8");
+      this.writeConfig(JSON.stringify(fcDyn, null, 2) + "\n");
       this.verifyPersisted(["feed", "subscriptions", feedHost.hostId, "enabled"], coercedDyn);
       return;
     }
@@ -1215,7 +1238,7 @@ export class ConfigStore {
       }
     }
     mkdirSync(dirname(this.configPath), { recursive: true });
-    writeFileSync(this.configPath, JSON.stringify(fileConfig, null, 2) + "\n", "utf-8");
+    this.writeConfig(JSON.stringify(fileConfig, null, 2) + "\n");
     this.verifyPersisted(KEY_TO_PATH[key], coerced);
   }
 
@@ -1226,7 +1249,9 @@ export class ConfigStore {
    */
   reset(key?: string): void {
     if (key === undefined) {
-      try { unlinkSync(this.configPath); } catch { /* missing is fine */ }
+      try { unlinkSync(this.configPath); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
       return;
     }
     const removedMessage = removedContextSettingMessage(key);
@@ -1238,7 +1263,7 @@ export class ConfigStore {
       const fcDyn = this.readConfigFile();
       const subsParent = getNestedValue(fcDyn, ["feed", "subscriptions"]) as Record<string, unknown> | undefined;
       if (subsParent && feedHost.hostId in subsParent) delete subsParent[feedHost.hostId];
-      writeFileSync(this.configPath, JSON.stringify(fcDyn, null, 2) + "\n", "utf-8");
+      this.writeConfig(JSON.stringify(fcDyn, null, 2) + "\n");
       return;
     }
     if (!isValidKey(key)) {
@@ -1265,7 +1290,7 @@ export class ConfigStore {
         }
       }
     }
-    writeFileSync(this.configPath, JSON.stringify(fileConfig, null, 2) + "\n", "utf-8");
+    this.writeConfig(JSON.stringify(fileConfig, null, 2) + "\n");
   }
 
   private readConfigFile(): Record<string, unknown> {

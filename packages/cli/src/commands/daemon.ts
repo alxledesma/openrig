@@ -2,6 +2,7 @@ import { Command } from "commander";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { acquireDaemonStartLock } from "../daemon-start-lock.js";
+import { formatDaemonHostForUrl } from "../client.js";
 import { execFileSync, spawn } from "node:child_process";
 import { fetchWithTimeout } from "../fetch-with-timeout.js";
 import {
@@ -11,6 +12,7 @@ import {
   readLogs,
   tailLogs,
   type LifecycleDeps,
+  type ProcessLiveness,
   OPENRIG_DIR,
   STATE_FILE,
   resolveBindIntent,
@@ -33,30 +35,70 @@ export function createIsProcessAlive(deps: ProcessAliveDeps): (pid: number) => b
   };
 }
 
+export type SignalOutcome = "sent" | "missing" | "not-permitted";
+
+/** kill(pid, 0) as an outcome. POSIX: only ESRCH means no such process; EPERM means the process
+ *  EXISTS but this shell may not signal it (another user's process, or a sandbox such as Codex's). */
+export function signalProbe(pid: number, kill: (pid: number, signal: 0) => unknown = process.kill): SignalOutcome {
+  try {
+    kill(pid, 0);
+    return "sent";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM" ? "not-permitted" : "missing";
+  }
+}
+
+/** #275 — three-state liveness for status reads. Only a missing process (ESRCH) or a zombie is
+ *  dead. A process that exists but cannot be inspected (EPERM, or `ps` cannot run, as inside
+ *  Codex's macOS sandbox) is UNKNOWN, never dead: calling it dead turned a running daemon into
+ *  `stale` before any health probe. The boolean createIsProcessAlive (start/stop) is unchanged. */
+export function createProcessLiveness(deps: {
+  signal: (pid: number) => SignalOutcome;
+  readProcessState: (pid: number) => string | null;
+}): (pid: number) => ProcessLiveness {
+  return (pid: number) => {
+    if (deps.signal(pid) === "missing") return "dead";
+    const state = deps.readProcessState(pid)?.trim();
+    if (!state) return "unknown";
+    return state.startsWith("Z") ? "dead" : "alive";
+  };
+}
+
+type ExecFile = (file: string, args: string[], options: { encoding: "utf-8" }) => string;
+
+// Windows has no ps(1) and no zombie state, so the signal probe alone decides liveness there.
+export function readProcessState(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+  run: ExecFile = execFileSync,
+): string | null {
+  if (platform === "win32") return "R";
+  try {
+    return run("ps", ["-o", "state=", "-p", String(pid)], { encoding: "utf-8" });
+  } catch {
+    return null;
+  }
+}
+
 export function realDeps(): LifecycleDeps {
   const isProcessAlive = createIsProcessAlive({
-    signalCheck: (pid) => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch {
-        return false;
-      }
-    },
-    readProcessState: (pid) => {
-      try {
-        return execFileSync("ps", ["-o", "state=", "-p", String(pid)], { encoding: "utf-8" });
-      } catch {
-        return null;
-      }
-    },
+    signalCheck: (pid) => signalProbe(pid) === "sent",
+    readProcessState: (pid) => readProcessState(pid),
+  });
+  const processLiveness = createProcessLiveness({
+    signal: (pid) => signalProbe(pid),
+    readProcessState: (pid) => readProcessState(pid),
   });
 
   return {
+    processLiveness,
     acquireStartLock: () => acquireDaemonStartLock(OPENRIG_DIR),
     spawn: (cmd, args, opts) => spawn(cmd, args, opts as Parameters<typeof spawn>[2]),
-    fetch: async (url) => {
-      const res = await fetchWithTimeout(globalThis.fetch, url, {}, {
+    // The optional signal is forwarded so an owned startup probe that times out is genuinely
+    // CANCELLED rather than merely abandoned: fetchWithTimeout already honours an external signal.
+    // Ordinary callers (status/stop) pass no signal and keep their exact prior behaviour.
+    fetch: async (url, options) => {
+      const res = await fetchWithTimeout(globalThis.fetch, url, { signal: options?.signal }, {
         timeoutMs: 1_500,
         timeoutMessage: `Daemon health probe timed out for ${url}`,
       });
@@ -183,13 +225,8 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
             contextRoot: config.context.root,
             skillsRoot: config.skills.root,
             topologyRoot: config.topology.root,
-            // V1 pre-release CLI/daemon Item 1 — project the
-            // ConfigStore-resolved rotation tunables into the daemon
-            // process env so file-stored values
-            // (`rig config set transcripts.lines 500`) actually
-            // reach the rotation hook.
-            transcriptsLines: config.transcripts.lines,
-            transcriptsPollIntervalSeconds: config.transcripts.pollIntervalSeconds,
+            // Live transcript tunables are read from the shared config file.
+            // Only operator-provided environment overrides should mask edits.
             // V0.3.1 slice 05 kernel-rig-as-default — propagated via
             // OPENRIG_NO_KERNEL env var so the daemon's kernel-boot
             // check in startup.ts honors the flag.
@@ -211,7 +248,7 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
           const timeoutMs = opts.waitForKernelMs && /^\d+$/.test(opts.waitForKernelMs)
             ? parseInt(opts.waitForKernelMs, 10)
             : 60_000;
-          const baseUrl = `http://${state.host}:${state.port}`;
+          const baseUrl = `http://${formatDaemonHostForUrl(state.host ?? "127.0.0.1")}:${state.port}`;
           const result = await waitForKernelReady(baseUrl, timeoutMs);
           if (result.ok) {
             console.log(`Kernel ${result.kernelState}; variant=${result.variant ?? "(none)"}`);

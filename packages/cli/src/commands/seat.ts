@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { Command } from "commander";
-import { DaemonClient, terminalAuthHeaders } from "../client.js";
+import { DaemonClient, DaemonTimeoutError, terminalAuthHeaders } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
@@ -164,7 +164,7 @@ function printHuman(status: SeatStatusResponse): void {
   }
   console.log(`Startup: ${display(status.startup_status, "unknown")}`);
   console.log(`Occupant lifecycle: ${status.occupant_lifecycle}`);
-  console.log(`Continuity outcome: ${display(status.continuity_outcome, "unknown")}`);
+  console.log(`Continuity outcome: ${display(status.continuity_outcome, "unverified")}`);
   console.log(`Handover result: ${display(status.handover_result)}`);
   console.log(`Previous occupant: ${display(status.previous_occupant)}`);
   console.log(`Handover at: ${display(status.handover_at)}`);
@@ -351,7 +351,7 @@ Examples:
     .option("--operator <address>", "Operator initiating the handover")
     .option("--dry-run", "Plan the handover without changing topology")
     .option("--json", "JSON output for agents")
-    .description("Plan a safe two-phase seat handover")
+    .description("Hand a seat to a successor (two-phase). Pass --dry-run to plan without changing topology.")
     .addHelpText("after", `
 Examples:
   rig seat handover spec-writer@openrig-pm --reason context-wall --dry-run
@@ -428,14 +428,22 @@ rig seat handover, THEN retarget the view. Examples:
   cmd
     .command("clear-attention")
     .argument("<session>", "Canonical session name (e.g. dev-impl@my-rig)")
-    .option("--reason <text>", "Operator attestation override (skip evidence gate)")
+    .option("--reason <text>", "Attest startup or subset-restore attention; cannot bypass full-restore or pane-identity checks")
     .option("--json", "JSON output for agents")
-    .description("Clear stuck attention_required startup status with evidence or operator attestation")
+    .description("Reconcile seat attention using the checks for its attention class")
     .addHelpText("after", `
 Examples:
   rig seat clear-attention dev-impl@my-rig
   rig seat clear-attention dev-impl@my-rig --reason "founder re-authed, confirmed live"
   rig seat clear-attention dev-impl@my-rig --json
+
+--reason can acknowledge startup-status and subset-restore attention. It does
+not bypass full-restore continuity or pane-identity checks. Acknowledgment alone
+does not prove that the original conversation resumed.
+If the recorded native token needs correction and you know the actual token:
+  printf '%s' "$TOKEN" | rig seat set-resume-token dev-impl@my-rig --token-stdin --reason "verified native token"
+Then rerun clear-attention to check the live evidence. Setting the token alone,
+or stopping and relaunching the seat, does not prove continuity.
 `)
     .action(async (session: string, opts: { reason?: string; json?: boolean }) => {
       const deps = getDeps();
@@ -482,20 +490,45 @@ Examples:
     if (!daemonStatusGuard(daemon)) return;
     const client = deps.clientFactory(getDaemonUrl(daemon));
     const endpoint = `/api/seat/${path}/${encodeURIComponent(seat)}`;
-    // A rehost is the ONLY verb whose server-side work is bounded by native process
-    // behaviour rather than a fast local write: it proves the pane root, waits for the
-    // runner to actually exit, types a same-file resume and polls the launch sidecar, which
-    // can legitimately take ~35s. The client default is 5000ms, so the CLI used to abort
-    // at 5s and report a timeout even though the daemon completed the rehost durably.
-    // This is a per-request timeout for that one call only. It does not change the client
-    // default, the global timeout, or any other verb, and it is NOT a retry: a timed-out
-    // request stays failed and is never re-sent, because a rehost is exactly the kind of
-    // effect that must not be issued twice.
-    const res = (path === "rehost-runner")
-      ? await client.post<Record<string, unknown>>(endpoint, body, { headers: terminalAuthHeaders(), timeoutMs: REHOST_TIMEOUT_MS })
-      : (path === "set-codex-profile" || path === "set-cwd")
-        ? await client.post<Record<string, unknown>>(endpoint, body, { headers: terminalAuthHeaders() })
-        : await client.post<Record<string, unknown>>(endpoint, body);
+    // Per-request timeouts, each for one verb only. The client default, the global
+    // timeout and every other verb are unchanged. NONE of these is a retry: a
+    // timed-out request stays failed and is never re-sent, because a rehost, a
+    // launch or a permission change is exactly the kind of effect that must not
+    // be issued twice.
+    let res;
+    try {
+      // A rehost is the verb whose server-side work is bounded by native process
+      // behaviour rather than a fast local write: it proves the pane root, waits for
+      // the runner to actually exit, types a same-file resume and polls the launch
+      // sidecar, which can legitimately take ~35s. The client default is 5000ms, so
+      // the CLI used to abort at 5s and report a timeout even though the daemon
+      // completed the rehost durably.
+      res = path === "rehost-runner"
+        ? await client.post<Record<string, unknown>>(endpoint, body, { headers: terminalAuthHeaders(), timeoutMs: REHOST_TIMEOUT_MS })
+        : path === "launch"
+          ? await client.post<Record<string, unknown>>(endpoint, body, { timeoutMs: 120_000 })
+          // #260: a dynamic Claude mode waits up to 5 s for the capability query before
+          // the daemon answers, so the 5 s default deadline would abort before its
+          // refusal arrives.
+          : path === "set-permissions"
+            ? await client.post<Record<string, unknown>>(endpoint, body, { timeoutMs: 10_000 })
+            : (path === "set-codex-profile" || path === "set-cwd")
+              ? await client.post<Record<string, unknown>>(endpoint, body, { headers: terminalAuthHeaders() })
+              : await client.post<Record<string, unknown>>(endpoint, body);
+    } catch (err) {
+      if (path !== "launch" || !(err instanceof DaemonTimeoutError)) throw err;
+      const error = {
+        ok: false as const,
+        code: "launch_outcome_unknown",
+        status: "unknown",
+        message: "The CLI timed out waiting for the daemon; the launch may still be in progress.",
+        guidance: `Check the outcome before retrying: rig seat status ${seat}`,
+      };
+      if (opts.json) console.log(JSON.stringify(error, null, 2));
+      else printSeatError(error, error.message);
+      process.exitCode = 1;
+      return;
+    }
     if (opts.json) {
       console.log(JSON.stringify(res.data, null, 2));
       if (res.status >= 400) process.exitCode = res.status >= 500 ? 2 : 1;
@@ -784,12 +817,36 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
   if (!daemonStatusGuard(daemon)) return; // B8-1b: epistemic-matched
 
   const client = deps.clientFactory(getDaemonUrl(daemon));
-  const res = await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(`/api/seat/handover/${encodeURIComponent(seat)}`, {
+  const handoverRoute = `/api/seat/handover/${encodeURIComponent(seat)}`;
+  const handoverBody = {
     source: opts.source,
     reason: opts.reason,
     operator: opts.operator,
     dryRun: opts.dryRun === true,
-  });
+  };
+  let res;
+  try {
+    // #260: a mutating handover launches and readies the successor, so it gets the
+    // launch request window. A dry run only plans, and keeps the default deadline.
+    res = opts.dryRun === true
+      ? await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(handoverRoute, handoverBody)
+      : await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(handoverRoute, handoverBody, { timeoutMs: 120_000 });
+  } catch (err) {
+    // The daemon keeps working when the client stops waiting, so reaching the bound leaves a
+    // mutating handover's outcome unknown. One request; no retry.
+    if (opts.dryRun === true || !(err instanceof DaemonTimeoutError)) throw err;
+    const error = {
+      ok: false as const,
+      code: "handover_outcome_unknown",
+      status: "unknown",
+      message: "The CLI stopped waiting for the daemon after 120 seconds, so the handover outcome is unknown. The daemon may still be working on it.",
+      guidance: `Inspect the seat before considering another handover: rig seat status ${seat}. A handover result shown there may belong to an earlier attempt.`,
+    };
+    if (opts.json) console.log(JSON.stringify(error, null, 2));
+    else printSeatError(error, error.message);
+    process.exitCode = 1;
+    return;
+  }
 
   if (opts.json) {
     console.log(JSON.stringify(res.data, null, 2));

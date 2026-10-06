@@ -15,25 +15,29 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { ClaudeResumeAdapter } from "../adapters/claude-resume.js";
 import type { CodexResumeAdapter } from "../adapters/codex-resume.js";
 import type { PiResumeAdapter } from "../adapters/pi-resume.js";
+import type { OmpResumeAdapter } from "../adapters/omp-resume.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { assessNativeResumeProbe } from "./native-resume-probe.js";
+import { verifyClaudePaneProcess } from "./native-process-lineage.js";
+import { reanchorBuiltinStartupFile, reanchorShippedProjectionEntry } from "./builtin-startup-files.js";
 import type {
   RestoreOutcome,
   RestoreRigResult,
   RestoreResult,
-  RestoreValidationBlocker,
   RestoreNodeResult,
   SnapshotData,
   NodeWithBinding,
   Edge,
   Session,
   Checkpoint,
-  RigServicesRecord,
   RestoreSnapshotSelection,
 } from "./types.js";
 import { AppliedLaunchObservationStore } from "./applied-launch-observation-store.js";
+import { classifyPaneRuntimeMatch } from "./seat-identity-reconciler.js";
+import { isShellForeground } from "./shell-classifier.js";
 import { rebindAndVerifyPaneIdentity } from "./seat-attention-reconciler.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
+import { validatePreRestore } from "./restore-preconditions.js";
 import { resolveSnapshotRestoreTopology } from "./restore-topology.js";
 
 // L3: result shape for runtime-truth reconciliation. A reconciliation that
@@ -138,6 +142,7 @@ interface RestoreOrchestratorDeps {
   /** OPR.0.4.6.PI1 FR-6 — optional so older wiring/tests keep working; a Pi
    *  resume without the adapter falls through to the honest no-adapter error. */
   piResume?: PiResumeAdapter;
+  ompResume?: OmpResumeAdapter;
   transcriptStore?: TranscriptStore;
   serviceOrchestrator?: import("./service-orchestrator.js").ServiceOrchestrator;
   listProcesses?: () => Promise<Array<{ pid: number; ppid: number; command: string }>>;
@@ -156,6 +161,7 @@ export class RestoreOrchestrator {
   private claudeResume: ClaudeResumeAdapter;
   private codexResume: CodexResumeAdapter;
   private piResume: PiResumeAdapter | null;
+  private ompResume: OmpResumeAdapter | null;
   private transcriptStore: TranscriptStore | null;
   private serviceOrchestrator: import("./service-orchestrator.js").ServiceOrchestrator | null;
   private listProcesses: (() => Promise<Array<{ pid: number; ppid: number; command: string }>>) | undefined;
@@ -195,6 +201,7 @@ export class RestoreOrchestrator {
     this.claudeResume = deps.claudeResume;
     this.codexResume = deps.codexResume;
     this.piResume = deps.piResume ?? null;
+    this.ompResume = deps.ompResume ?? null;
     this.transcriptStore = deps.transcriptStore ?? null;
     this.serviceOrchestrator = deps.serviceOrchestrator ?? null;
     this.listProcesses = deps.listProcesses;
@@ -259,7 +266,7 @@ export class RestoreOrchestrator {
     this.activeRestores.add(rigId);
 
     try {
-      const validation = this.validatePreRestore(snapshot.data, {
+      const validation = validatePreRestore(snapshot.data, {
         fsOps: opts?.fsOps,
         servicesRecord: this.rigRepo.getServicesRecord(rigId),
         freshLogicalIds: opts?.freshLogicalIds,
@@ -572,215 +579,6 @@ export class RestoreOrchestrator {
         affected: held,
       },
     };
-  }
-
-  private validatePreRestore(
-    data: SnapshotData,
-    opts: {
-      fsOps?: { exists(path: string): boolean };
-      servicesRecord?: RigServicesRecord | null;
-      freshLogicalIds?: string[];
-    },
-  ): { blockers: RestoreValidationBlocker[]; warnings: string[] } {
-    const blockers: RestoreValidationBlocker[] = [];
-    const warnings: string[] = [];
-    const exists = opts.fsOps?.exists ?? (() => true);
-
-    const add = (blocker: RestoreValidationBlocker) => blockers.push(blocker);
-    const nodes = Array.isArray(data.nodes) ? data.nodes : null;
-    const sessions = Array.isArray(data.sessions) ? data.sessions : null;
-    const edges = Array.isArray(data.edges) ? data.edges : null;
-    const checkpoints = data.checkpoints && typeof data.checkpoints === "object" ? data.checkpoints : null;
-
-    if (!data.rig || typeof data.rig.id !== "string") {
-      add({
-        code: "invalid_snapshot_data",
-        severity: "critical",
-        target: "snapshot.rig",
-        message: "Snapshot is missing the rig record needed for restore.",
-        remediation: "Capture a new snapshot or restore from a structurally valid snapshot.",
-      });
-    }
-    if (!nodes) {
-      add({
-        code: "invalid_snapshot_data",
-        severity: "critical",
-        target: "snapshot.nodes",
-        message: "Snapshot is missing the node list needed for restore.",
-        remediation: "Capture a new snapshot or restore from a structurally valid snapshot.",
-      });
-    }
-    if (!sessions) {
-      add({
-        code: "invalid_snapshot_data",
-        severity: "critical",
-        target: "snapshot.sessions",
-        message: "Snapshot is missing session records needed for restore.",
-        remediation: "Capture a new snapshot or restore from a structurally valid snapshot.",
-      });
-    }
-    if (!edges) {
-      add({
-        code: "invalid_snapshot_data",
-        severity: "critical",
-        target: "snapshot.edges",
-        message: "Snapshot is missing topology edges needed for restore planning.",
-        remediation: "Capture a new snapshot or restore from a structurally valid snapshot.",
-      });
-    }
-    if (!checkpoints) {
-      add({
-        code: "invalid_snapshot_data",
-        severity: "critical",
-        target: "snapshot.checkpoints",
-        message: "Snapshot is missing the checkpoint map needed for restore.",
-        remediation: "Capture a new snapshot or restore from a structurally valid snapshot.",
-      });
-    }
-
-    if (!nodes || !checkpoints) {
-      return { blockers, warnings };
-    }
-
-    const topology = resolveSnapshotRestoreTopology(data);
-    for (const invalidNodeId of topology.invalidRosterIds) {
-      add({
-        code: "invalid_topology_roster",
-        severity: "critical",
-        nodeId: invalidNodeId,
-        target: "snapshot.topologyRoster",
-        message: `Intended topology roster names node ${invalidNodeId}, which is absent from snapshot.nodes.`,
-        remediation: "Capture a new snapshot from the authoritative materialized topology.",
-      });
-    }
-
-    for (const node of topology.intendedNodes) {
-      const checkpoint = checkpoints[node.id] ?? null;
-      if (checkpoint && !node.cwd) {
-        add({
-          code: "checkpoint_missing_node_cwd",
-          severity: "critical",
-          nodeId: node.id,
-          logicalId: node.logicalId,
-          target: "checkpoint",
-          message: `Checkpoint exists for ${node.logicalId}, but the node has no cwd to receive it.`,
-          remediation: "Update the rig spec to include a cwd for this node, then capture a new snapshot or restore manually.",
-        });
-      }
-
-      const startupCtx = data.nodeStartupContext?.[node.id] ?? null;
-      if (!startupCtx) continue;
-
-      // OPR.0.5.7.1 D6a — validate replay files IFF the node will CONSUME
-      // replay (desk static ruling on e42420990): none => fresh path,
-      // validate; ambiguity => the node stops loudly and consumes nothing,
-      // skip; explicit fresh or a non-resume policy => deliberate fresh,
-      // validate; resume_if_possible with no token => stop-and-ask, consumes
-      // nothing, skip; usable type + token => exact resume, skip; a token
-      // WITHOUT a usable resume type follows the current fresh path,
-      // validate.
-      const resolution = resolveActiveSnapshotSession(data, node.id);
-      const freshListed = opts.freshLogicalIds?.includes(node.logicalId) ?? false;
-      let consumesReplay: boolean;
-      if (resolution.kind === "ambiguous") {
-        consumesReplay = false;
-      } else if (resolution.kind === "none") {
-        consumesReplay = true;
-      } else {
-        const sess = resolution.session;
-        const policy = sess.restorePolicy ?? "resume_if_possible";
-        if (freshListed || policy !== "resume_if_possible") consumesReplay = true;
-        else if (!sess.resumeToken) consumesReplay = false;
-        else if (!!sess.resumeType && sess.resumeType !== "none") consumesReplay = false;
-        else consumesReplay = true;
-      }
-
-      for (const file of consumesReplay ? startupCtx.resolvedStartupFiles ?? [] : []) {
-        if (!file.required) {
-          if (this.pathLike(file.absolutePath) && !exists(file.absolutePath)) {
-            warnings.push(`Restore pre-validation: optional startup file missing for ${node.logicalId}: ${file.absolutePath}`);
-          }
-          continue;
-        }
-        if (this.pathLike(file.ownerRoot) && !exists(file.ownerRoot)) {
-          add({
-            code: "startup_owner_root_missing",
-            severity: "critical",
-            nodeId: node.id,
-            logicalId: node.logicalId,
-            target: file.path,
-            path: file.ownerRoot,
-            message: `Required startup file owner root is missing for ${node.logicalId}: ${file.ownerRoot}`,
-            remediation: "Restore the agent/source root or capture a new snapshot with reachable startup context.",
-          });
-        }
-        if (this.pathLike(file.absolutePath) && !exists(file.absolutePath)) {
-          add({
-            code: "required_startup_file_missing",
-            severity: "critical",
-            nodeId: node.id,
-            logicalId: node.logicalId,
-            target: file.path,
-            path: file.absolutePath,
-            message: `Required startup file is missing for ${node.logicalId}: ${file.absolutePath}`,
-            remediation: "Restore the missing startup file or capture a new snapshot before retrying restore.",
-          });
-        }
-      }
-
-      // OPR.0.3.4.5 (behavior 09): projection-validity != session continuity.
-      // A stale/missing projected skill/artifact must NOT abort a restore that
-      // has a valid native resume. Demoted from critical blockers to warnings
-      // flagged as projection_drift (compose slice-03's drift reporting shape).
-      // The existing post-launch filter (:855-885) already skips missing
-      // entries with a "(skipped)" warning; here we prevent the pre-restore
-      // gate from blocking the attempt entirely. Missing REQUIRED startup
-      // files and genuinely-fatal blockers (malformed snapshot, missing nodes)
-      // stay critical above.
-      for (const entry of startupCtx.projectionEntries ?? []) {
-        if (this.pathLike(entry.sourcePath) && !exists(entry.sourcePath)) {
-          warnings.push(`projection_drift: source root missing for ${node.logicalId}: ${entry.sourcePath} (projection will be skipped at startup; session continuity is unaffected)`);
-        }
-        if (this.pathLike(entry.absolutePath) && !exists(entry.absolutePath)) {
-          warnings.push(`projection_drift: entry missing for ${node.logicalId}: ${entry.absolutePath} (projection will be skipped at startup; session continuity is unaffected)`);
-        }
-      }
-    }
-
-    const servicesRecord = opts.servicesRecord ?? null;
-    if (servicesRecord) {
-      if (this.pathLike(servicesRecord.rigRoot) && !exists(servicesRecord.rigRoot)) {
-        add({
-          code: "service_rig_root_missing",
-          severity: "critical",
-          target: "services.rigRoot",
-          path: servicesRecord.rigRoot,
-          message: `Service rig root is missing: ${servicesRecord.rigRoot}`,
-          remediation: "Restore the service rig root or update the services record before retrying restore.",
-        });
-      }
-      if (this.pathLike(servicesRecord.composeFile) && !exists(servicesRecord.composeFile)) {
-        add({
-          code: "service_compose_file_missing",
-          severity: "critical",
-          target: "services.composeFile",
-          path: servicesRecord.composeFile,
-          message: `Service compose file is missing: ${servicesRecord.composeFile}`,
-          remediation: "Restore the compose file or update the services record before retrying restore.",
-        });
-      }
-    }
-
-    return { blockers, warnings };
-  }
-
-  private pathLike(value: unknown): value is string {
-    return typeof value === "string" && value.trim().length > 0 && (
-      value.startsWith("/")
-      || value.startsWith("./")
-      || value.startsWith("../")
-      || value.startsWith("~")
-    );
   }
 
   private captureNodeState(nodeId: string, rigId: string): { binding: import("./types.js").Binding | null; sessions: { id: string; status: string }[] } {
@@ -1196,7 +994,7 @@ export class RestoreOrchestrator {
         await this.rollbackToZeroSession(node.id, sessionName, launchResult?.session.id, priorState);
         return { nodeId: node.id, logicalId: node.logicalId, status: "awaiting-decision", error: `Original session unresumable: resume requested but no token available. No session is running. Re-run with --fresh ${node.logicalId} for a deliberate fresh-primed seat, or restore the original session manually.` };
       } else {
-        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", node.codexConfigProfile, node.model, this.resolveRestorePosture(node.id, rigId));
+        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", node.codexConfigProfile, node.model, this.resolveRestorePosture(node.id, rigId), node.effort);
         if (resumeOutcome.kind === "resumed") {
           baseStatus = "resumed";
         } else if (resumeOutcome.kind === "attention_required") {
@@ -1303,8 +1101,9 @@ export class RestoreOrchestrator {
         if (adapter) {
           // Prefilter: check which files/entries still exist
           const existsFn = opts.fsOps?.exists ?? (() => true);
-          const sourceEntries = replayContained ? [] : startupCtx.projectionEntries;
-          const sourceFiles = replayContained ? [] : startupCtx.resolvedStartupFiles;
+          const sourceEntries = replayContained ? [] : startupCtx.projectionEntries.map((e) => reanchorShippedProjectionEntry(e, undefined, existsFn));
+          // #261: recognized built-in startup files follow the running install.
+          const sourceFiles = replayContained ? [] : startupCtx.resolvedStartupFiles.map((f) => reanchorBuiltinStartupFile(f, undefined, undefined, existsFn));
           const sourceActions = replayContained ? [] : startupCtx.startupActions;
           const filteredEntries = sourceEntries.filter((e) => {
             if (!existsFn(e.absolutePath)) {
@@ -1361,6 +1160,7 @@ export class RestoreOrchestrator {
             // found" on every resumed Pi seat). Claude/Codex silently lost
             // their -m/--model on restore the same way.
             model: node.model ?? undefined,
+            effort: node.effort ?? undefined,
           };
 
           try {
@@ -1409,7 +1209,8 @@ export class RestoreOrchestrator {
                 ? ((startupResult.continuityOutcome === "resumed" || nativeContinuityProved) ? "resumed" : baseStatus)
                 : baseStatus;
               if (finalStatus === "resumed") {
-                return this.finishJoinedResume(node, sessionName, resumeToken, launchResult?.session.id);
+                return this.finishJoinedResume(node, sessionName, resumeToken, launchResult?.session.id,
+                  isPodAware && node.runtime === "claude-code");
               }
               return { nodeId: node.id, logicalId: node.logicalId, status: finalStatus };
             }
@@ -1487,6 +1288,7 @@ export class RestoreOrchestrator {
     sessionName: string,
     resumeToken: string | null,
     sessionId?: string,
+    managedClaudeResume = false,
   ): Promise<RestoreNodeResult> {
     const identity = await rebindAndVerifyPaneIdentity({
       db: this.db,
@@ -1499,7 +1301,19 @@ export class RestoreOrchestrator {
       requireExactResumeLineage: true,
       ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}),
     });
+    const markManagedResumeAttention = () => {
+      if (!managedClaudeResume || !sessionId) return;
+      // The join awaits native observations. Only the exact launched row, still
+      // current and running, owns this readiness write after those awaits.
+      const current = this.db.prepare(
+        "SELECT id, session_name, status FROM sessions WHERE node_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+      ).get(node.id) as { id: string; session_name: string; status: string } | undefined;
+      if (current?.id === sessionId && current.session_name === sessionName && current.status === "running") {
+        this.sessionRegistry.updateStartupStatus(sessionId, "attention_required");
+      }
+    };
     if (!identity.ok) {
+      markManagedResumeAttention();
       return {
         nodeId: node.id,
         logicalId: node.logicalId,
@@ -1509,13 +1323,21 @@ export class RestoreOrchestrator {
     }
     // Legacy resume adapters do not write native metadata. Fill only the
     // launched row's empty token after proof; never overwrite a hook/operator.
-    if (node.runtime === "codex" && sessionId && resumeToken) {
+    const provedClaudeWrapper = node.runtime === "claude-code"
+      && classifyPaneRuntimeMatch(identity.command, node.runtime) === "mismatch"
+      && isShellForeground(identity.command?.trim().toLowerCase() ?? "");
+    if ((node.runtime === "codex" || provedClaudeWrapper || managedClaudeResume) && sessionId && resumeToken) {
       const current = this.db.prepare("SELECT node_id, session_name, status, resume_token FROM sessions WHERE id = ?").get(sessionId) as
         { node_id: string; session_name: string; status: string; resume_token: string | null } | undefined;
       const sameSession = current?.node_id === node.id && current.session_name === sessionName && current.status === "running";
-      const retained = sameSession && (current.resume_token === resumeToken
-        || (!current.resume_token && this.sessionRegistry.updateResumeToken(sessionId, "codex_id", resumeToken, "scrape")));
+      // Startup already retained the managed token. Recheck after the awaited
+      // join; a hook/operator may have changed it meanwhile. Never backfill here.
+      const retained = sameSession && (managedClaudeResume
+        ? this.sessionRegistry.resumeTokenMatches(sessionId, "claude_id", resumeToken)
+        : current.resume_token === resumeToken
+          || (!current.resume_token && this.sessionRegistry.updateResumeToken(sessionId, node.runtime === "codex" ? "codex_id" : "claude_id", resumeToken, "scrape")));
       if (!retained) {
+        markManagedResumeAttention();
         const store = new SeatIdentityStore(this.db);
         const proof = store.getForNode(node.id);
         if (proof) store.upsert({ ...proof, verdict: "mismatch", reason: "process_identity_mismatch" });
@@ -1615,6 +1437,7 @@ export class RestoreOrchestrator {
     // OPR.0.4.8.3 Seam B: the seat's restored launch posture (persisted provenance,
     // custom policies re-validated when readable). Absent = env decision.
     resolvedPosture?: "floor" | "full_bypass",
+    effort?: string | null,
   ): Promise<
     | { kind: "resumed" }
     | { kind: "retry_fresh" }
@@ -1633,7 +1456,7 @@ export class RestoreOrchestrator {
       permissionMode = override.permissionMode;
     } catch (error) { return { kind: "failed", message: `Permission selection: ${(error as Error).message}` }; }
     if (this.claudeResume.canResume(resumeType, resumeToken)) {
-      const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId);
+      const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId, ...(effort !== undefined ? [effort] : []));
       if (result.ok) {
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
         return { kind: "resumed" };
@@ -1651,7 +1474,7 @@ export class RestoreOrchestrator {
     }
 
     if (this.codexResume.canResume(resumeType, resumeToken)) {
-      const result = await this.codexResume.resume(sessionName, resumeType, resumeToken, cwd, codexConfigProfile, resolvedPosture, model);
+      const result = await this.codexResume.resume(sessionName, resumeType, resumeToken, cwd, codexConfigProfile, resolvedPosture, model, ...(effort !== undefined ? [effort] : []));
       if (result.ok) {
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
         return { kind: "resumed" };
@@ -1690,6 +1513,19 @@ export class RestoreOrchestrator {
       }
       return { kind: "failed", message: result.message };
     }
+    if (this.ompResume?.canResume(resumeType, resumeToken)) {
+      const result = await this.ompResume.resume(sessionName, resumeType, resumeToken, cwd, model, resolvedPosture);
+      if (result.ok) {
+        if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
+        return { kind: "resumed" };
+      }
+      if (result.code === "retry_fresh") return { kind: "retry_fresh" };
+      if (result.code === "attention_required") {
+        return { kind: "attention_required", message: result.message, evidence: (result as { evidence?: string }).evidence };
+      }
+      return { kind: "failed", message: result.message };
+    }
+
 
     return { kind: "failed", message: "No resume adapter available for this runtime/token combination." };
   }
@@ -1817,7 +1653,21 @@ export class RestoreOrchestrator {
     }
     const paneCommand = await this.tmuxAdapter.getPaneCommand(identity.pane);
     const paneContent = (await this.tmuxAdapter.capturePaneContent(identity.pane, 40)) ?? "";
-    const probe = assessNativeResumeProbe({ runtime, paneCommand, paneContent });
+    const claudeResumeIdentityVerified = runtime === "claude-code" && !!await verifyClaudePaneProcess({
+      target: identity.pane,
+      tmux: this.tmuxAdapter,
+      expectedToken: expectedResumeToken,
+      requireResume: true,
+      ...(this.listProcesses ? { listProcesses: this.listProcesses } : {}),
+    });
+    const probe = assessNativeResumeProbe({
+      runtime,
+      paneCommand,
+      paneContent,
+      // Headerless readiness requires the same stable foreground/argv proof
+      // as the resume adapter; a token-bearing descendant alone is insufficient.
+      ...(runtime === "claude-code" ? { claudeResumeIdentityVerified } : {}),
+    });
     const fgProcess = runtime === "claude-code" ? "claude" as const : runtime === "codex" ? "codex" as const : null;
     if (!fgProcess) {
       return { ok: false, code: "fg_process_not_runtime", detail: `Node runtime is ${runtime ?? "unknown"}, not claude/codex.` };
