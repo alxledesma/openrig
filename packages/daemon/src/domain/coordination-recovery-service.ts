@@ -7,10 +7,10 @@ import { ADMISSION_DUTY_KIND, CONFIRMATION_DUTY_KIND, FrontierPlanning, PLANNING
 /** The frontier kinds are next-work planning obligations, not administrative refresh:
  *  admission and confirmation deliberately keep the strict effect-debt gate because
  *  the administrative allowlist stays explicitly qualification-refresh only. */
-type DutyKind='held-history-authoring'|'held-history-pickup'|'held-history-retirement'|'acceptance'|'recovery'|'materialization'|'outcome-qualification-refresh'|'lifecycle-retirement'|'frontier-planning'|'frontier-admission'|'frontier-confirmation';
+type DutyKind='held-history-authoring'|'held-history-pickup'|'held-history-retirement'|'acceptance'|'recovery'|'materialization'|'outcome-qualification-refresh'|'admission-refresh'|'lifecycle-retirement'|'frontier-planning'|'frontier-admission'|'frontier-confirmation';
 const dutyKinds:Record<DutyKind,{binding:'currentHolder'|'currentOperator'|'recipientOnly';effectClass:'state-changing'|'report-only'}>={
  'held-history-authoring':{binding:'currentHolder',effectClass:'state-changing'},'held-history-pickup':{binding:'currentOperator',effectClass:'state-changing'},'held-history-retirement':{binding:'recipientOnly',effectClass:'report-only'},
- acceptance:{binding:'currentHolder',effectClass:'state-changing'},recovery:{binding:'currentHolder',effectClass:'state-changing'},materialization:{binding:'currentOperator',effectClass:'state-changing'},'outcome-qualification-refresh':{binding:'currentOperator',effectClass:'state-changing'},'lifecycle-retirement':{binding:'recipientOnly',effectClass:'report-only'},
+ acceptance:{binding:'currentHolder',effectClass:'state-changing'},recovery:{binding:'currentHolder',effectClass:'state-changing'},materialization:{binding:'currentOperator',effectClass:'state-changing'},'outcome-qualification-refresh':{binding:'currentOperator',effectClass:'state-changing'},'admission-refresh':{binding:'currentOperator',effectClass:'state-changing'},'lifecycle-retirement':{binding:'recipientOnly',effectClass:'report-only'},
  'frontier-planning':{binding:'currentHolder',effectClass:'state-changing'},'frontier-admission':{binding:'currentOperator',effectClass:'state-changing'},'frontier-confirmation':{binding:'currentOperator',effectClass:'state-changing'}
 };
 export interface DutyFacts {claim:boolean;send:boolean;act:boolean;complete:boolean;close:boolean;retired:boolean;failedByRecipient:boolean;superseded:boolean;expired:boolean;queueId:string;reason?:string}
@@ -34,7 +34,7 @@ const successfulReturn=(state:string,disposition:string|null):boolean=>!!disposi
    * staged or renewed. Any other hold stays a bare observation. */
 export const FRONTIER_INTAKE_ROUTED_REASONS=['frontier-planning-duty-exhausted','frontier-boundary-blocked','frontier-boundary-declined','frontier-operator-absent'] as readonly string[];
 export const LIFECYCLE_INTAKE_RENEWAL_REASONS=['lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
-export const INTAKE_ROUTED_REASONS=['current-admission-required','uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict','terminal-return-incarnation-changed','terminal-return-contract-drift','terminal-return-duty-exhausted','terminal-return-seat_dispatch_reserved','terminal-return-coordinator_resource_conflict','lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
+export const INTAKE_ROUTED_REASONS=['uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict','terminal-return-incarnation-changed','terminal-return-contract-drift','terminal-return-duty-exhausted','terminal-return-seat_dispatch_reserved','terminal-return-coordinator_resource_conflict','lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
 function heldDispatchCode(error:unknown):string|undefined {
  const e=error as {code?:string;message?:string};
  if(e.code==='SQLITE_CONSTRAINT_TRIGGER'&&e.message==='seat_dispatch_reserved')return 'seat_dispatch_reserved';
@@ -135,7 +135,7 @@ export class CoordinationRecoveryService {
    * only the Operator's own qualification refresh (F3) uses it. The pre-existing
    * materialization duty keeps its strict zero-debt gate, and no future kind inherits
    * this relaxation by default. Held-history kinds already used that gate before. */
-  private administrativeDuty(kind:string):boolean {return kind==='outcome-qualification-refresh';}
+  private administrativeDuty(kind:string):boolean {return kind==='outcome-qualification-refresh'||kind==='admission-refresh';}
   /** This control plane's own accountable intake is its recovery traffic, not an unknown
    * external effect: a genuine wake to the Operator seat for a retained hold never blocks
    * the administrative duty it announces. Provenance is exact (watchdog sender, audit
@@ -192,7 +192,7 @@ let previousQueueId:string|undefined;if(prior){const r=JSON.parse(prior.receipt)
   const body=JSON.stringify({action:'report-own-expired-administrative-duty-outcome',rigId,queueId,claimCommand:'rig queue claim '+queueId,targetQueueId,targetBodyHash:r.targetBodyHash,originalDeadline:Date.parse(target.expiresAt),recipientGeneration:generation,deadline:r.deadline,grantsAuthority:false,required:'Read the exact frozen expired target and its retained evidence. Genuinely claim this fresh failure-only duty under your own native identity. Report the actual target failed/canceled through rig queue update '+targetQueueId+' --state failed --note <actual-own-expiry-disposition>. Do not claim or execute expired work, renew its authority, infer delivery, retry an uncertain mutation, accept, bind, dispatch, release resources or alter the original notice. The old target stays unclaimed if it was unclaimed. If the genuine target terminal receipt already exists, claim and close this report referencing it; do not repeat the target mutation.'});
   this.db.transaction(()=>{if(!this.dutyBinding(rigId,r)||!this.dutyProtection(rigId,r)||this.repo.getById(queueId))return;this.repo.createWithinTransaction({qitemId:queueId,sourceSession:'watchdog@system',destinationSession:r.recipient,body,expiresAt:new Date(r.deadline).toISOString(),identityProvenance:'system:operator-authorized-coordination',nudge:false});const id=this.repo.stageHeldHistoryAuthoringWake(queueId,r.recipient,generation),notice=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(id) as any;this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,queueId,'coordinator-lifecycle-control',JSON.stringify({...r,bodyHash:digest(body),noticeBodyHash:digest(notice.body)}),digest(body));})();return this.repo.getById(queueId)?queueId:undefined;
  }
- private lifecycleDuty(rigId:string,kind:'acceptance'|'recovery'|'materialization'|'outcome-qualification-refresh'|'frontier-planning'|'frontier-admission'|'frontier-confirmation',packageKey:string,recipient:string,recipientGeneration:string,semanticKey:string,details:Record<string,unknown>):CoordinationResult {
+ private lifecycleDuty(rigId:string,kind:'acceptance'|'recovery'|'materialization'|'outcome-qualification-refresh'|'admission-refresh'|'frontier-planning'|'frontier-admission'|'frontier-confirmation',packageKey:string,recipient:string,recipientGeneration:string,semanticKey:string,details:Record<string,unknown>):CoordinationResult {
   const a=this.authority.get(rigId)!,plan=this.plan(rigId)!,rootId='qitem-coordination-lifecycle-'+digest(rigId+':'+kind+':'+semanticKey).slice(0,24);
   const rows=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')=? AND json_extract(receipt,'$.packageKey')=? ORDER BY rowid DESC").all(rigId,kind,packageKey) as any[];
   const prior=rows.map(v=>JSON.parse(v.receipt)).find(r=>r.semanticKey===semanticKey||(r.semanticKey===undefined&&(kind==='materialization'?r.contractHash===details.contractHash:r.originalQueueId===details.originalQueueId&&r.dispositionId===details.dispositionId)));
@@ -205,11 +205,12 @@ let queueId=rootId,previousQueueId:string|undefined,expiredUnclaimed=false;
     // own unresolved wake, and an accountable intake instead of a silent dead end.
     if(!facts.superseded&&(!facts.retired||(expiredUnclaimed&&!this.dutyNoticeContained(rigId,prior)))){const retirementQueueId=this.stageDutyRetirement(rigId,prior);return {key:kind+':'+packageKey,state:'held',queueId:prior.queueId,reason:facts.retired?'lifecycle-recipient-protected':'lifecycle-duty-exhausted',deadline:prior.deadline,...(retirementQueueId?{activityEvidence:{retirementQueueId}}:{})};}
     if(!this.dutySubjectReady(rigId,prior))return {key:kind+':'+packageKey,state:'held',queueId:prior.queueId,reason:'lifecycle-return-contract-drift',deadline:prior.deadline};
-    previousQueueId=prior.queueId;const bindingVersion=kind==='materialization'||kind==='outcome-qualification-refresh'?recipientGeneration:recipientGeneration+':'+a.epoch;queueId='qitem-coordination-lifecycle-'+digest(rootId+':successor:'+prior.queueId+':'+bindingVersion).slice(0,24);
+    previousQueueId=prior.queueId;const bindingVersion=kind==='materialization'||kind==='outcome-qualification-refresh'||kind==='admission-refresh'?recipientGeneration:recipientGeneration+':'+a.epoch;queueId='qitem-coordination-lifecycle-'+digest(rootId+':successor:'+prior.queueId+':'+bindingVersion).slice(0,24);
    }
    const existing=this.repo.getById(queueId),deadline=existing?.expiresAt?Date.parse(existing.expiresAt):this.now()+1200000;if(existing)return {key:kind+':'+packageKey,state:'pending-native-'+kind,queueId,deadline};
    if(!this.lifecycleRecipientReady(rigId,recipient,packageKey,undefined,this.administrativeDuty(kind)))return {key:kind+':'+packageKey,state:'held',queueId:prior?.queueId,reason:'lifecycle-recipient-protected',deadline};
-  let bodyValue:any={action:kind==='acceptance'?'accept-exact-return-or-own-recovery':kind==='recovery'?'own-exact-failed-return-recovery':kind==='outcome-qualification-refresh'?'refresh-exact-expired-outcome-qualification':'materialize-exact-admitted-frontier',rigId,queueId,packageKey,recipientGeneration,deadline,grantsAuthority:false,...details,required:kind==='acceptance'?'Claim this finite duty under current holder identity. Inspect the exact typed disposed return and required technical evidence. Use supported coordination-accept only when all classifier, qualification and independent review gates actually pass. An incomplete or unverified outcome requires distinct admitted, configured and genuinely picked-up recovery; record its exact active custody through coordination-lifecycle-recovery. Prose is not acceptance or owned recovery. Original acceptance alone releases the existing authorized frontier; never invent work or waive a gate.':kind==='recovery'?'Claim this finite recovery-only duty under the current native holder identity. Preserve the exact failed/denied/canceled original and its genuine typed disposition. Technical acceptance is forbidden for this original failure. Coordinate with the genuine current Operator to materialize a distinct admitted current recovery in the existing plan if absent; do not invent or reopen work. After actual worker pickup, record its exact active custody and evidence through coordination-lifecycle-recovery. Successful duty closure requires that verified distinct owned recovery; prose, a pending ticket and a failed-return acceptance attempt are not completion. Unknown effects, quiescence, current admission and qualifications remain protected.':kind==='outcome-qualification-refresh'?'Claim this finite current-Operator duty under your exact native identity. Revalidate the unchanged policy, provider configuration, existing private-input permission and credential availability without logging credentials. Submit a fresh dated qualification through rig coordinator outcome-qualification-refresh using the exact dutyQueueId in qualificationRefreshContract. Preserve the logical policy revision, provider/privacy/paid/calibration/negative-advice settings, prior decisions, unresolved assessment/recovery/acceptance references, and unknown effects. No provider test, provider retry, automatic renewal, policy rewrite, positive authority or acceptance waiver is authorized.': 'Claim this finite Operator intake. Inspect the immutable admitted contract, retained accepted predecessor references and current plan. Materialize this exact package into the existing plan with actual current qualification, capacity, effort, native generation/configuration and recovery evidence through coordination-plan. Preserve unchanged accepted history and dormant backup bytes. If scope or a protected gate prevents this, park the concrete boundary; this notice grants no admission, qualification, dispatch or acceptance.'};
+  let bodyValue:any={action:kind==='acceptance'?'accept-exact-return-or-own-recovery':kind==='recovery'?'own-exact-failed-return-recovery':kind==='outcome-qualification-refresh'?'refresh-exact-expired-outcome-qualification':kind==='admission-refresh'?'refresh-exact-expired-task-admission':'materialize-exact-admitted-frontier',rigId,queueId,packageKey,recipientGeneration,deadline,grantsAuthority:false,...details,required:kind==='acceptance'?'Claim this finite duty under current holder identity. Inspect the exact typed disposed return and required technical evidence. Use supported coordination-accept only when all classifier, qualification and independent review gates actually pass. An incomplete or unverified outcome requires distinct admitted, configured and genuinely picked-up recovery; record its exact active custody through coordination-lifecycle-recovery. Prose is not acceptance or owned recovery. Original acceptance alone releases the existing authorized frontier; never invent work or waive a gate.':kind==='recovery'?'Claim this finite recovery-only duty under the current native holder identity. Preserve the exact failed/denied/canceled original and its genuine typed disposition. Technical acceptance is forbidden for this original failure. Coordinate with the genuine current Operator to materialize a distinct admitted current recovery in the existing plan if absent; do not invent or reopen work. After actual worker pickup, record its exact active custody and evidence through coordination-lifecycle-recovery. Successful duty closure requires that verified distinct owned recovery; prose, a pending ticket and a failed-return acceptance attempt are not completion. Unknown effects, quiescence, current admission and qualifications remain protected.':kind==='outcome-qualification-refresh'?'Claim this finite current-Operator duty under your exact native identity. Revalidate the unchanged policy, provider configuration, existing private-input permission and credential availability without logging credentials. Submit a fresh dated qualification through rig coordinator outcome-qualification-refresh using the exact dutyQueueId in qualificationRefreshContract. Preserve the logical policy revision, provider/privacy/paid/calibration/negative-advice settings, prior decisions, unresolved assessment/recovery/acceptance references, and unknown effects. No provider test, provider retry, automatic renewal, policy rewrite, positive authority or acceptance waiver is authorized.': kind==='admission-refresh'?'Claim this finite current-Operator duty under your exact native identity. Re-assess and re-submit evidence for this ONE expired task admission; the runtime never renews it and never judges the qualification for you. Read the exact task bytes and the LIVE owner identity, then assess qualification, capacity and effort evidence against the LIVE owner generation and configurationDigest named in this notice, never against the prior admission. Record a new coordination-plan revision in which ONLY this task carries a freshly assessed admission, through your existing supported coordination-plan write. A byte-identical re-submission, a TTL-only extension of the stale admission, or any stale generation or configurationDigest is refused and does not complete this duty. This duty grants no qualification, acceptance, dispatch or delivery authority, does not reconcile or retry uncertain effects, and never extends a TTL by itself.':'Claim this finite Operator intake. Inspect the immutable admitted contract, retained accepted predecessor references and current plan. Materialize this exact package into the existing plan with actual current qualification, capacity, effort, native generation/configuration and recovery evidence through coordination-plan. Preserve unchanged accepted history and dormant backup bytes. If scope or a protected gate prevents this, park the concrete boundary; this notice grants no admission, qualification, dispatch or acceptance.'};
+  if(kind==='admission-refresh')bodyValue.admissionRefreshContract={rigId,dutyQueueId:queueId,taskKey:details.taskKey,packageKey,owner:details.owner,ownerGeneration:details.ownerGeneration,configurationDigest:details.liveConfigurationDigest,admission:{generation:'<live owner generation>',configurationDigest:'<live configurationDigest>',qualificationRef:'<actual-new-proof-reference>',capacityRef:'<actual-new-capacity-reference>',effortRef:'<actual-new-effort-reference>',validUntil:'<actual-finite-proof-deadline>'}};
   if(kind==='outcome-qualification-refresh')bodyValue.qualificationRefreshContract={rigId,dutyQueueId:queueId,operationId:'<new-exact-operation-id>',policyRevision:details.policyRevision,policyDigest:details.policyDigest,qualifiedAt:'<actual-fresh-proof-time>',qualification:{ref:'<actual-new-proof-reference>',providerConfigDigest:details.providerConfigDigest,validUntil:'<actual-finite-proof-deadline>'}};
   let body=JSON.stringify(bodyValue);
   if(kind==='recovery'){const b=JSON.parse(body);b.required='Claim this finite recovery-only duty under the current native holder identity. Preserve the exact failed/denied/canceled original and its genuine typed disposition. Technical acceptance is forbidden for this original failure. Coordinate with the genuine current Operator to materialize a distinct admitted current recovery in the existing plan if absent; do not invent or reopen work. After actual worker pickup, record its exact active custody and evidence through coordination-lifecycle-recovery. Successful duty closure requires that verified distinct owned recovery; prose, a pending ticket and a failed-return acceptance attempt are not completion. Unknown effects, quiescence, current admission and qualifications remain protected.';body=JSON.stringify(b);}
@@ -223,6 +224,80 @@ this.db.transaction(()=>{this.repo.createWithinTransaction({qitemId:queueId,sour
    if(expiredUnclaimed)return {key:kind+':'+packageKey,state:'held',queueId:prior!.queueId,reason:'lifecycle-duty-expired-unclaimed',deadline:prior!.deadline,activityEvidence:{successorQueueId:queueId}};
    return {key:kind+':'+packageKey,state:'pending-native-'+kind,queueId,deadline};
   }
+ /** IMMUTABLE TASK INTENT: every field the task actually asks for, EXCLUDING the
+  *  admission proof. The admission is precisely what this duty exists to refresh, so
+  *  folding it into the subject digest would make a genuine refresh unable to complete
+  *  (the bytes necessarily change) while a byte-identical task could never present a
+  *  newer expiry. Intent is therefore the stable identity of the task request, and the
+  *  prior stale admission is bound separately in the receipt. */
+ private admissionTaskIntentDigest(t:CoordinationTask):string {
+  const {admission:_priorAdmissionProof,...intent}=t;
+  return digest(JSON.stringify(intent));
+ }
+ /** WHY the current admission is stale, from LIVE facts only. Never from the prior
+  *  admission itself, which is what makes it evidence rather than a restatement. */
+ private admissionStaleReason(t:CoordinationTask):'expired'|'generation_changed'|'configuration_changed'|null {
+  const liveGen=this.authority.generation(t.owner),liveCfg=this.configurationDigest(t.owner),ad=t.admission;
+  if(liveGen!==ad.generation)return 'generation_changed';
+  if(liveCfg!==ad.configurationDigest)return 'configuration_changed';
+  if(!Number.isFinite(ad.validUntil)||ad.validUntil<=this.now())return 'expired';
+  return null;
+ }
+ /** One accountable Operator duty per (packageKey, task bytes, live owner generation,
+  *  live configuration, prior expiry). An identical retained task under a new plan
+  *  revision therefore keeps the SAME duty; a changed owner generation or configuration
+  *  correctly opens a NEW one. */
+ private stageAdmissionRefreshDuty(rigId:string,t:CoordinationTask):CoordinationResult|undefined {
+  const plan=this.plan(rigId),operatorGeneration=this.authority.generation('operator-agent@kernel');
+  if(!plan||!operatorGeneration||plan.operatorGeneration!==operatorGeneration)return undefined;
+  const ownerGeneration=this.authority.generation(t.owner),liveConfigurationDigest=this.configurationDigest(t.owner);
+  if(!ownerGeneration||!liveConfigurationDigest)return undefined;
+  const staleReason=this.admissionStaleReason(t);
+  if(!staleReason)return undefined;
+  const taskIntentDigest=this.admissionTaskIntentDigest(t),priorValidUntil=t.admission.validUntil;
+  // digest() takes a string in this codebase (see stageOutcomeQualificationDuty and every
+  // other semanticKey site). The design's object literal is serialized explicitly.
+  const semanticKey=digest(JSON.stringify({packageKey:t.packageKey,taskIntentDigest,ownerGeneration,liveConfigurationDigest,priorValidUntil}));
+  return this.lifecycleDuty(rigId,'admission-refresh',t.packageKey,'operator-agent@kernel',operatorGeneration,semanticKey,{
+   taskKey:t.key,packageKey:t.packageKey,owner:t.owner,ownerGeneration,liveConfigurationDigest,
+   staleReason,priorAdmission:{validUntil:t.admission.validUntil,generation:t.admission.generation,configurationDigest:t.admission.configurationDigest,qualificationRef:t.admission.qualificationRef,capacityRef:t.admission.capacityRef,effortRef:t.admission.effortRef},
+   taskIntentDigest,planRevision:plan.revision,
+  });
+ }
+ /** Postcondition: the CURRENT plan carries this same task, now genuinely admitted
+  *  against the LIVE owner generation and configuration, with a strictly newer expiry
+  *  than the stale one AND than the duty's issue time. A byte-identical re-submission or
+  *  a TTL-only extension therefore cannot complete it. Evidence CONTENT is never read
+  *  or judged here. */
+ private admissionRefreshCompleted(rigId:string,r:any):boolean {
+  const plan=this.plan(rigId),operatorGeneration=this.authority.generation('operator-agent@kernel');
+  if(!plan||!operatorGeneration||plan.operatorGeneration!==operatorGeneration||r.operatorGeneration!==operatorGeneration)return false;
+  const task=plan.tasks.find(t=>t.key===r.taskKey&&t.packageKey===r.packageKey&&t.owner===r.owner);
+  // Subject intent must be UNCHANGED: this duty refreshes an admission, it never changes
+  // the work the task asks for.
+  if(!task||this.admissionTaskIntentDigest(task)!==r.taskIntentDigest)return false;
+  if(task.admission.generation!==r.ownerGeneration||task.admission.configurationDigest!==r.liveConfigurationDigest)return false;
+  if(task.admission.generation!==this.authority.generation(task.owner))return false;
+  if(task.admission.configurationDigest!==this.configurationDigest(task.owner))return false;
+  if(!(task.admission.validUntil>r.priorAdmission.validUntil&&task.admission.validUntil>r.issuedAt))return false;
+  // FRESH ASSESSMENT, not a TTL extension. The prior evidence references must all have been
+  // re-issued: a re-submission that only moves validUntil, or that reuses the stale
+  // qualification/capacity/effort references, cannot complete this duty. Reference VALUES
+  // are compared, never read or judged; the runtime still writes no admission.
+  if(task.admission.qualificationRef===r.priorAdmission.qualificationRef)return false;
+  if(task.admission.capacityRef===r.priorAdmission.capacityRef)return false;
+  if(task.admission.effortRef===r.priorAdmission.effortRef)return false;
+  return this.admittedNow(task);
+ }
+ /** Subject readiness while the operator may act: the exact task is still in the plan
+  *  with identical bytes and is STILL not admitted. Once it is admitted the duty is
+  *  complete and the successor link is not opened. */
+ private admissionRefreshSubjectReady(rigId:string,r:any):boolean {
+  const plan=this.plan(rigId);
+  if(!plan)return false;
+  const task=plan.tasks.find(t=>t.key===r.taskKey&&t.packageKey===r.packageKey&&t.owner===r.owner);
+  return !!task&&this.admissionTaskIntentDigest(task)===r.taskIntentDigest&&!this.admittedNow(task);
+ }
  stageOutcomeQualificationDuty(rigId:string,details:{policyRevision:string;policyDigest:string;providerConfigDigest:string;qualificationRef:string;qualificationValidUntil:number}):string|null {
   const assessment=this.authority.runtimeOutcomeAssessment,plan=this.plan(rigId),generation=this.authority.generation('operator-agent@kernel');
   if(!assessment?.qualificationBoundaryMatches(rigId,details)||!plan||!generation||plan.operatorGeneration!==generation)return null;
@@ -550,6 +625,7 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
    if(!record||!op)return false;try{const b=JSON.parse(op.receipt);return b.kind==='coordinator-held-history-recovery-binding.v1'&&b.actor==='operator-agent@kernel'&&b.generation===parent.operatorGeneration&&b.originalMutations===0&&JSON.stringify(b.effects)===JSON.stringify(parent.effects.map((e:any)=>e.outboxId))&&b.binding?.queueId===parent.recordQueueId&&b.binding.bodyHash===digest(record.body)&&b.binding.lead===parent.holder&&b.binding.leadGeneration===parent.holderGeneration&&record.claimed_by_generation_uuid===parent.operatorGeneration;}catch{return false;}
   }
   if(r.kind==='outcome-qualification-refresh')return this.authority.runtimeOutcomeAssessment?.qualificationRefreshCompleted(rigId,r)===true;
+  if(r.kind==='admission-refresh')return this.admissionRefreshCompleted(rigId,r);
   if(r.kind==='materialization'){const plan=this.plan(rigId),pkg=this.db.prepare('SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(rigId,r.packageKey) as any;return !!plan&&pkg?.contract_hash===r.contractHash&&plan.tasks.some(t=>t.packageKey===r.packageKey&&this.admittedNow(t));}
   if(r.kind===PLANNING_DUTY_KIND)return this.frontierPlanning().planPostcondition(rigId,r);
   if(r.kind===ADMISSION_DUTY_KIND)return this.frontierPlanning().admissionPostcondition(rigId,r);
@@ -591,6 +667,7 @@ private dutyProtection(rigId:string,r:any):boolean {
   if(r.kind==='held-history-authoring')return this.heldHistoryAuthoringReady(rigId,{...r,planRevision:this.plan(rigId)?.revision},this.dutyExcludedNotices(r));
   if(r.kind==='held-history-pickup'){const p=this.lifecycleControl(r.authoringQueueId)?.receipt;return !!p&&this.heldHistoryRecord(p)!==null&&this.heldHistoryAuthoringReady(rigId,{...p,planRevision:this.plan(rigId)?.revision},['wake-intent-'+p.queueId,...this.dutyExcludedNotices(r)]);}
   if(r.kind==='outcome-qualification-refresh')return this.authority.runtimeOutcomeAssessment?.qualificationBoundaryMatches(rigId,r)===true;
+  if(r.kind==='admission-refresh')return this.admissionRefreshSubjectReady(rigId,r);
   if(r.kind==='materialization'){const plan=this.plan(rigId),pkg=this.db.prepare('SELECT contract_hash FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(rigId,r.packageKey) as any;return pkg?.contract_hash===r.contractHash&&!plan?.tasks.some(t=>t.packageKey===r.packageKey)&&r.acceptedPredecessors.every((v:any)=>this.exactAccepted(rigId,v.queueId,v.dispositionId));}
   if(r.kind===PLANNING_DUTY_KIND)return this.frontierPlanning().planActAllowed(rigId,r);
   if(r.kind===ADMISSION_DUTY_KIND)return this.frontierPlanning().admissionActAllowed(rigId,r);
@@ -751,7 +828,11 @@ private dutyProtection(rigId:string,r:any):boolean {
   if(held.subject)return {packageKey:held.subject.packageKey,owner:held.subject.owner};
   const plan=this.plan(rigId);if(!plan)return null;
   const missing=missingReturns.find(m=>'terminal-return:'+m.package_key===held.key);
-  const control=held.queueId?this.lifecycleControl(held.queueId)?.receipt:null,administrative=held.key.startsWith('outcome-qualification-refresh:')?{packageKey:held.key.slice('outcome-qualification-refresh:'.length),owner:'operator-agent@kernel'}:null;
+  const control=held.queueId?this.lifecycleControl(held.queueId)?.receipt:null;
+  // Administrative duty prefixes resolve their subject from the key alone, so a held duty that
+  // never staged a queue row (protected recipient, no prior control receipt) is still routable.
+  const administrativePrefix=['outcome-qualification-refresh:','admission-refresh:'].find(p=>held.key.startsWith(p));
+  const administrative=administrativePrefix?{packageKey:held.key.slice(administrativePrefix.length),owner:'operator-agent@kernel'}:null;
   // Renewal keeps the original package key resolution for a terminal return whose
   // control row is already consumed; first staging still needs a real subject.
   const terminal=forRenewal&&held.key.startsWith('terminal-return:')?{packageKey:held.key.slice('terminal-return:'.length),owner:control?.recipient??'operator-agent@kernel'}:null;
@@ -1027,7 +1108,22 @@ private dutyProtection(rigId:string,r:any):boolean {
     const ready=this.predecessorsReady(rigId,t);
     if(!ready){result.push({key:t.key,state:'held',reason:'predecessor-disposition',deadline:t.deadline});continue;}
     if(this.workerEffectDebt(t.owner)){result.push({key:t.key,state:'held',reason:'uncertain-worker-effect',deadline:t.deadline});continue;}
-    if(!this.admittedNow(t)){result.push({key:t.key,state:'held',reason:'current-admission-required',deadline:t.deadline});continue;}
+    if(!this.admittedNow(t)){
+     result.push({key:t.key,state:'held',reason:'current-admission-required',deadline:t.deadline});
+     // One shared, renewing, accountable admission-refresh duty for the stale task.
+     // Staging is read-only apart from the duty's own hash-bound wake, which is excluded
+     // from debt via administrativeDuty(). It writes no admission and extends no TTL.
+     //
+     // The duty's OWN result is propagated, never discarded. A duty held for a protected
+     // recipient, an exhausted chain, an unresolved retirement or subject drift is
+     // accountable in its own right and must reach the existing intake/retirement chain;
+     // dropping it left a silent hold once 'current-admission-required' left the routed
+     // list. A duty that staged or completed needs no intake, so a successfully staged duty
+     // still never produces a duplicate legacy hold.
+     const refresh=this.stageAdmissionRefreshDuty(rigId,t);
+     if(refresh?.state==='held')
+      result.push({key:refresh.key,state:'held',reason:refresh.reason,deadline:refresh.deadline??t.deadline,...(refresh.queueId?{queueId:refresh.queueId}:{}),...(refresh.activityEvidence?{activityEvidence:refresh.activityEvidence}:{})});
+     continue;}
     const gen=this.authority.generation(t.owner);
     const sample=this.activity(t.owner),observedNow=this.now();
     if(!gen||!coordinationIdle(sample,gen,observedNow)){

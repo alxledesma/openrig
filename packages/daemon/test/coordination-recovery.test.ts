@@ -1,4 +1,4 @@
-import {makeCoordinatorContinuityPolicy} from '../src/domain/policies/coordinator-continuity.js';
+import { LIFECYCLE_INTAKE_RENEWAL_REASONS,makeCoordinatorContinuityPolicy} from '../src/domain/policies/coordinator-continuity.js';
 import type {RuntimeAvailability} from '../src/domain/coordinator-runtime-availability.js';
 import {spawn} from 'node:child_process';
 import {once} from 'node:events';
@@ -8,7 +8,7 @@ import {mkdtempSync,rmSync} from 'node:fs';import {tmpdir} from 'node:os';import
 import type Database from 'better-sqlite3';
 import {createDb} from '../src/db/connection.js';import {EventBus} from '../src/domain/event-bus.js';
 import {QueueRepository} from '../src/domain/queue-repository.js';import {OutboxHandler} from '../src/domain/outbox-handler.js';
-import {CoordinationRecoveryService,coordinationIdle,type CoordinationActivity,type CoordinationTask,type CoordinationPlan} from '../src/domain/coordination-recovery-service.js';
+import {CoordinationRecoveryService,LIFECYCLE_INTAKE_RENEWAL_REASONS,coordinationIdle,type CoordinationActivity,type CoordinationTask,type CoordinationPlan} from '../src/domain/coordination-recovery-service.js';
 import {SeatActivityService} from '../src/domain/seat-activity-service.js';
 import {RuntimeOutcomeAssessment} from '../src/domain/runtime-outcome-assessment.js';
 import {digest} from '../src/domain/coordinator-authority-service.js';import {seed,token} from './helpers/coordinator-fixture.js';
@@ -637,8 +637,26 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES('op-reservation','op-rotation','operator-agent@kernel','operator-agent@kernel','operator-agent-g1','native-old','operator-agent@kernel','operator-agent-g1','hash','{}','{}','reserved',?,?)").run(new Date(clock).toISOString(),new Date(clock).toISOString());
   const result=svc.reconcile('lead@xv','lead-g1','xv');
   expect(result.find(r=>r.key==='expired')?.reason).toBe('current-admission-required');expect(result.find(r=>r.key==='product')?.state).toBe('pending-pickup');
-  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordination-intake-hold'").get()).toEqual({n:1});
+  // R2: the held admission-refresh result is PROPAGATED into reconciliation, so a protected
+  // duty is an EXPLICIT accountable hold rather than a silent one. No duty row exists yet
+  // (protection is evaluated before staging) and the legacy reason stays unrouted.
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='admission-refresh'").get()).toEqual({n:0});
+  const propagated=result.find(r=>r.key==='admission-refresh:expired');
+  expect(propagated).toBeTruthy();
+  expect(propagated!.state).toBe('held');
+  expect(propagated!.reason).toBe('lifecycle-recipient-protected');
+  // The independent ready assignment is NOT rolled back by any of this.
+  expect(result.find(r=>r.key==='product')?.state).toBe('pending-pickup');
+  // Exactly ONE mechanism accounts for the hold: never the legacy current-admission-required.
+  expect(db.prepare("SELECT count(*) n FROM queue_items WHERE json_valid(body)=1 AND json_extract(body,'$.reason')='current-admission-required'").get()).toEqual({n:0});
+  // Once the reservation clears, the native duty stages on the next reconcile.
+  // The reservation itself is untouched by anything above.
   expect(db.prepare("SELECT state FROM seat_dispatch_reservations WHERE reservation_id='op-reservation'").get()).toEqual({state:'reserved'});
+  db.prepare("UPDATE seat_dispatch_reservations SET state='released' WHERE reservation_id='op-reservation'").run();
+  const after=svc.reconcile('lead@xv','lead-g1','xv');
+  expect(after.find(r=>r.key==='product')?.state).toBe('pending-pickup');
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='admission-refresh' AND json_extract(receipt,'$.packageKey')='expired'").get()).toEqual({n:1});
+  expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='admission-refresh' AND json_extract(receipt,'$.packageKey')='expired'").get()).toEqual({n:1});
  });
 
  it('cyclic recovery activation chain cannot masquerade as a ready independent plan',()=>{
@@ -1001,4 +1019,238 @@ const task=(key:string,owner='builder@xv',more:Partial<CoordinationTask>={}):Coo
       expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...next,revision:'r2',tasks:next.tasks.map((t,i)=>i===0?{...t,deadline:clock+300000,admission:task('xv-architect','builder@xv',{deadline:clock+300000}).admission!}:t)})).toThrow('Frozen revision cannot change');
     });
   });
+
+// TASK-ADMISSION-RECOVERY-DESIGN: one shared, renewing, accountable admission-refresh
+// lifecycle duty. The runtime stages the duty and verifies a postcondition; it never
+// writes an admission, extends a TTL, grants qualification or fabricates evidence.
+describe('admission-refresh lifecycle duty',()=>{
+ // Authoritative receipt shape: coordinator_operations.kind is 'coordinator-lifecycle-control';
+ // rowid is the authoritative INSERTION order (operation_id is hash-derived, so it does not order by age).
+ // and the duty kind lives at receipt.$.kind (see lifecycleDuty's INSERT).
+ const refreshRows=()=>db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordinator-lifecycle-control' AND json_extract(receipt,'$.kind')='admission-refresh' ORDER BY rowid").all() as any[];
+ const refreshAll=()=>refreshRows().map(v=>JSON.parse(v.receipt));
+ /** Every stale task gets its OWN duty, so assertions are scoped by package subject rather
+  *  than assuming the plan holds a single stale task. */
+ const refreshReceipt=(packageKey?:string)=>{const all=refreshAll();const scoped=packageKey?all.filter(r=>r.packageKey===packageKey):all;return scoped.length?scoped[scoped.length-1]:null;};
+ /** A task only becomes RETAINED-and-STALE by being admitted with a CURRENT admission
+  *  and then having time advance past its validUntil. Configuring it already-stale would
+  *  be refused by configure() itself, which is exactly the fence under test elsewhere. */
+ const STALE_PLAN=(owner='reviewer@xv')=>{configure([task('expired',owner),task('expired-repair','architect@xv',{recoveryFor:'expired'})]);const admittedAt=svc.plan('xv')!.tasks.find(t=>t.key==='expired')!.admission.validUntil;repo.coordinatorAuthority.renew('lead@xv',token,600000,'renew-stale-window');clock+=admittedAt+2-clock;vi.setSystemTime(clock);refresh();return admittedAt;};
+ const r_gen=(t:CoordinationTask)=>t.admission.generation;
+ const r_cfg=(t:CoordinationTask)=>svc.configurationDigest(t.owner)!;
+ const dutyBody=()=>{const r=refreshReceipt('expired');return r?JSON.parse((db.prepare('SELECT body FROM queue_items WHERE qitem_id=?').get(r.queueId) as any).body):null;};
+
+ it('AR1 a stale task is held and stages one accountable Operator duty bound to live facts',()=>{
+  const admittedAt=STALE_PLAN();
+  const results=svc.reconcile('lead@xv','lead-g1','xv');
+  expect(results.find(r=>r.key==='expired')?.reason).toBe('current-admission-required');
+  const r=refreshReceipt('expired');
+  
+  expect(r).toBeTruthy();
+  expect(r.recipient).toBe('operator-agent@kernel');
+  expect(dutyBody().grantsAuthority).toBe(false);
+  expect(r.staleReason).toBe('expired');
+  expect(r.ownerGeneration).toBe(repo.coordinatorAuthority.generation('reviewer@xv'));
+  expect(r.liveConfigurationDigest).toBe(svc.configurationDigest('reviewer@xv'));
+  expect(r.priorAdmission.validUntil).toBe(admittedAt);
+  expect(r.taskIntentDigest).toBe((svc as any).admissionTaskIntentDigest(svc.plan('xv')!.tasks.find(t=>t.key==='expired')!));
+  expect(r.priorAdmission.qualificationRef).toBe(task('expired','reviewer@xv').admission.qualificationRef);
+  expect(r.planRevision).toBe(svc.plan('xv')!.revision);
+  // The duty carries the LIVE generation and a placeholder contract, never a carried-forward grant.
+  const body=dutyBody();
+  expect(body.action).toBe('refresh-exact-expired-task-admission');
+  expect(body.admissionRefreshContract.ownerGeneration).toBe(r.ownerGeneration);
+  expect(body.admissionRefreshContract.admission.qualificationRef).toBe('<actual-new-proof-reference>');
+  expect(body.admissionRefreshContract.admission.generation).toBe('<live owner generation>');
+ });
+
+ it('AR2 staging writes no admission, no TTL change and no assignment',()=>{
+  STALE_PLAN();
+  const pkgBefore=db.prepare("SELECT contract FROM coordinator_packages WHERE rig_id=(SELECT id FROM rigs WHERE name=?) AND package_key='expired'").get('xv');
+  const tasksBefore=JSON.stringify(svc.plan('xv')!.tasks);
+  const assignmentsBefore=db.prepare('SELECT count(*) n FROM coordinator_assignments').get();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  expect(db.prepare("SELECT contract FROM coordinator_packages WHERE rig_id=(SELECT id FROM rigs WHERE name=?) AND package_key='expired'").get('xv')).toEqual(pkgBefore);
+  expect(JSON.stringify(svc.plan('xv')!.tasks)).toBe(tasksBefore);
+  expect(db.prepare('SELECT count(*) n FROM coordinator_assignments').get()).toEqual(assignmentsBefore);
+  expect(db.prepare('SELECT count(*) n FROM coordinator_resources').get()).toEqual({n:0});
+  expect(db.prepare('SELECT count(*) n FROM coordinator_stage_assignments').get()).toEqual({n:0});
+ });
+
+ it('AR3 dedup: the same retained task under a new plan revision keeps ONE duty',()=>{
+  STALE_PLAN();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  const first=refreshReceipt('expired')!;
+  expect(first.semanticKey).toBeTruthy();
+  svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2'});
+  svc.reconcile('lead@xv','lead-g1','xv');
+  const scoped=refreshAll().filter(r=>r.packageKey==='expired');
+  expect(scoped.length).toBe(1);
+  expect(scoped[0].semanticKey).toBe(first.semanticKey);
+  expect(scoped[0].queueId).toBe(first.queueId);
+ });
+
+ it('AR4 a changed owner configuration opens a NEW duty with configuration_changed',()=>{
+  STALE_PLAN();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  expect(refreshReceipt('expired')!.staleReason).toBe('expired');
+  const before=refreshAll().filter(r=>r.packageKey==='expired').length;
+  db.prepare("UPDATE nodes SET model='different-model' WHERE logical_id='reviewer'").run();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  const scoped=refreshAll().filter(r=>r.packageKey==='expired');
+  expect(scoped.length).toBe(before+1);
+  expect(scoped[scoped.length-1].staleReason).toBe('configuration_changed');
+  expect(scoped[scoped.length-1].liveConfigurationDigest).toBe(svc.configurationDigest('reviewer@xv'));
+  expect(scoped[scoped.length-1].semanticKey).not.toBe(scoped[0].semanticKey);
+ });
+
+ it('AR5 worker effect debt on the owner yields NO admission-refresh duty and preserves UNKNOWN',()=>{
+  STALE_PLAN();
+  db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state) VALUES('w-unknown','watchdog@system','reviewer@xv','live',?,'indeterminate')").run(new Date(clock).toISOString());
+  const before=db.prepare("SELECT outbox_id,delivery_state FROM outbox_entries WHERE delivery_state='indeterminate' ORDER BY outbox_id").all();
+  const results=svc.reconcile('lead@xv','lead-g1','xv');
+  expect(results.find(r=>r.key==='expired')?.reason).toBe('uncertain-worker-effect');
+  // No admission-refresh duty for the effect-debt task itself. Its repair sibling expires on the
+  // same clock and is an independent subject, so the duty is scoped by packageKey.
+  expect(refreshAll().map(r=>r.packageKey)).not.toContain('expired');
+  const after=db.prepare("SELECT outbox_id,delivery_state FROM outbox_entries WHERE delivery_state='indeterminate' ORDER BY outbox_id").all() as any[];
+  // The UNKNOWN row is byte-preserved and never retried or relabelled.
+  expect(after.find(r=>r.outbox_id==='w-unknown')).toEqual({outbox_id:'w-unknown',delivery_state:'indeterminate'});
+  expect(after).toHaveLength(before.length);
+ });
+
+ it('AR6 a retired Operator generation cannot complete the duty',()=>{
+  STALE_PLAN();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  const r=refreshReceipt('expired');
+  expect((svc as any).admissionRefreshCompleted('xv',{...r,operatorGeneration:'retired-generation'})).toBe(false);
+  // And the un-refreshed real receipt is not complete either.
+  expect((svc as any).admissionRefreshCompleted('xv',r)).toBe(false);
+ });
+
+ it('AR7 TTL-only extension of the stale admission does NOT complete the duty',()=>{
+  STALE_PLAN();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  const r=refreshReceipt('expired')!;
+  // Only validUntil moves; the stale evidence references are carried forward.
+  const current=svc.plan('xv')!.tasks.find(t=>t.key==='expired')!;
+  const ttlOnly={...current,admission:{...current.admission,validUntil:clock+900000}};
+  svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:svc.plan('xv')!.tasks.map(t=>t.key==='expired'?ttlOnly:t)});
+  // The ORIGINAL frozen duty receipt is used unchanged; nothing is forged.
+  expect((svc as any).admissionRefreshCompleted('xv',r)).toBe(false);
+ });
+
+ it('AR7b reused evidence reference does NOT complete the duty',()=>{
+  STALE_PLAN();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  const r=refreshReceipt('expired')!;
+  const current=svc.plan('xv')!.tasks.find(t=>t.key==='expired')!;
+  // Re-issuing only ONE of the three references is not a genuine re-assessment.
+  // Generation and configuration stay valid here, so configure() accepts and the
+  // postcondition is the fence under test.
+  const partials=[{qualificationRef:'<new-qualification-proof>'},{capacityRef:'<new-capacity-proof>'},{effortRef:'<new-effort-proof>'}];
+  partials.forEach((partial,i)=>{
+   const mixed={...current,admission:{...current.admission,...partial,validUntil:clock+900000}};
+   svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2-'+i,tasks:svc.plan('xv')!.tasks.map(t=>t.key==='expired'?mixed:t)});
+   expect((svc as any).admissionRefreshCompleted('xv',r)).toBe(false);
+  });
+ });
+
+ it('AR7c a changed task intent does NOT complete the duty',()=>{
+  STALE_PLAN();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  const r=refreshReceipt('expired')!;
+  const current=svc.plan('xv')!.tasks.find(t=>t.key==='expired')!;
+  const fresh=task('expired','reviewer@xv').admission;
+  // New evidence AND a newer expiry, but the task now asks for DIFFERENT work. The action
+  // changes (not the body) so configure() still admits it; only the INTENT differs.
+  const changedIntent={...current,action:'Do something else entirely and return bounded evidence',deadline:clock+900000,admission:{...fresh,qualificationRef:'<new-qualification-proof>',capacityRef:'<new-capacity-proof>',effortRef:'<new-effort-proof>',validUntil:clock+900000}};
+  // The duty's own subject gate: a different task request is a different subject.
+  expect((svc as any).admissionTaskIntentDigest(changedIntent)).not.toBe(r.taskIntentDigest);
+  // And in practice the earlier obligation fence refuses a changed RETAINED task outright,
+  // so such a submission cannot even reach the postcondition.
+  expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:svc.plan('xv')!.tasks.map(t=>t.key==='expired'?changedIntent:t)})).toThrow('Retain all existing tasks unchanged');
+  expect((svc as any).admissionRefreshCompleted('xv',r)).toBe(false);
+ });
+
+ it('AR7d a stale owner generation or configuration is refused at configure, before any duty',()=>{
+  STALE_PLAN();
+  const current=svc.plan('xv')!.tasks.find(t=>t.key==='expired')!;
+  const fresh=task('expired','reviewer@xv').admission;
+  const good={generation:r_gen(current),configurationDigest:r_cfg(current),qualificationRef:'<new-qualification-proof>',capacityRef:'<new-capacity-proof>',effortRef:'<new-effort-proof>',validUntil:clock+900000};
+  // A stale generation is refused by the existing admission gate, so no duty can even start.
+  expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:svc.plan('xv')!.tasks.map(t=>t.key==='expired'?{...t,admission:{...good,generation:'rotated-generation'}}:t)})).toThrow('Exact current');
+  // Likewise for a stale configuration digest.
+  expect(()=>svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r3',tasks:svc.plan('xv')!.tasks.map(t=>t.key==='expired'?{...t,admission:{...good,configurationDigest:'stale-configuration-digest'}}:t)})).toThrow('Exact current');
+  expect(fresh.validUntil).toBeGreaterThan(0);
+ });
+
+ it('AR8 a genuine fresh assessment completes the duty, using the ORIGINAL staged receipt',()=>{
+  STALE_PLAN();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  const r=refreshReceipt('expired')!;
+  // Freeze the receipt as staged. It is NEVER mutated or re-digested by this test.
+  const staged=JSON.parse(JSON.stringify(r));
+  const current=svc.plan('xv')!.tasks.find(t=>t.key==='expired')!;
+  const fresh=task('expired','reviewer@xv').admission;
+  // The Operator's genuine re-assessment: same task intent, all three evidence references
+  // re-issued, live owner generation/configuration, current Operator binding, newer expiry.
+  const refreshed={...current,admission:{generation:r.ownerGeneration,configurationDigest:r.liveConfigurationDigest,qualificationRef:'<new-qualification-proof>',capacityRef:'<new-capacity-proof>',effortRef:'<new-effort-proof>',validUntil:clock+900000}};
+  expect((svc as any).admissionTaskIntentDigest(refreshed)).toBe(staged.taskIntentDigest);
+  svc.configure('operator-agent@kernel','operator-agent-g1',{...svc.plan('xv')!,revision:'r2',tasks:svc.plan('xv')!.tasks.map(t=>t.key==='expired'?refreshed:t)});
+  expect(fresh.generation).toBe(r.ownerGeneration);
+  // The untouched staged receipt now completes: this is the previously impossible case.
+  expect((svc as any).admissionRefreshCompleted('xv',staged)).toBe(true);
+  // And the normal gate is what admits it; the duty dispatched nothing itself.
+  const live=svc.plan('xv')!.tasks.find(t=>t.key==='expired')!;
+  expect((svc as any).admittedNow(live)).toBe(true);
+  expect(db.prepare("SELECT count(*) n FROM coordinator_assignments WHERE package_key='expired'").get()).toEqual({n:0});
+ });
+
+ it('AR10 an expired refresh duty with an indeterminate wake keeps UNKNOWN and exposes the retirement/accountable path',()=>{
+  STALE_PLAN();
+  const first=svc.reconcile('lead@xv','lead-g1','xv');
+  const staged=refreshReceipt('expired')!;
+  expect(staged.queueId).toBeTruthy();
+  // The duty's own wake is UNKNOWN: delivery could not be determined.
+  db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+staged.queueId);
+  // Let the duty expire unclaimed.
+  // dutyFacts() derives expiry from the durable receipt deadline, so expire it there.
+  db.prepare("UPDATE coordinator_operations SET receipt=json_set(receipt,'$.deadline',?) WHERE operation_id=? AND kind='coordinator-lifecycle-control'").run(clock-1,staged.queueId);
+  db.prepare("UPDATE queue_items SET expires_at=? WHERE qitem_id=?").run(new Date(clock-1).toISOString(),staged.queueId);
+  const unknownBefore=db.prepare("SELECT outbox_id,delivery_state FROM outbox_entries WHERE delivery_state='indeterminate' ORDER BY outbox_id").all() as any[];
+  const results=svc.reconcile('lead@xv','lead-g1','xv');
+  const expiredHold=results.find(r=>r.key==='admission-refresh:expired');
+  expect(expiredHold).toBeTruthy();
+  expect(expiredHold!.state).toBe('held');
+  // The EXISTING typed lifecycle reason, not a silent original hold.
+  // The EXISTING typed lifecycle response to an expired-unclaimed duty: a supported duty
+  // retirement is staged and the accountable reason is surfaced, not a silent original hold.
+  // Whichever typed lifecycle outcome the chain reaches, it is one the renewing intake
+  // machinery already routes, and it is NOT the silent original hold.
+  expect(expiredHold!.reason).not.toBe('current-admission-required');
+  expect(LIFECYCLE_INTAKE_RENEWAL_REASONS as readonly string[]).toContain(expiredHold!.reason!);
+  expect(expiredHold!.queueId).toBe(staged.queueId);
+  // The duty is retired/retirement-routed, so a supported duty-retirement queue row exists for it.
+  const retirements=db.prepare("SELECT qitem_id FROM queue_items WHERE qitem_id LIKE 'qitem-coordination-lifecycle-%' AND qitem_id<>?").all(staged.queueId) as any[];
+  expect(retirements.length+Number(Boolean((expiredHold!.activityEvidence as any)?.retirementQueueId))).toBeGreaterThan(0);
+  // The reason is one the renewing intake chain already knows how to route.
+  expect(LIFECYCLE_INTAKE_RENEWAL_REASONS as readonly string[]).toContain(expiredHold!.reason!);
+  // The UNKNOWN wake is byte-preserved and never retried, released or relabelled.
+  const unknownAfter=db.prepare("SELECT outbox_id,delivery_state FROM outbox_entries WHERE delivery_state='indeterminate' ORDER BY outbox_id").all() as any[];
+  expect(unknownAfter.find(r=>r.outbox_id==='wake-intent-'+staged.queueId)).toEqual({outbox_id:'wake-intent-'+staged.queueId,delivery_state:'indeterminate'});
+  expect(unknownAfter).toHaveLength(unknownBefore.length);
+  expect(first.find(r=>r.key==='expired')?.reason).toBe('current-admission-required');
+ });
+
+ it('AR9 the duty never dispatches the stale task and never bypasses the hold',()=>{
+  STALE_PLAN();
+  const results=svc.reconcile('lead@xv','lead-g1','xv');
+  const expired=results.find(r=>r.key==='expired')!;
+  expect(expired.state).toBe('held');
+  expect(expired.queueId).toBeUndefined();
+  expect(db.prepare("SELECT count(*) n FROM coordinator_assignments WHERE package_key='expired'").get()).toEqual({n:0});
+ });
+});
+
 });
