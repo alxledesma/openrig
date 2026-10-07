@@ -95,6 +95,11 @@ export class NativeDutyLaunchStore {
     this.now=input.now ?? Date.now;
   }
   private readonly now:()=>number;
+  /** Validate launch dependencies before a recovery stops its current process. */
+  assertReady(): void {
+    if (!unchangedInstalled(this.node) || !unchangedInstalled(this.supervisor)) throw new Error("native-duty-installed-files-changed");
+    privatePath(this.root, true);
+  }
   prepare(input:NativeDutyLaunchInput):PreparedNativeDutyLaunch {
     const identity:NativeDutyLaunchIdentity={scopeId:input.scopeId,launchId:input.launchId ?? randomUUID(),nodeId:input.nodeId,
       sessionName:input.sessionName,generation:input.generation,runtime:input.runtime,configurationDigest:input.configurationDigest};
@@ -207,7 +212,7 @@ function ancestry(rows:NativeProcessRow[],child:number,ancestor:number):NativePr
 }
 
 /** Two fresh independent OS samples. A PID claim or launch nonce alone proves nothing. */
-export async function observeNativeDutyLaunch(store:NativeDutyLaunchStore,input:{scope:NativeDutyScope;launchId:string;supervisorPid:number},deps:NativeDutyLaunchObserverDeps):Promise<NativeDutyProof|null> {
+export async function observeNativeDutyLaunch(store:NativeDutyLaunchStore,input:{scope:Pick<NativeDutyScope,"scopeId"|"nodeId"|"sessionName"|"generation"|"runtime"|"configurationDigest">;launchId:string;supervisorPid:number},deps:NativeDutyLaunchObserverDeps):Promise<NativeDutyProof|null> {
   try {
     const {scope,launchId,supervisorPid}=input;if(!Number.isSafeInteger(supervisorPid)||supervisorPid<=1)return null;
     const read=store.read(scope.scopeId,launchId);if(!read)return null;

@@ -1,3 +1,4 @@
+import type { CodexRehostInput, CodexRehostResult } from "./codex-rehost.js";
 import type { NativeProcessLister } from "./native-process-lineage.js";
 import type { NativeProcessRow } from "./native-process-lineage.js";
 import type Database from "better-sqlite3";
@@ -75,6 +76,7 @@ export interface SeatLifecycleDeps {
    *  the shipped session-file existence check, and the session-file tail reader
    *  used for the idle witness. */
   piResume?: PiRehostResume;
+  codexRehost?: { rehost(input: CodexRehostInput): Promise<CodexRehostResult> };
   piProve?: (session: string) => Promise<PiRehostProof | null>;
   piRunnerState?: (sessionName: string) => PiRehostRunnerState | null;
   piSessionFileExists?: (path: string) => boolean;
@@ -259,6 +261,7 @@ export interface RehostCustodySnapshot {
   unknownEffects: { count: number; digest: string }; sessionFile: string;
 }
 export type RehostRunnerResult =
+  | CodexRehostResult
   | {
       ok: true; seat: SeatDescriptor; generation: string; generationUnchanged: true; sessionFile: string;
       launchIdBefore: string; launchIdAfter: string | null; durableModel: string | null;
@@ -477,6 +480,7 @@ export class SeatLifecycleService {
   private readonly codexProfileHome: string;
   private readonly codexProfileProbe: (profile: string) => Promise<unknown>;
   private readonly piResume?: PiRehostResume;
+  private readonly codexRehost?: SeatLifecycleDeps["codexRehost"];
   private readonly piProve?: (session: string) => Promise<PiRehostProof | null>;
   private readonly piRunnerState?: (sessionName: string) => PiRehostRunnerState | null;
   private readonly piSessionFileExists?: (path: string) => boolean;
@@ -522,6 +526,7 @@ export class SeatLifecycleService {
       await runCodex("codex", ["-p", profile, "mcp", "list"], { timeout: 10_000, maxBuffer: 1024 * 1024 });
     });
     this.piResume = deps.piResume;
+    this.codexRehost = deps.codexRehost;
     this.piProve = deps.piProve;
     this.piRunnerState = deps.piRunnerState;
     this.piSessionFileExists = deps.piSessionFileExists;
@@ -1697,8 +1702,18 @@ export class SeatLifecycleService {
     const resolved = this.resolveSeat(input.seatRef);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
+    if (resolved.entry.runtime === "codex") {
+      if (legacyNativeWitness || stoppedTargetRecovery || input.stoppedTargetAcceptanceReference !== undefined)
+        return { ok: false, code: "rehost_recovery_modes_exclusive", message: "Pi recovery modes do not authorize Codex process rehost." };
+      if (!this.codexRehost)
+        return { ok: false, code: "rehost_unavailable", message: "Verified supervised Codex rehost dependencies are unavailable; no process touched." };
+      const sessionName = resolved.entry.canonicalSessionName ?? (resolved.entry.logicalId ? `${resolved.entry.logicalId}@${resolved.entry.rigName}` : null);
+      if (!sessionName)
+        return { ok: false, code: "rehost_process_identity_unproven", message: "Seat has no canonical session name to rehost." };
+      return this.codexRehost.rehost({ nodeId: resolved.nodeId, sessionName, reason: input.reason, operator: input.operator });
+    }
     if (resolved.entry.runtime !== "pi")
-      return { ok: false, code: "rehost_requires_pi_runtime", message: `Same-generation runner rehost is defined for pi seats only; this seat runtime is '${resolved.entry.runtime ?? "unknown"}'. No other runtime has a shipped same-session-file resume primitive here.` };
+      return { ok: false, code: "rehost_requires_pi_runtime", message: `Same-generation process rehost is unavailable for runtime '${resolved.entry.runtime ?? "unknown"}'.` };
     // The guard gate runs BEFORE the seam gate: a disarmed guard is a refusal on its own
     // merits and must not be masked by a missing-seam refusal. Nothing is signalled either
     // way, because both refusals precede every effect.

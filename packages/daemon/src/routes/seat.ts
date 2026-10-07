@@ -424,6 +424,7 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   const lifecycle = new SeatLifecycleService({
     db: rigRepo.db,
     rigRepo,
+    codexRehost: c.get("codexRehost" as never) as import("../domain/codex-rehost.js").CodexSameGenerationRehost | undefined,
     sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
     eventBus: c.get("eventBus" as never) as EventBus,
     tmuxAdapter,
@@ -530,7 +531,7 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));
 });
 
-function seatLifecycleStatus(code: SeatRefusal["code"]): 400 | 404 | 409 | 500 | 502 {
+function seatLifecycleStatus(code: string): 400 | 404 | 409 | 500 | 502 {
   if (code === "seat_ref_required" || code === "missing_model" || code === "missing_reason" || code === "missing_actor" || code === "fresh_required" || code === "invalid_cwd" || code === "invalid_codex_profile" || code === "profile_not_installed") return 400;
   if (code === "seat_not_found") return 404;
   if (code === "tmux_probe_failed") return 502;

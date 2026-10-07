@@ -244,6 +244,16 @@ export class SeatDeliveryGuard {
     return true;
   }
 
+  /** Only the current async rehost operation may inspect its replacement while
+   * its own guard is held. This grants neither input nor lifecycle authority. */
+  ownsRunnerRehost(nodeId: string): boolean {
+    const lease = this.scope.getStore()?.get(nodeId);
+    if (!lease?.active || lease.rehost !== true) return false;
+    this.assertCurrent(nodeId, lease);
+    this.assertRehostGuard(nodeId);
+    return true;
+  }
+
   /** Read-only cross-request observation; unlike ownsLifecycle this confers no
    * authority and does not depend on the observer's async execution context. */
   lifecycleActive(nodeId: string): boolean {

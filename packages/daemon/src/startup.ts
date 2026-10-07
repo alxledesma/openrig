@@ -1,6 +1,7 @@
 import { assessPiDispatchReadiness } from "./domain/dispatch-runtime-readiness.js";
 import { NativeDutyIntegration } from "./domain/native-duty-integration.js";
 import { NativeDutyLaunchStore, observeNativeDutyLaunch } from "./domain/native-duty-launch.js";
+import { createCodexRehostIntegration } from "./domain/codex-rehost-integration.js";
 import {makeResilienceRolloutPolicy} from './domain/policies/resilience-rollout.js';
 import {ResilienceRolloutService} from './domain/resilience-rollout-service.js';
 import {RuntimeOutcomeAssessment} from "./domain/runtime-outcome-assessment.js";
@@ -1217,6 +1218,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
 
   // (ContextUsageStore is constructed above, ahead of ClaimService, for FR-3.)
   const whoamiService = new WhoamiService({ db, rigRepo, sessionRegistry, transcriptStore, contextUsageStore });
+  const codexRehost = createCodexRehostIntegration({
+    db, guard: deliveryGuard, tmux: tmuxAdapter, whoami: whoamiService, activity: seatActivityService,
+    adapter: codexAdapter, resume: codexResume, launchEnvironment: seatLaunchEnvironment, store: nativeDutyStore,
+    launchPath: process.env.PATH ?? "", snapshotRoot: nodePath.join(OPENRIG_HOME, "state", "codex-rehost"),
+    detectDaemonSupport: codexDaemonSupportProbe(process.env.PATH, undefined, configuredCodexHome),
+    configurationDigest: session => queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(session),
+  });
   const nodeCmuxService = new NodeCmuxService(rigRepo, sessionRegistry, cmuxAdapter, tmuxAdapter);
   // W2a-1 — producer wiring: the live occupant generation resolves synchronously from the shipped
   // occupant-tenure ledger. generation_uuid CHANGES for a new occupant and persists only within one
@@ -1296,6 +1304,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     discoveryRepo,
     claimService,
     liveProjectionRecovery,
+    codexRehost,
     selfAttachService,
     rigLifecycleService,
     rigExpansionService,
