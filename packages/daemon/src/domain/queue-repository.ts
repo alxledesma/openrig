@@ -4318,6 +4318,27 @@ export class QueueRepository {
   private workflowGuidance?: (packetId: string) => string[];
   attachWorkflowGuidance(reader: (packetId: string) => string[]): void { this.workflowGuidance = reader; }
 
+  isStandingAuthorityMarker(qitemId: string): boolean {
+    return this.coordinatorAuthority.isStandingAuthorityMarker(qitemId);
+  }
+
+  /** Shared ordinary-work boundary; raw queue/custody faces remain visible. */
+  ordinaryWorkActionable(qitemId: string): boolean {
+    return !this.isStandingAuthorityMarker(qitemId) && this.genericWatchActionable(qitemId);
+  }
+
+  /** Stable semantic identity of an obligation. Deliberately excludes timestamps,
+   * nudges, summaries and same-state notes, including this policy's own receipts. */
+  parkedObligationRevision(qitemId: string): string | null {
+    const q = this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(qitemId) as any;
+    if (!q || !isBlockerLive(q.state)) return null;
+    const fields = ['source_session','destination_session','state','body','priority','blocked_on','handed_off_to','handed_off_from','closure_reason','closure_target','claimed_by_generation_uuid','minting_generation_uuid','resolution'];
+    const wake = this.getParkWakeStatus(qitemId);
+    const blocker = wake?.kind === 'blocker' ? this.db.prepare('SELECT state,destination_session,claimed_by_generation_uuid,blocked_on FROM queue_items WHERE qitem_id=?').get(wake.ref) : null;
+    const semanticTransition = (this.db.prepare("SELECT MAX(transition_id) id FROM queue_native_custody_evidence WHERE qitem_id=? AND json_extract(receipt,'$.beforeQueue.state')!=json_extract(receipt,'$.afterQueue.state')").get(qitemId) as {id:number|null}).id;
+    return createHash('sha256').update(JSON.stringify({queue:fields.map(k=>q[k]??null),semanticTransition,wake:wake?{kind:wake.kind,ref:wake.ref,live:wake.live}:null,blocker:blocker??null})).digest('hex');
+  }
+
   /** Classification only; no queue projection to avoid lifecycle-facts recursion. */
   genericWatchActionable(qitemId: string): boolean {
     return this.coordinatorAuthority.coordinationRecovery?.genericWatchActionable(qitemId) ?? true;

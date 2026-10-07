@@ -369,6 +369,7 @@ activityRoutes.get("/parked", (c) => {
   const queueRepo = c.get("queueRepo" as never) as
     | {
         list: (opts: { destinationSession?: string; state?: string[]; limit?: number }) => Array<{ qitemId: string; state: string; summary?: string | null }>;
+        isStandingAuthorityMarker?: (qitemId: string) => boolean;
         getParkWakeStatus: (qitemId: string) => import("../domain/queue-wake-repository.js").ParkWakeStatus | null;
       }
     | undefined;
@@ -390,6 +391,7 @@ activityRoutes.get("/parked", (c) => {
         .map((r) => ({ qitemId: r.qitemId, state: r.state as "pending" | "in-progress" | "blocked", summary: r.summary ?? null })),
       limit,
     }),
+    isStandingAuthorityMarker: (qitemId: string) => queueRepo.isStandingAuthorityMarker?.(qitemId) ?? false,
     getParkWake: (qitemId: string) => queueRepo.getParkWakeStatus(qitemId),
   };
 

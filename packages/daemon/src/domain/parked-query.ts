@@ -57,6 +57,7 @@ export interface ParkedQueryDeps {
    *  narrows this silently — the scope string in the result names exactly what ran. */
   listOpenObligations: (destinationSession: string, limit: number) => ObligationRead;
   /** Optional only for pre-073 fixtures. Missing is honestly wakeless. */
+  isStandingAuthorityMarker?: (qitemId: string) => boolean;
   getParkWake?: (qitemId: string) => unknown;
 }
 
@@ -83,6 +84,8 @@ export interface SeatParkedDiagnosis {
     limit: number;
     items: ObligationRow[];
     held: HeldObligation[];
+    /** Visible custody markers excluded from ordinary park-driving work. */
+    authority: ObligationRow[];
   };
   confidence: { activity: "high" | "none"; obligations: "complete" | "truncation-possible" | "unavailable" };
 }
@@ -121,12 +124,14 @@ export function diagnoseSeatParked(
   const state = deps.getSeatState(seat.seatNodeId);
   const scope = `destination=${seat.sessionName} state=pending,in-progress,blocked limit=${PARKED_OBLIGATION_LIMIT}`;
   const read = deps.listOpenObligations(seat.sessionName, PARKED_OBLIGATION_LIMIT);
-  const held: HeldObligation[] = read.rows.filter((r) => r.state === "blocked").map((row) => {
+  const authority = read.rows.filter(r=>deps.isStandingAuthorityMarker?.(r.qitemId) === true);
+  const actionable = read.rows.filter(r=>!authority.includes(r));
+  const held: HeldObligation[] = actionable.filter((r) => r.state === "blocked").map((row) => {
     const wake = parseWake(deps.getParkWake?.(row.qitemId));
     return { ...row, state: "blocked", wake, healthy: wake?.live === true && (!wake.unconsumed || wake.recoveryOwner === "queue-stuck-sweep") };
   });
   const unhealthyHeld = held.filter((row) => !row.healthy);
-  const open = read.rows.filter((r) => r.state !== "blocked");
+  const open = actionable.filter((r) => r.state !== "blocked");
   const complete = read.rows.length < read.limit;
 
   const obligations: SeatParkedDiagnosis["obligations"] = {
@@ -137,6 +142,7 @@ export function diagnoseSeatParked(
     complete,
     limit: read.limit,
     items: open,
+    authority,
     held,
   };
 

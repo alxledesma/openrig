@@ -432,7 +432,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
   const findings: StuckSweepFindingAction[] = [];
   const refusals: StuckSweepRefusal[] = [];
   const recordRefusal = async (c: Candidate, error: unknown, now: Date): Promise<void> => {
-    if (!deps.queueRepo.genericWatchActionable(c.row.qitemId)) return;
+    if (!deps.queueRepo.ordinaryWorkActionable(c.row.qitemId)) return;
     const refusal: StuckSweepRefusal = { qitemId: c.row.qitemId, kind: c.kind,
       code: refusalCode(error), message: error instanceof Error ? error.message : String(error) };
     refusals.push(refusal);
@@ -461,7 +461,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     // Half 1 — claimed-never-closed. The claimant holds the obligation; the finding
     // routes to them.
     for (const row of deps.queueRepo.findOverdue({ now: now.toISOString() })) {
-      if (isFindingRow(row) || !deps.queueRepo.genericWatchActionable(row.qitemId)) continue;
+      if (isFindingRow(row) || !deps.queueRepo.ordinaryWorkActionable(row.qitemId)) continue;
       candidates.push({
         kind: "overdue-claim",
         row,
@@ -484,7 +484,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       .all() as Array<{ qitem_id: string }>;
     for (const { qitem_id } of claimedRows) {
       const row = deps.queueRepo.getById(qitem_id);
-      if (!row || isFindingRow(row) || !deps.queueRepo.genericWatchActionable(row.qitemId)) continue;
+      if (!row || isFindingRow(row) || !deps.queueRepo.ordinaryWorkActionable(row.qitemId)) continue;
       const stalled = stalledPickupFinding(row);
       if (!stalled) continue;
       candidates.push({
@@ -508,7 +508,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       if (!notice || now.getTime() - Date.parse(notice.at) <= resolvePickupThresholdMinutes() * 60_000) continue;
       const binding = deps.db.prepare("SELECT qitem_id FROM queue_transition_wakes WHERE wake_ref = ? AND phase = 'armed' ORDER BY transition_id DESC LIMIT 1").get(job.job_id) as { qitem_id: string } | undefined;
       const row = binding ? deps.queueRepo.getById(binding.qitem_id) : null;
-      if (!row || !deps.queueRepo.genericWatchActionable(row.qitemId) || row.state !== "blocked" || deps.queueRepo.getParkWakeStatus(row.qitemId)?.ref !== job.job_id) continue;
+      if (!row || !deps.queueRepo.ordinaryWorkActionable(row.qitemId) || row.state !== "blocked" || deps.queueRepo.getParkWakeStatus(row.qitemId)?.ref !== job.job_id) continue;
       const response = lastMeaningfulTransition(deps.db, row.qitemId);
       if (response && Date.parse(response.at) > Date.parse(notice.at)) continue;
       const ownerActivity = deps.queueRepo.ownerActivity(row.destinationSession);
@@ -523,7 +523,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     // live S01 ladder are S01's territory; an exhausted ladder is the handback and lands
     // here exactly once (the dedup tag keeps it to one finding).
     for (const row of deps.queueRepo.findUndelivered()) {
-      if (isFindingRow(row) || !deps.queueRepo.genericWatchActionable(row.qitemId)) continue;
+      if (isFindingRow(row) || !deps.queueRepo.ordinaryWorkActionable(row.qitemId)) continue;
       if (hasLiveLadder(deps.db, row.qitemId)) continue;
       candidates.push({
         kind: "undelivered-wake",
@@ -551,7 +551,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       .all(cutoff) as Array<{ qitem_id: string }>;
     for (const { qitem_id } of unclaimedRows) {
       const row = deps.queueRepo.getById(qitem_id);
-      if (!row || isFindingRow(row) || !deps.queueRepo.genericWatchActionable(row.qitemId)) continue;
+      if (!row || isFindingRow(row) || !deps.queueRepo.ordinaryWorkActionable(row.qitemId)) continue;
       const actionableAt = pendingSince(deps.db, row.qitemId) ?? row.tsCreated;
       if (actionableAt > cutoff) continue;
       if (hasLiveLadder(deps.db, row.qitemId)) continue;
@@ -618,7 +618,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       .all(custodyCutoff, JSON.stringify(openDanglingIds)) as Array<{ qitem_id: string }>;
     for (const { qitem_id } of custodyRows) {
       const row = deps.queueRepo.getById(qitem_id);
-      if (!row || isFindingRow(row) || !deps.queueRepo.genericWatchActionable(row.qitemId)) continue;
+      if (!row || isFindingRow(row) || !deps.queueRepo.ordinaryWorkActionable(row.qitemId)) continue;
       const targets = (row.closureTarget ?? row.handedOffTo ?? "")
         .split(",")
         .map((target) => target.trim())
@@ -660,7 +660,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     // new one is created durable + waking (the create path's default nudge).
     const liveDedupTags = new Set<string>();
     for (const c of [...new Map(candidates.map(c => [c.row.qitemId, c])).values()]) {
-      if (!deps.queueRepo.genericWatchActionable(c.row.qitemId)) continue;
+      if (!deps.queueRepo.ordinaryWorkActionable(c.row.qitemId)) continue;
       // A detected condition stays live even if its route or recovery is refused.
       const dedupTag = findingDedupTag(c.kind, c.row.qitemId);
       liveDedupTags.add(dedupTag);

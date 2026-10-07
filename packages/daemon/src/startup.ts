@@ -2080,6 +2080,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
                   })),
                 limit,
               }),
+              isStandingAuthorityMarker: (qitemId: string) => queueRepoInstance.isStandingAuthorityMarker(qitemId),
               getParkWake: (qitemId: string) => queueRepoInstance.getParkWakeStatus(qitemId),
             };
             return diagnoseRigParked(
@@ -2095,6 +2096,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           // the obligation row (reserve-before-deliver); failures land in the
           // ladder's native last_nudge_result vocabulary.
           rows: {
+            semanticRevision: (qitemId) => queueRepoInstance.parkedObligationRevision(qitemId),
+            ordinaryWorkActionable: (qitemId) => queueRepoInstance.ordinaryWorkActionable(qitemId),
             recoveryOwnsWake: (qitemId) => queueRecoveryOwnsWake(db, queueRepoInstance.getById(qitemId)),
             listTransitions: (qitemId: string) =>
               queueRepoInstance

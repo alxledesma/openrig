@@ -94,6 +94,14 @@ export class CoordinatorAuthorityService {
    return registered ?? this.db.prepare("SELECT n.rig_id,n.id FROM nodes n JOIN rigs r ON r.id=n.rig_id WHERE n.logical_id=? AND r.name=?")
      .get(parts[0],parts[1]) as {rig_id:string;id:string}|undefined;
  }
+ /** A live acknowledged registered baton is standing authority, not product work.
+  * Expired/reconciling/recovery or inconsistent custody remains actionable. */
+ isStandingAuthorityMarker(queueId:string):boolean {
+  const a=this.db.prepare('SELECT * FROM coordinator_authority WHERE baton_id=?').get(queueId) as Authority|undefined;
+  if(!a||a.state!=='active'||a.lease_until<=this.now()||this.generation(a.owner_session)!==a.owner_generation)return false;
+  const q=this.db.prepare('SELECT destination_session,state,claimed_at,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(queueId) as any;
+  return !!q&&q.destination_session===a.owner_session&&q.state==='in-progress'&&!!q.claimed_at&&q.claimed_by_generation_uuid===a.owner_generation;
+ }
  generation(session: string): string | null {
    const node = this.local(session); if (!node) return null;
    const row = this.db.prepare(`SELECT t.generation_uuid FROM sessions s JOIN occupant_tenures t ON t.node_id=s.node_id

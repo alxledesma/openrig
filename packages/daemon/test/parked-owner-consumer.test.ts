@@ -209,24 +209,13 @@ describe("parked-owner-consumer policy — unit contract (OPR.0.5.6.24)", () => 
     // recoverable at the next episode and is NOT claimed as exactly-once.
   });
 
-  it("episode: close-then-re-park earns an ordinal-bumped key; needsInput churn does not", async () => {
+  it("activity and needsInput churn cannot rearm unchanged obligations", async () => {
     const store = new RowStore();
-    const policy = makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store));
-    const sent1 = await policy.evaluate(makeJob());
-    expect(sent1.action).toBe("send");
-    const key1 = String(sent1.notes?.["episodeKey"]);
-    // churn: same park, different needsInput reason — still already-woken
-    const churned = parkedSeat({ activity: { value: "idle-at-prompt", needsInput: { count: 1, reason: "permission prompt" } } });
-    expect((await makeParkedOwnerConsumerPolicy(makeDeps([churned], store)).evaluate(makeJob())).action).toBe("skip");
-    // resume: closes the episode durably
-    const closing = await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat({ parked: false })], store)).evaluate(makeJob());
-    expect(closing.action).toBe("skip");
-    expect(String((closing as { reason?: unknown }).reason)).toMatch(/episode[-_]ended/);
-    expect(store.appended.some((a) => a.note.startsWith(CLOSE_PREFIX))).toBe(true);
-    // re-park: new ordinal
-    const sent2 = await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store)).evaluate(makeJob());
-    expect(sent2.action).toBe("send");
-    expect(String(sent2.notes?.["episodeKey"])).toBe(key1.replace(/#1$/, "#2"));
+    expect((await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store)).evaluate(makeJob())).action).toBe('send');
+    const active = await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat({parked:false})], store)).evaluate(makeJob());
+    expect(active.action).toBe('skip');
+    expect(store.appended.some(a=>a.note.startsWith(CLOSE_PREFIX))).toBe(false);
+    expect((await makeParkedOwnerConsumerPolicy(makeDeps([parkedSeat()], store)).evaluate(makeJob())).action).toBe('skip');
   });
 
   it("episode: an obligation-set change during one park earns its own wake (new idsHash)", async () => {

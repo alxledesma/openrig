@@ -61,6 +61,8 @@ export interface ParkedOwnerConsumerDeps {
     /** FRESH open-obligation ids for a seat at the send boundary (B1 recheck). */
     listOpenIds: (destinationSession: string) => string[];
     /** Existing delivery/recovery ownership; does not change the parked diagnosis. */
+    semanticRevision?: (qitemId: string) => string | null;
+    ordinaryWorkActionable?: (qitemId: string) => boolean;
     recoveryOwnsWake?: (qitemId: string) => boolean;
   };
 }
@@ -220,15 +222,8 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
         ].filter((v, i, a) => a.indexOf(v) === i);
 
         if (seat.parked === false) {
-          // The episode ends when the seat reads not-parked: close every open
-          // reserve key on the seat's rows, durably, on this pass (bounded —
-          // one close note per open key, never a write per clean scan).
-          for (const qitemId of knownRows) {
-            for (const key of openKeysOnRow(deps.rows.listTransitions(qitemId))) {
-              deps.rows.appendNote(qitemId, `${CLOSE_PREFIX} ${key} (seat resumed)`);
-              if (!closures.includes(key)) closures.push(key);
-            }
-          }
+          // Activity does not discharge an obligation or rearm its wake.
+
           continue;
         }
 
@@ -254,20 +249,34 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
         // B1 — the delivery-boundary recheck: re-read the seat's open rows NOW;
         // an obligation closed after diagnosis must not be named or woken.
         const fresh = new Set(deps.rows.listOpenIds(seat.sessionName));
-        const namedIds = ids.filter((id) => fresh.has(id) && !deps.rows.recoveryOwnsWake?.(id));
+        const namedIds = ids.filter((id) => fresh.has(id) && deps.rows.ordinaryWorkActionable?.(id) !== false && !deps.rows.recoveryOwnsWake?.(id));
         if (namedIds.length === 0) {
           skipped.push({ seat: seat.sessionName, why: ids.some(id => fresh.has(id)) ? "recovery-already-owns-wake" : "obligation-closed-between-derive-and-wake" });
           continue;
         }
 
-        const idsHash = idsHashOf(namedIds);
+        const semantics = namedIds.map(id => ({id, revision: deps.rows.semanticRevision?.(id) ??
+          seat.obligations.items.find(r=>r.qitemId===id)?.state ?? (seat.obligations.held.some(r=>r.qitemId===id)?'blocked':'unknown')}));
+        const idsHash = 'v2-' + idsHashOf(semantics.map(r=>JSON.stringify(r)));
+
         const primaryRow = namedIds[0]!;
         const ep = rowEpisode(deps.rows.listTransitions(primaryRow), idsHash);
-        if (ep.openKey !== null) {
+        // A reserved semantic revision remains consumed even if historical activity
+        // appended a close note. Retries belong to the ladder, not activity churn.
+        if (ep.nextOrdinal > 1) {
           skipped.push({
             seat: seat.sessionName,
             why: ep.refused ? "destination-refused-interactive-prompt" : "already-woken-this-episode",
           });
+          continue;
+        }
+
+        // Upgrade old ID-only receipts conservatively: baseline an already-woken
+        // set without another send. The next actual semantic revision can rearm.
+        const legacy = rowEpisode(deps.rows.listTransitions(primaryRow), idsHashOf(namedIds));
+        if (legacy.nextOrdinal > 1 && !deps.rows.listTransitions(primaryRow).some(t=>t.transitionNote?.startsWith(RESERVE_PREFIX) && t.transitionNote.includes('|v2-'))) {
+          deps.rows.appendNote(primaryRow, `${RESERVE_PREFIX} ${seat.sessionName}|${idsHash}#1; obligations ${namedIds.join(',')}`);
+          skipped.push({seat:seat.sessionName,why:'existing-wake-semantic-baseline'});
           continue;
         }
 
