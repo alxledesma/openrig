@@ -130,6 +130,34 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     expect(listProcesses).toHaveBeenCalledTimes(2);
   });
 
+  it("sends to the bound Codex wrapper only after an incomplete census is followed by two stable proofs", async () => {
+    const listProcesses = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(wrapperProcesses())
+      .mockResolvedValueOnce(wrapperProcesses());
+    const { transport, sendText, sendKeys } = wrappedSeat(listProcesses);
+
+    expect(await watchdogSend(transport, "dev-check@my-rig")).toMatchObject({ ok: true });
+    expect(listProcesses).toHaveBeenCalledTimes(3);
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(sendKeys).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the shell guard closed when the third census loses the native process", async () => {
+    const listProcesses = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(wrapperProcesses())
+      .mockResolvedValueOnce([]);
+    const { transport, sendText, sendKeys } = wrappedSeat(listProcesses);
+
+    expect(await watchdogSend(transport, "dev-check@my-rig")).toMatchObject({
+      ok: false, sent: false, reason: "target_runtime_unverified",
+    });
+    expect(listProcesses).toHaveBeenCalledTimes(3);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(sendKeys).not.toHaveBeenCalled();
+  });
+
   it("proven native wrapper still refuses an approval prompt", async () => {
     const { transport, tmux, sendText, sendKeys } = wrappedSeat();
     tmux.capturePaneContent = async () => "Would you like to run the following command?\n› 1. Yes, proceed (y)\n2. No\nPress enter to confirm or esc to cancel";

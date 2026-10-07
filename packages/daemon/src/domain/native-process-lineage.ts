@@ -249,9 +249,16 @@ export async function observeCodexPaneProcess(input: Parameters<typeof observeNa
 
 export async function verifyCodexPaneProcess(input: Parameters<typeof observeCodexPaneProcess>[0]): Promise<CodexProcessObservation | null> {
   const first = await observeCodexPaneProcess(input);
-  if (!first) return null;
   const second = await observeCodexPaneProcess(input);
-  return second?.fingerprint === first.fingerprint ? second : null;
+  if (first) return second?.fingerprint === first.fingerprint ? second : null;
+  // A failed/incomplete first process census is UNKNOWN, not proof that the
+  // shell is idle. Allow one bounded resample window for the pane-bound native
+  // process table to settle, but require two consecutive identical positive
+  // observations before this can clear the shell guard.
+  if (!second) return null;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const third = await observeCodexPaneProcess(input);
+  return third?.fingerprint === second.fingerprint ? third : null;
 }
 
 export async function observeClaudePaneProcess(input: Parameters<typeof observeNativePaneProcess>[0]): Promise<NativeProcessObservation | null> {

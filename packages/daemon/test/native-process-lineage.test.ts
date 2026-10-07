@@ -20,6 +20,25 @@ describe("joined native Codex identity", () => {
     expect((await check(rows))?.process.pid).toBe(13);
     expect(findExactNativeResumeProcess(rows(), 10, "codex", token)?.pid).toBe(13);
   });
+  it("recovers from one incomplete process census only after two stable pane-bound proofs", async () => {
+    const listProcesses = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(rows())
+      .mockResolvedValueOnce(rows());
+
+    expect((await check(listProcesses))?.process.pid).toBe(13);
+    expect(listProcesses).toHaveBeenCalledTimes(3);
+  });
+  it("refuses recovery when the third census changes pane-bound identity", async () => {
+    const changed = rows().map(r => r.pid === 13 ? { ...r, command: `${r.command} --verbose` } : r);
+    const listProcesses = vi.fn()
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(rows())
+      .mockResolvedValueOnce(changed);
+
+    expect(await check(listProcesses)).toBeNull();
+    expect(listProcesses).toHaveBeenCalledTimes(3);
+  });
   it("proves direct-native resume", async () => {
     expect((await check(() => [{ ...rows()[3]!, pid: 10, ppid: 1 }]))?.process.pid).toBe(10);
   });
