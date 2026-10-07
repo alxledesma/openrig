@@ -513,7 +513,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     const observed=Date.parse(identity?.observed_at??'');
     const identityVerified=identity?.verdict==='verified'&&identity.session_name===session&&observed<=Date.now()&&Date.now()-observed<=3000;
     return {generation,identityVerified,identityObservedAt:identity?.observed_at??null,state,witness:seatActivityService.getRotationActivityWitness(state.seatNodeId)};
-  },Date.now,sessions=>seatIdentityReconciler.reconcileFresh(sessions));
+  },Date.now,sessions=>seatIdentityReconciler.reconcileFresh(sessions),async session=>{
+    const observed=await seatActivityService.pollSeat(session);
+    if(!observed)throw new Error('native-worker-activity-unavailable');
+  });
   queueRepoInstance.coordinatorAuthority.runtimeOutcomeAssessment = new RuntimeOutcomeAssessment(queueRepoInstance);
   const resilienceRollout = new ResilienceRolloutService(queueRepoInstance,watchdogJobsRepoInstance);
   queueRepoInstance.coordinatorAuthority.resilienceRollout = resilienceRollout;

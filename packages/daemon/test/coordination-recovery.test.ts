@@ -663,7 +663,7 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   const beforeOutbox=db.prepare('SELECT * FROM outbox_entries').all(),beforeTransitions=Object.fromEntries(pairs.flatMap(pair=>[pair.target,pair.sweep]).map(id=>[id,(db.prepare('SELECT count(*) n FROM queue_transitions WHERE qitem_id=?').get(id) as any).n]));
   const input={rigId:'xv',rows:pairs.map(pair=>({targetQueueId:pair.target,targetBodyHash:pair.targetBodyHash,sweepFindingQueueId:pair.sweep,sweepFindingBodyHash:pair.sweepFindingBodyHash})),deadline:clock+30000};
   expect(repo.getById(pairs[0].target)).toMatchObject({sourceSession:'operator-agent@kernel',destinationSession:'builder@xv',state:'pending'});
-  const result=svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input);
+  const result=await svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input);
   expect(result).toMatchObject({outcome:'unknown-preserved',wakeReplayed:false,custodyTransferred:false});
   const receipt=JSON.parse((db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id='xv' AND operation_id=? AND kind='qualification-assessment-uncertainty'").get(result.operationId) as any).receipt);
   expect(receipt).toMatchObject({queueDisposition:'terminalized-unresolvable',wakeDelivery:'unknown-not-proven-failed',taskExecution:'unknown',wakeReplayed:false,custodyTransferred:false});
@@ -675,7 +675,7 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
    expect((db.prepare('SELECT transition_note FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1').get(id) as any).transition_note).toContain('task execution UNKNOWN');
   }
   expect(()=>repo.update({qitemId:pairs[0].target,actorSession:'builder@xv',actorGeneration:'builder-g1',identityProvenance:'transport:v1',state:'pending',reopen:true,transitionNote:'retry'})).toThrow('Only the exact append-only UNKNOWN-preserved disposition may terminalize this legacy row');
-  expect(svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input)).toEqual(result);
+  expect(await svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input)).toEqual(result);
   expect(db.prepare('SELECT * FROM outbox_entries').all()).toEqual(beforeOutbox);
   const beforeCount=db.prepare('SELECT count(*) n FROM queue_items').get();
   await expect(repo.handoff({qitemId:pairs[0].target,fromSession:'operator-agent@kernel',toSession:'builder@xv',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',nudge:false})).rejects.toMatchObject({code:'qualification_uncertainty_handoff_refused'});
@@ -688,36 +688,51 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   const duty=svc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:svc.configurationDigest('builder@xv')!,deadline:clock+30000,contract});
   expect(duty.queueId).not.toBe(pairs[0].target);expect(repo.getById(pairs[0].target)?.state).toBe('failed');expect(repo.getById(pairs[1].target)?.state).toBe('failed');
   expect(db.prepare('SELECT count(*) n FROM outbox_entries WHERE outbox_id LIKE ?').get('wake-intent-'+duty.queueId)).toEqual({n:1});
+  clock+=30001;vi.setSystemTime(clock);
+  expect(await svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input)).toEqual(result);
  });
- it('qualification uncertainty disposition rejects malformed rows and invalid expiry without effects',()=>{
+ it('qualification uncertainty disposition rejects malformed rows and invalid expiry without effects',async()=>{
   const before=db.prepare('SELECT count(*) n FROM queue_transitions').get();
-  for(const input of [null,{rigId:{},rows:[],deadline:clock+30000},{rigId:[],rows:[],deadline:clock+30000}])expect(refusal(()=>svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input as any)).code).toBe('qualification_uncertainty_contract_invalid');
+  for(const input of [null,{rigId:{},rows:[],deadline:clock+30000},{rigId:[],rows:[],deadline:clock+30000}])await expect(svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input as any)).rejects.toMatchObject({code:'qualification_uncertainty_contract_invalid'});
   const malformed=[null,{targetQueueId:7,targetBodyHash:'a'.repeat(64),sweepFindingQueueId:'sweep',sweepFindingBodyHash:'b'.repeat(64)}];
-  for(const row of malformed)expect(refusal(()=>svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',{rigId:'xv',rows:[row] as any,deadline:clock+30000})).code).toBe('qualification_uncertainty_contract_invalid');
+  for(const row of malformed)await expect(svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',{rigId:'xv',rows:[row] as any,deadline:clock+30000})).rejects.toMatchObject({code:'qualification_uncertainty_contract_invalid'});
   const nowIso=new Date(clock).toISOString(),target='legacy-assessment-invalid-expiry',sweep='sweep-assessment-invalid-expiry';
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,expires_at,body) VALUES (?,?,?,?,?,?,?,?)').run(target,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending','not-a-date','qualification assessment legacy');
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES (?,?,?,?,?,?,?)').run(sweep,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending','STUCK SWEEP FINDING (undelivered-wake) row: '+target);
   samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});
-  expect(refusal(()=>svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',{rigId:'xv',rows:[{targetQueueId:target,targetBodyHash:digest(repo.getById(target)!.body),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body)}],deadline:clock+30000})).code).toBe('qualification_uncertainty_target_invalid');
+  await expect(svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',{rigId:'xv',rows:[{targetQueueId:target,targetBodyHash:digest(repo.getById(target)!.body),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body)}],deadline:clock+30000})).rejects.toMatchObject({code:'qualification_uncertainty_target_invalid'});
   expect(repo.getById(target)?.state).toBe('pending');expect(repo.getById(sweep)?.state).toBe('pending');expect(db.prepare('SELECT count(*) n FROM queue_transitions').get()).toEqual(before);
  });
- it('qualification uncertainty disposition refuses a linked wake effect without changing custody',()=>{
+ it('qualification uncertainty disposition refuses a linked wake effect without changing custody',async()=>{
   samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});const nowIso=new Date(clock).toISOString(),target='legacy-assessment-linked',sweep='sweep-assessment-linked';
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,expires_at,body) VALUES (?,?,?,?,?,?,?,?)').run(target,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending',new Date(clock-1000).toISOString(),'qualification assessment legacy');
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES (?,?,?,?,?,?,?)').run(sweep,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending','STUCK SWEEP FINDING (undelivered-wake) row: '+target);
   db.transaction(()=>repo.stageWakeIntent(target,'operator-agent@kernel','builder@xv','system:operator-authorized-coordination',true,'builder-g1'))();db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+target);
   const before=db.prepare('SELECT count(*) n FROM queue_transitions').get();
-  expect(refusal(()=>svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',{rigId:'xv',rows:[{targetQueueId:target,targetBodyHash:digest(repo.getById(target)!.body),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body)}],deadline:clock+30000})).code).toBe('qualification_uncertainty_effect_linked');
+  await expect(svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',{rigId:'xv',rows:[{targetQueueId:target,targetBodyHash:digest(repo.getById(target)!.body),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body)}],deadline:clock+30000})).rejects.toMatchObject({code:'qualification_uncertainty_effect_linked'});
   expect(db.prepare('SELECT count(*) n FROM queue_transitions').get()).toEqual(before);expect(repo.getById(target)?.state).toBe('pending');expect(repo.getById(sweep)?.state).toBe('pending');expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id=?").get('wake-intent-'+target)).toEqual({delivery_state:'indeterminate'});
  });
- it('qualification uncertainty disposition requires fresh same-generation Worker observation',()=>{
+ it('qualification uncertainty disposition refreshes stale Worker identity just in time and still refuses without it',async()=>{
   const nowIso=new Date(clock).toISOString(),target='legacy-assessment-stale-worker',sweep='sweep-assessment-stale-worker';
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,expires_at,body) VALUES (?,?,?,?,?,?,?,?)').run(target,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending',new Date(clock-1000).toISOString(),'qualification assessment legacy');
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES (?,?,?,?,?,?,?)').run(sweep,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending','STUCK SWEEP FINDING (undelivered-wake) row: '+target);
   samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock-5000).toISOString()});
   const before=db.prepare('SELECT count(*) n FROM queue_transitions').get();
-  expect(refusal(()=>svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',{rigId:'xv',rows:[{targetQueueId:target,targetBodyHash:digest(repo.getById(target)!.body),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body)}],deadline:clock+30000})).code).toBe('qualification_uncertainty_worker_not_quiescent');
+  const input={rigId:'xv',rows:[{targetQueueId:target,targetBodyHash:digest(repo.getById(target)!.body),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body)}],deadline:clock+30000};
+  await expect(svc.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input)).rejects.toMatchObject({code:'qualification_uncertainty_worker_not_quiescent'});
   expect(db.prepare('SELECT count(*) n FROM queue_transitions').get()).toEqual(before);expect(repo.getById(target)?.state).toBe('pending');expect(repo.getById(sweep)?.state).toBe('pending');
+  const refreshCalls:string[][]=[];
+  const refreshed=new CoordinationRecoveryService(repo,session=>samples.get(session)??null,()=>clock,async sessions=>{refreshCalls.push([...sessions]);samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});},async session=>{expect(session).toBe('builder@xv');samples.set(session,{...sample(session),identityObservedAt:new Date(clock).toISOString()});});
+  const [result,replay]=await Promise.all([refreshed.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input),refreshed.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input)]);
+  expect(refreshCalls).toEqual([['builder@xv'],['builder@xv']]);expect(result).toMatchObject({outcome:'unknown-preserved',wakeReplayed:false,custodyTransferred:false});expect(replay).toEqual(result);
+  expect(repo.getById(target)?.state).toBe('failed');expect(repo.getById(sweep)?.state).toBe('failed');
+  const receipt=JSON.parse((db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id='xv' AND operation_id=? AND kind='qualification-assessment-uncertainty'").get(result.operationId) as any).receipt);
+  expect(Date.parse(receipt.observationAt)).toBe(clock);expect(receipt.workerGeneration).toBe('builder-g1');expect(receipt.configurationDigest).toBe(svc.configurationDigest('builder@xv'));
+  const callsBeforeUnauthorized=refreshCalls.length;
+  await expect(refreshed.recordQualificationAssessmentUncertainty('builder@xv','builder-g1',input)).rejects.toMatchObject({code:'qualification_uncertainty_operator_required'});
+  expect(refreshCalls).toHaveLength(callsBeforeUnauthorized);
+  db.prepare("UPDATE occupant_tenures SET generation_uuid='operator-agent-g2' WHERE node_id='operator-agent@kernel'").run();
+  await expect(refreshed.recordQualificationAssessmentUncertainty('operator-agent@kernel','operator-agent-g1',input)).rejects.toMatchObject({code:'qualification_uncertainty_operator_required'});
  });
  it.each(['indeterminate','sending'] as const)('qualification retirement preserves %s wake effects and issues no new duty',deliveryState=>{
   samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});

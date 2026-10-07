@@ -61,7 +61,7 @@ export function coordinationIdle(sample:CoordinationActivity|null,generation:str
 /** Durable plans use the existing append-only operation store, with queue/resource
  * mutations in one SQLite transaction. Reconciliation never manufactures worker claims. */
 export class CoordinationRecoveryService {
- constructor(private repo:QueueRepository,private activity:(session:string)=>CoordinationActivity|null,private now:()=>number=Date.now,private refreshIdentity?:(sessions:readonly string[])=>Promise<void>){}
+ constructor(private repo:QueueRepository,private activity:(session:string)=>CoordinationActivity|null,private now:()=>number=Date.now,private refreshIdentity?:(sessions:readonly string[])=>Promise<void>,private refreshWorkerActivity?:(session:string)=>Promise<void>){}
  authorizeTerminalReturnSuccessor(actor:string,generation:string,input:{rigId:string;intakeQueueId:string;previousControlId:string;previousBodyHash:string;workerGeneration:string;holderGeneration:string;deadline:number;operationId:string}):{queueId:string} {
   return this.db.transaction(()=>{
    if(actor!=='operator-agent@kernel'||!generation||this.authority.generation(actor)!==generation)fail('coordination_operator_required','Current native Operator required');
@@ -166,19 +166,41 @@ export class CoordinationRecoveryService {
 /** Explicitly contain expired legacy bootstrap rows whose wake linkage is absent.
  * This does not claim failed delivery or completed execution: it records both as
  * UNKNOWN, terminalizes only the exact stale queue records, and never retries a wake. */
- recordQualificationAssessmentUncertainty(actor:string,generation:string,input:{rigId:string;rows:Array<{targetQueueId:string;targetBodyHash:string;sweepFindingQueueId:string;sweepFindingBodyHash:string}>;deadline:number}):{operationId:string;outcome:'unknown-preserved';wakeReplayed:false;custodyTransferred:false} {
+ async recordQualificationAssessmentUncertainty(actor:string,generation:string,input:{rigId:string;rows:Array<{targetQueueId:string;targetBodyHash:string;sweepFindingQueueId:string;sweepFindingBodyHash:string}>;deadline:number}):Promise<{operationId:string;outcome:'unknown-preserved';wakeReplayed:false;custodyTransferred:false}> {
   if(!input||typeof input!=='object'||Array.isArray(input)||typeof (input as any).rigId!=='string'||(input as any).rigId.length<1||(input as any).rigId.length>256)fail('qualification_uncertainty_contract_invalid','A bounded string rigId is required');
+  // Resolve only the exact requested targets before refreshing identity. This read
+  // does not grant authority or change custody; the transaction below repeats every
+  // row, hash, effect, authority and quiescence guard after the asynchronous refresh.
+  if(!Array.isArray(input.rows)||input.rows.length<1||input.rows.length>4||input.rows.some((row:any)=>!row||typeof row!=='object'||Array.isArray(row)||typeof row.targetQueueId!=='string'||row.targetQueueId.length<1||row.targetQueueId.length>256||typeof row.sweepFindingQueueId!=='string'||row.sweepFindingQueueId.length<1||row.sweepFindingQueueId.length>256||typeof row.targetBodyHash!=='string'||typeof row.sweepFindingBodyHash!=='string'))fail('qualification_uncertainty_contract_invalid','One to four exact legacy pairs are required');
+  const rows=[...input.rows].sort((a,b)=>a.targetQueueId.localeCompare(b.targetQueueId));
+  if(new Set(rows.flatMap(r=>[r.targetQueueId,r.sweepFindingQueueId])).size!==rows.length*2||rows.some(r=>r.targetQueueId===r.sweepFindingQueueId||!/^([a-f0-9]{64})$/.test(r.targetBodyHash)||!/^([a-f0-9]{64})$/.test(r.sweepFindingBodyHash)))fail('qualification_uncertainty_contract_invalid','Each legacy target and sweep must have a unique ID and exact SHA-256 body hash');
+  const preflightNow=this.now(),preflightAuthority=this.authority.get(input.rigId),preflightPlan=this.plan(input.rigId);
+  if(actor!=='operator-agent@kernel'||!generation||this.authority.generation(actor)!==generation||!preflightAuthority||preflightAuthority.state!=='active'||preflightAuthority.lease_until<=preflightNow||!preflightAuthority.owner_session||preflightAuthority.owner_generation!==this.authority.generation(preflightAuthority.owner_session)||preflightPlan)fail('qualification_uncertainty_operator_required','Current native Operator, live authority and planless qualification bootstrap required');
+  const requestIdentity={rigId:input.rigId,operatorGeneration:generation,rows,deadline:input.deadline};
+  const operationId='qualification-assessment-uncertainty:'+digest(JSON.stringify(requestIdentity)).slice(0,32),requestHash=digest(JSON.stringify(requestIdentity));
+  const previous=this.db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='qualification-assessment-uncertainty'").get(input.rigId,operationId) as {receipt:string;request_hash:string}|undefined;
+  if(previous){if(previous.request_hash!==requestHash)fail('qualification_uncertainty_conflict','A different uncertainty disposition is already recorded');return {operationId,outcome:'unknown-preserved',wakeReplayed:false,custodyTransferred:false};}
+  if(!Number.isSafeInteger(input.deadline))fail('qualification_uncertainty_contract_invalid','Finite disposition deadline required');
+  const workers=new Set(rows.map(row=>this.repo.getById(row.targetQueueId)?.destinationSession).filter((value):value is string=>typeof value==='string'));
+  if(workers.size!==1||rows.some(row=>!this.repo.getById(row.targetQueueId)))fail('qualification_uncertainty_target_invalid','Exact legacy qualification targets must share one current Worker');
+  const worker=[...workers][0]!,workerGenerationBefore=this.authority.generation(worker);
+  if(!workerGenerationBefore||!this.db.prepare('SELECT 1 FROM sessions s JOIN nodes n ON n.id=s.node_id WHERE s.session_name=? AND n.rig_id=?').get(worker,input.rigId))fail('qualification_uncertainty_worker_not_quiescent','Current native Worker identity and rig binding required');
+  try {
+   await Promise.all([this.refreshIdentity?.([worker]),this.refreshWorkerActivity?.(worker)]);
+  } catch {
+   fail('qualification_uncertainty_worker_not_quiescent','Fresh native Worker identity and idle observation could not be obtained');
+  }
+  if(this.authority.generation(worker)!==workerGenerationBefore)fail('qualification_uncertainty_worker_not_quiescent','Worker generation changed during the native identity refresh');
   return this.db.transaction(()=>{
    const now=this.now(),authority=this.authority.get(input.rigId),plan=this.plan(input.rigId);
    if(actor!=='operator-agent@kernel'||!generation||this.authority.generation(actor)!==generation||!authority||authority.state!=='active'||authority.lease_until<=now||!authority.owner_session||authority.owner_generation!==this.authority.generation(authority.owner_session)||plan)fail('qualification_uncertainty_operator_required','Current native Operator, live authority and planless qualification bootstrap required');
-   if(!Number.isSafeInteger(input.deadline)||input.deadline<=now||input.deadline>now+1200000||!Array.isArray(input.rows)||input.rows.length<1||input.rows.length>4)fail('qualification_uncertainty_contract_invalid','One to four exact legacy pairs and a finite deadline within twenty minutes are required');
+   if(!Number.isSafeInteger(input.deadline)||input.deadline>now+1200000||!Array.isArray(input.rows)||input.rows.length<1||input.rows.length>4)fail('qualification_uncertainty_contract_invalid','One to four exact legacy pairs and a finite deadline within twenty minutes are required');
    if(input.rows.some((row:any)=>!row||typeof row!=='object'||Array.isArray(row)||typeof row.targetQueueId!=='string'||row.targetQueueId.length<1||row.targetQueueId.length>256||typeof row.sweepFindingQueueId!=='string'||row.sweepFindingQueueId.length<1||row.sweepFindingQueueId.length>256||typeof row.targetBodyHash!=='string'||typeof row.sweepFindingBodyHash!=='string'))fail('qualification_uncertainty_contract_invalid','Each legacy pair must contain bounded queue IDs and string body hashes');
    const rows=[...input.rows].sort((a,b)=>a.targetQueueId.localeCompare(b.targetQueueId));
    if(new Set(rows.flatMap(r=>[r.targetQueueId,r.sweepFindingQueueId])).size!==rows.length*2||rows.some(r=>r.targetQueueId===r.sweepFindingQueueId||!/^([a-f0-9]{64})$/.test(r.targetBodyHash)||!/^([a-f0-9]{64})$/.test(r.sweepFindingBodyHash)))fail('qualification_uncertainty_contract_invalid','Each legacy target and sweep must have a unique ID and exact SHA-256 body hash');
-   const requestIdentity={rigId:input.rigId,operatorGeneration:generation,rows,deadline:input.deadline};
-   const operationId='qualification-assessment-uncertainty:'+digest(JSON.stringify(requestIdentity)).slice(0,32),requestHash=digest(JSON.stringify(requestIdentity));
-   const previous=this.db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='qualification-assessment-uncertainty'").get(input.rigId,operationId) as {receipt:string;request_hash:string}|undefined;
-   if(previous){if(previous.request_hash!==requestHash)fail('qualification_uncertainty_conflict','A different uncertainty disposition is already recorded');return {operationId,outcome:'unknown-preserved' as const,wakeReplayed:false as const,custodyTransferred:false as const};}
+   const committed=this.db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='qualification-assessment-uncertainty'").get(input.rigId,operationId) as {receipt:string;request_hash:string}|undefined;
+   if(committed){if(committed.request_hash!==requestHash)fail('qualification_uncertainty_conflict','A different uncertainty disposition is already recorded');return {operationId,outcome:'unknown-preserved' as const,wakeReplayed:false as const,custodyTransferred:false as const};}
+   if(input.deadline<=now)fail('qualification_uncertainty_contract_invalid','Finite disposition deadline required');
    const pairs=rows.map(binding=>{
     const target=this.repo.getById(binding.targetQueueId),sweep=this.repo.getById(binding.sweepFindingQueueId);
     if(!target)fail('qualification_uncertainty_target_invalid','Exact legacy qualification target is missing');
