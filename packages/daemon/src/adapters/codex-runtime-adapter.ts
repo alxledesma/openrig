@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { readInstalledCodexProfile } from "../domain/seat-lifecycle-service.js";
 import { isCodexUpdateMenu } from "../domain/codex-update-menu.js";
 import { readOpenCodexRollout } from "../domain/codex-open-rollout.js";
 import nodePath from "node:path";
@@ -332,6 +335,34 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     }
 
     return { delivered, failed };
+  }
+
+  async preflightRuntimeMigration(binding: NodeBinding): Promise<{
+    profileSha256: string;
+    effective: { model: string; provider: string; effort: string; approval: string; sandbox: string };
+    authenticated: true;
+  }> {
+    const profile = binding.codexConfigProfile;
+    if (!profile || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(profile)) throw new Error("Explicit installed Codex profile required");
+    const home = nodePath.dirname(this.resolveCodexConfigPath());
+    const before = readInstalledCodexProfile(home, profile);
+    if ("code" in before) throw new Error(before.code);
+    if (before.effective.model !== binding.model || before.effective.effort !== binding.effort) throw new Error("Codex profile model/effort mismatch");
+    const sandbox = binding.launchPosture === "full_bypass" ? "danger-full-access" : "workspace-write";
+    if (before.effective.sandbox !== sandbox || (binding.launchPosture === "full_bypass" && before.effective.approval !== "never")) {
+      throw new Error("Codex profile changes the persisted launch posture");
+    }
+    const env = { ...process.env, CODEX_HOME: home, ...(this.launchPath ? { PATH: this.launchPath } : {}) };
+    const run = promisify(execFile);
+    try {
+      await run("codex", ["--version"], { cwd: binding.cwd, env, timeout: 10_000, maxBuffer: 1024 * 1024 });
+      await run("codex", ["-p", profile, "mcp", "list"], { cwd: binding.cwd, env, timeout: 10_000, maxBuffer: 1024 * 1024 });
+      // Native login status checks existing Codex auth; Pi auth is never read.
+      await run("codex", ["login", "status"], { cwd: binding.cwd, env, timeout: 10_000, maxBuffer: 1024 * 1024 });
+    } catch { throw new Error("Codex availability, profile load or existing authentication could not be verified"); }
+    const after = readInstalledCodexProfile(home, profile);
+    if ("code" in after || before.sha256 !== after.sha256) throw new Error("Codex profile changed during preflight");
+    return { profileSha256: before.sha256, effective: before.effective, authenticated: true };
   }
 
   async launchHarness(

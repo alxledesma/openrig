@@ -12,6 +12,7 @@ import type { EventBus } from "../domain/event-bus.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import { observeClaudePaneStartedAt } from "../domain/native-process-lineage.js";
 import { SeatStatusService } from "../domain/seat-status-service.js";
+import { SeatRuntimeMigration, RuntimeMigrationRefusal } from "../domain/seat-runtime-migration.js";
 import { SeatHandoverService } from "../domain/seat-handover-service.js";
 import { SeatSwitchClientService } from "../domain/seat-switch-client-service.js";
 import { SeatLifecycleService, type SeatRefusal } from "../domain/seat-lifecycle-service.js";
@@ -110,9 +111,25 @@ seatRoutes.get("/status/:seatRef", (c) => {
   return c.json(result, 404);
 });
 
+seatRoutes.get("/runtime-migration/:operationId", async c => {
+  const token = c.get("terminalBearerToken" as never) as string | null;
+  if (!token) return c.json({ok:false,code:"runtime_migration_authenticated_control_required"},503);
+  const authResponse = await authBearerTokenMiddleware({expectedToken:token})(c,async()=>{});
+  if (authResponse) return authResponse;
+  let address:string|undefined; try { address=getConnInfo(c).remote.address; } catch {}
+  if (c.req.header("Origin") || !isRotationLoopback(address)) return c.json({ok:false,code:"runtime_migration_local_only"},403);
+  const rigRepo = c.get("rigRepo" as never) as RigRepository;
+  try {
+    const migration = new SeatRuntimeMigration({db:rigRepo.db,rigRepo,
+      sessionRegistry:c.get("sessionRegistry" as never) as SessionRegistry,eventBus:c.get("eventBus" as never) as EventBus,
+      tmuxAdapter:c.get("tmuxAdapter" as never) as TmuxAdapter});
+    return c.json(migration.inspect(c.req.param("operationId"),transportSenderSession(c)??"",c.req.header("X-OpenRig-Occupant-Generation")??""));
+  } catch(error) { return c.json({ok:false,code:error instanceof RuntimeMigrationRefusal?error.code:"runtime_migration_status_unavailable"},409); }
+});
+
 seatRoutes.post("/handover/:seatRef", async (c) => {
   const body: Record<string, unknown> = await c.req.json().catch(() => ({}));
-  if(body["rotationExpected"]){
+  if(body["rotationExpected"] || body["runtimeMigration"] !== undefined){
     const token = c.get("terminalBearerToken" as never) as string | null;
     if (!token) return c.json({ok:false,code:"rotation_authenticated_control_required"},503);
     const authResponse = await authBearerTokenMiddleware({expectedToken:token})(c, async()=>{});
@@ -128,6 +145,8 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     activity:c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService,
     tmux:c.get("tmuxAdapter" as never) as TmuxAdapter}) : undefined;
   const service = new SeatHandoverService({
+    migrationPiSkillRoot: session => join(piSeatPaths(join(OPENRIG_HOME,"state","pi"),session).agentDir,"skills"),
+    migrationPiProve: makePiNativeProver(rigRepo.db, execCommand, { fs: { readFile: (p: string) => readFileSync(p, "utf-8") }, piStateRoot: join(OPENRIG_HOME, "state", "pi") }),
     rotationPrecondition,
     dispatchReservations: rotationPrecondition && (c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard ? new SeatDispatchReservationService({db:rigRepo.db,guard:(c.get("tmuxAdapter" as never) as TmuxAdapter).deliveryGuard!,verifyPredecessor:rotationPrecondition,observeSuccessor:async()=>{throw new Error("Successor observation uses authenticated reservation route");}}) : undefined,
     db: rigRepo.db,
@@ -224,6 +243,7 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     dryRun: body["dryRun"] === true,
     rotationActor: transportSenderSession(c) ?? undefined,
     rotationActorGeneration: c.req.header("X-OpenRig-Occupant-Generation"),
+    runtimeMigration: body["runtimeMigration"],
     rotationExpected: body["rotationExpected"] && typeof body["rotationExpected"] === "object" ? body["rotationExpected"] as Record<string, unknown> : undefined,
   });
 
@@ -231,6 +251,8 @@ seatRoutes.post("/handover/:seatRef", async (c) => {
     return c.json("plan" in result ? result.plan : result.result);
   }
 
+  if (result.code === "runtime_migration_refused") return c.json(result, 409);
+  if (result.code === "runtime_migration_unknown") return c.json(result, 503);
   if (result.code === "missing_reason" || result.code === "invalid_source") {
     return c.json(result, 400);
   }

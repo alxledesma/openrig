@@ -1,3 +1,5 @@
+import { DeliveryGuardError } from "./seat-delivery-guard.js";
+import { SeatRuntimeMigration, parseRuntimeMigration, runtimeMigrationReservationId, RuntimeMigrationRefusal, type PreparedRuntimeMigration } from "./seat-runtime-migration.js";
 import type { SeatDispatchReservationService, DispatchReservation } from "./seat-dispatch-reservation.js";
 import { RotationPreconditionRefusal } from "./rotation-precondition.js";
 import type Database from "better-sqlite3";
@@ -92,6 +94,7 @@ export type SeatHandoverResult =
   | { ok: false; code: "current_occupant_required" | "discovered_not_active" | "successor_tmux_absent" | "successor_already_managed" | "successor_is_current" | "runtime_mismatch"; message: string; guidance: string }
   | { ok: false; code: "discovered_not_found"; message: string; guidance: string }
   | { ok: false; code: "tmux_probe_failed" | "handover_commit_failed" | "successor_create_failed" | "context_delivery_failed"; message: string; guidance: string }
+  | { ok: false; code: "runtime_migration_refused" | "runtime_migration_unknown"; refusalCode?: string; message: string; guidance: string; reservationId?: string; blindRetryAllowed: false }
   | Extract<SeatStatusResult, { ok: false }>;
 
 interface NodeRow {
@@ -131,6 +134,10 @@ interface SeatHandoverServiceDeps {
   eventBus: EventBus;
   tmuxAdapter: TmuxAdapter;
   now?: () => Date;
+  migrationPredecessorProcessExists?: (pid: number) => boolean;
+  migrationPiSkillRoot?: (session: string) => string;
+  migrationPiProve?: (session: string) => Promise<import("./coordinator-runtime-availability.js").PiNativeProof | null>;
+  migrationFileExists?: (path: string) => boolean;
   /** OpenRig identity/activity env stamped onto a created successor session,
    *  mirroring the launch identity env. Defaults to {} (the three core identity
    *  vars are always derived internally). */
@@ -277,7 +284,11 @@ export class SeatHandoverService {
     rotationExpected?: Record<string, unknown>;
     rotationActor?: string;
     rotationActorGeneration?: string;
+    runtimeMigration?: unknown;
+    /** Internal prepared capability; never accepted from the HTTP body. */
+    preparedMigration?: { controller: SeatRuntimeMigration; value: PreparedRuntimeMigration; started: boolean };
   }): Promise<SeatHandoverResult> {
+    if (input.runtimeMigration !== undefined) return this.handoverAcrossRuntime(input);
     if (input.dryRun) {
       const planResult = this.planner.plan({ ...input, dryRun: true });
       if (planResult.ok) {
@@ -347,7 +358,10 @@ export class SeatHandoverService {
       };
     }
 
-    const node = this.lookupNode(statusResult.status);
+    const predecessorNode = this.lookupNode(statusResult.status);
+    const migrationTarget = input.preparedMigration?.value.request.target;
+    const node = migrationTarget ? { ...predecessorNode, runtime: migrationTarget.runtime, model: migrationTarget.model,
+      effort: migrationTarget.effort, codex_config_profile: migrationTarget.codexConfigProfile } : predecessorNode;
     if (input.rotationExpected && this.deps.dispatchReservations) {
       const id=String(input.rotationExpected["reservationId"]??"");
       if(!this.deps.dispatchReservations.ownsAttemptLock(id))return this.deps.dispatchReservations.withAttemptLock(id,input.rotationActor??"",input.rotationActorGeneration??"",()=>this.handover(input));
@@ -360,7 +374,7 @@ export class SeatHandoverService {
           if(input.rotationExpected)this.deps.dispatchReservations?.recordUnexpectedFailure(String(input.rotationExpected["reservationId"]??""),input.rotationActor??"",input.rotationActorGeneration??"");
           throw error;
         }
-      }, typeof input.rotationExpected?.["reservationId"] === "string" ? input.rotationExpected["reservationId"] : undefined);
+      }, input.preparedMigration?.value.reservationId ?? (typeof input.rotationExpected?.["reservationId"] === "string" ? input.rotationExpected["reservationId"] : undefined));
     }
     let dispatchReservation: DispatchReservation | undefined;
     if (input.rotationExpected) {
@@ -455,7 +469,7 @@ export class SeatHandoverService {
     // the resolver ran post-launch, read the successor's fresh sidecar, and honestly found nothing —
     // silently). Resolution is a pure read; nothing downstream of it depends on the launch.
     const rawRecapResolution = this.predecessorRecapResolver
-      ? this.predecessorRecapResolver({ nodeId: node.id, runtime: node.runtime, sessionName: latestSession.session_name })
+      ? this.predecessorRecapResolver({ nodeId: node.id, runtime: predecessorNode.runtime, sessionName: latestSession.session_name })
       : undefined;
     // Defensive against the pre-B16 resolver contract (null = silent no-recap): an injected legacy
     // resolver must not crash the handover — its null becomes a named unavailable like every other.
@@ -491,6 +505,13 @@ export class SeatHandoverService {
     if (input.rotationExpected) {try{await this.deps.rotationPrecondition!(input.seatRef, input.rotationExpected);}catch(error){throw new RotationPreconditionRefusal((error as Error).message);}}
     if (dispatchReservation) this.deps.dispatchReservations!.start(dispatchReservation, input.rotationActor ?? "", input.rotationActorGeneration ?? "");
     if (dispatchReservation) this.deps.dispatchReservations!.recordPrepared(dispatchReservation,input.rotationActor??"",input.rotationActorGeneration??"",occupantGeneration??"");
+    if (input.preparedMigration) {
+      const m = input.preparedMigration;
+      await m.controller.verifyBeforeEffects(m.value, input.rotationActor ?? "", input.rotationActorGeneration ?? "");
+      m.controller.begin(m.value, input.rotationActor ?? "", input.rotationActorGeneration ?? "", occupantGeneration!);
+      m.started = true;
+      m.value.binding.launchGeneration = occupantGeneration ?? undefined;
+    }
     const launch = await this.successorLauncher.createSuccessor({
       // Seam B: the successor is the SAME seat continuing — persisted policy posture carries.
       // 0.5.2-07 model fidelity: carry the seat's SPEC-pinned model so the successor launch reads the
@@ -500,6 +521,7 @@ export class SeatHandoverService {
       node: { id: node.id, runtime: node.runtime, cwd: node.cwd, launchPosture: successorPosture, ...permissionOverride, model: node.model, effort: node.effort ?? undefined, codexConfigProfile: node.codex_config_profile ?? undefined },
       departingSessionName: latestSession.session_name,
       occupantGeneration,
+      ...(input.preparedMigration ? { beforeLaunch: () => input.preparedMigration!.controller.project(input.preparedMigration!.value) } : {}),
       // OPR.0.5.5.5: a fork-sourced successor launches as a NATIVE FORK of the
       // resolved id — it carries the incumbent context from its first byte.
       ...(forkSource ? { forkSource } : {}),
@@ -527,6 +549,8 @@ export class SeatHandoverService {
       finally {if(dispatchReservation)this.deps.dispatchReservations!.recordFailedPrecommit(dispatchReservation.reservation_id,input.rotationActor??"",input.rotationActorGeneration??"",{preparedGeneration:occupantGeneration??"",discoveredId:launch.discoveredId,nativeId:launch.resumeToken??null,replacementStarted:true},code,cleanup);}
     };
 
+    if (input.preparedMigration) await input.preparedMigration.controller.deliverContext(input.preparedMigration.value);
+
     // 3. fresh: deliver the captured restore packet to the live successor BEFORE
     //    continuity verify (a blank occupant is a relaunch, not a handover).
     //    discovered is operator-prepared and needs no delivery.
@@ -551,7 +575,7 @@ export class SeatHandoverService {
         departingSession: latestSession.session_name,
         capturedContext,
         recap: resolved?.recap,
-        recordPath: resolved?.recordPath,
+        recordPath: input.preparedMigration?.value.predecessorNativeId ?? resolved?.recordPath,
         recapUnavailableReason: resolved ? undefined : (predecessorRecapResolution as { unavailableReason: string }).unavailableReason,
         ...(authoredRecapInfo ?? {}),
       });
@@ -624,6 +648,14 @@ export class SeatHandoverService {
       contextDelivered = true;
     }
 
+    if (input.preparedMigration && !launch.resumeToken) {
+      const captured = await this.deps.runtimeAdapters?.codex?.captureNativeResumeToken?.(input.preparedMigration.value.binding);
+      if (captured) { launch.resumeToken = captured.token; launch.resumeType = captured.resumeType; }
+    }
+    if (input.preparedMigration && (!launch.resumeToken || !validateResumeToken("codex", launch.resumeToken).ok)) {
+      throw new RuntimeMigrationRefusal("runtime_migration_successor_unknown", "Fresh Codex native identity was not established; reservation retained");
+    }
+
     // 4. Verify continuity + rebind via the EXISTING discovered->commit path.
     //    On any failure, unwind the created successor (no binding to unwind).
     return this.finalizeWithDiscovered({
@@ -646,7 +678,51 @@ export class SeatHandoverService {
       dispatchReservation,
       rotationActor: input.rotationActor,
       rotationActorGeneration: input.rotationActorGeneration,
+      preparedMigration: input.preparedMigration,
     });
+  }
+
+  private async handoverAcrossRuntime(input: Parameters<SeatHandoverService["handover"]>[0]): Promise<SeatHandoverResult> {
+    let capability: { controller: SeatRuntimeMigration; value: PreparedRuntimeMigration; started: boolean } | undefined;
+    try {
+      const request = parseRuntimeMigration(input.runtimeMigration);
+      const source = parseHandoverSource(input.source);
+      if (!source.ok) return source;
+      if (!input.reason?.trim() || !["fresh", "rebuild"].includes(source.source.mode) || input.rotationExpected || input.preparedMigration) {
+        throw new RuntimeMigrationRefusal("runtime_migration_invalid", "Explicit fresh/rebuild reason required; migration cannot compose with rotation or native fork");
+      }
+      const status = this.statusService.getStatus(input.seatRef);
+      if (!status.ok) return status;
+      const node = this.lookupNode(status.status), guard = this.tmuxAdapter.deliveryGuard;
+      const controller = new SeatRuntimeMigration({ ...this.deps, piProve: this.deps.migrationPiProve, piSkillRoot: this.deps.migrationPiSkillRoot, predecessorProcessExists: this.deps.migrationPredecessorProcessExists, fileExists: this.deps.migrationFileExists });
+      const actor = input.rotationActor ?? "", generation = input.rotationActorGeneration ?? "";
+      const actorNode = controller.actor(actor, generation);
+      if (!guard) throw new RuntimeMigrationRefusal("runtime_migration_guard_unavailable", "Lifecycle guard required");
+      return await guard.lifecycle([node.id, actorNode], async () => {
+        const prepared = await controller.prepare(node.id, request, actor, generation, input.dryRun === true);
+        if (input.dryRun) {
+          const plan = this.planner.plan({ ...input, operator: actor, dryRun: true });
+          if (!plan.ok) throw new RuntimeMigrationRefusal("runtime_migration_invalid", plan.message);
+          return { ok: true, plan: { ...plan.plan, runtimeMigration: prepared.request } };
+        }
+        capability = { controller, value: prepared, started: false };
+        const result = await this.handover({ ...input, operator: actor, runtimeMigration: undefined, preparedMigration: capability });
+        if (!result.ok && capability.started) {
+          throw new RuntimeMigrationRefusal(result.code, "Successor effect or commit could not be verified; old Pi history and exclusion are retained");
+        }
+        return result;
+      }, runtimeMigrationReservationId(request.operationId));
+    } catch (error) {
+      if (capability?.started) {
+        try { capability.controller.unknown(capability.value, input.rotationActor ?? "", input.rotationActorGeneration ?? ""); } catch { /* The durable started fence remains authoritative if diagnostic audit fails. */ }
+        return { ok: false, code: "runtime_migration_unknown", reservationId: capability.value.reservationId, blindRetryAllowed: false,
+          message: "Migration effect is not fully committed; the durable reservation, predecessor history and custody remain intact.",
+          guidance: "Inspect this exact runtime-migration reservation and native pane before an explicit recovery. Do not replay or use rotation release." };
+      }
+      return { ok: false, code: "runtime_migration_refused", refusalCode: error instanceof RuntimeMigrationRefusal || error instanceof DeliveryGuardError ? error.code : "preflight_unavailable",
+        blindRetryAllowed: false, message: error instanceof RuntimeMigrationRefusal || error instanceof DeliveryGuardError ? error.message : "Runtime migration preflight unavailable; no process replaced.",
+        guidance: "Resolve the named preflight boundary, then prepare a fresh exact dry-run packet. No custody was released." };
+    }
   }
 
   /**
@@ -678,6 +754,7 @@ export class SeatHandoverService {
     dispatchReservation?: DispatchReservation;
     rotationActor?: string;
     rotationActorGeneration?: string;
+    preparedMigration?: { controller: SeatRuntimeMigration; value: PreparedRuntimeMigration; started: boolean };
   }): Promise<SeatHandoverResult> {
     const fail = async (result: SeatHandoverResult): Promise<SeatHandoverResult> => {
       if (input.cleanup) await input.cleanup(result.ok?"unknown_failure":result.code);
@@ -769,6 +846,7 @@ export class SeatHandoverService {
       dispatchReservation: input.dispatchReservation,
       rotationActor: input.rotationActor,
       rotationActorGeneration: input.rotationActorGeneration,
+      preparedMigration: input.preparedMigration,
     });
     if (!committed.ok) return fail(committed);
     this.tmuxAdapter.deliveryGuard?.rebindLifecycle(input.node.id);
@@ -984,9 +1062,12 @@ export class SeatHandoverService {
     dispatchReservation?: DispatchReservation;
     rotationActor?: string;
     rotationActorGeneration?: string;
+    preparedMigration?: { controller: SeatRuntimeMigration; value: PreparedRuntimeMigration; started: boolean };
   }): SeatHandoverResult {
     const handoverAt = this.now().toISOString();
     const tx = this.db.transaction(() => {
+      const migration = input.preparedMigration;
+      migration?.controller.commitConfiguration(migration.value, input.rotationActor ?? "", input.rotationActorGeneration ?? "");
       const rows = this.db.prepare(
         "SELECT id FROM sessions WHERE node_id = ? AND status NOT IN ('superseded', 'detached', 'exited') ORDER BY id"
       ).all(input.node.id) as Array<{ id: string }>;
@@ -1087,6 +1168,8 @@ export class SeatHandoverService {
         input.dispatchReservation.reservation_id, input.rotationActor ?? "", input.rotationActorGeneration ?? "",
       );
 
+      if (migration) migration.controller.committed(migration.value, input.rotationActor ?? "", input.rotationActorGeneration ?? "",
+        this.sessionRegistry.currentOccupantTenure(input.node.id)!.generationUuid, input.launchToken!.token);
       const event = this.eventBus.persistWithinTransaction({
         type: "seat.handover_completed",
         rigId: input.status.rig_id,
@@ -1157,7 +1240,7 @@ export class SeatHandoverService {
           logicalId: input.status.logical_id,
           podId: input.status.pod_id,
           podNamespace: input.status.pod_namespace,
-          runtime: input.status.runtime,
+          runtime: input.node.runtime,
         },
         source: input.reportedSource,
         reason: input.reason,

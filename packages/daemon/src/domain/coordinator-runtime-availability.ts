@@ -15,7 +15,7 @@ export interface RuntimeAvailability { session: string; generation: string; stat
  * equal to the node's latest occupant tenure. Environment text never leaves
  * this module except the single extracted generation token; fingerprints carry
  * only identifiers. */
-export interface PiNativeProof { state: "present" | "absent"; generation: string; launchId: string | null; fingerprint: string; quiescence?: PiQuiescenceProof }
+export interface PiNativeProof { lastEntryId?: string | null; state: "present" | "absent"; generation: string; launchId: string | null; fingerprint: string; quiescence?: PiQuiescenceProof }
 /** Native idle/busy evidence carried alongside an identity proof. Evidence
  *  ONLY — nothing here grants authority, recovery, queue, guard, qualification
  *  or send rights.
@@ -204,7 +204,7 @@ export function makePiNativeProver(db: Database.Database, exec: (command: string
         const runnerEv = await genFor(runner.pid), piEv = await genFor(piProc.pid);
         if (runnerEv.value !== binding.generation_uuid) return unknown("generation_unverified_runner", { detail: runnerEv.value === null ? "empty" : "ok" });
         if (piEv.value !== binding.generation_uuid) return unknown("generation_unverified_child", { detail: piEv.value === null ? "empty" : "ok" });
-        return { state: "present", generation: binding.generation_uuid, launchId: launchFlag, fingerprint: JSON.stringify({ pane: match[1], runner: [runner.pid, runner.ppid], pi: [piProc.pid, piProc.ppid], launchId: launchFlag, sidecarUpdatedAt: state.updatedAt, genSources: [runnerEv.source, piEv.source] }), quiescence: readQuiescence(state, launchFlag, binding.resume_token, binding.generation_uuid) };
+        return { state: "present", generation: binding.generation_uuid, launchId: launchFlag, lastEntryId: state.lastEntryId ?? null, fingerprint: JSON.stringify({ pane: match[1], runner: [runner.pid, runner.ppid], pi: [piProc.pid, piProc.ppid], launchId: launchFlag, sidecarUpdatedAt: state.updatedAt, genSources: [runnerEv.source, piEv.source] }), quiescence: readQuiescence(state, launchFlag, binding.resume_token, binding.generation_uuid) };
       };
       const first = await sample(), second = await sample();
       if (!first || !second) return unknown("unstable_between_samples");

@@ -52,6 +52,7 @@ export interface SeatHandoverPlan {
     restoreOutcome: SeatStatus["restore_outcome"];
   };
   phases: SeatHandoverPhase[];
+  runtimeMigration?: import("./seat-runtime-migration.js").RuntimeMigrationRequest;
 }
 
 export type SeatHandoverPlanResult =

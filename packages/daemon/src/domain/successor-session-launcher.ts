@@ -151,6 +151,8 @@ export class SuccessorSessionLauncher {
     occupantGeneration?: string | null;
     /** Synchronous physical-cutover observer; runs after the retiree is proven gone and before respawn. */
     onReplacementStarted?: () => void;
+    /** Migration-only target projection in the verified blank pane, before launch. */
+    beforeLaunch?: () => Promise<void>;
     /** OPR.0.5.5.5 fork source: the successor launches as a NATIVE FORK of this
      *  resolved id (adapter forkSource seam) — it carries the incumbent's
      *  conversation from its first byte; the returned resume token is the NEW
@@ -254,6 +256,10 @@ export class SuccessorSessionLauncher {
     //    on ANY launch/readiness failure we do NOT killSession the preserved seat — that would destroy
     //    the retiree's recoverable state. We return the structured failure and leave the re-wakeable
     //    shell in the pane; commit never runs, so the binding is not repointed.
+    if (input.beforeLaunch) {
+      try { await input.beforeLaunch(); }
+      catch { return { ok: false, code: "successor_projection_failed", step: "start_agent", message: "Target startup projection failed", replacementStarted: true }; }
+    }
     const started = await this.startAgent(input.node, departingSession, pane.id, cwd, input.forkSource, input.occupantGeneration);
     if (!started.ok) {
       return { ok: false, code: started.code, step: "start_agent", message: started.message, replacementStarted: true };

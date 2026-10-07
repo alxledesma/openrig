@@ -366,7 +366,7 @@ export type SetModelResult =
   | { ok: true; seat: SeatDescriptor; from: string | null; to: string; changed: boolean }
   | SeatRefusal;
 
-type CodexProfileEffective = { model: string; provider: string; effort: string; approval: string; sandbox: string };
+export type CodexProfileEffective = { model: string; provider: string; effort: string; approval: string; sandbox: string };
 export type SetCodexProfileResult =
   | { ok: true; seat: SeatDescriptor; from: string | null; to: string; changed: boolean; effective: CodexProfileEffective; profileSha256: string; effect: string }
   | SeatRefusal;
@@ -377,7 +377,7 @@ const CODEX_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhig
 const CODEX_APPROVALS = new Set(["never", "untrusted", "on-failure", "on-request"]);
 const CODEX_SANDBOXES = new Set(["read-only", "workspace-write", "danger-full-access"]);
 
-function readInstalledCodexProfile(home: string, name: string, requireExplicit = true): { effective: CodexProfileEffective; sha256: string } | SeatRefusal {
+export function readInstalledCodexProfile(home: string, name: string, requireExplicit = true): { effective: CodexProfileEffective; sha256: string } | SeatRefusal {
   const path = resolve(home, `${name}.config.toml`);
   let bytes: Buffer;
   try {
@@ -1344,7 +1344,7 @@ export class SeatLifecycleService {
     return row?.resume_token?.trim() || null;
   }
 
-  private readStartupContext(
+  readStartupContext(
     nodeId: string,
     cwd: string,
   ): { ok: true; context: ParsedStartupContext } | { ok: false; refusal: SeatRefusal } {

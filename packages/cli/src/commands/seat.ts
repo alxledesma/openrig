@@ -349,6 +349,7 @@ Examples:
     .option("--source <source>", "Source: fresh (default; launches a new agent), discovered:<id> (operator-prepared), fork:<id> (native fork of the source conversation), or rebuild (fresh agent primed from the seat's durable artifacts).")
     .option("--reason <reason>", "Why the handover is happening")
     .option("--operator <address>", "Operator initiating the handover")
+    .option("--runtime-migration <file>", "Explicit Pi-to-Codex JSON packet; dry-run returns exact bindings for one execution")
     .option("--dry-run", "Plan the handover without changing topology")
     .option("--json", "JSON output for agents")
     .description("Hand a seat to a successor (two-phase). Pass --dry-run to plan without changing topology.")
@@ -581,6 +582,14 @@ resume/successor launch reads it at call time. Examples:
         console.log(`Model for ${s?.logicalId}@${s?.rigName}: ${String(data["from"] ?? "none")} -> ${String(data["to"])} (audited).`);
         console.log("The next managed resume/successor launch composes the new model.");
       });
+    });
+
+  cmd.command("runtime-migration-status <operationId>")
+    .description("Read one runtime migration outcome; never retries or releases an uncertain attempt")
+    .action(async (operationId: string) => {
+      const daemon = await getDaemonStatus(getDeps().lifecycleDeps); if (!daemonStatusGuard(daemon)) return;
+      const response = await getDeps().clientFactory(getDaemonUrl(daemon)).get(`/api/seat/runtime-migration/${encodeURIComponent(operationId)}`, {headers:terminalAuthHeaders()});
+      console.log(JSON.stringify(response.data,null,2)); if(response.status>=400)process.exitCode=1;
     });
 
   const reservation = cmd.command("dispatch-reservation").description("Exact persistent cutover exclusion and disposition contracts");
@@ -829,6 +838,7 @@ The token is read from STDIN only (never an argument). Examples:
 }
 
 interface HandoverActionOpts {
+  runtimeMigration?: string;
   source?: string;
   reason?: string;
   operator?: string;
@@ -855,6 +865,16 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
     return;
   }
 
+  let runtimeMigration: unknown;
+  if (opts.runtimeMigration) {
+    try {
+      runtimeMigration = JSON.parse(fs.readFileSync(opts.runtimeMigration, "utf8"));
+      if (!runtimeMigration || typeof runtimeMigration !== "object" || Array.isArray(runtimeMigration)) throw new Error("object required");
+    } catch {
+      const error = { ok: false, code: "runtime_migration_invalid", message: "Migration packet must be a readable JSON object file." };
+      console.log(opts.json ? JSON.stringify(error) : error.message); process.exitCode = 2; return;
+    }
+  }
   const daemon = await getDaemonStatus(deps.lifecycleDeps);
   if (!daemonStatusGuard(daemon)) return; // B8-1b: epistemic-matched
 
@@ -864,6 +884,7 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
     source: opts.source,
     reason: opts.reason,
     operator: opts.operator,
+    ...(runtimeMigration === undefined ? {} : { runtimeMigration }),
     dryRun: opts.dryRun === true,
   };
   let res;
@@ -871,8 +892,8 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
     // #260: a mutating handover launches and readies the successor, so it gets the
     // launch request window. A dry run only plans, and keeps the default deadline.
     res = opts.dryRun === true
-      ? await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(handoverRoute, handoverBody)
-      : await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(handoverRoute, handoverBody, { timeoutMs: 120_000 });
+      ? await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(handoverRoute, handoverBody, runtimeMigration === undefined ? undefined : { headers: terminalAuthHeaders(), timeoutMs: 60_000 })
+      : await client.post<SeatHandoverPlan | SeatHandoverMutationResult | SeatStatusError>(handoverRoute, handoverBody, { timeoutMs: 120_000, ...(runtimeMigration === undefined ? {} : { headers: terminalAuthHeaders() }) });
   } catch (err) {
     // The daemon keeps working when the client stops waiting, so reaching the bound leaves a
     // mutating handover's outcome unknown. One request; no retry.
@@ -882,7 +903,9 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
       code: "handover_outcome_unknown",
       status: "unknown",
       message: "The CLI stopped waiting for the daemon after 120 seconds, so the handover outcome is unknown. The daemon may still be working on it.",
-      guidance: `Inspect the seat before considering another handover: rig seat status ${seat}. A handover result shown there may belong to an earlier attempt.`,
+      guidance: runtimeMigration !== undefined
+        ? `Do not replay this migration. Inspect its exact operation with rig seat runtime-migration-status ${(runtimeMigration as {operationId?: string}).operationId ?? "<operationId>"}; the durable fence remains until explicit recovery.`
+        : `Inspect the seat before considering another handover: rig seat status ${seat}. A handover result shown there may belong to an earlier attempt.`,
     };
     if (opts.json) console.log(JSON.stringify(error, null, 2));
     else printSeatError(error, error.message);
@@ -905,6 +928,7 @@ export async function runSeatHandover(seat: string, opts: HandoverActionOpts, de
   const data = res.data as SeatHandoverPlan | SeatHandoverMutationResult;
   if (data.dryRun) {
     printHumanHandoverPlan(data);
+    if (runtimeMigration !== undefined) console.log(JSON.stringify((data as SeatHandoverPlan & { runtimeMigration?: unknown }).runtimeMigration, null, 2));
   } else {
     printHumanHandoverResult(data);
   }
@@ -925,6 +949,7 @@ export function handoverCommand(depsOverride?: SeatDeps): Command {
     .option("--source <source>", "Successor source: fresh (default; launches a new agent), discovered:<id> (operator-prepared), fork:<id> (native fork of the source conversation), or rebuild (fresh agent primed from the seat's durable artifacts).")
     .option("--reason <reason>", "Why the handover is happening")
     .option("--operator <address>", "Operator initiating the handover")
+    .option("--runtime-migration <file>", "Explicit Pi-to-Codex JSON packet; dry-run returns exact bindings for one execution")
     .option("--dry-run", "Plan the handover without changing topology")
     .option("--json", "JSON output for agents")
     .description("Hand a seat to a successor: create -> deliver context -> verify continuity -> rebind")

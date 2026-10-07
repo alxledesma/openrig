@@ -48,6 +48,9 @@ export class SeatDispatchReservationService {
   private fail(code: string, message: string): never { throw new DispatchReservationError(code, message); }
   get(id: string): DispatchReservation {
     const r = this.deps.db.prepare("SELECT * FROM seat_dispatch_reservations WHERE reservation_id=?").get(id) as DispatchReservation | undefined;
+    if (r && JSON.parse(r.expected_json)?.protocol === "runtime-migration-v1") {
+      this.fail("reservation_protocol_mismatch", "Runtime migration requires its own inspected outcome; rotation cannot release or reinterpret this fence.");
+    }
     return r ?? this.fail("reservation_not_found", "No such durable dispatch reservation");
   }
   private actor(actor: string, generation: string) {
@@ -188,6 +191,7 @@ export class SeatDispatchReservationService {
     const requestHash = digest({ actor, actorGeneration, input });
     const old = this.deps.db.prepare("SELECT * FROM seat_dispatch_reservations WHERE reservation_id=? OR (node_id=? AND operation_id=?)").get(input.reservationId, input.nodeId, input.operationId) as DispatchReservation | undefined;
     if (old) {
+      this.get(old.reservation_id); // Reject a different protocol before replay.
       if (old.state === "released" || old.request_hash !== requestHash || old.reservation_id !== input.reservationId || old.predecessor_generation !== target.occupant) this.fail("reservation_replay_changed", "Reservation replay differs, was released or incumbent changed; new attempt requires fresh IDs/preflight");
       return old;
     }
@@ -215,6 +219,7 @@ export class SeatDispatchReservationService {
     return r;
   }
   start(r: DispatchReservation, actor: string, generation: string) {
+    this.get(r.reservation_id); // No cross-protocol mutation through this seam.
     if (!this.deps.guard.ownsLifecycle(r.node_id)) this.fail("reservation_lifecycle_required", "Lifecycle lease required");
     this.deps.db.transaction(() => {
       this.actor(actor, generation);

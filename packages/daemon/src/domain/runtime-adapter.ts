@@ -162,6 +162,14 @@ export interface RuntimeAdapter {
     opts: { name: string; resumeToken?: string; forkSource?: ForkSource },
   ): Promise<HarnessLaunchResult>;
 
+  /** Read-only migration preflight in the SAME executable/home/PATH used for
+   * managed launch. No credential bytes or model request may leave this seam. */
+  preflightRuntimeMigration?(binding: NodeBinding): Promise<{
+    profileSha256: string;
+    effective: { model: string; provider: string; effort: string; approval: string; sandbox: string };
+    authenticated: true;
+  }>;
+
   /** Pure native identity observation after the first prompt created its rollout. */
   captureNativeResumeToken?(binding: NodeBinding): Promise<{ token: string; resumeType: string } | undefined>;
 
