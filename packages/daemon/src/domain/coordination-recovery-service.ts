@@ -1,5 +1,6 @@
 import { rotationLocalAddresses } from "./rotation-local-custody.js";
 import type { QueueRepository } from "./queue-repository.js";
+import type { NativeQueueCustodyReceipt, QueueTransition } from "./queue-transition-log.js";
 import { CoordinatorFenceError, digest, type CoordinatorToken } from "./coordinator-authority-service.js";
 import type { ActivityEvidence, ArbitratedSeatState } from "./activity-taxonomy.js";
 import { ADMISSION_DUTY_KIND, CONFIRMATION_DUTY_KIND, FrontierPlanning, PLANNING_DUTY_KIND, type FrontierAdmissionReceipt, type FrontierConfirmationReceipt, type FrontierPlanReceipt, type FrontierReopenReceipt, type FrontierSnapshot, type LegacyClassificationInput, type LegacyClassificationReceipt, type LegacyRevocationInput, type LegacyRevocationReceipt, type ScopeSource } from "./frontier-planning.js";
@@ -88,7 +89,7 @@ export class CoordinationRecoveryService {
  }
  /** A correction notice continues the exact claimed control; it creates no queue
   * assignment and cannot change its custody, original return or resource locks. */
- private terminalReturnContinuationContext(rigId:string,controlQueueId:string,bodyHash:string,workerGeneration:string,deadline:number,excludeEffect?:string,retirement=false) {
+ private terminalReturnContinuationContext(rigId:string,controlQueueId:string,bodyHash:string,workerGeneration:string,deadline:number,excludeEffect?:string|string[],retirement=false) {
   const op=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-control'").get(rigId,controlQueueId) as {receipt:string}|undefined;
   const control=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(controlQueueId) as any;
   const r=op?JSON.parse(op.receipt):null,b=control?JSON.parse(control.body):null,a=this.authority.get(rigId),plan=this.plan(rigId);
@@ -603,6 +604,7 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
  /** One bounded scan per pass, written by the registered observer path only. */
  private recordSystemWakeOutcomes(rigId:string):void {
   this.recordAssignmentWakeOutcomes(rigId);
+  this.recordNativeReturnNoticeOutcomes(rigId);
   // Completed scope may no longer be traversed by task reconciliation. Record only
   // exact terminal lifecycle pointer outcomes; never infer transport delivery.
   const completed=this.db.prepare("SELECT c.receipt FROM coordinator_operations c JOIN queue_items q ON q.qitem_id=json_extract(c.receipt,'$.queueId') JOIN outbox_entries o ON o.outbox_id='wake-intent-'||q.qitem_id WHERE c.rig_id=? AND c.kind='coordinator-lifecycle-control' AND q.state IN ('done','failed','denied','canceled','handed-off') AND o.delivery_state='indeterminate' AND NOT EXISTS (SELECT 1 FROM coordinator_operations p WHERE p.rig_id=c.rig_id AND p.kind='held-history-control-outcome' AND p.operation_id='held-control-outcome:'||o.outbox_id) ORDER BY c.rowid LIMIT 200").all(rigId) as Array<{receipt:string}>;
@@ -633,7 +635,129 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
  }
  /** The one consumption predicate both debt gates call. */
  noticeOutcomeContained(rigId:string,row:any):boolean {
-  return this.assignmentWakeOutcomeContained(rigId,row)||this.heldHistoryNoticeOutcomeContained(rigId,row)||this.systemWakeOutcomeContained(rigId,row)||this.diagnosticWakeContained(row);
+  return this.nativeReturnNoticeOutcomeContained(rigId,row)||this.assignmentWakeOutcomeContained(rigId,row)||this.heldHistoryNoticeOutcomeContained(rigId,row)||this.systemWakeOutcomeContained(rigId,row)||this.diagnosticWakeContained(row);
+ }
+ /** G15 C1 producer binding: one indeterminate watchdog instruction notice for exactly
+  * one native-return continuation/retirement proof of this rig. Pending/sending rows can
+  * never bind; nothing is re-sent and no UNKNOWN is rewritten. */
+ private static readonly NATIVE_RETURN_NOTICE_KINDS={continuation:'native-terminal-return-continuation',retirement:'native-terminal-return-retirement'} as const;
+ private nativeReturnNoticeBinding(rigId:string,row:any):{rigId:string;kind:'continuation'|'retirement';proofId:string;controlQueueId:string;worker:string;workerGeneration:string;noticeRow:any;controlReceipt:any}|null{
+  if(!row||row.delivery_state!=='indeterminate'||row.sender_session!=='watchdog@system'||row.identity_provenance!=='system:operator-authorized-coordination')return null;
+  const outboxId=String(row.outbox_id??'');if(!outboxId.startsWith('wake-intent-native-return-'))return null;
+  const proofId=outboxId.slice('wake-intent-'.length);
+  const kind=proofId.startsWith('native-return-continuation:')?'continuation':proofId.startsWith('native-return-retirement:')?'retirement':null;
+  if(!kind)return null;const controlQueueId=proofId.slice(('native-return-'+kind+':').length);if(!controlQueueId||controlQueueId.includes(':'))return null;
+  const op=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind=?").get(rigId,proofId,CoordinationRecoveryService.NATIVE_RETURN_NOTICE_KINDS[kind]) as {rig_id:string;receipt:string}|undefined;
+  if(!op||op.rig_id!==rigId)return null;let n:any;try{n=JSON.parse(op.receipt);}catch{return null;}
+  if(!n||n.outboxId!==outboxId||n.controlQueueId!==controlQueueId||digest(row.body)!==n.outboxBodyHash||n.worker!==row.destination_session||(kind==='retirement'?n.retirement!==true:n.retirement!==undefined))return null;
+  if(String(row.audit_pointer??'')!==controlQueueId)return null;
+  let tags:any;try{tags=JSON.parse(row.tags??'[]');}catch{return null;}
+  if(!Array.isArray(tags)||tags.length!==3||tags[0]!=='queue:native-return-continuation'||tags[1]!==proofId||tags[2]!=='queue:recipient-generation:'+n.workerGeneration)return null;
+  const saved=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-control'").get(rigId,controlQueueId) as {receipt:string}|undefined;
+  if(!saved)return null;let c:any;try{c=JSON.parse(saved.receipt);}catch{return null;}
+  if(!c||typeof c!=='object'||Array.isArray(c))return null;
+  const control=this.repo.getById(controlQueueId);let body:any;try{body=control?JSON.parse(control.body):null;}catch{return null;}
+  if(!control||!body||typeof n.worker!=='string'||typeof n.workerGeneration!=='string'||!n.workerGeneration||
+     c.queueId!==controlQueueId||c.worker!==n.worker||c.workerGeneration!==n.workerGeneration||control.sourceSession!=='watchdog@system'||control.destinationSession!==c.worker||
+     digest(control.body)!==c.bodyHash||n.controlBodyHash!==c.bodyHash||n.controlReceiptHash!==digest(saved.receipt)||
+     body.action!=='record-exact-native-terminal-return'||body.rigId!==rigId||body.originalQueueId!==c.originalQueueId||body.packageKey!==c.packageKey||body.recipientGeneration!==c.workerGeneration||body.grantsAuthority!==false)return null;
+  return {rigId,kind,proofId,controlQueueId,worker:String(n.worker),workerGeneration:String(n.workerGeneration),noticeRow:row,controlReceipt:c};
+ }
+ /** Read-only reader for the R7 immutable custody-evidence contract
+  * (queue-native-custody.v1, published in 349b4d70). A missing
+  * table/row, malformed JSON or absent actorGeneration is unproven and stays held; no
+  * generation is ever inferred from mutable claim fields. This service reads evidence; it never manufactures producer receipts. */
+ private nativeCustodyEvidenceCache:{schemaVersion:number;exists:boolean}|undefined;
+ private nativeCustodyEvidenceTransition(actual:QueueTransition):NativeQueueCustodyReceipt|null {
+  const schemaVersion=Number(this.db.pragma('schema_version',{simple:true}));
+  if(!this.nativeCustodyEvidenceCache||this.nativeCustodyEvidenceCache.schemaVersion!==schemaVersion)this.nativeCustodyEvidenceCache={schemaVersion,exists:!!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue_native_custody_evidence'").get()};
+  if(!this.nativeCustodyEvidenceCache.exists)return null;
+  const row=this.db.prepare('SELECT receipt FROM queue_native_custody_evidence WHERE transition_id=? AND qitem_id=?').get(actual.transitionId,actual.qitemId) as {receipt:string}|undefined;
+  let r:any;try{r=JSON.parse(row?.receipt??'null');}catch{return null;}
+  if(!r||r.kind!=='queue-native-custody.v1'||typeof r.actorGeneration!=='string'||!r.actorGeneration||actual.identityProvenance!=='transport:v1')return null;
+  const t=r.transition;
+  if(!t||Object.keys(t).length!==Object.keys(actual).length||Object.entries(actual).some(([key,value])=>t[key]!==value)||
+     !r.beforeQueue||!r.afterQueue||r.beforeQueue.qitem_id!==actual.qitemId||r.afterQueue.qitem_id!==actual.qitemId||r.afterQueue.state!==actual.state)return null;
+  return r as NativeQueueCustodyReceipt;
+ }
+ private nativeCustodySnapshotEqual(a:any,b:any):boolean {
+  return !!a&&!!b&&typeof a==='object'&&typeof b==='object'&&!Array.isArray(a)&&!Array.isArray(b)&&
+    Object.keys(a).length===Object.keys(b).length&&Object.entries(a).every(([key,value])=>b[key]===value);
+ }
+ /** A genuine terminal state-change, followed only by exact same-generation native notes, proves
+  * retirement. The archive-aware immutable receipts identify each actor; mutable claim fields are
+  * consistency checks only. A later note cannot manufacture an earlier terminal actor. */
+ private nativeReturnTerminalOutcome(binding:NonNullable<ReturnType<CoordinationRecoveryService['nativeReturnNoticeBinding']>>):number|null {
+  const control=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(binding.controlQueueId) as any;
+  if(!control||!['done','failed','canceled'].includes(control.state)||control.claimed_by_generation_uuid!==binding.workerGeneration)return null;
+  const history=this.repo.transitionLog.listForQitem(binding.controlQueueId);
+  let expected=control,scanned=0;
+  for(let i=history.length-1;i>=0&&scanned++<2000;i--){
+   const t=history[i];if(!t)return null;const r=this.nativeCustodyEvidenceTransition(t);
+   if(!r||r.actorGeneration!==binding.workerGeneration||t.actorSession!==binding.worker||t.state!==control.state||
+      !this.nativeCustodySnapshotEqual(r.afterQueue,expected)||r.beforeQueue.source_session!=='watchdog@system'||r.beforeQueue.destination_session!==binding.worker||
+      r.beforeQueue.body!==control.body||r.beforeQueue.claimed_by_generation_uuid!==binding.workerGeneration||r.beforeQueue.claimed_at!==control.claimed_at)return null;
+   if(['in-progress','blocked'].includes(String(r.beforeQueue.state)))
+    return Date.parse(t.ts)>=Date.parse(String(binding.noticeRow.ts_dispatched))?t.transitionId:null;
+   if(r.beforeQueue.state!==control.state||!this.nativeCustodySnapshotEqual(r.beforeQueue,r.afterQueue))return null;
+   expected=r.beforeQueue;
+  }
+  return null;
+ }
+ private nativeReturnNoticeOutcomeProof(binding:NonNullable<ReturnType<CoordinationRecoveryService['nativeReturnNoticeBinding']>>,expected?:{outcomeTransitionId?:number;dispositionOperationId?:string}):{outcomeTransitionId?:number;dispositionOperationId?:string}|null {
+  if(this.authority.generation(binding.worker)!==binding.workerGeneration)return null;
+  if(!expected||expected.outcomeTransitionId!==undefined){
+   const terminal=this.nativeReturnTerminalOutcome(binding);
+   if(terminal!==null&&(!expected||expected.outcomeTransitionId===terminal))return {outcomeTransitionId:terminal};
+  }
+  if(binding.kind==='continuation'&&(!expected||expected.dispositionOperationId!==undefined)){
+   const a=this.db.prepare("SELECT a.disposition_id,a.destination,a.body_hash,q.body,q.claimed_by_generation_uuid,p.contract FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.package_key=? AND a.queue_id=?").get(binding.rigId,binding.controlReceipt.packageKey,binding.controlReceipt.originalQueueId) as any;
+   if(a?.disposition_id&&(!expected||expected.dispositionOperationId===a.disposition_id)){
+    const d=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='disposition'").get(binding.rigId,a.disposition_id) as {receipt:string}|undefined;
+    let dr:any,contract:any;try{dr=JSON.parse(d?.receipt??'null');contract=JSON.parse(a.contract);}catch{return null;}
+    if(dr&&dr.actor===binding.worker&&dr.generation===binding.workerGeneration&&dr.packageKey===binding.controlReceipt.packageKey&&
+       a.destination===binding.worker&&a.claimed_by_generation_uuid===binding.workerGeneration&&digest(a.body)===a.body_hash&&contract?.destination===binding.worker&&contract.bodyHash===a.body_hash&&typeof contract.returnContract?.destination==='string'&&Array.isArray(contract.returnContract?.evidenceRequired)&&
+       this.validContinuationReturn(a.disposition_id,binding.worker,binding.workerGeneration,binding.controlReceipt.packageKey,contract))return {dispositionOperationId:a.disposition_id};
+   }
+  }
+  return null;
+ }
+ private nativeReturnNoticeOutcomeContained(rigId:string,row:any):boolean{
+  const binding=this.nativeReturnNoticeBinding(rigId,row);if(!binding)return false;
+  const saved=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-return-notice-outcome'").get(rigId,'native-return-notice-outcome:'+row.outbox_id) as {receipt:string}|undefined;
+  if(!saved)return false;
+  try{const p=JSON.parse(saved.receipt);if(p.outboxId!==row.outbox_id||('outcomeTransitionId' in p)===('dispositionOperationId' in p)||p.noticeSnapshotHash!==digest(JSON.stringify(row))||p.proofId!==binding.proofId||p.controlQueueId!==binding.controlQueueId||p.worker!==binding.worker||p.workerGeneration!==binding.workerGeneration||p.deliveryConclusion!=='unknown'||p.originalMutations!==0||p.outcomeOnly!==true||p.grantsAuthority!==false)return false;
+   const proof=this.nativeReturnNoticeOutcomeProof(binding,p);if(!proof)return false;
+   return 'outcomeTransitionId' in proof?p.outcomeTransitionId===proof.outcomeTransitionId:p.dispositionOperationId===proof.dispositionOperationId;}catch{return false;}
+ }
+ private nativeReturnNoticeCursor=new Map<string,number>();
+ private recordNativeReturnNoticeOutcomes(rigId:string):void{
+  let from=this.nativeReturnNoticeCursor.get(rigId)??0,scanned=0;
+  while(scanned<2000){
+   const rows=this.db.prepare("SELECT o.rowid scan_rowid,o.* FROM outbox_entries o WHERE o.rowid>? AND o.delivery_state='indeterminate' AND o.sender_session='watchdog@system' AND o.outbox_id LIKE 'wake-intent-native-return-%' AND NOT EXISTS(SELECT 1 FROM coordinator_operations c WHERE c.rig_id=? AND c.operation_id='native-return-notice-outcome:'||o.outbox_id AND c.kind='native-return-notice-outcome') ORDER BY o.rowid LIMIT 200").all(from,rigId) as any[];
+   for(const scannedRow of rows){
+    const {scan_rowid:_,...row}=scannedRow,binding=this.nativeReturnNoticeBinding(rigId,row);if(!binding)continue;
+    const proof=this.nativeReturnNoticeOutcomeProof(binding);if(!proof)continue;
+    const receipt={outboxId:row.outbox_id,noticeSnapshotHash:digest(JSON.stringify(row)),proofId:binding.proofId,controlQueueId:binding.controlQueueId,worker:binding.worker,workerGeneration:binding.workerGeneration,...proof,deliveryConclusion:'unknown',originalMutations:0,outcomeOnly:true,grantsAuthority:false};
+    this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'native-return-notice-outcome:'+row.outbox_id,'native-return-notice-outcome',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   }
+   scanned+=rows.length;from=rows.length?Number((rows[rows.length-1] as any).scan_rowid):0;
+   if(rows.length<200){from=0;break;}
+  }
+  this.nativeReturnNoticeCursor.set(rigId,from);
+ }
+ /** Root-approved C2 lineage-exact failure-only retirement exclusion: only the
+  * indeterminate producer-bound instruction notices of THIS original + current worker
+  * generation lineage qualify. Pending/sending rows and unrelated effects never do.
+  * Successor authorization, non-retirement continuation and every dispatch/duty gate
+  * still require full C1 containment. */
+ private nativeReturnRetirementChainNotices(rigId:string,originalQueueId:string,worker:string,workerGeneration:string):string[]{
+  const ids:string[]=[];
+  for(const row of this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state='indeterminate' AND sender_session='watchdog@system' AND outbox_id LIKE 'wake-intent-native-return-%'").all() as any[]){
+   const binding=this.nativeReturnNoticeBinding(rigId,row);if(!binding)continue;
+   if(binding.controlReceipt.originalQueueId===originalQueueId&&binding.worker===worker&&binding.workerGeneration===workerGeneration&&this.authority.generation(worker)===workerGeneration)ids.push(String(row.outbox_id));
+  }
+  return ids;
  }
  private recordHeldHistoryNoticeOutcome(rigId:string,parent:any):void {
   const row=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+parent.queueId) as any;if(!row||!this.heldHistoryNoticeOutcomeProof(rigId,row))return;
@@ -1099,7 +1223,9 @@ private dutyProtection(rigId:string,r:any):boolean {
    const saved=this.db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-retirement'").get(input.rigId,id) as {receipt:string;request_hash:string}|undefined;
    if(saved){if(saved.request_hash!==requestHash)fail('coordination_return_retirement_conflict','This expired duty already has its one finite retirement notice');const r=JSON.parse(saved.receipt);return {queueId:r.controlQueueId,outboxId:r.outboxId,deadline:r.deadline};}
    if(input.deadline>this.now()+1200000)fail('coordination_return_retirement_required','Retirement notice must expire within twenty minutes');
-   const c=this.terminalReturnContinuationContext(input.rigId,input.controlQueueId,input.controlBodyHash,input.workerGeneration,input.deadline,undefined,true);
+  let chainNotices:string[]=[];
+  try{const controlOp=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-control'").get(input.rigId,input.controlQueueId) as {receipt:string}|undefined;const cr=controlOp?JSON.parse(controlOp.receipt):null;if(cr&&cr.workerGeneration===input.workerGeneration)chainNotices=this.nativeReturnRetirementChainNotices(input.rigId,String(cr.originalQueueId),String(cr.worker),input.workerGeneration);}catch{chainNotices=[];}
+  const c=this.terminalReturnContinuationContext(input.rigId,input.controlQueueId,input.controlBodyHash,input.workerGeneration,input.deadline,chainNotices,true);
    const intakeBodyHash=this.exactRetirementIntake(input.rigId,input.intakeQueueId,input.controlQueueId,generation,c.r.packageKey);
    const outboxId=this.repo.stageNativeTerminalReturnContinuation({controlQueueId:input.controlQueueId,worker:c.r.worker,workerGeneration:input.workerGeneration,proofId:id,body:JSON.stringify({action:'retire-expired-native-terminal-return',controlQueueId:input.controlQueueId,originalQueueId:c.r.originalQueueId,deadline:input.deadline,grantsAuthority:false,allowedClosureStates:['failed','canceled'],required:'This is a finite failure-only retirement notice. Your original duty has expired; do not execute expired work, dispose product scope, redo work or release locks. Under your own genuine native identity, record failed or canceled for ONLY controlQueueId through the supported queue update with an honest expiry reason. Preserve the original product claim, all typed returns, evidence and effects. Current Operator can then use the existing exact successor API. No automatic cancellation, acceptance or expiry extension is granted.'})});
    const effect=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get(outboxId) as {body:string};
@@ -1128,7 +1254,12 @@ private dutyProtection(rigId:string,r:any):boolean {
   const op=this.db.prepare("SELECT rig_id,receipt FROM coordinator_operations WHERE operation_id=? AND kind IN ('native-terminal-return-continuation','native-terminal-return-retirement')").get(proofId) as {rig_id:string;receipt:string}|undefined;
   if(!op)return false;const r=JSON.parse(op.receipt);
   try{
-   const c=this.terminalReturnContinuationContext(op.rig_id,r.controlQueueId,r.controlBodyHash,r.workerGeneration,r.deadline,r.outboxId,r.retirement===true);
+   // Sending the one already-authorized failure-only retirement must revalidate the same C2
+   // lineage exception as staging it. Ordinary continuations and all successor/dispatch gates keep debt.
+   const controlOp=r.retirement?this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='native-terminal-return-control'").get(op.rig_id,r.controlQueueId) as {receipt:string}|undefined:undefined;
+   const controlReceipt=controlOp?JSON.parse(controlOp.receipt):null;
+   const excluded=r.retirement&&controlReceipt?[r.outboxId,...this.nativeReturnRetirementChainNotices(op.rig_id,controlReceipt.originalQueueId,r.worker,r.workerGeneration)]:r.outboxId;
+   const c=this.terminalReturnContinuationContext(op.rig_id,r.controlQueueId,r.controlBodyHash,r.workerGeneration,r.deadline,excluded,r.retirement===true);
    const effect=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(r.outboxId) as any;
    if(r.retirement&&this.exactRetirementIntake(op.rig_id,r.intakeQueueId,r.controlQueueId,r.operatorGeneration,c.r.packageKey)!==r.intakeBodyHash)return false;
    return destination===r.worker&&c.receiptHash===r.controlReceiptHash&&c.a.epoch===r.epoch&&c.a.owner_session===r.holder&&c.a.owner_generation===r.holderGeneration&&c.plan.operatorGeneration===r.operatorGeneration&&this.authority.generation(r.actor)===r.actorGeneration&&(r.actor==='operator-agent@kernel'||r.actor===c.a.owner_session)&&!!effect&&effect.sender_session===source&&effect.destination_session===destination&&effect.audit_pointer===r.controlQueueId&&['pending','sending'].includes(effect.delivery_state)&&digest(effect.body)===r.outboxBodyHash&&(!r.dispositionId||this.validContinuationReturn(r.dispositionId,r.worker,r.workerGeneration,c.r.packageKey,c.contract));
@@ -1368,7 +1499,7 @@ private dutyProtection(rigId:string,r:any):boolean {
     const current=this.authority.generation(missing.destination),contract=JSON.parse(missing.contract);
     const restriction=plan!.dispatchRestrictions?.find(r=>r.session===missing.destination);
     const scopeHeld=restriction&&(restriction.generation!==current||restriction.validUntil<=this.now()||!restriction.packageKeys.includes(missing.package_key));
-    const reason=!current||current!==missing.claimed_by_generation_uuid?'terminal-return-incarnation-changed':digest(missing.body)!==missing.body_hash||contract.destination!==missing.destination||contract.bodyHash!==missing.body_hash||!this.authority.terminalReturnResourcesRetained(rigId,missing.package_key,contract)?'terminal-return-contract-drift':scopeHeld?'checkpoint-quiescence':this.workerEffectDebt(missing.destination)?'uncertain-worker-effect':null;
+    const reason=!current||current!==missing.claimed_by_generation_uuid?'terminal-return-incarnation-changed':digest(missing.body)!==missing.body_hash||contract.destination!==missing.destination||contract.bodyHash!==missing.body_hash||!this.authority.terminalReturnResourcesRetained(rigId,missing.package_key,contract)?'terminal-return-contract-drift':scopeHeld?'checkpoint-quiescence':this.workerEffectDebt(missing.destination,this.nativeReturnRetirementChainNotices(rigId,missing.queue_id,missing.destination,current))?'uncertain-worker-effect':null;
     if(reason){result.push({key:'terminal-return:'+missing.package_key,state:'held',queueId:missing.queue_id,reason,deadline:Date.parse(missing.ts_updated)+1200000});continue;}
     let queueId='qitem-coordination-terminal-return-'+digest(rigId+':'+missing.queue_id+':'+current).slice(0,24);const deadline=this.now()+1200000;
     const latest=this.db.prepare("SELECT q.qitem_id,q.body,o.receipt FROM coordinator_operations o JOIN queue_items q ON q.qitem_id=o.operation_id WHERE o.rig_id=? AND o.kind='native-terminal-return-control' AND json_extract(o.receipt,'$.originalQueueId')=? AND json_extract(o.receipt,'$.workerGeneration')=? ORDER BY q.ts_created DESC,q.rowid DESC LIMIT 1").get(rigId,missing.queue_id,current) as {qitem_id:string;body:string;receipt:string}|undefined;
