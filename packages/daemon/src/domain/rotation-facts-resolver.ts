@@ -4,6 +4,7 @@ import type Database from 'better-sqlite3';
 import {readFileSync,realpathSync} from 'node:fs';import {resolve,sep} from 'node:path';import {createHash} from 'node:crypto';import {execFile} from 'node:child_process';import{promisify}from'node:util';
 import type{WhoamiService}from'./whoami-service.js';import type{SeatActivityService}from'./seat-activity-service.js';import type{TmuxAdapter}from'../adapters/tmux.js';import{codexRotationContract}from'./rotation-native-proof.js';import{assertRotationPrecondition,assertManagedUnattended}from'./rotation-precondition.js';
 import { rotationLocalAddresses, rotationActiveQueueRows } from './rotation-local-custody.js';
+import { proveCodexNativeThread } from "./codex-native-thread-proof.js";
 const exec=promisify(execFile);
 export function rotationFactsResolver(deps:{db:Database.Database;whoami:WhoamiService;activity:SeatActivityService;tmux:TmuxAdapter;root:string}) {
  return async(seat:string,expected:Record<string,unknown>):Promise<void>=>{
@@ -38,24 +39,64 @@ export function assertSuccessorProfileContinuity(config:Record<string,unknown>,p
  if(provider!==contract.provider||effort!==contract.effort||approval!==(contract.permissions as {approval:string}).approval)throw new Error("Successor native profile would change provider, effort or approval policy");
 }
 
-export async function resolveRotationNativeState(deps:{db:Database.Database;whoami:WhoamiService;tmux:TmuxAdapter},seat:string) {
-  const who=deps.whoami.resolve({sessionName:seat,compact:false});if(!who || who.identity.runtime!=='codex')throw new Error('Native rotation proof currently supports Codex only');
-  const usage=who.contextUsage as {sessionId?:string;transcriptPath?:string;fresh?:boolean}|undefined;
-  if(!usage?.fresh || !usage.sessionId || !usage.transcriptPath)throw new Error('Current native generation/checkpoint unavailable');
-  const node=deps.db.prepare('SELECT model,codex_config_profile FROM nodes WHERE id=?').get(who.identity.nodeId) as {model:string|null;codex_config_profile:string|null};
-  const binding=deps.db.prepare('SELECT tmux_pane FROM bindings WHERE node_id=?').get(who.identity.nodeId) as {tmux_pane:string|null}|undefined;
-  if(!binding?.tmux_pane)throw new Error('Managed pane unavailable');
-  const pid=await deps.tmux.getPanePid(binding.tmux_pane);if(!pid)throw new Error('Managed process PID unavailable');
-  const result=await exec('/bin/ps',['-axo','pid=,ppid=,comm='],{maxBuffer:16*1024*1024});
-  const processes=parseProcessInventory(result.stdout);
-  const descendants=new Set([pid]);for(let i=0;i<processes.length;i++){let added=false;for(const p of processes)if(descendants.has(Number(p[2]))&&!descendants.has(Number(p[1]))){descendants.add(Number(p[1]));added=true;}if(!added)break;}
-  const native=processes.filter(p=>descendants.has(Number(p[1]))&&/(^|\/)codex$/.test(p[3]!));if(native.length!==1)throw new Error('Exactly one native Codex process required');
-  const args=await exec('/bin/ps',['-p',native[0]![1]!,'-o','args='],{maxBuffer:1024*1024});
-  const argv=args.stdout.trim().split(/\s+/);const runtimeContract=codexRotationContract(usage.transcriptPath,usage.sessionId,argv,node.model,node.codex_config_profile);
-  const config=parseToml(readFileSync(resolve(process.env["CODEX_HOME"]??resolve(homedir(),".codex"),"config.toml"),"utf8")) as Record<string,unknown>;
-  if(!node.codex_config_profile || !/^[a-zA-Z0-9_-]+$/.test(node.codex_config_profile))throw new Error("Safe native successor profile required");
-  const profilePath=resolve(process.env["CODEX_HOME"]??resolve(homedir(),".codex"),`${node.codex_config_profile}.config.toml`);
-  const profile=parseToml(readFileSync(profilePath,"utf8")) as Record<string,unknown>;
-  assertSuccessorProfileContinuity(config,profile,runtimeContract,argv);
-  return {who,usage,runtimeContract};
+type CodexNativeStateDeps = { db: Database.Database; whoami: WhoamiService; tmux: TmuxAdapter };
+
+/** Rotation's capacity/checkpoint policy still requires fresh token telemetry. */
+export async function resolveRotationNativeState(deps: CodexNativeStateDeps, seat: string) {
+  return resolveNativeState(deps, seat, true);
+}
+
+/** Native history/identity is independent of token-count age. This does not
+ * grant fresh usage, idle, kernel identity or custody: callers retain those gates. */
+export async function resolveCodexNativeState(deps: CodexNativeStateDeps, seat: string) {
+  return resolveNativeState(deps, seat, false);
+}
+
+async function resolveNativeState(deps: CodexNativeStateDeps, seat: string, requireFreshUsage: boolean) {
+  const who = deps.whoami.resolve({ sessionName: seat, compact: false });
+  if (!who || who.identity.runtime !== "codex") throw new Error("Native rotation proof currently supports Codex only");
+  const usage = who.contextUsage as { sessionId?: string; transcriptPath?: string; fresh?: boolean } | undefined;
+  if (!usage?.sessionId || !usage.transcriptPath || (requireFreshUsage && !usage.fresh)) {
+    throw new Error("Current native generation/checkpoint unavailable");
+  }
+  const currentSession = () => deps.db.prepare(`SELECT n.runtime,n.model,n.codex_config_profile,
+    s.id sessionId,s.session_name sessionName,s.resume_type resumeType,s.resume_token nativeId
+    FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE n.id=? ORDER BY s.id DESC LIMIT 1`)
+    .get(who.identity.nodeId) as { runtime: string; model: string | null; codex_config_profile: string | null;
+      sessionId: string; sessionName: string; resumeType: string; nativeId: string | null } | undefined;
+  const node = currentSession();
+  if (!node || node.runtime !== "codex" || node.sessionName !== who.identity.sessionName
+    || node.resumeType !== "codex_id" || !node.nativeId) throw new Error("Current saved Codex session unavailable");
+  if (usage.sessionId !== node.nativeId) throw new Error("Current native thread differs from saved session");
+  const binding = deps.db.prepare("SELECT tmux_pane FROM bindings WHERE node_id=?").get(who.identity.nodeId) as { tmux_pane: string | null } | undefined;
+  if (!binding?.tmux_pane) throw new Error("Managed pane unavailable");
+  const pid = await deps.tmux.getPanePid(binding.tmux_pane);
+  if (!pid) throw new Error("Managed process PID unavailable");
+  const result = await exec("/bin/ps", ["-axo", "pid=,ppid=,comm="], { maxBuffer: 16 * 1024 * 1024 });
+  const processes = parseProcessInventory(result.stdout);
+  const descendants = new Set([pid]);
+  for (let i = 0; i < processes.length; i++) {
+    let added = false;
+    for (const p of processes) if (descendants.has(Number(p[2])) && !descendants.has(Number(p[1]))) {
+      descendants.add(Number(p[1])); added = true;
+    }
+    if (!added) break;
+  }
+  const native = processes.filter(p => descendants.has(Number(p[1])) && /(^|\/)codex$/.test(p[3]!));
+  if (native.length !== 1) throw new Error("Exactly one native Codex process required");
+  const args = await exec("/bin/ps", ["-p", native[0]![1]!, "-o", "args="], { maxBuffer: 1024 * 1024 });
+  const revalidateThread = requireFreshUsage ? undefined
+    : await proveCodexNativeThread(Number(native[0]![1]), usage.transcriptPath, args.stdout);
+  const argv = args.stdout.trim().split(/\s+/);
+  const runtimeContract = codexRotationContract(usage.transcriptPath, usage.sessionId, argv, node.model, node.codex_config_profile);
+  const configHome = process.env["CODEX_HOME"] ?? resolve(homedir(), ".codex");
+  const config = parseToml(readFileSync(resolve(configHome, "config.toml"), "utf8")) as Record<string, unknown>;
+  if (!node.codex_config_profile || !/^[a-zA-Z0-9_-]+$/.test(node.codex_config_profile)) throw new Error("Safe native successor profile required");
+  const profile = parseToml(readFileSync(resolve(configHome, `${node.codex_config_profile}.config.toml`), "utf8")) as Record<string, unknown>;
+  assertSuccessorProfileContinuity(config, profile, runtimeContract, argv);
+  if (JSON.stringify(currentSession()) !== JSON.stringify(node)
+    || (deps.db.prepare("SELECT tmux_pane FROM bindings WHERE node_id=?").get(who.identity.nodeId) as { tmux_pane: string | null } | undefined)?.tmux_pane !== binding.tmux_pane
+    || await deps.tmux.getPanePid(binding.tmux_pane) !== pid) throw new Error("Current Codex binding changed during native observation");
+  await revalidateThread?.();
+  return { who, usage, runtimeContract };
 }

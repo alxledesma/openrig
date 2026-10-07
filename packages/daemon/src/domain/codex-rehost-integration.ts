@@ -10,7 +10,7 @@ import type { Binding } from "./types.js";
 import type { CodexDaemonSupportDetector } from "./codex-daemon-support.js";
 import { CodexSameGenerationRehost, type CodexRehostNativeState } from "./codex-rehost.js";
 import { NativeDutyLaunchStore, observeNativeDutyLaunch, verifyNativeDutyProcessIdentity } from "./native-duty-launch.js";
-import { resolveRotationNativeState } from "./rotation-facts-resolver.js";
+import { resolveCodexNativeState } from "./rotation-facts-resolver.js";
 import { listNativeProcesses } from "./native-process-lineage.js";
 import { SeatLaunchEnvironment, structuredNativeExecutable } from "./seat-launch-environment.js";
 
@@ -42,7 +42,7 @@ export function createCodexRehostIntegration(deps: {
   return new CodexSameGenerationRehost({
     db: deps.db, guard: deps.guard, tmux: deps.tmux, resume: deps.resume, snapshotRoot: deps.snapshotRoot,
     nativeState: async session => {
-      const state = await resolveRotationNativeState(deps, session);
+      const state = await resolveCodexNativeState(deps, session);
       const contract = state.runtimeContract as CodexRehostNativeState["runtimeContract"];
       if (!state.usage.sessionId || !state.usage.transcriptPath || contract.runtime !== "codex") throw new Error("Exact Codex native history unavailable");
       return { nodeId: state.who.identity.nodeId, sessionName: session, nativeId: state.usage.sessionId,
@@ -75,7 +75,7 @@ export function createCodexRehostIntegration(deps: {
       const posture = sandboxType === "danger-full-access" ? "full_bypass" : "floor";
       if (!stored || stored.tmuxPane !== current.pane || (node?.policy_launch_posture && node.policy_launch_posture !== posture)) throw new Error("Codex rehost persisted posture or pane mismatch");
       const verified = await deps.adapter.preflightRuntimeMigration({ ...stored, cwd: binding.cwd,
-        model: binding.model, effort: binding.effort ?? undefined, codexConfigProfile: binding.codexConfigProfile,
+        model: binding.model, effort: binding.effort ?? native.runtimeContract.effort ?? undefined, codexConfigProfile: binding.codexConfigProfile,
         launchPosture: posture });
       if (verified.effective.sandbox !== sandboxType || verified.effective.approval !== native.runtimeContract.permissions.approval
         || verified.effective.provider !== native.runtimeContract.provider) throw new Error("Codex rehost would change native permissions or provider");
