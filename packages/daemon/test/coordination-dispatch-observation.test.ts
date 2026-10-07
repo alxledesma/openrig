@@ -139,6 +139,36 @@ describe('shared prepared dispatch observations', () => {
     clock += 5000; vi.setSystemTime(clock); release(); await running;
     expect(assignments()).toHaveLength(1);
   });
+  it.each(['holder', 'observer'])('SM08 %s dispatch precedes slow global administration and unrelated task holds', async route => {
+    const unrelated=task('old-scope','reviewer@xv',{boundary:'owner-access'});
+    configure([unrelated,...primary()]);
+    if(route==='observer')job();
+    const service=svc as any;
+    const originalAdministration=service.centralLifecyclePass.bind(svc);
+    const originalScope=service.dispatchScopeHold.bind(svc);
+    let administration=0, observationStarted=false;
+    identityHook=async owner=>{if(owner==='builder@xv')observationStarted=true;};
+    service.centralLifecyclePass=(rigId:string)=>{
+      administration++;
+      // Same failure mechanism as the retained production-sized snapshot: a
+      // synchronous administrative pass alone outlasts native proof validity.
+      expect(sent).toContain(queueId('A'));
+      clock+=4500;vi.setSystemTime(clock);
+      return originalAdministration(rigId);
+    };
+    service.dispatchScopeHold=(plan:CoordinationPlan,t:CoordinationTask)=>{
+      if(observationStarted&&t.key==='old-scope'){
+        expect(sent).toContain(queueId('A'));
+        clock+=4500;vi.setSystemTime(clock);
+      }
+      return originalScope(plan,t);
+    };
+    const result=route==='observer'?await svc.supervisePrepared('xv','j'):await svc.reconcilePrepared('lead@xv','lead-g1','xv');
+    expect(administration).toBe(1);
+    expect(repo.getById(queueId('A'))?.state).toBe('pending');
+    expect(repo.getById(queueId('old-scope'))).toBeNull();
+    expect(result).toEqual(expect.arrayContaining([expect.objectContaining({key:'old-scope',state:'held'})]));
+  });
   it('a slow eligible owner does not age or block another owner and cannot dispatch on stale completed evidence', async () => {
     configure([...primary(), task('slow', 'reviewer@xv'), task('slow-repair', 'architect@xv', { recoveryFor: 'slow' })]);
     let release!: () => void; const blocked = new Promise<void>(resolve => { release = resolve; });

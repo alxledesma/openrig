@@ -1925,10 +1925,15 @@ private dutyProtection(rigId:string,r:any):boolean {
    if(this.authority.generation("operator-agent@kernel")!==plan!.operatorGeneration)fail("coordination_operator_retired","Reauthorize plan after Operator generation change");
    if(actor!==a!.owner_session||generation!==a!.owner_generation||this.authority.generation(actor)!==generation||a!.state!=="active"||a!.lease_until<=this.now())fail("coordinator_retired","Only reconciled current holder may dispatch");
    const token:CoordinatorToken={rigId,epoch:a!.epoch,generation};
-   this.recordSystemWakeOutcomes(rigId);
-   const lifecycle=this.centralLifecyclePass(rigId),result:CoordinationResult[]=[];
-   this.recordProgress(rigId);
+   // Native evidence has a strict lifetime. Whole-rig history/administration can
+   // take longer than that lifetime and belongs to the final unprepared pass,
+   // never between an owner's native observation and its guarded effect.
+   const dispatchOnly=!!scope?.size;
+   if(!dispatchOnly)this.recordSystemWakeOutcomes(rigId);
+   const lifecycle=dispatchOnly?[]:this.centralLifecyclePass(rigId),result:CoordinationResult[]=[];
+   if(!dispatchOnly)this.recordProgress(rigId);
    for(const t of plan!.tasks){
+    if(dispatchOnly&&!scope!.has(t.owner))continue;
     const dispatchHold=this.dispatchScopeHold(plan!,t);
     const assigned=this.db.prepare("SELECT a.queue_id,a.disposition_id,q.state,q.claimed_by_generation_uuid,q.destination_session FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=?").get(rigId,t.packageKey) as {queue_id:string;disposition_id:string|null;state:string;claimed_by_generation_uuid:string|null;destination_session:string}|undefined;
     if(assigned){
@@ -2006,6 +2011,7 @@ private dutyProtection(rigId:string,r:any):boolean {
     }
     result.push({key:t.key,state:'pending-pickup',queueId,deadline:t.deadline});
    }
+   if(dispatchOnly)return result;
    // A terminal UI state is not an attributed return. Detect retained scope even
    // when that completed assignment is absent from the latest dispatch plan.
    const missingReturns=this.missingAttributedReturns(rigId);
@@ -2214,6 +2220,15 @@ if(!effectRig)return true;
  supervise(rigId:string,jobId:string):CoordinationResult[]|null {return this.superviseScoped(rigId,jobId);}
  private superviseScoped(rigId:string,jobId:string,scope?:DispatchScope):CoordinationResult[]|null {
   return this.db.transaction(()=>{
+   if(scope?.size){
+    const plan=this.plan(rigId),a=this.authority.get(rigId);
+    if(!plan||!a)fail('coordination_plan_required','Explicit current recovery plan required');
+    this.assertCoordinationObserver(rigId,jobId,plan!);
+    // Observer authority is checked here; the owner/lease/plan/generation and
+    // every native dispatch fence remain checked inside reconcileScoped.
+    // Peer transfer, recovery and global intake run once in the final pass.
+    return this.reconcileScoped(a!.owner_session,a!.owner_generation,rigId,scope);
+   }
    // The registered Operator observer records outcome-only receipts without any
    // plan or holder, which is the only path a pre-plan rollout rig has.
    if(this.db.prepare("SELECT 1 FROM watchdog_jobs WHERE job_id=? AND policy='coordinator-continuity' AND state='active' AND target_session='operator-agent@kernel' AND registered_by_session='operator-agent@kernel' AND registered_by_generation_uuid=?").get(jobId,this.authority.generation('operator-agent@kernel')??''))this.recordSystemWakeOutcomes(rigId);
