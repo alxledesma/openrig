@@ -84,6 +84,22 @@ async function automaticAckLifecycle(contained=false){
  expect(f.duties()).toHaveLength(2);expect(f.typed).toHaveLength(2);expect(f.reports.map(e=>outbox.getById(e.outboxId)?.deliveryState)).toEqual(['delivered','delivered']);const frontier=f.recovery.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='auto-task0');expect(frontier,JSON.stringify(frontier)).toMatchObject({state:'pending-pickup'});expect(db.prepare("SELECT count(*) n FROM coordinator_assignments WHERE package_key='auto-task0'").get()).toEqual({n:1});if(preserved)expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='contained-ack-history'").get()).toEqual(preserved);
 }
 it('automatic exact recipient duties settle multiple real direct reports sequentially before existing frontier resumes',()=>automaticAckLifecycle());
+it('automatic recipient receipt cannot terminally settle a live canonical coordinator baton',async()=>{
+ const f=await automaticAckFixture();await f.stage();await f.repo.drainPendingWakeIntents();
+ const duty=f.duties()[0],evidence=outbox.recipientAcknowledgmentContract('reviewer@xv','reviewer-g1',duty.effectId);
+ f.repo.claim({qitemId:duty.queueId,destinationSession:'reviewer@xv',identityProvenance:'transport:v1',actorGeneration:'reviewer-g1'});
+ // Exercise the distinct receipt-derived SQL writer against the same live-baton
+ // invariant. The duty itself is otherwise fully valid and genuinely claimed.
+ db.prepare("UPDATE coordinator_authority SET baton_id=? WHERE rig_id='xv'").run(duty.queueId);
+ const before=f.repo.transitionLog.listForQitem(duty.queueId);
+ const receipt=outbox.acknowledgeRecipientDelivery('reviewer@xv','reviewer-g1',evidence.contract);
+ expect(outbox.getById(duty.effectId)?.deliveryState).toBe('delivered');
+ expect(f.repo.getById(duty.queueId)).toMatchObject({state:'in-progress'});
+ expect(db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(duty.queueId)).toEqual({claimed_by_generation_uuid:'reviewer-g1'});
+ expect(f.repo.transitionLog.listForQitem(duty.queueId)).toEqual(before);
+ expect(db.prepare("SELECT count(*) n FROM events WHERE type='outbox.recipient_acknowledged' AND json_extract(payload,'$.outboxId')=?").get(duty.effectId)).toEqual({n:1});
+ expect(receipt.receiptId).toBeTruthy();
+});
 it('automatic acknowledgment honors exact same-rig contained history through two native receipts and current frontier',()=>automaticAckLifecycle(true));
 it.each(['job','generation','quiescence','typing','reservation','pending-wake','sending','ordinary-audit','unknown-notice','expiry','body-drift'])('automatic exact recipient duty preserves protected %s and never repeats unknown transport',async kind=>{
  const f=await automaticAckFixture(kind!=='unknown-notice');if(kind==='job')db.prepare("UPDATE watchdog_jobs SET state='stopped'").run();if(kind==='generation')db.prepare("UPDATE occupant_tenures SET generation_uuid='new' WHERE node_id='operator-agent@kernel'").run();if(kind==='quiescence')db.prepare("UPDATE coordinator_operations SET receipt=json_set(receipt,'$.dispatchRestrictions',json('[{\"session\":\"reviewer@xv\",\"generation\":\"reviewer-g1\",\"validUntil\":9999999999999,\"packageKeys\":[]}]')) WHERE kind='coordination-plan'").run();if(kind==='typing')db.prepare("INSERT INTO seat_delivery_guards(node_id,desired,effective,actor,reason,changed_at) VALUES ('reviewer@xv',1,1,'test','typing',datetime('now'))").run();if(kind==='reservation')db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES ('reserved','cutover','reviewer@xv','reviewer@xv','reviewer-g1','native-reviewer','operator-agent@kernel','operator-agent-g1','hash','{}','{}','reserved',?,datetime('now'))").run(new Date().toISOString());if(kind==='pending-wake'||kind==='ordinary-audit'||kind==='sending'){const e=outbox.record({outboxId:kind==='pending-wake'?'wake-intent-executable':'unproven-effect',senderSession:'reviewer@xv',destinationSession:'operator-agent@kernel',body:'do not retry'});if(kind==='sending')outbox.claimForDelivery(e.outboxId);}

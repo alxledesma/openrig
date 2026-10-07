@@ -160,6 +160,7 @@ export function queueRoutes(): Hono {
         : err.code === "terminal_reopen_target_invalid" ? 400
         : err.code === "reopen_note_required" ? 400
         : err.code === "reopen_not_applicable" ? 400
+        : err.code === "coordinator_baton_terminal_close_requires_authority" ? 409
         : err.code === "claim_destination_mismatch" ? 403
         : err.code === "qitem_not_claimable" ? 409
         : err.code === "qitem_not_in_progress" ? 409
@@ -350,6 +351,8 @@ export function queueRoutes(): Hono {
     const source = repo.getById(qitemId);
     try{repo.assertAdministrativeClaimant(qitemId,body.fromSession,c.req.header("X-OpenRig-Occupant-Generation"),transportSenderSession(c as Context)===body.fromSession?"transport:v1":null);}catch(error){return errorResponse(c,error);}
     if (!source) return c.json({ error: "qitem_not_found", message: `qitem ${qitemId} not found` }, 404);
+    try { repo.assertCoordinatorBatonDispositionAllowed(qitemId); }
+    catch (error) { return errorResponse(c, error); }
 
     // The deterministic successor identity is also the local custody key.
     // It must be derived before the re-drive preflight so the comparator and

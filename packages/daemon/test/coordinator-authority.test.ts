@@ -220,6 +220,50 @@ describe("coordinator exclusion and custody",()=>{
   db.prepare("UPDATE queue_items SET state='done' WHERE qitem_id='baton'").run();
   await expect(create()).rejects.toThrow("exact canonical baton claim");expect(repo.getById("work")).toBeNull();
  });
+ it.each(["done","failed","denied","canceled","handed-off"] as const)("generic queue disposition %s cannot close a live coordinator authority baton",state=>{
+  const beforeItem=repo.getById("baton");
+  const beforeTransitions=repo.transitionLog.listForQitem("baton");
+  const beforeAuthority=svc.get("xv");
+  expect(()=>repo.update({qitemId:"baton",actorSession:"lead@xv",actorGeneration:"lead-g1",identityProvenance:"transport:v1",state,closureReason:"no-follow-on"})).toThrowError(expect.objectContaining({code:"coordinator_baton_terminal_close_requires_authority"}));
+  expect(repo.getById("baton")).toEqual(beforeItem);
+  expect(repo.transitionLog.listForQitem("baton")).toEqual(beforeTransitions);
+  expect(svc.get("xv")).toEqual(beforeAuthority);
+ });
+ it("local and cross-host handoff writers cannot close a live coordinator authority baton",async()=>{
+  const snapshot=()=>JSON.stringify([
+   db.prepare("SELECT * FROM queue_items ORDER BY qitem_id").all(),
+   db.prepare("SELECT * FROM queue_transitions ORDER BY transition_id").all(),
+   db.prepare("SELECT * FROM coordinator_assignments ORDER BY queue_id").all(),
+   db.prepare("SELECT * FROM coordinator_resources ORDER BY resource_key").all(),
+   db.prepare("SELECT * FROM events ORDER BY seq").all(),
+   db.prepare("SELECT * FROM outbox_entries ORDER BY rowid").all(),
+  ]);
+  const before=snapshot();
+  const error=expect.objectContaining({code:"coordinator_baton_terminal_close_requires_authority"});
+  const base={qitemId:"baton",fromSession:"lead@xv",toSession:"builder@xv",body:"successor",actorGeneration:"lead-g1",identityProvenance:"transport:v1",nudge:false};
+  await expect(repo.handoff(base)).rejects.toThrowError(error);
+  expect(snapshot()).toBe(before);
+  await expect(repo.handoffAndComplete(base)).rejects.toThrowError(error);
+  expect(snapshot()).toBe(before);
+  expect(()=>repo.closeCrossHostHandoffSource({...base,closureTarget:"next@other-host",terminalState:"handed-off"})).toThrowError(error);
+  expect(snapshot()).toBe(before);
+ });
+ it("generic queue disposition cannot close a canonical baton in recovery state",()=>{
+  db.prepare("UPDATE coordinator_authority SET state='recovery' WHERE rig_id='xv'").run();
+  const beforeItem=repo.getById("baton"),beforeTransitions=repo.transitionLog.listForQitem("baton");
+  expect(()=>repo.update({qitemId:"baton",actorSession:"lead@xv",actorGeneration:"lead-g1",identityProvenance:"transport:v1",state:"done",closureReason:"no-follow-on"})).toThrowError(expect.objectContaining({code:"coordinator_baton_terminal_close_requires_authority"}));
+  expect(repo.getById("baton")).toEqual(beforeItem);
+  expect(repo.transitionLog.listForQitem("baton")).toEqual(beforeTransitions);
+  expect(svc.get("xv")?.state).toBe("recovery");
+ });
+ it("authority-owned transfer remains allowed while generic close stays fenced in reconciliation",()=>{
+  const moved=transfer();
+  expect(moved).toMatchObject({epoch:2,state:"reconciling",owner_session:"peer@xv",owner_generation:"peer-g1"});
+  expect(db.prepare("SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id='baton'").get()).toEqual({destination_session:"peer@xv",state:"pending",claimed_by_generation_uuid:null});
+  expect(repo.transitionLog.listForQitem("baton").at(-1)?.transitionNote).toContain("epoch 2");
+  expect(()=>repo.update({qitemId:"baton",actorSession:"peer@xv",actorGeneration:"peer-g1",identityProvenance:"transport:v1",state:"done",closureReason:"no-follow-on"})).toThrowError(expect.objectContaining({code:"coordinator_baton_terminal_close_requires_authority"}));
+  expect(db.prepare("SELECT destination_session,state,claimed_by_generation_uuid FROM queue_items WHERE qitem_id='baton'").get()).toEqual({destination_session:"peer@xv",state:"pending",claimed_by_generation_uuid:null});
+ });
  it("changed transfer contract cannot reuse an operation ID",()=>{
   transfer();expect(()=>svc.transfer("lead@xv","lead-g1",{expected:token,oldOwner:"lead@xv",recipient:"lead@xv",recipientGeneration:"lead-g1",leaseMs:10000,operationId:"transfer"})).toThrow("changed contract");
   expect(svc.get("xv")?.epoch).toBe(2);

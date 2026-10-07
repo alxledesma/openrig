@@ -64,6 +64,9 @@ export const TERMINAL_QUEUE_STATES = ["done", "handed-off"] as const satisfies r
 export function isTerminalState(state: string): boolean {
   return (TERMINAL_QUEUE_STATES as readonly string[]).includes(state);
 }
+const TERMINAL_COORDINATOR_BATON_DISPOSITIONS = new Set<string>([
+  "done", "failed", "denied", "canceled", "handed-off",
+]);
 
 /** 0.5.1-53 — the ACTIVE (still-progressing) states. A blocker is "live" iff active; any other
  *  state (done/handed-off/canceled/denied/failed) means the block will never lift. This is DISTINCT
@@ -1066,6 +1069,24 @@ export class QueueRepository {
     const issued=this.abandonmentAuthorization(qitemId);if(!issued)return;const r=issued.receipt,q=this.getById(qitemId),claimed=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(qitemId) as {claimed_by_generation_uuid:string}|undefined;
     if(provenance!=='transport:v1'||actor!==r.sender||!generation||generation!==r.senderGeneration||this.coordinatorAuthority.generation(actor)!==generation||!q?.claimedAt||q.destinationSession!==actor||claimed?.claimed_by_generation_uuid!==generation)throw new QueueRepositoryError('outbox_authorization_claimant_required','Only exact original claimed sender with current native transport generation/provenance may change administrative custody, report own failure/cancel, or return actual retirement receipt; Operator, replacement identity and body assertions cannot close it.');
   }
+  /** A live canonical control baton can only be terminally disposed by an
+   * authority lifecycle operation. Generic queue close paths all share this
+   * guard; coordinator recovery/transfer code retains its own fenced writes. */
+  private assertCoordinatorBatonTerminalCloseRequiresLifecycle(qitemId:string):void {
+    if(!this.coordinatorAuthority.available())return;
+    const authorityBaton=this.db.prepare("SELECT state FROM coordinator_authority WHERE baton_id=? AND state IN ('active','reconciling','recovery')").get(qitemId) as {state:string}|undefined;
+    if(authorityBaton)throw new QueueRepositoryError(
+      "coordinator_baton_terminal_close_requires_authority",
+      `qitem ${qitemId} is the canonical baton for coordinator authority (${authorityBaton.state}); generic queue completion cannot close it. Keep the baton live until a supported authority lifecycle operation records the disposition.`,
+      {authorityState:authorityBaton.state,qitemId},
+    );
+  }
+  /** Read-only preflight for split, cross-host handoff choreography. Keep the
+   *  repository close guard too: the route check prevents an orphan successor,
+   *  while this second check protects the source if custody changes meanwhile. */
+  assertCoordinatorBatonDispositionAllowed(qitemId:string):void {
+    this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(qitemId);
+  }
   private assertNativeTerminalReturnCompleted(qitemId:string):void {
     const ack=this.recipientAckDuty(qitemId);if(ack&&(!this.outbox||this.outbox.getById(ack.effectId)?.deliveryState!=='delivered'||!this.db.prepare("SELECT 1 FROM events WHERE type='outbox.recipient_acknowledged' AND json_extract(payload,'$.outboxId')=? AND json_extract(payload,'$.actor')=? AND json_extract(payload,'$.generation')=?").get(ack.effectId,ack.recipient,ack.recipientGeneration)))throw new QueueRepositoryError('outbox_ack_duty_incomplete','Actual native acknowledgment receipt is required; original message is not work or acceptance authority');
     if(this.abandonmentAuthorization(qitemId)&&!this.actualAbandonmentReceipt(qitemId))throw new QueueRepositoryError('outbox_authorization_incomplete','Exact genuine UNKNOWN retirement receipt must precede successful administrative duty closure. If authority expired, only the genuine claimant failed/canceled disposition is supported; preserve original UNKNOWN effect and old receipts.');
@@ -1662,6 +1683,8 @@ export class QueueRepository {
       if(actor!==r.recipient||generation!==r.recipientGeneration||hash(this.outbox.getById(effectId)!.body)!==r.contract.bodySha256||!q||!['pending','in-progress','blocked'].includes(q.state)||q.sourceSession!=='watchdog@system'||q.destinationSession!==actor||q.expiresAt!==new Date(r.deadline).toISOString()||hash(q.body)!==r.queueBodyHash||!notice||notice.deliveryState!=='delivered'||notice.senderSession!=='watchdog@system'||notice.destinationSession!==actor||notice.auditPointer!==r.queueId||hash(notice.body)!==r.noticeBodyHash||(!this.recipientAckProtection(r,notice.outboxId)||!this.recipientAckPredecessor(r)))continue;
       const receipt=this.db.prepare('SELECT ts_created FROM queue_items WHERE qitem_id=?').get(receiptId) as {ts_created:string}|undefined;if(!receipt||Date.parse(receipt.ts_created)>r.deadline||Date.parse(receipt.ts_created)<Date.parse(q.tsCreated))continue;
       if(q.state==='pending'){if(q.claimedAt)continue;}else this.assertRecipientAckClaimant(r.queueId,actor,generation,'transport:v1');
+      try { this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(r.queueId); }
+      catch (error) { if (error instanceof QueueRepositoryError && error.code === "coordinator_baton_terminal_close_requires_authority") continue; throw error; }
       this.db.prepare("UPDATE queue_items SET state='done',closure_reason='no-follow-on',closure_target=NULL,closure_required_at=NULL,ts_updated=? WHERE qitem_id=?").run(new Date().toISOString(),r.queueId);
       // The runtime disposes an exact receipt-only duty; it never fabricates a native claim or reading assertion.
       this.transitionLog.append({qitemId:r.queueId,state:'done',actorSession:'watchdog@system',identityProvenance:'system:operator-authorized-coordination',closureReason:'no-follow-on',transitionNote:'Receipt-derived settlement: actual recipient '+actor+' generation '+generation+' acknowledgment '+receiptId});
@@ -2100,6 +2123,7 @@ export class QueueRepository {
       const beforeCustody = this.custodySnapshot(input.qitemId);
       const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
+      this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
       this.coordinatorAuthority.reserve(input.fromSession, input.toSession, body, newId, input.dispatch, false, input.qitemId);
       this.db
         .prepare(
@@ -2293,6 +2317,7 @@ export class QueueRepository {
       const beforeCustody = this.custodySnapshot(input.qitemId);
       const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
+      this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
       this.coordinatorAuthority.reserve(input.fromSession, input.toSession, body, newId, input.dispatch, false, input.qitemId);
       this.db
         .prepare(
@@ -2487,6 +2512,7 @@ export class QueueRepository {
       const beforeCustody = this.custodySnapshot(input.qitemId);
       const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
+      this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
       this.db
         .prepare(
           `UPDATE queue_items
@@ -2980,6 +3006,8 @@ export class QueueRepository {
     // non-workflow qitems return null from the predicate — closure
     // behavior byte-identical (the zero-friction negative).
     const isTerminalClosure = isTerminalState(input.state);
+    if (input.state && TERMINAL_COORDINATOR_BATON_DISPOSITIONS.has(input.state))
+      this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
     if (isTerminalClosure && !input.viaWorkflowVerb && this.workflowFrontierPredicate) {
       const binding = this.workflowFrontierPredicate(input.qitemId);
       if (binding) {

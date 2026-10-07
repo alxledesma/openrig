@@ -16,7 +16,7 @@
 //   - /handoff closes the source `handed-off`; /handoff-and-complete closes
 //     it `done` — same choreography, one mechanism.
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
@@ -24,14 +24,10 @@ import { Hono } from "hono";
 import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
-import { coreSchema } from "../src/db/migrations/001_core_schema.js";
-import { eventsSchema } from "../src/db/migrations/003_events.js";
-import { queueItemsSchema } from "../src/db/migrations/024_queue_items.js";
-import { queueTransitionsSchema } from "../src/db/migrations/025_queue_transitions.js";
-import { queueTargetRepoSchema } from "../src/db/migrations/039_queue_target_repo.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import {
   QueueRepository,
+  QueueRepositoryError,
   deriveCrossHostSuccessorId,
   stampSelfHostSuffix,
 } from "../src/domain/queue-repository.js";
@@ -59,7 +55,7 @@ function jsonResponse(payload: unknown, status = 201): Response {
 
 function makeHarness(opts?: { fetchImpl?: typeof fetch; registry?: HostRegistry; destinationAdvisory?: QueueRepository["destinationAdvisory"] }) {
   const db = createDb();
-  migrate(db, [coreSchema, eventsSchema, queueItemsSchema, queueTransitionsSchema, queueTargetRepoSchema]);
+  migrate(db, ALL_MIGRATIONS);
   const bus = new EventBus(db);
   const repo = new QueueRepository(db, bus, { validateRig: () => true, destinationAdvisory: opts?.destinationAdvisory });
   const app = new Hono();
@@ -205,6 +201,22 @@ describe("MH-3 C2 — cross-host handoff (route choreography)", () => {
     for (const v of [row.s, row.d, row.b, row.ho]) {
       if (v) expect(v.split("@").length).toBeLessThanOrEqual(2);
     }
+  });
+
+  it("cross-host live-baton preflight refuses before forwarding a successor", async () => {
+    let forwarded = false;
+    h = makeHarness({ fetchImpl: (async () => { forwarded = true; return jsonResponse({}); }) as unknown as typeof fetch });
+    await seedSource(h.repo);
+    vi.spyOn(h.repo as any, "assertCoordinatorBatonDispositionAllowed").mockImplementation(() => {
+      throw new QueueRepositoryError("coordinator_baton_terminal_close_requires_authority", "canonical baton requires authority lifecycle disposition");
+    });
+
+    const res = await post(h.app, "/api/queue/qitem-source-1/handoff", { ...HANDOFF, hostId: "vps-b", nudge: true });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "coordinator_baton_terminal_close_requires_authority" });
+    expect(forwarded).toBe(false);
+    expect(h.repo.getById("qitem-source-1")?.state).toBe("pending");
+    expect(rowCount(h.db)).toBe(1);
   });
 
   it("handoff-and-complete cross-host: same choreography, source closes `done`", async () => {
