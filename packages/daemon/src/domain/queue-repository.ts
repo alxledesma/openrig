@@ -683,6 +683,7 @@ export class QueueRepository {
   private readonly recipientAckDuties=new WeakSet<QueueCreateInput>();
   private readonly nativeTerminalReturnControls=new WeakSet<QueueCreateInput>();
   private readonly outboxAbandonAuthorizations=new WeakSet<QueueCreateInput>();
+  private readonly qualificationAssessmentDuties=new WeakSet<QueueCreateInput>();
   readonly db: Database.Database;
   readonly transitionLog: QueueTransitionLog;
   private readonly eventBus: EventBus;
@@ -1908,6 +1909,15 @@ export class QueueRepository {
     this.nativeTerminalReturnControls.add(input);
     try{return this.createWithinTransaction(input);}finally{this.nativeTerminalReturnControls.delete(input);}
   }
+
+  /** Internal coordinator-only assignment creation for the pre-admission qualification loop.
+   * The service validates live issuer/holder/worker identity and the immutable scope first. */
+  createQualificationAssessmentDuty(input:QueueCreateInput) {
+    if(!this.db.inTransaction||input.sourceSession!=='watchdog@system'||input.dispatch||input.identityProvenance!=='system:operator-authorized-coordination'||!input.qitemId?.startsWith('qitem-coordination-lifecycle-'))throw new QueueRepositoryError('qualification_duty_internal_required','Qualification duty requires its validated atomic coordinator issue path');
+    let body:any;try{body=JSON.parse(input.body);}catch{throw new QueueRepositoryError('qualification_duty_internal_required','Qualification duty body must be valid JSON');}
+    if(body.schema!=='qualification-assessment-duty.v1'||body.action!=='perform-exact-qualification-only-assessment'||body.scope!=='qualification-only'||body.grantsAuthority!==false||body.contract?.productAuthority!==false||body.contract?.scope!=='qualification-only')throw new QueueRepositoryError('qualification_duty_internal_required','Qualification-only, non-product contract required');
+    this.qualificationAssessmentDuties.add(input);try{return this.createWithinTransaction(input);}finally{this.qualificationAssessmentDuties.delete(input);}
+  }
   createWithinTransaction(input: QueueCreateInput): {
     qitemId: string;
     persistedEvent: PersistedEvent;
@@ -1978,7 +1988,7 @@ export class QueueRepository {
       humanQuestions = parsed.questions;
     }
     const id = input.qitemId ?? newQitemId();
-    if(!this.recipientAckDuties.has(input)&&!this.nativeTerminalReturnControls.has(input)&&!this.outboxAbandonAuthorizations.has(input))this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
+    if(!this.recipientAckDuties.has(input)&&!this.nativeTerminalReturnControls.has(input)&&!this.outboxAbandonAuthorizations.has(input)&&!this.qualificationAssessmentDuties.has(input))this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
     const ts = new Date().toISOString();
     const priority = input.priority ?? "routine";
     const tier = input.tier ?? null;
@@ -2124,6 +2134,7 @@ export class QueueRepository {
       const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
+      this.assertNativeTerminalReturnCompleted(input.qitemId);
       this.coordinatorAuthority.reserve(input.fromSession, input.toSession, body, newId, input.dispatch, false, input.qitemId);
       this.db
         .prepare(
@@ -2318,6 +2329,7 @@ export class QueueRepository {
       const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
+      this.assertNativeTerminalReturnCompleted(input.qitemId);
       this.coordinatorAuthority.reserve(input.fromSession, input.toSession, body, newId, input.dispatch, false, input.qitemId);
       this.db
         .prepare(

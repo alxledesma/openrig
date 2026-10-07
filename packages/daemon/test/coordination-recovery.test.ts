@@ -515,6 +515,62 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   const changed=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,async()=>{db.prepare("UPDATE occupant_tenures SET generation_uuid='new-builder' WHERE node_id='builder@xv'").run();});
   await expect(changed.probeWorker('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv'})).rejects.toThrow('Worker changed');
  });
+ it('qualification-only duty requires native Worker return and independent Lead evidence review, grants no product authority',async()=>{
+  configure(normal());samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});
+  const contract={schema:'qualification-assessment-contract.v1' as const,artifactRef:'pilot/qualification-check.json',artifactSha256:'sha256:'+'a'.repeat(64),taskDigest:'sha256:'+'b'.repeat(64),scope:'qualification-only' as const,productAuthority:false as const};
+  const issued=svc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:svc.configurationDigest('builder@xv')!,deadline:clock+30000,contract});
+  const frozen=JSON.parse(repo.getById(issued.queueId)!.body);expect(frozen).toMatchObject({scope:'qualification-only',grantsAuthority:false,contractDigest:issued.contractDigest,workerGeneration:'builder-g1'});
+  expect(svc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:svc.configurationDigest('builder@xv')!,deadline:clock+60000,contract})).toEqual(issued);
+  expect(db.prepare('SELECT 1 FROM coordinator_packages WHERE rig_id=? AND package_key=?').get('xv','qualification-assessment:'+issued.contractDigest)).toBeUndefined();
+  expect(svc.dutyFacts(issued.queueId).send).toBe(true);
+  repo.claim({qitemId:issued.queueId,destinationSession:'builder@xv',actorGeneration:'builder-g1',identityProvenance:'transport:v1'});
+  const returnBody=JSON.stringify({schema:'qualification-assessment-return.v1',dutyQueueId:issued.queueId,contractDigest:issued.contractDigest,workerGeneration:'builder-g1',configurationDigest:svc.configurationDigest('builder@xv'),artifact:{ref:contract.artifactRef,sha256:contract.artifactSha256},evidence:[{kind:'task-result',ref:'pilot/results/qualification-check.json'}]});
+  await repo.create({qitemId:'qualification-assessment-return',sourceSession:'builder@xv',destinationSession:'lead@xv',body:returnBody,identityProvenance:'transport:v1',nudge:false});
+  repo.claim({qitemId:'qualification-assessment-return',destinationSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1'});
+  repo.update({qitemId:'qualification-assessment-return',actorSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+  svc.recordQualificationAssessmentReturn('builder@xv','builder-g1',{rigId:'xv',dutyQueueId:issued.queueId,returnQueueId:'qualification-assessment-return'});
+  expect(()=>repo.update({qitemId:issued.queueId,actorSession:'builder@xv',actorGeneration:'builder-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'})).toThrow('Exact native acceptance');
+  await expect(repo.handoff({qitemId:issued.queueId,fromSession:'builder@xv',toSession:'lead@xv',actorGeneration:'builder-g1',identityProvenance:'transport:v1',body:'Premature handoff',nudge:false})).rejects.toThrow('Exact native acceptance');
+  await expect(repo.handoffAndComplete({qitemId:issued.queueId,fromSession:'builder@xv',toSession:'lead@xv',actorGeneration:'builder-g1',identityProvenance:'transport:v1',body:'Premature completion',nudge:false})).rejects.toThrow('Exact native acceptance');
+  expect(()=>svc.recordQualificationAssessmentReturn('builder@xv','builder-g1',{rigId:'other-rig',dutyQueueId:issued.queueId,returnQueueId:'qualification-assessment-return'})).toThrow('Exact unexpired native Worker claim');
+  expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id='other-rig'").get()).toBeUndefined();
+  expect(()=>svc.assessQualificationDuty('peer@xv',repo.coordinatorAuthority.generation('peer@xv')!,{rigId:'xv',dutyQueueId:issued.queueId,finding:'evidence-sufficient',evidenceRef:'pilot/reviews/qualification-check.json'})).toThrow('Exact current Lead holder');
+  db.prepare("UPDATE occupant_tenures SET generation_uuid='operator-agent-g2' WHERE node_id='operator-agent@kernel'").run();
+  expect(()=>svc.assessQualificationDuty('lead@xv','lead-g1',{rigId:'xv',dutyQueueId:issued.queueId,finding:'evidence-sufficient',evidenceRef:'pilot/reviews/qualification-check.json'})).toThrow('Exact current Lead holder and Operator');
+  db.prepare("UPDATE occupant_tenures SET generation_uuid='operator-agent-g1' WHERE node_id='operator-agent@kernel'").run();
+  const review=svc.assessQualificationDuty('lead@xv','lead-g1',{rigId:'xv',dutyQueueId:issued.queueId,finding:'evidence-sufficient',evidenceRef:'pilot/reviews/qualification-check.json'});
+  expect(review.grantsAuthority).toBe(false);
+  const reviewReceipt=JSON.parse((db.prepare("SELECT receipt FROM coordinator_operations WHERE operation_id=? AND kind='qualification-assessment-review'").get(review.reviewId) as any).receipt);
+  expect(reviewReceipt).toMatchObject({finding:'evidence-sufficient',grantsAuthority:false,workerGeneration:'builder-g1'});
+  expect(reviewReceipt.qualification).toBeUndefined();expect(reviewReceipt.admission).toBeUndefined();
+  repo.update({qitemId:issued.queueId,actorSession:'builder@xv',actorGeneration:'builder-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+  expect(svc.dutyFacts(issued.queueId).close).toBe(true);
+  clock+=30001;vi.setSystemTime(clock);expect(svc.dutyFacts(issued.queueId).close).toBe(true);
+  expect(db.prepare("SELECT count(*) n FROM coordinator_packages WHERE rig_id='xv'").get()).toEqual({n:2});
+ });
+ it.each(['unauthorized','stale-worker','expired'] as const)('qualification-only duty refuses %s without creating a queue or review',kind=>{
+  configure(normal());samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});const contract={schema:'qualification-assessment-contract.v1' as const,artifactRef:'pilot/qualification-check.json',artifactSha256:'sha256:'+'a'.repeat(64),taskDigest:'sha256:'+'b'.repeat(64),scope:'qualification-only' as const,productAuthority:false as const};
+  const before=db.prepare('SELECT count(*) n FROM queue_items').get();let actor='operator-agent@kernel',generation='operator-agent-g1',workerGeneration='builder-g1',deadline=clock+30000;
+  if(kind==='unauthorized'){actor='lead@xv';generation='lead-g1';}if(kind==='stale-worker')workerGeneration='builder-old';if(kind==='expired')deadline=clock;
+  const error=refusal(()=>svc.stageQualificationAssessment(actor,generation,{rigId:'xv',worker:'builder@xv',workerGeneration,configurationDigest:svc.configurationDigest('builder@xv')!,deadline,contract}));
+  expect(error.code).toMatch(kind==='unauthorized'?'qualification_duty_operator_required':kind==='stale-worker'?'qualification_duty_worker_stale':'qualification_duty_deadline_invalid');
+  expect(db.prepare('SELECT count(*) n FROM queue_items').get()).toEqual(before);
+  expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind IN ('qualification-assessment-return','qualification-assessment-review')").get()).toBeUndefined();
+ });
+ it('qualification-only successor preserves an expired duty after its known wake is contained',()=>{
+  configure(normal());samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});const contract={schema:'qualification-assessment-contract.v1' as const,artifactRef:'pilot/qualification-check.json',artifactSha256:'sha256:'+'c'.repeat(64),taskDigest:'sha256:'+'d'.repeat(64),scope:'qualification-only' as const,productAuthority:false as const};
+  const first=svc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:svc.configurationDigest('builder@xv')!,deadline:clock+1000,contract});const oldBody=repo.getById(first.queueId)!.body,oldDeadline=repo.getById(first.queueId)!.expiresAt;
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE outbox_id=?").run('wake-intent-'+first.queueId);clock+=1001;vi.setSystemTime(clock);
+  const next=svc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:svc.configurationDigest('builder@xv')!,deadline:clock+20000,contract});
+  expect(next.queueId).not.toBe(first.queueId);expect(repo.getById(first.queueId)?.body).toBe(oldBody);expect(repo.getById(first.queueId)?.expiresAt).toBe(oldDeadline);expect(JSON.parse(repo.getById(next.queueId)!.body).previousQueueId).toBe(first.queueId);
+  expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id=?").get('wake-intent-'+first.queueId)).toEqual({delivery_state:'delivered'});
+ });
+ it('qualification-only expired duty with UNKNOWN wake remains the sole hold and is never retried',()=>{
+  configure(normal());samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});const contract={schema:'qualification-assessment-contract.v1' as const,artifactRef:'pilot/qualification-check.json',artifactSha256:'sha256:'+'e'.repeat(64),taskDigest:'sha256:'+'f'.repeat(64),scope:'qualification-only' as const,productAuthority:false as const};
+  const first=svc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:svc.configurationDigest('builder@xv')!,deadline:clock+1000,contract});db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+first.queueId);clock+=1001;vi.setSystemTime(clock);
+  const held=svc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:svc.configurationDigest('builder@xv')!,deadline:clock+20000,contract});
+  expect(held.queueId).toBe(first.queueId);expect(db.prepare("SELECT count(*) n FROM queue_items WHERE qitem_id LIKE 'qitem-coordination-lifecycle-%'").get()).toEqual({n:1});expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id=?").get('wake-intent-'+first.queueId)).toEqual({delivery_state:'indeterminate'});
+ });
  it('Operator successor control requires exact native intake and refuses uncertainty, drift and replay changes',async()=>{
   configure(normal(),{product:['source.ts']});const original=svc.reconcile('lead@xv','lead-g1','xv')[0].queueId!;
   repo.claim({qitemId:original,destinationSession:'builder@xv',identityProvenance:'transport:v1'});repo.update({qitemId:original,actorSession:'builder@xv',state:'done',closureReason:'no-follow-on'});
