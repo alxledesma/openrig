@@ -6,10 +6,65 @@ import { Command } from "commander";
 import { DaemonClient, terminalAuthHeaders } from "../client.js";
 
 const DEFAULT_READ_TIMEOUT_MS = 30_000;
+const MAX_QUALIFICATION_DUTY_MS = 20 * 60_000;
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+const SHA256_CONTRACT = /^sha256:[a-f0-9]{64}$/;
 function readTimeout(value:string):number|undefined {
  if(!/^\d+$/.test(value))return undefined;
  const ms=Number(value);
  return Number.isSafeInteger(ms)&&ms>=1_000&&ms<=60_000?ms:undefined;
+}
+
+function isRecord(value:unknown):value is Record<string,unknown> {
+ return typeof value==="object"&&value!==null&&!Array.isArray(value);
+}
+function hasExactKeys(value:Record<string,unknown>,keys:readonly string[]):boolean {
+ const actual=Object.keys(value);
+ return actual.length===keys.length&&keys.every(key=>Object.hasOwn(value,key));
+}
+function boundedText(value:unknown,max=256):value is string {
+ return typeof value==="string"&&value.trim().length>0&&value.length<=max;
+}
+function boundedDutyDeadline(value:unknown):boolean {
+ const now=Date.now();
+ return Number.isSafeInteger(value)&&(value as number)>now&&(value as number)<=now+MAX_QUALIFICATION_DUTY_MS;
+}
+/** Local shape bounds prevent malformed or overbroad assessment contracts from reaching the API.
+ * The daemon remains authoritative for identity, custody, wake effects, plan and lease fences. */
+function qualificationDutyInputError(operation:string,value:unknown):string|undefined {
+ if(!isRecord(value))return "contract must be a JSON object";
+ if(operation==="qualification-assessment-stage"){
+  const keys=["rigId","worker","workerGeneration","configurationDigest","deadline","contract"] as const;
+  if(!hasExactKeys(value,keys))return "stage contract must contain only rigId, worker, workerGeneration, configurationDigest, deadline, and contract";
+  const c=value.contract;
+  if(!boundedText(value.rigId)||!boundedText(value.worker)||!boundedText(value.workerGeneration)
+    ||typeof value.configurationDigest!=="string"||!SHA256_HEX.test(value.configurationDigest)||!boundedDutyDeadline(value.deadline)||!isRecord(c)
+    ||!hasExactKeys(c,["schema","artifactRef","artifactSha256","taskDigest","scope","productAuthority"])
+    ||c.schema!=="qualification-assessment-contract.v1"||!boundedText(c.artifactRef,2048)
+    ||typeof c.artifactSha256!=="string"||!SHA256_CONTRACT.test(c.artifactSha256)
+    ||typeof c.taskDigest!=="string"||!SHA256_CONTRACT.test(c.taskDigest)
+    ||c.scope!=="qualification-only"||c.productAuthority!==false)
+   return "stage requires the exact native Worker binding and qualification-only artifact contract; nothing was sent";
+ }
+ if(operation==="qualification-assessment-retirement-stage"){
+  const keys=["rigId","targetQueueId","targetBodyHash","sweepFindingQueueId","sweepFindingBodyHash","deadline"] as const;
+  if(!hasExactKeys(value,keys)||!boundedText(value.rigId)||!boundedText(value.targetQueueId)
+    ||!boundedText(value.sweepFindingQueueId)||typeof value.targetBodyHash!=="string"||!SHA256_HEX.test(value.targetBodyHash)
+    ||typeof value.sweepFindingBodyHash!=="string"||!SHA256_HEX.test(value.sweepFindingBodyHash)||!boundedDutyDeadline(value.deadline))
+   return "retirement stage requires exact target and failed-wake sweep hashes plus a deadline within twenty minutes; nothing was sent";
+ }
+ if(operation==="qualification-assessment-return"){
+  if(!hasExactKeys(value,["rigId","dutyQueueId","returnQueueId"])||!boundedText(value.rigId)
+    ||!boundedText(value.dutyQueueId)||!boundedText(value.returnQueueId))
+   return "return requires only rigId, dutyQueueId, and the Worker-authored returnQueueId; nothing was sent";
+ }
+ if(operation==="qualification-assessment-review"){
+  if(!hasExactKeys(value,["rigId","dutyQueueId","finding","evidenceRef"])||!boundedText(value.rigId)
+    ||!boundedText(value.dutyQueueId)||!boundedText(value.evidenceRef,2048)
+    ||typeof value.finding!=="string"||!["evidence-sufficient","evidence-insufficient","inconclusive"].includes(value.finding))
+   return "review requires the exact duty, a bounded evidence reference, and a supported finding; no qualification is inferred";
+ }
+ return undefined;
 }
 
 /** Exact JSON contracts keep authority and evidence explicit; no implied automatic takeover. */
@@ -106,10 +161,15 @@ export function coordinatorCommand():Command {
    console.log(JSON.stringify({...(receipt&&typeof receipt==="object"?receipt:{}),operationId,operationIdSource:generated?"generated":"supplied",preparedContract:preparedPath,expectedEpoch,expectedObligationsDigest},null,2));if(res.status>=400)process.exitCode=1;
   });
 
-for(const op of ["active-expiry-recover","held-history-adopt","held-history-recovery-bind","held-history-custody-evidence","held-history-custody-attest","outbox-abandon-evidence","outbox-abandon-continue","outcome-qualification-refresh","outcome-recovery-bind","outbox-abandon-authorize","outbox-abandon-notify","enable","transfer","acknowledge","renew","admit","dispose","recover","legacy-inventory","migrate-legacy","diagnostic-wake-dispose","coordination-plan","coordination-reconcile","coordination-accept","coordination-continue-custody","outcome-configure","resilience-materialize","reconciliation-recover","coordination-worker-probe","coordination-return-successor","coordination-return-continue","coordination-return-retire","coordination-return-intake-refresh","coordination-lifecycle-recovery","coordination-frontier-plan","coordination-frontier-admit","coordination-frontier-confirm","coordination-frontier-boundary","coordination-frontier-legacy-classify","coordination-frontier-legacy-revoke"]){
+for(const op of ["active-expiry-recover","held-history-adopt","held-history-recovery-bind","held-history-custody-evidence","held-history-custody-attest","outbox-abandon-evidence","outbox-abandon-continue","outcome-qualification-refresh","outcome-recovery-bind","outbox-abandon-authorize","outbox-abandon-notify","enable","transfer","acknowledge","renew","admit","dispose","recover","legacy-inventory","migrate-legacy","diagnostic-wake-dispose","coordination-plan","coordination-reconcile","coordination-accept","coordination-continue-custody","outcome-configure","resilience-materialize","reconciliation-recover","coordination-worker-probe","coordination-return-successor","coordination-return-continue","coordination-return-retire","coordination-return-intake-refresh","coordination-lifecycle-recovery","coordination-frontier-plan","coordination-frontier-admit","coordination-frontier-confirm","coordination-frontier-boundary","coordination-frontier-legacy-classify","coordination-frontier-legacy-revoke","qualification-assessment-stage","qualification-assessment-retirement-stage","qualification-assessment-return","qualification-assessment-review"]){
    cmd.command(`${op} <contractFile>`).description(op==="dispose"?'Submit {"rigId":"...","packageKey":"original admitted package key","dispositionId":"new worker-authored JSON return queue ID"}. The original worker may dispose its own terminal return; holder role is not required.':"Submit exact frozen JSON contract; caller identity/generation derive from seat environment")
     .action(async(file:string)=>{
-     const contract=JSON.parse(fs.readFileSync(file,"utf8"));
+     let contract:Record<string,unknown>;
+     try{contract=JSON.parse(fs.readFileSync(file,"utf8"));}
+     catch{process.stderr.write("contract file is unreadable or invalid JSON; nothing was sent\n");process.exitCode=1;return;}
+     if(!isRecord(contract)){process.stderr.write("contract must be a JSON object; nothing was sent\n");process.exitCode=1;return;}
+     const invalid=qualificationDutyInputError(op,contract);
+     if(invalid){process.stderr.write(`${invalid}\n`);process.exitCode=1;return;}
      if(op==="dispose"&&["rigId","packageKey","dispositionId"].some(k=>typeof contract?.[k]!=="string"||!contract[k].trim()))throw new Error("dispose requires JSON {rigId,packageKey,dispositionId}; dispositionId is the NEW worker-authored typed-return queue item, not the original assignment or duty ID");
      const res=await new DaemonClient().post(`/api/coordinator/${op}`,contract, { headers: terminalAuthHeaders() });
      console.log(JSON.stringify(res.data,null,2));if(res.status>=400)process.exitCode=1;

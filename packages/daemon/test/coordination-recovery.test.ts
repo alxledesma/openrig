@@ -652,16 +652,28 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   const third=svc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',{...input,deadline:clock+30000});
   expect(third.queueId).not.toBe(next.queueId);expect(JSON.parse(repo.getById(third.queueId)!.body).chainIds).toEqual([third.queueId,next.queueId,first.queueId]);expect(svc.dutyFacts(third.queueId).send).toBe(true);expect(repo.getById(first.queueId)?.state).toBe('pending');expect(repo.getById(next.queueId)?.state).toBe('pending');
  });
- it('qualification retirement preserves UNKNOWN wake effects and issues no new duty',()=>{
+ it.each(['indeterminate','sending'] as const)('qualification retirement preserves %s wake effects and issues no new duty',deliveryState=>{
   samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});
   const old='legacy-qualification-assessment-unknown',sweep='legacy-qualification-sweep-unknown',nowIso=new Date(clock).toISOString();
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,expires_at,body) VALUES (?,?,?,?,?,?,?,?)').run(old,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending',new Date(clock-1000).toISOString(),'# Legacy qualification assessment\nExpired before pickup.');
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES (?,?,?,?,?,?,?)').run(sweep,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending','STUCK SWEEP FINDING (undelivered-wake)\nrow: '+old+'\nwhy: wake failed before delivery; nothing retried it');
   db.transaction(()=>repo.stageWakeIntent(old,'operator-agent@kernel','builder@xv','system:operator-authorized-coordination',true,'builder-g1'))();
-  db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE outbox_id=?").run('wake-intent-'+old);
+  db.prepare('UPDATE outbox_entries SET delivery_state=? WHERE outbox_id=?').run(deliveryState,'wake-intent-'+old);
   const before=db.prepare('SELECT count(*) n FROM queue_items').get();
   expect(refusal(()=>svc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',{rigId:'xv',targetQueueId:old,targetBodyHash:digest(repo.getById(old)!.body),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body),deadline:clock+30000})).code).toBe('qualification_retirement_effect_unknown');
   expect(db.prepare('SELECT count(*) n FROM queue_items').get()).toEqual(before);expect(repo.getById(old)?.state).toBe('pending');expect(repo.getById(sweep)?.state).toBe('pending');
+ });
+ it('qualification retirement refuses unrelated Worker custody without creating a duty',()=>{
+  samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});
+  const old='legacy-qualification-assessment-unrelated-custody',sweep='legacy-qualification-sweep-unrelated-custody',other='unrelated-worker-custody',nowIso=new Date(clock).toISOString();
+  db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,expires_at,body) VALUES (?,?,?,?,?,?,?,?)').run(old,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending',new Date(clock-1000).toISOString(),'# Legacy qualification assessment\nExpired before pickup.');
+  db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES (?,?,?,?,?,?,?)').run(sweep,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending','STUCK SWEEP FINDING (undelivered-wake)\nrow: '+old+'\nwhy: wake failed before delivery; nothing retried it');
+  db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES (?,?,?,?,?,?,?)').run(other,nowIso,nowIso,'lead@xv','builder@xv','pending','Unrelated active assignment; preserve its custody.');
+  db.transaction(()=>repo.stageWakeIntent(old,'operator-agent@kernel','builder@xv','system:operator-authorized-coordination',true,'builder-g1'))();
+  db.prepare("UPDATE outbox_entries SET delivery_state='failed' WHERE outbox_id=?").run('wake-intent-'+old);
+  const before=db.prepare('SELECT count(*) n FROM queue_items').get();
+  expect(refusal(()=>svc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',{rigId:'xv',targetQueueId:old,targetBodyHash:digest(repo.getById(old)!.body),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body),deadline:clock+30000})).code).toBe('qualification_duty_worker_protected');
+  expect(db.prepare('SELECT count(*) n FROM queue_items').get()).toEqual(before);expect(repo.getById(old)?.state).toBe('pending');expect(repo.getById(sweep)?.state).toBe('pending');expect(repo.getById(other)?.state).toBe('pending');
  });
  it.each(['unauthorized','stale-worker','expired'] as const)('qualification-only duty refuses %s without creating a queue or review',kind=>{
   configure(normal());samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});const contract={schema:'qualification-assessment-contract.v1' as const,artifactRef:'pilot/qualification-check.json',artifactSha256:'sha256:'+'a'.repeat(64),taskDigest:'sha256:'+'b'.repeat(64),scope:'qualification-only' as const,productAuthority:false as const};
