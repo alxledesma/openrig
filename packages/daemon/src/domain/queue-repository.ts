@@ -4318,9 +4318,15 @@ export class QueueRepository {
   private workflowGuidance?: (packetId: string) => string[];
   attachWorkflowGuidance(reader: (packetId: string) => string[]): void { this.workflowGuidance = reader; }
 
+  /** Classification only; no queue projection to avoid lifecycle-facts recursion. */
+  genericWatchActionable(qitemId: string): boolean {
+    return this.coordinatorAuthority.coordinationRecovery?.genericWatchActionable(qitemId) ?? true;
+  }
+
   evaluateWaitReminder(input: { jobId: string }) {
     const binding = this.wakeRepo.findCurrentQitemsByGeneratedTimer(input.jobId)[0];
     if (!binding && this.wakeRepo.findLiveQitemsByAttachedWatchdog(input.jobId).length > 0) return null;
+    if (binding && !this.genericWatchActionable(binding.qitemId)) return { action: "terminal" as const, reason: "queue_control_contained" };
     const result = evaluateQueueWait(this.watchdogJobsRepo ?? new WatchdogJobsRepository(this.db), input.jobId, binding ? this.waitingView(binding.qitemId) : null);
     // Only an already-admitted send reads prose: healthy silence, receipts and
     // failed-delivery retries remain owned by the existing wait evaluator.

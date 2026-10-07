@@ -736,6 +736,7 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
   const controls: WakeControlReceipt[] = [];
   const refusals: Array<{ qitemId: string; phase: string; code: string; recoveryQueueId?: string; recoveryError?: string }> = [];
   const refuse = async (row: QueueItem, phase: string, error: unknown) => {
+    if (!deps.queueRepo.genericWatchActionable(row.qitemId)) return;
     const code = typeof (error as {code?:unknown})?.code === "string" ? (error as {code:string}).code : error instanceof Error ? error.message : "wake_ladder_refused";
     const refusal: typeof refusals[number] = { qitemId: row.qitemId, phase, code }; refusals.push(refusal);
     try {
@@ -862,7 +863,7 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
 
     for (const { qitem_id } of [...batonRows, ...parkedOwnerFailureRows]) {
       const row = deps.queueRepo.getById(qitem_id);
-      if (!row) continue;
+      if (!row || !deps.queueRepo.genericWatchActionable(row.qitemId)) continue;
       try {
       const usagePool = usagePoolBySeat.get(row.destinationSession);
       // OPR.0.5.6.24: the usage-limit PARK mutation applies only to pending
@@ -1102,7 +1103,7 @@ async function advancePromptRefusals(
   const unreadableDestinations = new Set<string>();
   const loggedRows = new Set<string>();
   const readCandidate = (id: string, destination: string): QueueItem | null => {
-    try { return deps.queueRepo.getById(id); } catch {
+    try { return deps.queueRepo.genericWatchActionable(id) ? deps.queueRepo.getById(id) : null; } catch {
       unreadableDestinations.add(destination);
       if (!loggedRows.has(id)) {
         loggedRows.add(id);

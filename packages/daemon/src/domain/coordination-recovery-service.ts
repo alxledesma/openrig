@@ -1131,15 +1131,29 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
  private containedQualificationCustody(rigId:string,worker:string,generation:string,configurationDigest:string,assessmentIds:string[]):Set<string> {
   const allowed=new Set(assessmentIds);if(allowed.size===0)return allowed;
   const rows=this.db.prepare("SELECT qitem_id FROM queue_items WHERE destination_session=? AND state='pending' AND claimed_at IS NULL AND expires_at<=?").all(worker,new Date(this.now()).toISOString()) as Array<{qitem_id:string}>;
-  for(const {qitem_id} of rows){
-   const control=this.lifecycleControl(qitem_id),r=control?.receipt;
-   if(!control||control.rigId!==rigId||r.kind!=='qualification-assessment-retirement'||r.recipient!==worker||r.recipientGeneration!==generation||r.configurationDigest!==configurationDigest||!assessmentIds.includes(r.targetQueueId))continue;
-   const target=this.lifecycleControl(r.targetQueueId),q=this.repo.getById(r.targetQueueId);
-   if(!target||target.rigId!==rigId||target.receipt.kind!=='qualification-assessment'||target.receipt.recipient!==worker||target.receipt.recipientGeneration!==generation||target.receipt.configurationDigest!==configurationDigest||!q||digest(q.body)!==r.targetBodyHash)continue;
-   const facts=this.dutyFacts(qitem_id);
-   if(facts.expired&&facts.complete&&facts.retired&&this.dutyNoticeContained(rigId,r))allowed.add(qitem_id);
-  }
+  for(const {qitem_id} of rows)if(this.containedQualificationRetirement(qitem_id,rigId,worker,generation,configurationDigest,assessmentIds))allowed.add(qitem_id);
   return allowed;
+ }
+ /** Shared immutable proof for staging custody and generic watch classification.
+  * Never terminalizes the historical queue row or concludes delivery. */
+ private containedQualificationRetirement(queueId:string,rigId:string,worker:string,generation:string,configurationDigest:string,assessmentIds?:string[]):boolean {
+  const row=this.db.prepare("SELECT state,claimed_at,expires_at FROM queue_items WHERE qitem_id=? AND destination_session=?").get(queueId,worker) as {state:string;claimed_at:string|null;expires_at:string|null}|undefined;
+  if(!row||row.state!=='pending'||row.claimed_at!==null||!row.expires_at||row.expires_at>new Date(this.now()).toISOString())return false;
+  const control=this.lifecycleControl(queueId),r=control?.receipt;
+  if(!control||control.rigId!==rigId||r.kind!=='qualification-assessment-retirement'||r.recipient!==worker||r.recipientGeneration!==generation||r.configurationDigest!==configurationDigest||assessmentIds&&!assessmentIds.includes(r.targetQueueId))return false;
+  const target=this.lifecycleControl(r.targetQueueId),q=this.repo.getById(r.targetQueueId);
+  if(!target||target.rigId!==rigId||target.receipt.kind!=='qualification-assessment'||target.receipt.recipient!==worker||target.receipt.recipientGeneration!==generation||target.receipt.configurationDigest!==configurationDigest||!q||digest(q.body)!==r.targetBodyHash)return false;
+  const facts=this.dutyFacts(queueId);
+  return facts.expired&&facts.complete&&facts.retired&&this.dutyNoticeContained(rigId,r);
+ }
+ /** Pure, opt-out only for positively contained report-only history. Call at watch
+  * execution boundaries, never queue projection (dutyFacts reads queue faces). */
+ genericWatchActionable(queueId:string,expectedRigId?:string):boolean {
+  try {
+   const control=this.lifecycleControl(queueId),r=control?.receipt;
+   if(!control||expectedRigId&&control.rigId!==expectedRigId||r.kind!=='qualification-assessment-retirement'||!this.db.prepare('SELECT 1 FROM sessions s JOIN nodes n ON n.id=s.node_id WHERE s.session_name=? AND n.rig_id=?').get(r.recipient,control.rigId)||!r.recipientGeneration||!r.configurationDigest||this.authority.generation(r.recipient)!==r.recipientGeneration||this.configurationDigest(r.recipient)!==r.configurationDigest)return true;
+   return !this.containedQualificationRetirement(queueId,control.rigId,r.recipient,r.recipientGeneration,r.configurationDigest);
+  }catch(error){if(error instanceof SyntaxError)return true;throw error;}
  }
  private dutyExcludedNotices(r:any):string[] {
   const ids=['wake-intent-'+r.queueId];if(dutyKinds[r.kind as DutyKind]?.effectClass!=='report-only')return ids;
@@ -1846,7 +1860,7 @@ private dutyProtection(rigId:string,r:any):boolean {
      result.push({key:t.key,state:'held',reason:'fresh-activity-required',deadline:t.deadline,activityEvidence:{expectedGeneration:gen,generation:sample?.generation??null,identityVerified:sample?.identityVerified??false,identityAgeMs:age(sample?.identityObservedAt),activity:sample?.state.activity??null,decidedBy:sample?.state.decidedBy??null,needsInputCount:sample?.state.needsInput.count??null,witnessActivity:sample?.witness?.activity??null,witnessRung:sample?.witness?.rung??null,witnessAgeMs:age(sample?.witness?.observedAt),witnessSeatMatches:!!sample?.witness&&sample.witness.seatNodeId===sample.state.seatNodeId,swapGeneration:sample?.state.lastSwap?.generation??null,witnessPredatesSwap:!!sample?.witness&&!!sample.state.lastSwap&&Date.parse(sample.witness.observedAt)<Date.parse(sample.state.lastSwap.at)}});continue;
     }
     // An unrelated queue claim is an exclusive worker obligation, even while idle.
-    if(this.db.prepare("SELECT 1 FROM queue_items WHERE destination_session IN (?,?) AND state IN ('pending','in-progress','blocked')").get(...rotationLocalAddresses(this.db,t.owner))){result.push({key:t.key,state:'held',reason:'existing-worker-custody',deadline:t.deadline});continue;}
+    if((this.db.prepare("SELECT qitem_id FROM queue_items WHERE destination_session IN (?,?) AND state IN ('pending','in-progress','blocked')").all(...rotationLocalAddresses(this.db,t.owner)) as Array<{qitem_id:string}>).some(row=>this.genericWatchActionable(row.qitem_id,rigId))){result.push({key:t.key,state:'held',reason:'existing-worker-custody',deadline:t.deadline});continue;}
     const queueId=`qitem-coordination-${digest(rigId+':'+t.packageKey).slice(0,24)}`;
     // A retained pre-ledger row is history, not a new assignment. Never recreate
     // it or manufacture ownership; keep this slice accountable and continue others.
