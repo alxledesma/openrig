@@ -135,7 +135,8 @@ describe("qualification assessment coordinator CLI verbs", () => {
     const file = contractFile(body);
     await coordinatorCommand().parseAsync(["node", "rig", operation, file]);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.actor).toMatch(/^operator-agent@kernel@.+/);
+    // This isolated fixture has no durable origin instance; preserve the exact native actor.
+    expect(calls[0]?.actor).toBe(actor);
     expect(calls[0]).toMatchObject({ operation, generation, body });
     if (operation === "qualification-assessment-stage") {
       expect(recovery.prepareQualificationWorkerStageObservation).toHaveBeenCalledWith(calls[0]?.actor, generation, rigId, body.worker, body.workerGeneration, body.configurationDigest);

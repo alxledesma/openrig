@@ -1589,7 +1589,18 @@ private dutyProtection(rigId:string,r:any):boolean {
   const identityVerified=observation?.identityVerified===true&&observation.generation===before&&Number.isFinite(identityAt)&&identityAt<=now&&now-identityAt<=3000;
   return {worker:input.worker,generation:before,configurationDigest:this.configurationDigest(input.worker),observedAt:now,identityVerified,idle:identityVerified&&coordinationIdle(observation,before,now),observation,grantsAuthority:false};
  }
- async refreshActivity(rigId:string):Promise<void> {const plan=this.plan(rigId);if(plan?.refreshDispatchIdentity===true){const coordinators=JSON.parse(this.authority.get(rigId)?.coordinators??'[]') as string[];const retained=this.db.prepare("SELECT DISTINCT a.destination FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.disposition_id IS NULL AND q.state IN ('done','failed','denied','canceled','handed-off')").all(rigId) as Array<{destination:string}>;await this.refreshIdentity?.([...new Set([...coordinators,...plan.tasks.map(t=>t.owner),...retained.map(r=>r.destination)])]);}}
+ async refreshActivity(rigId:string):Promise<void> {
+  const plan=this.plan(rigId);if(plan?.refreshDispatchIdentity!==true)return;
+  const coordinators=JSON.parse(this.authority.get(rigId)?.coordinators??'[]') as string[];
+  const retained=this.db.prepare("SELECT DISTINCT a.destination FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.disposition_id IS NULL AND q.state IN ('done','failed','denied','canceled','handed-off')").all(rigId) as Array<{destination:string}>;
+  const recipients=[...new Set([...coordinators,...plan.tasks.map(t=>t.owner),...retained.map(r=>r.destination)])];
+  const planSnapshot=JSON.stringify(plan),bindings=recipients.map(session=>({session,generation:this.authority.generation(session),configuration:this.configurationDigest(session)}));
+  // Poll the real deciding activity producer alongside identity, never retimestamp cached evidence.
+  // An unavailable pane must not starve supervision of the entire rig. Failed
+  // polls preserve existing evidence; each recipient still passes its own freshness gates.
+  await Promise.all([this.refreshIdentity?.(recipients),Promise.allSettled(recipients.map(async session=>this.refreshWorkerActivity?.(session)))]);
+  if(JSON.stringify(this.plan(rigId))!==planSnapshot||bindings.some(({session,generation,configuration})=>this.authority.generation(session)!==generation||this.configurationDigest(session)!==configuration))fail('coordination_worker_probe_changed','Plan, generation or configuration changed during continuity observation');
+ }
  private get authority(){return this.repo.coordinatorAuthority;}
  private get db(){return this.authority.db;}
  private assertQualificationStageOperator(actor:string,generation:string,rigId:string):void {
@@ -1604,7 +1615,8 @@ private dutyProtection(rigId:string,r:any):boolean {
   if(!member||!beforeGeneration||!beforeConfiguration||expectedGeneration&&expectedGeneration!==beforeGeneration||expectedConfigurationDigest&&expectedConfigurationDigest!==beforeConfiguration)fail('qualification_duty_worker_stale','Exact current Worker generation and configuration digest required');
   if(!this.refreshIdentity||!this.refreshWorkerActivity)fail('qualification_duty_worker_not_quiescent','Fresh native Worker identity and activity observers are required');
   const refreshIdentity=this.refreshIdentity!,refreshWorkerActivity=this.refreshWorkerActivity!;
-  try { await refreshIdentity([worker]); await refreshWorkerActivity(worker); }
+  // Start both native observers together: serial probes can age the first witness beyond the 3s fence.
+  try { await Promise.all([refreshIdentity([worker]),refreshWorkerActivity(worker)]); }
   catch { fail('qualification_duty_worker_not_quiescent','Fresh native Worker identity and activity observation could not be obtained'); }
   this.assertQualificationStageOperator(actor,generation,rigId);
   const currentGeneration=this.authority.generation(worker),currentConfiguration=this.configurationDigest(worker);

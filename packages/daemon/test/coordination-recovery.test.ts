@@ -232,6 +232,73 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   svc.reconcile('lead@xv','lead-g1','xv');
   expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordination-reconcile'").get()).toEqual(before);
  });
+ it.each(['idle','busy','stale-witness','unknown','generation','configuration','plan','unavailable-unrelated','unavailable-target'] as const)('automatic continuity refreshes stale activity after exact A acceptance: %s',async outcome=>{
+  const tasks=[task('product'),task('repair','architect@xv',{recoveryFor:'product'}),task('next','reviewer@xv'),task('next-repair','architect@xv',{recoveryFor:'next'})];
+  for(const t of tasks)repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv',t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+  const parent=db.prepare("SELECT contract_hash FROM coordinator_packages WHERE rig_id='xv' AND package_key='product'").get() as {contract_hash:string};
+  const parentQueue='qitem-coordination-'+digest('xv:product').slice(0,24);
+  tasks[2].predecessors=[{packageKey:'product',contractHash:parent.contract_hash,queueId:parentQueue}];
+  const initial=configure(tasks,{}, {refreshDispatchIdentity:true});job();
+  const a=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='product')!.queueId!;
+  await finishTyped('product','builder@xv',a,'accepted-A-return');
+  const duty=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='acceptance:product')!.queueId!;
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  repo.claim({qitemId:duty,destinationSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1'});
+  const old=new Date(clock-3001).toISOString(),reviewer=samples.get('reviewer@xv')!;
+  samples.set('reviewer@xv',{...reviewer,witness:{...reviewer.witness!,observedAt:old}});
+  svc.accept('lead@xv','lead-g1','xv','product','accepted-A-return','actual/A-accepted.md');
+  repo.update({qitemId:duty,actorSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+  expect(db.prepare("SELECT 1 FROM coordinator_assignments WHERE package_key='next'").get()).toBeUndefined();
+  if(outcome==='unknown'){
+   repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv','unknown-effect',{inputDigest:digest('unknown-effect'),destination:'reviewer@xv',bodyHash:digest('preserve UNKNOWN'),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
+   await repo.create({qitemId:'unresolved-reviewer-effect',sourceSession:'lead@xv',destinationSession:'reviewer@xv',body:'preserve UNKNOWN',dispatch:{token,packageKey:'unknown-effect'},nudge:false});
+   repo.claim({qitemId:'unresolved-reviewer-effect',destinationSession:'reviewer@xv',actorGeneration:'reviewer-g1',identityProvenance:'transport:v1'});
+   repo.update({qitemId:'unresolved-reviewer-effect',actorSession:'reviewer@xv',actorGeneration:'reviewer-g1',identityProvenance:'transport:v1',state:'failed'});
+   db.transaction(()=>repo.stageWakeIntent('unresolved-reviewer-effect','lead@xv','reviewer@xv','transport:v1',true,'reviewer-g1'))();
+   db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE audit_pointer='unresolved-reviewer-effect'").run();
+  }
+  const unknownBefore=db.prepare("SELECT * FROM outbox_entries WHERE delivery_state='indeterminate'").all();
+  let identityPending=false,resolveIdentity!:()=>void;const polled:string[]=[];
+  const identity=vi.fn(async()=>{identityPending=true;await new Promise<void>(resolve=>{resolveIdentity=resolve;});identityPending=false;});
+  const poll=vi.fn(async(session:string)=>{
+   expect(identityPending).toBe(true);polled.push(session);
+   if((outcome==='unavailable-unrelated'&&session==='architect@xv')||(outcome==='unavailable-target'&&session==='reviewer@xv'))throw new Error('native-worker-activity-unavailable');
+   const observed=sample(session);
+   if(session==='reviewer@xv'){
+    if(outcome==='busy'){observed.state.activity='working';observed.witness!.activity='working';}
+    if(outcome==='stale-witness')observed.witness!.observedAt=old;
+    if(outcome==='generation')db.prepare("UPDATE occupant_tenures SET generation_uuid='reviewer-g2' WHERE node_id='reviewer@xv'").run();
+    if(outcome==='configuration')db.prepare("UPDATE nodes SET model='changed-during-poll' WHERE id='reviewer@xv'").run();
+    if(outcome==='plan')svc.configure('operator-agent@kernel','operator-agent-g1',{...initial,revision:'changed-during-poll'});
+   }
+   samples.set(session,observed);
+  });
+  svc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,identity,poll);repo.coordinatorAuthority.coordinationRecovery=svc;
+  const policy=makeCoordinatorContinuityPolicy(repo.coordinatorAuthority,async()=>{});
+  const evaluation=policy.evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);
+  // Availability and the first yield finish before these native observers start.
+  for(let i=0;i<10&&!identityPending;i++)await Promise.resolve();
+  expect(identityPending).toBe(true);expect(polled).toEqual(expect.arrayContaining(['lead@xv','peer@xv','builder@xv','reviewer@xv','architect@xv']));
+  resolveIdentity();
+  if(['generation','configuration','plan'].includes(outcome))await expect(evaluation).rejects.toMatchObject({code:'coordination_worker_probe_changed'});
+  else {
+   const observed=await evaluation;
+   if(outcome==='busy'||outcome==='stale-witness'||outcome==='unknown'||outcome==='unavailable-target')expect((observed.notes!.coordination as any[]).find(r=>r.key==='next')).toMatchObject({state:'held',reason:outcome==='unknown'?'uncertain-worker-effect':'fresh-activity-required'});
+  }
+  const next=db.prepare("SELECT queue_id FROM coordinator_assignments WHERE package_key='next'").all() as Array<{queue_id:string}>;
+  if(outcome==='idle'||outcome==='unavailable-unrelated'){
+   expect(next).toHaveLength(1);expect(next[0].queue_id).not.toBe(a);expect(repo.getById(next[0].queue_id)?.state).toBe('pending');
+   const resolution=JSON.parse((db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='coordination-predecessor-resolution' AND operation_id='coordination-predecessor-resolution:xv:next'").get() as {receipt:string}).receipt);
+   expect(resolution.predecessors).toEqual([{packageKey:'product',contractHash:parent.contract_hash,queueId:a,dispositionId:'accepted-A-return',acceptOperationId:'coordination-accept:product'}]);
+   expect(db.prepare("SELECT count(*) n FROM outbox_entries WHERE audit_pointer=?").get(next[0].queue_id)).toEqual({n:1});
+   // Repeated automatic passes cannot duplicate B or imply its native pickup.
+   const repeat=policy.evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);
+   for(let i=0;i<10&&!identityPending;i++)await Promise.resolve();resolveIdentity();await repeat;
+   expect(db.prepare("SELECT count(*) n FROM coordinator_assignments WHERE package_key='next'").get()).toEqual({n:1});
+   expect(repo.getById(next[0].queue_id)?.state).toBe('pending');
+  }else expect(next).toHaveLength(0);
+  expect(db.prepare("SELECT * FROM outbox_entries WHERE delivery_state='indeterminate'").all()).toEqual(unknownBefore);
+ });
  it('native identity refresh enables only the checkpoint-authorized recovery, with genuine pickup and no Peer takeover',async()=>{
   const tasks=[task('product'),task('unrelated','peer@xv',{recoveryFor:'product'}),task('repair','peer@xv',{recoveryFor:'product'})];
   const initial=configure(tasks);job();samples.delete('builder@xv');samples.get('peer@xv')!.identityVerified=false;
@@ -660,15 +727,21 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   expect(repo.getById(old)?.state).toBe('pending');expect(repo.getById(sweep)?.state).toBe('pending');
  });
  it('qualification assessment and retirement stage from refreshed identity and idle activity, rejecting a changed Worker generation',async()=>{
-  const refreshed:string[]=[];
+  const refreshed:string[]=[];let identityPending=false,deferNextIdentity=true,activityStartedWhileIdentityPending=false,resolveIdentity!:()=>void;
   const stageSvc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,async sessions=>{
    for(const session of sessions){
     refreshed.push('identity:'+session);
+    identityPending=true;
+   }
+   if(deferNextIdentity){deferNextIdentity=false;await new Promise<void>(resolve=>{resolveIdentity=resolve;});}
+   for(const session of sessions){
+    identityPending=false;
     const current=samples.get(session)!;
     samples.set(session,{...current,identityVerified:true,identityObservedAt:new Date(clock).toISOString()});
    }
   },async session=>{
    refreshed.push('activity:'+session);
+   activityStartedWhileIdentityPending=identityPending;
    const current=samples.get(session)!;
    const fresh=sample(session);
    samples.set(session,{...fresh,identityObservedAt:current.identityObservedAt??new Date(clock).toISOString()});
@@ -681,7 +754,11 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   stale('builder@xv');
   const builderConfig=stageSvc.configurationDigest('builder@xv')!;
   expect(refusal(()=>stageSvc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:builderConfig,deadline:clock+30000,contract})).message).toContain('fresh native observation prepared');
-  const assessmentObservation=await stageSvc.prepareQualificationWorkerStageObservation('operator-agent@kernel','operator-agent-g1','xv','builder@xv','builder-g1',builderConfig);
+  const assessmentPending=stageSvc.prepareQualificationWorkerStageObservation('operator-agent@kernel','operator-agent-g1','xv','builder@xv','builder-g1',builderConfig);
+  await Promise.resolve();
+  expect(activityStartedWhileIdentityPending).toBe(true);
+  resolveIdentity();
+  const assessmentObservation=await assessmentPending;
   expect(refreshed.slice(0,2)).toEqual(['identity:builder@xv','activity:builder@xv']);
   const assessment=stageSvc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:builderConfig,deadline:clock+30000,contract},assessmentObservation);
   expect(repo.getById(assessment.queueId)?.destinationSession).toBe('builder@xv');
@@ -709,6 +786,23 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   stale('reviewer@xv');
   await expect(changedSvc.prepareQualificationWorkerStageObservation('operator-agent@kernel','operator-agent-g1','xv','reviewer@xv','reviewer-g1',changedSvc.configurationDigest('reviewer@xv')!)).rejects.toMatchObject({code:'qualification_duty_worker_stale'});
   expect(db.prepare('SELECT count(*) n FROM queue_items').get()).toEqual(priorRows);
+ });
+ it.each(['configuration','stale-identity','stale-activity','observer-failure'] as const)('qualification concurrent observation holds on %s without creating custody',async failure=>{
+  const beforeRows=db.prepare('SELECT count(*) n FROM queue_items').get();
+  const freshSvc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,async sessions=>{
+   for(const session of sessions){
+    const current=samples.get(session)!;
+    samples.set(session,{...current,identityObservedAt:new Date(clock-(failure==='stale-identity'?3001:0)).toISOString()});
+   }
+  },async session=>{
+   if(failure==='observer-failure')throw new Error('native activity unavailable');
+   if(failure==='configuration')db.prepare("UPDATE nodes SET model='changed-during-observation' WHERE id=?").run(session);
+   const current=samples.get(session)!,fresh=sample(session);
+   samples.set(session,{...fresh,identityObservedAt:current.identityObservedAt,witness:{...fresh.witness!,observedAt:new Date(clock-(failure==='stale-activity'?3001:0)).toISOString()}});
+  });
+  const configuration=freshSvc.configurationDigest('builder@xv')!;
+  await expect(freshSvc.prepareQualificationWorkerStageObservation('operator-agent@kernel','operator-agent-g1','xv','builder@xv','builder-g1',configuration)).rejects.toMatchObject({code:failure==='configuration'?'qualification_duty_worker_stale':'qualification_duty_worker_not_quiescent'});
+  expect(db.prepare('SELECT count(*) n FROM queue_items').get()).toEqual(beforeRows);
  });
  it('qualification retirement does not observe completion after the Operator binding changes',()=>{
   samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});
@@ -1106,6 +1200,19 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
  function unavailableSetup(){const prior=configure(normal());svc.configure('operator-agent@kernel','operator-agent-g1',{...prior,revision:'unavailable-r2',allowIdlePeerTransfer:false,allowUnavailablePeerTransfer:true});job();repo.coordinatorAuthority.renew('lead@xv',token,10000,'short-lease');clock+=10001;vi.setSystemTime(clock);refresh();}
  function observer(state:RuntimeAvailability['state']='absent',age=0,generation='lead-g1'){repo.coordinatorAuthority.setRuntimeObserver(async session=>({session,generation:session==='lead@xv'?generation:'peer-g1',state:session==='lead@xv'?state:'present',observedAt:clock-age,fingerprint:'actual-test-census-'+session}));}
  it('admitted unavailable expired owner transfers automatically with actual Peer wake/claim/ACK preserving worker custody',async()=>{const initial=configure(normal(),{product:['file:valuable']});const work=svc.reconcile('lead@xv','lead-g1','xv')[0];repo.claim({qitemId:work.queueId!,destinationSession:'builder@xv'});db.prepare("UPDATE outbox_entries SET delivery_state='delivered' WHERE delivery_state='pending'").run();svc.configure('operator-agent@kernel','operator-agent-g1',{...initial,revision:'unavailable-r2',allowIdlePeerTransfer:false,allowUnavailablePeerTransfer:true});job();const before=db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(work.queueId),resourcesBefore=db.prepare('SELECT * FROM coordinator_resources').all();repo.coordinatorAuthority.renew('lead@xv',token,10000,'short-lease');clock+=10001;vi.setSystemTime(clock);refresh();observer();db.prepare("INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES ('peer-binding','peer@xv','peer@xv','%2')").run();const sends:string[]=[];repo.attachTransport({send:async(session,text,opts)=>{sends.push(opts!.queueAssignmentId!);repo.claim({qitemId:opts!.queueAssignmentId!,destinationSession:session});return {ok:true,verified:true};}});await makeCoordinatorContinuityPolicy(repo.coordinatorAuthority).evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);const a=repo.coordinatorAuthority.get('xv')!;expect(a).toMatchObject({epoch:2,state:'reconciling',owner_session:'peer@xv'});expect(sends).toHaveLength(1);expect(repo.getById(sends[0])?.state).toBe('in-progress');expect(repo.getById('baton')?.state).toBe('pending');expect(db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(work.queueId)).toEqual(before);expect(db.prepare('SELECT * FROM coordinator_resources').all()).toEqual(resourcesBefore);expect(()=>repo.coordinatorAuthority.renew('lead@xv',token,60000,'retired')).toThrow();repo.coordinatorAuthority.acknowledge('peer@xv',{rigId:'xv',epoch:2,generation:'peer-g1'},{operationId:'peer-real-ack',obligationsDigest:repo.coordinatorAuthority.reconciliationDigest('xv')});expect(repo.getById('baton')?.state).toBe('in-progress');expect(svc.reconcile('peer@xv','peer-g1','xv')[0].state).toBe('picked-up');});
+ it('automatic continuity still supervises an unavailable owner when its activity poll fails',async()=>{
+  unavailableSetup();const prior=svc.plan('xv')!;
+  svc.configure('operator-agent@kernel','operator-agent-g1',{...prior,revision:'unavailable-observer',refreshDispatchIdentity:true});
+  observer();
+  const poll=vi.fn(async(session:string)=>{if(session==='lead@xv')throw new Error('native-worker-activity-unavailable');samples.set(session,sample(session));});
+  svc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,async()=>{},poll);repo.coordinatorAuthority.coordinationRecovery=svc;
+  const before=db.prepare('SELECT * FROM coordinator_resources').all();
+  await makeCoordinatorContinuityPolicy(repo.coordinatorAuthority,async()=>{}).evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);
+  expect(poll).toHaveBeenCalledWith('lead@xv');
+  expect(repo.coordinatorAuthority.get('xv')).toMatchObject({epoch:2,state:'reconciling',owner_session:'peer@xv'});
+  expect(repo.getById('baton')?.state).toBe('pending');
+  expect(db.prepare('SELECT * FROM coordinator_resources').all()).toEqual(before);
+ });
  it.each(['present','unknown'] as const)('expired lease plus %s native owner never permits unavailable takeover',async(state)=>{unavailableSetup();observer(state);await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');expect(svc.supervise('xv','j')?.[0].state).toBe('recovery-required');expect(repo.coordinatorAuthority.get('xv')?.epoch).toBe(1);expect(repo.getById('baton')?.state).toBe('in-progress');});
  it('stale or wrong generation native absence cannot substitute for current exclusion',async()=>{unavailableSetup();observer('absent',1001);await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');expect(repo.coordinatorAuthority.hasFreshUnavailableOwner('xv')).toBe(false);expect(svc.supervise('xv','j')?.[0].state).toBe('recovery-required');observer('absent',0,'retired');await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');expect(repo.coordinatorAuthority.hasFreshUnavailableOwner('xv')).toBe(false);expect(repo.coordinatorAuthority.get('xv')?.epoch).toBe(1);});
  it.each(['busy-peer','expired-admission','changed-baton','uncertain-effects','reserved-peer','old-operator'])('unavailable-owner %s refusal is accountable and preserves existing epoch/baton',async(reason)=>{unavailableSetup();observer();await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');if(reason==='busy-peer')samples.get('peer@xv')!.state.activity='working';if(reason==='expired-admission'){clock+=60000;vi.setSystemTime(clock);refresh();observer();await repo.coordinatorAuthority.refreshRuntimeAvailability('xv');}if(reason==='changed-baton')db.prepare("UPDATE queue_items SET claimed_by_generation_uuid='retired' WHERE qitem_id='baton'").run();if(reason==='uncertain-effects')repo.stageWakeIntent('baton','lead@xv','lead@xv','transport:v1',true);if(reason==='reserved-peer')db.exec("CREATE TEMP TRIGGER test_reserved_peer BEFORE INSERT ON queue_items WHEN NEW.destination_session='peer@xv' BEGIN SELECT RAISE(ABORT,'seat_dispatch_reserved'); END");if(reason==='old-operator')db.prepare("UPDATE occupant_tenures SET generation_uuid='operator-agent-g2' WHERE node_id='operator-agent@kernel'").run();if(reason==='old-operator')expect(()=>svc.supervise('xv','j')).toThrow('Current Operator');else{const held=svc.supervise('xv','j')![0];expect(held.state).toBe('held');expect(held.queueId).toBeTruthy();expect(repo.getById(held.queueId!)?.destinationSession).toBe('operator-agent@kernel');}expect(repo.coordinatorAuthority.get('xv')?.epoch).toBe(1);expect(repo.getById('baton')?.destinationSession).toBe('lead@xv');});
