@@ -358,6 +358,13 @@ export class CoordinationRecoveryService {
   const id='qitem-coordination-'+digest(rigId+':'+t.packageKey).slice(0,24);
   return !this.db.prepare('SELECT 1 FROM coordinator_assignments WHERE rig_id=? AND package_key=?').get(rigId,t.packageKey)&&!this.db.prepare('SELECT 1 FROM coordinator_stage_assignments WHERE rig_id=? AND package_key=?').get(rigId,t.packageKey)&&!this.db.prepare('SELECT 1 FROM coordinator_resources WHERE rig_id=? AND package_key=?').get(rigId,t.packageKey)&&!this.db.prepare("SELECT 1 FROM queue_items WHERE qitem_id=? AND state IN ('pending','in-progress','blocked')").get(id);
  }
+ /** Read-only work boundary for finite native continuation grants. Reuse exact
+  * acceptance and dormant recovery semantics instead of treating unused backup
+  * packages as perpetual work after their primary has been accepted. */
+ continuationTasks(rigId:string):CoordinationTask[] {
+  const plan=this.plan(rigId);if(!plan)return [];
+  return plan.tasks.filter(t=>!this.acceptedTaskHistory(rigId,t)&&!(t.recoveryFor&&this.dormantRecoveryHistory(rigId,t,plan)));
+ }
 /** Explicit administrative allowlist for the acknowledgment-contract debt boundary:
    * only the Operator's own qualification refresh (F3) uses it. The pre-existing
    * materialization duty keeps its strict zero-debt gate, and no future kind inherits
@@ -2046,9 +2053,26 @@ private dutyProtection(rigId:string,r:any):boolean {
    return result;
   }).immediate();
  }
- configurationDigest(session:string):string|null {
-  const row=this.db.prepare('SELECT n.id,n.runtime,n.model,n.profile,n.codex_config_profile,n.cwd FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(session);
-  return row?digest(JSON.stringify(row)):null;
+ configurationDigest(session:string,launch?:{nodeId:string;generation:string;runtime:string}):string|null {
+  const row=this.db.prepare('SELECT n.id,n.runtime,n.model,n.profile,n.codex_config_profile,n.cwd FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(session) as {id:string;runtime:string;model:string|null;profile:string|null;codex_config_profile:string|null;cwd:string|null}|undefined;
+  if(!row)return null;
+  if(launch){
+   if(row.id!==launch.nodeId)return null;
+   const reservation=this.db.prepare("SELECT expected_json,successor_generation FROM seat_dispatch_reservations WHERE node_id=? AND state='started'").get(launch.nodeId) as {expected_json:string;successor_generation:string|null}|undefined;
+   if(reservation){
+    let prepared:any;try{prepared=JSON.parse(reservation.expected_json);}catch{return null;}
+    if(prepared.protocol==='runtime-migration-v1'){
+     if(reservation.successor_generation!==launch.generation||prepared.expected?.nodeId!==row.id||prepared.expected?.sessionName!==session
+       ||prepared.target?.runtime!==launch.runtime||typeof prepared.target.model!=='string'||typeof prepared.target.codexConfigProfile!=='string')return null;
+     // The authenticated one-shot migration commits these exact fields only
+     // after native launch. Pin that staged configuration in the launch intent;
+     // an effect grant still requires the eventual current committed digest.
+     return digest(JSON.stringify({...row,runtime:prepared.target.runtime,model:prepared.target.model,codex_config_profile:prepared.target.codexConfigProfile}));
+    }
+   }
+   if(row.runtime!==launch.runtime)return null;
+  }
+  return digest(JSON.stringify(row));
  }
  private dispatchScopeHold(plan:CoordinationPlan,t:CoordinationTask):string|null {
   const r=plan.dispatchRestrictions?.find(r=>r.session===t.owner);if(!r)return null;

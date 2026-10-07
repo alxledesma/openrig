@@ -11,7 +11,7 @@ import Database from "better-sqlite3";
 import { parse as parseToml } from "smol-toml";
 import type { TmuxAdapter } from "./tmux.js";
 import type { SeatLaunchEnvironment } from "../domain/seat-launch-environment.js";
-import { codexPostureArg } from "./yolo-mode.js";
+import { codexPostureArg, codexPostureArgs } from "./yolo-mode.js";
 import type {
   RuntimeAdapter, NodeBinding, ResolvedStartupFile,
   InstalledResource, ProjectionResult, StartupDeliveryResult, ReadinessResult,
@@ -28,9 +28,9 @@ import {
   readCodexThreadIdFromCandidateHomes,
   type ResolveHomeDirByPid,
 } from "../domain/codex-thread-id.js";
-import { assessNativeResumeProbe, buildCodexResumeCore, type NativeResumeProbeResult } from "../domain/native-resume-probe.js";
+import { assessNativeResumeProbe, buildCodexResumeCore, buildCodexResumeArgs, type NativeResumeProbeResult } from "../domain/native-resume-probe.js";
 import { unknownDaemonSupportMessage, type CodexDaemonSupportDetector } from "../domain/codex-daemon-support.js";
-import { codexNetworkDefaultArg, type CodexNetworkDefaultReader } from "../domain/codex-network-default.js";
+import { codexNetworkDefaultArgs, type CodexNetworkDefaultReader } from "../domain/codex-network-default.js";
 import { resolveCodexGitAddDirs, type CodexGitAddDirResolver } from "../domain/codex-git-add-dirs.js";
 import { mergeManagedBlock } from "../domain/managed-blocks.js";
 import { parseSessionName } from "../domain/session-name.js";
@@ -385,6 +385,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     const profile = binding.codexConfigProfile?.trim();
     const profileArg = profile ? ` -p ${shellQuote(profile)}` : "";
     const postureArg = codexPostureArg(profileArg, process.env, binding.launchPosture);
+    const postureArgs = codexPostureArgs(profile, process.env, binding.launchPosture);
     const appliedLaunch = observeCodexSandbox(postureArg);
 
     // OPR.0.3.4.7 — profile-LOAD probe before launch/resume. A legacy
@@ -401,6 +402,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       }
     }
     const queueStateDirArg = this.buildQueueStateAddDirArg(opts.name);
+    const queueStateArgs = this.buildQueueStateAddDirArgs(opts.name);
     // #69: one daemon-support decision for this launch, for the Codex the seat pane runs
     // (its cwd, the launch PATH), applied to fresh, fork and resume.
     const daemonSupport = this.detectDaemonSupport ? await this.detectDaemonSupport(binding.cwd) : undefined;
@@ -410,7 +412,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     const daemonOptOut = daemonSupport?.kind === "supported";
     const daemonArg = daemonOptOut ? " --no-daemon" : "";
     // #275: on the plain floor, network access unless Codex reports an opt-out or policy.
-    const networkArg = await codexNetworkDefaultArg(this.readNetworkDefault, appliedLaunch, binding.cwd, opts.name);
+    const networkArgs = await codexNetworkDefaultArgs(this.readNetworkDefault, appliedLaunch, binding.cwd, opts.name);
+    const networkArg = networkArgs.length ? ` -c ${shellQuote(networkArgs[1]!)}` : "";
+    const topArgs = [...(daemonOptOut ? ["--no-daemon"] : []), ...postureArgs, ...networkArgs,
+      ...(model ? ["-m", model] : []), ...(effort ? ["-c", `model_reasoning_effort="${effort}"`] : [])];
 
     // Fork branch: `codex fork <parent_thread_id>`. Captures the NEW thread id
     // post-fork. Parent thread id is NOT persisted onto the new seat record
@@ -431,9 +436,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       // -s workspace-write floor flag.
       // 0.5.2-07 A2-3: the FORK path threads the SPEC model too (fork-instantiate reverted it before).
       const cmd = `codex${daemonArg}${postureArg}${networkArg}${modelArg}${effortArg} fork${queueStateDirArg} ${shellQuote(parentId)}`;
-      const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, this.seatLaunchEnvironment
-        ? await this.seatLaunchEnvironment.command(binding.tmuxSession, cmd, { codexCwd: binding.cwd, nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: this.runtime })
-        : this.launchCommand(cmd));
+      let launch: string;
+      try { launch = await this.composeNativeLaunch(binding, cmd, [...topArgs, "fork", ...queueStateArgs, parentId]); }
+      catch { return { ok: false, error: "Native duty launch composition refused" }; }
+      const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, launch);
       if (!textResult.ok) {
         return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
       }
@@ -454,18 +460,23 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     // -s danger-full-access (overrides even a named profile); otherwise the named profile, or
     // OpenRig's explicit -s workspace-write floor flag.
     // Issue #121: only the fresh launch adds git metadata dirs; resume and fork never did.
-    const gitDirArg = opts.resumeToken
-      ? ""
-      : (await this.resolveGitAddDirs(binding.cwd)).map((dir) => ` --add-dir ${shellQuote(dir)}`).join("");
+    const gitDirs = opts.resumeToken ? [] : await this.resolveGitAddDirs(binding.cwd);
+    const gitDirArg = gitDirs.map((dir) => ` --add-dir ${shellQuote(dir)}`).join("");
     const cmd = opts.resumeToken
       // 0.5.2-07 A2-3: the pod-aware RESUME path threads the SPEC model too (reverted before — the
       // grounding map assumed codex parity with the claude adapter, but only fresh emitted -m).
       ? buildCodexResumeCore(opts.resumeToken, profile, false, queueStateDirArg.trim() || undefined, binding.launchPosture, model, `${postureArg}${networkArg}`, daemonOptOut, effort)
       : `codex${daemonArg}${postureArg}${networkArg} -C ${shellQuote(binding.cwd)}${gitDirArg}${queueStateDirArg}${modelArg}${effortArg}`;
 
-    const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, this.seatLaunchEnvironment
-        ? await this.seatLaunchEnvironment.command(binding.tmuxSession, cmd, { codexCwd: binding.cwd, nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: this.runtime })
-        : this.launchCommand(cmd));
+    const args = opts.resumeToken
+      ? buildCodexResumeArgs({ resumeToken: opts.resumeToken, postureArgs, networkArgs, extraArgs: queueStateArgs, model, effort, daemonOptOut })
+      : [...(daemonOptOut ? ["--no-daemon"] : []), ...postureArgs, ...networkArgs, "-C", binding.cwd,
+        ...gitDirs.flatMap(dir => ["--add-dir", dir]), ...queueStateArgs, ...(model ? ["-m", model] : []),
+        ...(effort ? ["-c", `model_reasoning_effort="${effort}"`] : [])];
+    let launch: string;
+    try { launch = await this.composeNativeLaunch(binding, cmd, args); }
+    catch { return { ok: false, error: "Native duty launch composition refused" }; }
+    const textResult = await this.tmux.sendShellCommand(binding.tmuxSession, launch);
     if (!textResult.ok) {
       return { ok: false, error: `Failed to send launch command: ${textResult.message}` };
     }
@@ -488,15 +499,29 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return { ok: true, appliedLaunch };
   }
 
+  private async composeNativeLaunch(binding: NodeBinding, command: string, args: string[]): Promise<string> {
+    const env = this.seatLaunchEnvironment;
+    if (env && await env.usesNativeDuty?.(binding.tmuxSession!, binding.nodeId)) {
+      return env.structuredCommand(binding.tmuxSession!, { executable: "codex", args, cwd: binding.cwd },
+        { nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: "codex" });
+    }
+    return env ? env.command(binding.tmuxSession!, command, { codexCwd: binding.cwd, nodeId: binding.nodeId,
+      generation: binding.launchGeneration, runtime: this.runtime }) : this.launchCommand(command);
+  }
+
   private buildQueueStateAddDirArg(sessionName: string): string {
+    const args = this.buildQueueStateAddDirArgs(sessionName);
+    return args.length ? ` --add-dir ${shellQuote(args[1]!)}` : "";
+  }
+  private buildQueueStateAddDirArgs(sessionName: string): string[] {
     const identity = parseCanonicalSessionName(sessionName);
-    if (!identity) return "";
+    if (!identity) return [];
 
     const sharedDocsRoot = process.env.OPENRIG_SHARED_DOCS_ROOT?.trim()
       // OPR.0.3.2.14 — subpath scrubbed (internal-team layout → generic placeholder).
       || nodePath.join(this.fs.homedir ?? os.homedir(), ".openrig", "shared-docs");
     const queueStateRoot = nodePath.join(sharedDocsRoot, "rigs", identity.rig, "state", identity.pod);
-    return ` --add-dir ${shellQuote(queueStateRoot)}`;
+    return ["--add-dir", queueStateRoot];
   }
 
   private async captureProbeScreen(target: string): Promise<string> {

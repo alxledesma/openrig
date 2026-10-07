@@ -91,8 +91,16 @@ export async function codexNetworkDefaultArg(
   cwd: string,
   session: string,
 ): Promise<string> {
+  const args = await codexNetworkDefaultArgs(read, appliedLaunch, cwd, session);
+  return args.length ? ` -c ${shellQuote(args[1]!)}` : "";
+}
+
+export async function codexNetworkDefaultArgs(
+  read: CodexNetworkDefaultReader | undefined, appliedLaunch: AppliedLaunchObservation,
+  cwd: string, session: string,
+): Promise<string[]> {
   if (!read || appliedLaunch.state !== "observed" || appliedLaunch.value !== "workspace-write" || appliedLaunch.approvalPolicy != null) {
-    return "";
+    return [];
   }
   let result: CodexNetworkDefault;
   try {
@@ -101,7 +109,7 @@ export async function codexNetworkDefaultArg(
     result = { ...no(`the reader failed: ${firstLine(error)}`), elapsedMs: 0 };
   }
   console.log(`[openrig] codex network default for ${session}: ${result.apply ? "applied" : `not applied (${result.reason})`}, ${result.elapsedMs} ms`);
-  return result.apply ? ` -c ${shellQuote(CODEX_NETWORK_DEFAULT_OVERRIDE)}` : "";
+  return result.apply ? ["-c", CODEX_NETWORK_DEFAULT_OVERRIDE] : [];
 }
 
 export interface CodexNetworkReaderOptions {

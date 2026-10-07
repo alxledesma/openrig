@@ -2,13 +2,13 @@ import { setTimeout as sleep } from "node:timers/promises";
 import type { TmuxAdapter } from "./tmux.js";
 import type { SeatLaunchEnvironment } from "../domain/seat-launch-environment.js";
 import type { ResumeResult } from "./claude-resume.js";
-import { assessNativeResumeProbe, buildCodexResumeCore } from "../domain/native-resume-probe.js";
+import { assessNativeResumeProbe, buildCodexResumeCore, buildCodexResumeArgs } from "../domain/native-resume-probe.js";
 import { runSyncSite } from "../domain/sync-site-wrap.js";
 import { shellQuote } from "./shell-quote.js";
-import { codexPostureArg } from "./yolo-mode.js";
+import { codexPostureArg, codexPostureArgs } from "./yolo-mode.js";
 import { observeCodexSandbox } from "../domain/permission-drift.js";
 import { unknownDaemonSupportMessage, type CodexDaemonSupportDetector } from "../domain/codex-daemon-support.js";
-import { codexNetworkDefaultArg, type CodexNetworkDefaultReader } from "../domain/codex-network-default.js";
+import { codexNetworkDefaultArgs, type CodexNetworkDefaultReader } from "../domain/codex-network-default.js";
 
 const CODEX_TYPES = new Set(["codex_id", "codex_last"]);
 const SHELL_COMMANDS = new Set(["bash", "fish", "nu", "sh", "tmux", "zsh"]);
@@ -135,8 +135,10 @@ export class CodexResumeAdapter {
 
     const profileArg = codexConfigProfile ? ` -p ${shellQuote(codexConfigProfile)}` : "";
     const postureArg = codexPostureArg(profileArg, process.env, resolvedPosture);
+    const postureArgs = codexPostureArgs(codexConfigProfile, process.env, resolvedPosture);
     const appliedLaunch = observeCodexSandbox(postureArg);
-    const networkArg = await codexNetworkDefaultArg(this.options.readNetworkDefault, appliedLaunch, cwd, tmuxSessionName);
+    const networkArgs = await codexNetworkDefaultArgs(this.options.readNetworkDefault, appliedLaunch, cwd, tmuxSessionName);
+    const networkArg = networkArgs.length ? ` -c ${shellQuote(networkArgs[1]!)}` : "";
     const cmd = buildCodexResumeCore(
       resumeToken ?? "",
       codexConfigProfile,
@@ -150,9 +152,17 @@ export class CodexResumeAdapter {
     );
 
     const launchEnv = [this.options.launchPath ? `PATH=${shellQuote(this.options.launchPath)}` : "", this.options.codexHome ? `CODEX_HOME=${shellQuote(this.options.codexHome)}` : ""].filter(Boolean);
-    const textTarget = this.options.seatLaunchEnvironment
-      ? await this.options.seatLaunchEnvironment.command(tmuxSessionName, cmd, { codexCwd: cwd, runtime: "codex", ...(ledgerGeneration !== undefined ? { generation: ledgerGeneration } : {}) })
-      : launchEnv.length ? `env ${launchEnv.join(" ")} ${cmd}` : cmd;
+    let textTarget: string;
+    try {
+      const env = this.options.seatLaunchEnvironment;
+      textTarget = env && await env.usesNativeDuty?.(tmuxSessionName)
+        ? await env.structuredCommand(tmuxSessionName, { executable: "codex", cwd,
+          args: buildCodexResumeArgs({ resumeToken: resumeToken ?? "", useLast: resumeType === "codex_last",
+            postureArgs, networkArgs, model, effort, daemonOptOut: daemonSupport?.kind === "supported" }) },
+          { runtime: "codex", generation: ledgerGeneration })
+        : env ? await env.command(tmuxSessionName, cmd, { codexCwd: cwd, runtime: "codex", ...(ledgerGeneration !== undefined ? { generation: ledgerGeneration } : {}) })
+          : launchEnv.length ? `env ${launchEnv.join(" ")} ${cmd}` : cmd;
+    } catch { return { ok: false, code: "resume_failed", message: "Native duty launch composition refused" }; }
     // Structured binding proof (R3-F2): only LEADING environment assignments count —
     // a generation string inside command arguments proves nothing about the child env,
     // and the composer's best-effort fallback carries none at all.

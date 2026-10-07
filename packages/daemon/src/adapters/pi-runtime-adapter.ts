@@ -12,6 +12,7 @@
 import nodePath from "node:path";
 import { randomUUID } from "node:crypto";
 import type { TmuxAdapter } from "./tmux.js";
+import type { SeatLaunchEnvironment } from "../domain/seat-launch-environment.js";
 import { piTrust, yoloEnabled } from "./yolo-mode.js";
 import type {
   RuntimeAdapter, NodeBinding, ResolvedStartupFile,
@@ -24,7 +25,7 @@ import { validateResumeToken } from "../domain/resume-token-validation.js";
 import { mergeManagedBlock } from "../domain/managed-blocks.js";
 import { observePiResourceTrust, observeOmpApprovalMode } from "../domain/permission-drift.js";
 import {
-  piSeatPaths, parsePiRunnerState, buildPiRunnerCommand, buildPendingRunnerState,
+  piSeatPaths, parsePiRunnerState, buildPiRunnerCommand, buildPiRunnerArgs, buildPendingRunnerState,
   PI_RUNNER_READY_MARKER, PI_RUNNER_ERROR_MARKER, PI_RUNNER_EXIT_MARKER,
   type PiRunnerState, type RunnerRuntime,
 } from "./pi-runner-protocol.js";
@@ -40,6 +41,7 @@ export interface PiAdapterFsOps {
 }
 
 export interface PiRuntimeAdapterDeps {
+  seatLaunchEnvironment?: SeatLaunchEnvironment;
   tmux: TmuxAdapter;
   fsOps: PiAdapterFsOps;
   /** Root under which every Pi seat gets its isolated state dir (FR-7).
@@ -66,9 +68,11 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
   private trustPosture: "approve" | "no-approve";
   private sleep: (ms: number) => Promise<void>;
   private newLaunchId: () => string;
+  private seatLaunchEnvironment?: SeatLaunchEnvironment;
 
   constructor(deps: PiRuntimeAdapterDeps) {
     this.tmux = deps.tmux;
+    this.seatLaunchEnvironment = deps.seatLaunchEnvironment;
     this.fs = deps.fsOps;
     this.stateRoot = deps.stateRoot;
     this.runnerEntryPath = deps.runnerEntryPath;
@@ -243,7 +247,7 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
     const appliedLaunch = this.runtime === "omp"
       ? observeOmpApprovalMode(`--approval-mode ${trust === "approve" ? "yolo" : "always-ask"}`)
       : observePiResourceTrust(trust);
-    const cmd = buildPiRunnerCommand({
+    const launchOpts = {
       runtime: this.runtime,
       runnerEntryPath: this.runnerEntryPath,
       sessionName,
@@ -256,7 +260,15 @@ export class PiRuntimeAdapter implements RuntimeAdapter {
       sessionFile: opts.resumeToken,
       forkRef,
       launchId,
-    });
+    };
+    let cmd = buildPiRunnerCommand(launchOpts);
+    try {
+      if (this.runtime === "pi" && this.seatLaunchEnvironment && await this.seatLaunchEnvironment.usesNativeDuty(sessionName, binding.nodeId)) {
+        cmd = await this.seatLaunchEnvironment.structuredCommand(sessionName,
+          { executable: "node", args: buildPiRunnerArgs(launchOpts), cwd: binding.cwd },
+          { nodeId: binding.nodeId, generation: binding.launchGeneration, runtime: "pi" });
+      }
+    } catch { return { ok: false, error: "Native duty launch composition refused" }; }
 
     // Stage long commands without leaving a shell above the live runner.
     const textResult = await this.tmux.sendShellCommand(sessionName, cmd, undefined, { stageIfLong: true, execInScript: true });

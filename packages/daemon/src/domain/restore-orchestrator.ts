@@ -1524,7 +1524,7 @@ export class RestoreOrchestrator {
     // session file returns retry_fresh, which the caller maps to the
     // awaiting-decision stop-and-ask — never a silent fresh start (BR-6).
     if (this.piResume?.canResume(resumeType, resumeToken)) {
-      const result = await this.piResume.resume(sessionName, resumeType, resumeToken, cwd, model, resolvedPosture);
+      const result = await this.piResume.resume(sessionName, resumeType, resumeToken, cwd, model, resolvedPosture, launchGeneration);
       if (result.ok) {
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);
         return { kind: "resumed" };

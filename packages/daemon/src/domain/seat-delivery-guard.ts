@@ -47,6 +47,7 @@ export class SeatDeliveryGuard {
   /** Tracked per node, independent of the tail, so a human lease cannot START after the
    * rehost already holds the tail and still interleave with the stop/resume window. */
   private readonly rehostLeases = new Set<Lease>();
+  private readonly operationLeases = new Set<Lease>();
 
   constructor(
     readonly db: Database.Database,
@@ -151,8 +152,9 @@ export class SeatDeliveryGuard {
         throw new DeliveryGuardError("typing_guard_enabled", "Automatic input is paused for this seat. Disable its typing guard explicitly before this writing operation.");
       }
       const lease: Lease = { target: bound, active: true, origin: "automatic", reservationId };
+      this.operationLeases.add(lease);
       try { return await this.scope.run(new Map([...(this.scope.getStore() ?? []), [lease.target.nodeId, lease]]), fn); }
-      finally { lease.active = false; }
+      finally { lease.active = false; this.operationLeases.delete(lease); }
     });
   }
 
@@ -240,6 +242,13 @@ export class SeatDeliveryGuard {
     if (!lease?.active || !lease.lifecycle) return false;
     this.assertCurrent(nodeId, lease);
     return true;
+  }
+
+  /** Read-only cross-request observation; unlike ownsLifecycle this confers no
+   * authority and does not depend on the observer's async execution context. */
+  lifecycleActive(nodeId: string): boolean {
+    return [...this.operationLeases, ...this.rehostLeases].some(lease =>
+      lease.active && lease.target.nodeId === nodeId && (lease.lifecycle === true || lease.rehost === true));
   }
 
   /** Multi-seat restore takes leases in stable order before any rig mutation.

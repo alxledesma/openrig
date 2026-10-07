@@ -43,6 +43,20 @@ function fixture() {
 function signal() { let release!: () => void; const ready = new Promise<void>(r => { release = r; }); return { ready, release }; }
 
 describe("delivery pause and durable custody", () => {
+  it("exposes active lifecycle across request contexts without granting its lease", async () => {
+    const { db, guard } = fixture(); const entered = signal(); const finish = signal();
+    const running = guard.lifecycle(["a"], async () => {
+      expect(guard.ownsLifecycle("a")).toBe(true); entered.release(); await finish.ready;
+    });
+    await entered.ready;
+    expect(guard.ownsLifecycle("a")).toBe(false);
+    expect(guard.lifecycleActive("a")).toBe(true);
+    expect(guard.lifecycleActive("b")).toBe(false);
+    finish.release(); await running;
+    expect(guard.lifecycleActive("a")).toBe(false);
+    await expect(guard.lifecycle(["a"], async () => { throw new Error("failed launch"); })).rejects.toThrow("failed launch");
+    expect(guard.lifecycleActive("a")).toBe(false); db.close();
+  });
   it("does not activate between paste/submit or before lifecycle finishes", async () => {
     const { db, guard } = fixture(); const pasted = signal(); const finish = signal(); const writes: string[] = [];
     const running = guard.operation("a", async () => {

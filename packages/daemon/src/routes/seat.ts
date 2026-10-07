@@ -433,7 +433,9 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
     occupantInvalidator: (c.get("occupantInvalidator" as never) as import("../domain/occupant-invalidator.js").OccupantInvalidator | undefined) ?? undefined,
     activityOracle: (c.get("seatActivityService" as never) as import("../domain/seat-activity-service.js").SeatActivityService | undefined) ?? undefined,
     listProcesses: () => listNativeProcesses(),
-    piResume: new PiResumeAdapter(tmuxAdapter, fsOps, { stateRoot, runnerEntryPath }),
+    piResume: new PiResumeAdapter(tmuxAdapter, fsOps, { stateRoot, runnerEntryPath }, {
+      seatLaunchEnvironment: c.get("seatLaunchEnvironment" as never) as import("../domain/seat-launch-environment.js").SeatLaunchEnvironment | undefined,
+    }),
     piProve: makePiNativeProver(rigRepo.db, execCommand, { fs: { readFile: (p: string) => readFileSync(p, "utf-8") }, piStateRoot: stateRoot, diagnose: reasons => { proofReasons.push(...reasons); } }),
     piRunnerState: (sessionName: string) => {
       const p = piSeatPaths(stateRoot, sessionName).runnerStatePath;

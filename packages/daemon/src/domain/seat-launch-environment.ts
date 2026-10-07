@@ -73,6 +73,31 @@ export function launchExecutable(name: string, searchPath: string, cwd: string):
   throw new Error(`Seat launch requires ${name} on the daemon launch PATH.`);
 }
 
+export interface NativeDutyLaunchWrapper {
+  enabled(nodeId: string): boolean;
+  wrap(input: { nodeId: string; sessionName: string; generation: string; runtime: "codex" | "pi";
+    harness: { executable: string; args: string[]; cwd: string } }): Promise<{ executable: string; args: string[]; cwd: string }>;
+}
+
+/** Resolve a native command without interpreting shell text. npm Codex's exact
+ * env-node shebang pins BOTH its entry and daemon-selected interpreter.
+ */
+export function structuredNativeExecutable(name: string, args: string[], searchPath: string, cwd: string): { executable: string; args: string[]; cwd: string } {
+  const executable = path.isAbsolute(name) ? name : launchExecutable(name, searchPath, cwd);
+  accessSync(executable, constants.X_OK);
+  if (!statSync(executable).isFile()) throw new Error("Native executable unavailable");
+  if (name === "codex") {
+    const fd = openSync(executable, "r"); let line: string;
+    try { const bytes = Buffer.alloc(512); line = bytes.subarray(0, readSync(fd, bytes, 0, bytes.length, 0)).toString("utf8").split("\n")[0]!; }
+    finally { closeSync(fd); }
+    if (line.startsWith("#!")) {
+      if (!/^#![ \t]*\/usr\/bin\/env[ \t]+node[ \t]*\r?$/.test(line)) throw new Error("Unsupported native shebang");
+      return { executable: launchExecutable("node", searchPath, cwd), args: [executable, ...args], cwd };
+    }
+  }
+  return { executable, args: [...args], cwd };
+}
+
 /** Reassert only public seat metadata after shell startup. Session identity is
  * read from tmux's launch environment; a successor's reserved identity wins.
  * Credentials stay in the inherited channel. An explicitly selected Codex home
@@ -83,7 +108,39 @@ export class SeatLaunchEnvironment {
     private readonly sessionEnv: Readonly<Record<string, string | undefined>>,
     private readonly daemonCwd: string,
     private readonly cliPath?: string,
-    private readonly codexHome?: string) {}
+    private readonly codexHome?: string,
+    private readonly nativeDuty?: NativeDutyLaunchWrapper) {}
+
+  async usesNativeDuty(session: string, nodeId?: string): Promise<boolean> {
+    if (!this.nativeDuty) return false;
+    const id = nodeId ?? await this.tmux.getSessionEnv(session, "OPENRIG_NODE_ID");
+    if (!id) throw new Error("Native duty opt-in requires actual node identity");
+    return this.nativeDuty.enabled(id);
+  }
+
+  async structuredCommand(session: string, harness: { executable: string; args: string[]; cwd: string },
+    target: { nodeId?: string; generation?: string; runtime: "codex" | "pi" }): Promise<string> {
+    // This is an admission gate, deliberately outside command()'s best-effort catch.
+    if (!this.nativeDuty || !await this.usesNativeDuty(session, target.nodeId)) throw new Error("Native duty opt-in required");
+    const shell = path.basename(await this.tmux.getPaneCommand(session) ?? "").replace(/^-/, "");
+    if (!["sh", "bash", "zsh"].includes(shell)) throw new Error("Unsupported native duty pane shell");
+    const identity: Record<string, string | undefined> = {};
+    for (const key of ["OPENRIG_NODE_ID", "OPENRIG_SESSION_NAME", "OPENRIG_RUNTIME", "OPENRIG_OCCUPANT_GENERATION"]) identity[key] = await this.tmux.getSessionEnv(session, key);
+    if (!identity.OPENRIG_NODE_ID || !identity.OPENRIG_SESSION_NAME || (target.nodeId && target.nodeId !== identity.OPENRIG_NODE_ID)) throw new Error("Native duty identity unavailable");
+    if (target.generation !== undefined) identity.OPENRIG_OCCUPANT_GENERATION = target.generation;
+    identity.OPENRIG_RUNTIME = target.runtime;
+    if (!identity.OPENRIG_OCCUPANT_GENERATION || !this.sessionEnv.PATH || !path.isAbsolute(harness.cwd)) throw new Error("Native duty launch binding unavailable");
+    const resolved = structuredNativeExecutable(harness.executable, harness.args, this.sessionEnv.PATH, harness.cwd);
+    const wrapped = await this.nativeDuty.wrap({ nodeId: identity.OPENRIG_NODE_ID, sessionName: identity.OPENRIG_SESSION_NAME,
+      generation: identity.OPENRIG_OCCUPANT_GENERATION, runtime: target.runtime, harness: resolved });
+    if (!path.isAbsolute(wrapped.executable) || wrapped.cwd !== harness.cwd || !Array.isArray(wrapped.args)
+      || wrapped.args.some(arg => typeof arg !== "string" || arg.includes("\0"))) throw new Error("Native duty wrapper contract mismatch");
+    const binDir = this.rigBin();
+    const env = publicSeatEnvironment({ OPENRIG_TRANSCRIPTS_LINES: "", OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS: "", ...this.sessionEnv, ...identity });
+    if (target.runtime === "codex" && this.codexHome) env.CODEX_HOME = this.codexHome;
+    const assignments = Object.entries(env).map(([key, value]) => shellQuote(`${key}=${value}`));
+    return `/usr/bin/env ${assignments.join(" ")} PATH=${shellQuote(binDir)}:"$PATH" ${[wrapped.executable, ...wrapped.args].map(shellQuote).join(" ")}`;
+  }
 
   private rigBin(): string {
     const cli = realpathSync(this.cliPath ?? pairedCli());
@@ -101,6 +158,7 @@ export class SeatLaunchEnvironment {
   }
 
   async command(session: string, command: string, target: { codexCwd?: string; nodeId?: string; generation?: string; runtime?: string } = {}): Promise<string> {
+    if (await this.usesNativeDuty(session, target.nodeId)) throw new Error("Opted-in launch requires structured native argv");
     const searchPath = this.sessionEnv.PATH;
     const codexEnv = target.codexCwd !== undefined
       ? [searchPath ? `PATH=${shellQuote(searchPath)}` : "", this.codexHome ? `CODEX_HOME=${shellQuote(this.codexHome)}` : ""].filter(Boolean)

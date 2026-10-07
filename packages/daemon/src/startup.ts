@@ -1,4 +1,6 @@
 import { assessPiDispatchReadiness } from "./domain/dispatch-runtime-readiness.js";
+import { NativeDutyIntegration } from "./domain/native-duty-integration.js";
+import { NativeDutyLaunchStore, observeNativeDutyLaunch } from "./domain/native-duty-launch.js";
 import {makeResilienceRolloutPolicy} from './domain/policies/resilience-rollout.js';
 import {ResilienceRolloutService} from './domain/resilience-rollout-service.js';
 import {RuntimeOutcomeAssessment} from "./domain/runtime-outcome-assessment.js";
@@ -592,6 +594,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // by the seat-handover full-cycle composer when it creates a successor
   // session (OPR.0.4.3.04), so a handed-over successor self-identifies +
   // reports activity exactly like a launched seat.
+  const terminalTokenEnv = process.env.OPENRIG_TERMINAL_BEARER_TOKEN?.trim();
+  const terminalBearerToken = opts && Object.prototype.hasOwnProperty.call(opts, "terminalBearerToken")
+    ? opts.terminalBearerToken ?? null : terminalTokenEnv || null;
   const launchSessionEnv: Record<string, string | undefined> = {
     PATH: process.env.PATH,
     OPENRIG_HOME,
@@ -599,6 +604,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     OPENRIG_HOST: openRigHost,
     OPENRIG_URL: resolvedActivityHookUrl,
     OPENRIG_ACTIVITY_HOOK_TOKEN: resolvedActivityHookToken,
+    // Existing private tmux environment channel only; never typed into argv.
+    OPENRIG_TERMINAL_BEARER_TOKEN: terminalBearerToken ?? undefined,
     ...providerAuthEnv,
     HOME: daemonHome,
     USER: process.env.USER,
@@ -626,7 +633,25 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     },
   });
   const { SeatLaunchEnvironment } = await import("./domain/seat-launch-environment.js");
-  const seatLaunchEnvironment = new SeatLaunchEnvironment(tmuxAdapter, launchSessionEnv, process.cwd(), undefined, configuredCodexHome);
+  // Explicit stable-node opt-in controls the next managed launch. It grants no
+  // coordinator effect: a genuine Operator separately grants a finite scope.
+  const nativeDutyNodes = new Set((process.env.OPENRIG_NATIVE_DUTY_NODES ?? "").split(",").map(id => id.trim()).filter(Boolean));
+  if ([...nativeDutyNodes].some(id => !/^[A-Za-z0-9._:@-]{1,80}$/.test(id))) throw new Error("Invalid native duty node opt-in");
+  if (nativeDutyNodes.size && !terminalBearerToken) throw new Error("Native duty requires authenticated transport");
+  const nativeDutyStore = nativeDutyNodes.size ? new NativeDutyLaunchStore({
+    root: nodePath.join(OPENRIG_HOME, "state", "native-duty"), nodeExecutable: process.execPath,
+    supervisorEntry: nodePath.resolve(import.meta.dirname, "./adapters/native-duty-supervisor.js"),
+  }) : undefined;
+  const nativeDutyLaunch = {
+    enabled: (nodeId: string) => nativeDutyNodes.has(nodeId),
+    wrap: async (input: { nodeId: string; sessionName: string; generation: string; runtime: "codex" | "pi"; harness: { executable: string; args: string[]; cwd: string } }) => {
+      const configurationDigest = queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(input.sessionName, input);
+      if (!nativeDutyStore || !nativeDutyNodes.has(input.nodeId) || !configurationDigest) throw new Error("Native duty launch configuration unavailable");
+      return nativeDutyStore.prepare({ ...input, configurationDigest,
+        scopeId: `native-duty:${input.nodeId}:${input.generation}`, pollMs: 5000 }).launch;
+    },
+  };
+  const seatLaunchEnvironment = new SeatLaunchEnvironment(tmuxAdapter, launchSessionEnv, process.cwd(), undefined, configuredCodexHome, nativeDutyNodes.size ? nativeDutyLaunch : undefined);
   const nodeLauncher = new NodeLauncher({
     db,
     rigRepo,
@@ -660,12 +685,36 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   });
   const coordinatorRuntimeObserver = makeCoordinatorRuntimeObserver(db, opts?.tmuxExec ?? execCommand, undefined, piNativeProver);
   queueRepoInstance.coordinatorAuthority.setRuntimeObserver(coordinatorRuntimeObserver);
+  const nativeDutyBinding = (session: string) => {
+    const target = deliveryGuard.maybeTarget(session);
+    if (!target?.occupant || target.session !== session) return null;
+    const node = db.prepare("SELECT rig_id,runtime FROM nodes WHERE id=?").get(target.nodeId) as { rig_id: string; runtime: string } | undefined;
+    return node ? { nodeId: target.nodeId, session, generation: target.occupant, runtime: node.runtime, rigId: node.rig_id } : null;
+  };
+  const nativeDuty = new NativeDutyIntegration({ db, authority: queueRepoInstance.coordinatorAuthority,
+    binding: nativeDutyBinding, lifecycleActive: nodeId => deliveryGuard.lifecycleActive(nodeId),
+    observe: async (scope, launchId, supervisorPid) => nativeDutyStore ? observeNativeDutyLaunch(nativeDutyStore, { scope, launchId, supervisorPid }, {
+      tmux: tmuxAdapter, piProve: piNativeProver,
+      currentBinding: async nodeId => {
+        const target = deliveryGuard.maybeTarget(nodeId);
+        if (!target?.occupant || !target.pane) return null;
+        const binding = nativeDutyBinding(target.session);
+        const configurationDigest = queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(target.session);
+        if (!binding || !configurationDigest || (binding.runtime !== "pi" && binding.runtime !== "codex")) return null;
+        const row = db.prepare("SELECT resume_token FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1").get(nodeId) as { resume_token: string | null } | undefined;
+        return { nodeId, sessionName: target.session, generation: binding.generation, runtime: binding.runtime,
+          configurationDigest, pane: target.pane, resumeToken: row?.resume_token,
+          lifecycleReserved: deliveryGuard.lifecycleActive(nodeId) || deliveryGuard.protectionFacts(nodeId) !== null };
+      },
+    }) : null,
+  });
   const ompStateRoot = nodePath.join(OPENRIG_HOME, "state", "omp");
   const piRunnerEntryPath = nodePath.resolve(import.meta.dirname, "./adapters/pi-runner.js");
   const piResume = new PiResumeAdapter(
     tmuxAdapter,
     { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }) },
     { stateRoot: piStateRoot, runnerEntryPath: piRunnerEntryPath },
+    { seatLaunchEnvironment },
   );
   const ompResume = new OmpResumeAdapter(
     tmuxAdapter,
@@ -813,7 +862,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const codexAdapter = new CodexRuntimeAdapter({ tmux: tmuxAdapter, seatLaunchEnvironment, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; }, statMode: (p: string) => fs.statSync(p).mode, chmod: (p: string, m: number) => fs.chmodSync(p, m), homedir: daemonHome }, codexHome: configuredCodexHome, launchPath: process.env.PATH, detectDaemonSupport: codexDaemonSupportProbe(process.env.PATH, undefined, configuredCodexHome), readNetworkDefault: readCodexNetworkDefault, activityRelayPath: nodePath.resolve(import.meta.dirname, "../assets/plugins/openrig-core/hooks/scripts/activity-relay.cjs") });
   // OPR.0.4.6.PI1 — the RPC-first Pi adapter (runner-in-a-pane). Same fsOps
   // shape as the Codex adapter; seat isolation roots under piStateRoot.
-  const piAdapter = new PiRuntimeAdapter({ tmux: tmuxAdapter, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; } }, stateRoot: piStateRoot, runnerEntryPath: piRunnerEntryPath });
+  const piAdapter = new PiRuntimeAdapter({ tmux: tmuxAdapter, seatLaunchEnvironment, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; } }, stateRoot: piStateRoot, runnerEntryPath: piRunnerEntryPath });
   const ompAdapter = new OmpRuntimeAdapter({ tmux: tmuxAdapter, fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c, "utf-8"), exists: (p: string) => fs.existsSync(p), mkdirp: (p: string) => fs.mkdirSync(p, { recursive: true }), listFiles: (dir: string) => { const r: string[] = []; function w(d: string, pre: string) { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (e.isDirectory()) w(nodePath.join(d, e.name), nodePath.join(pre, e.name)); else r.push(pre ? nodePath.join(pre, e.name) : e.name); } } w(dir, ""); return r; } }, stateRoot: ompStateRoot, runnerEntryPath: piRunnerEntryPath });
   // OPR.0.5.1.1 — the stub runtime adapter (Pi-shaped node-script runner in a pane).
   // Same fsOps shape as Pi; the compiled runner entry lives in the daemon dist.
@@ -1202,6 +1251,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const compatibleSpecLibraryRoot = getCompatibleOpenRigPath("specs");
 
   const deps: AppDeps = {
+    nativeDuty,
+    seatLaunchEnvironment,
     rigRepo,
     sessionRegistry,
     daemonLifecycleStore,
@@ -1648,11 +1699,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // at route mount time (not per-request).
     deps.missionControlBearerToken = opts?.bearerToken ?? null;
 
-    const terminalTokenEnv = process.env.OPENRIG_TERMINAL_BEARER_TOKEN?.trim();
-    deps.terminalBearerToken =
-      opts && Object.prototype.hasOwnProperty.call(opts, "terminalBearerToken")
-        ? opts.terminalBearerToken ?? null
-        : terminalTokenEnv || null;
+    deps.terminalBearerToken = terminalBearerToken;
 
     // Notification dispatcher: chosen mechanism via env config.
     // OPENRIG_NOTIFICATIONS_MECHANISM=ntfy|webhook|none (default none).

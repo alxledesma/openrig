@@ -82,6 +82,15 @@ export function buildCodexResumeCore(
   return `codex${daemonArg}${profileOrPosture}${modelArg}${effortArg} resume ${middle}${tokenArg}`;
 }
 
+/** Launch-only argv producer. Legacy string APIs still accept opaque formatted
+ * extraArgs for compatibility; opted-in launch never parses those strings. */
+export function buildCodexResumeArgs(input: { resumeToken: string; useLast?: boolean; postureArgs: string[];
+  networkArgs?: string[]; extraArgs?: string[]; model?: string | null; effort?: string | null; daemonOptOut?: boolean }): string[] {
+  return [...(input.daemonOptOut ? ["--no-daemon"] : []), ...input.postureArgs, ...(input.networkArgs ?? []),
+    ...(input.model ? ["-m", input.model] : []), ...(input.effort ? ["-c", `model_reasoning_effort="${input.effort}"`] : []),
+    "resume", ...(input.extraArgs ?? []), input.useLast ? "--last" : input.resumeToken];
+}
+
 export function assessNativeResumeProbe(
   input: NativeResumeProbeInput
 ): NativeResumeProbeResult {

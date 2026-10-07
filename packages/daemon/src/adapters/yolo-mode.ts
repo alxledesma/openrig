@@ -66,6 +66,15 @@ export function codexPostureArg(
   return profileArg ? profileArg : " -s workspace-write";
 }
 
+/** Structured equivalent; callers supply raw profile, never a shell segment. */
+export function codexPostureArgs(profile?: string | null, env: NodeJS.ProcessEnv = process.env,
+  resolvedPosture?: ResolvedLaunchPosture): string[] {
+  const args = profile ? ["-p", profile] : [];
+  if (resolvedPosture === "full_bypass") return [...args, "-s", "danger-full-access", "-a", "never"];
+  if (yoloEnabled(env, resolvedPosture)) return [...args, "-s", "danger-full-access"];
+  return args.length ? args : ["-s", "workspace-write"];
+}
+
 /** Pi RESOURCE TRUST (Pi's --approve/--no-approve govern resource trust, NOT a permission policy):
  *  YOLO forces `approve`; otherwise the configured posture (default `no-approve`). */
 export function piTrust(

@@ -1,5 +1,6 @@
 import { dispatchReservationRoutes } from "./routes/dispatch-reservation.js";
 import { coordinatorRoutes } from "./routes/coordinator.js";
+import { nativeDutySupervisionRoutes } from "./routes/native-duty-supervision.js";
 import { healthDiagnosisRoutes } from "./routes/health-diagnosis.js";
 import type { HealthDiagnosisService } from "./domain/health-diagnosis.js";
 import type { HealthPolicyStore } from "./domain/health-policy.js";
@@ -147,6 +148,7 @@ import { createRouteTimingMiddleware } from "./domain/route-timing-recorder.js";
 import { browserBoundary, type BrowserBoundaryOptions } from "./middleware/browser-boundary.js";
 
 export interface AppDeps {
+  nativeDuty?: import("./domain/native-duty-integration.js").NativeDutyIntegration;
   proofSourceWatch?: import("./domain/proof/source-watch.js").ProofSourceWatch;
   /** S20 — effective bind plan for the health surface (absent = legacy body). */
   bindPlan?: { mode: "explicit" | "default"; hosts: string[]; tailscaleDetected: boolean; ignoredRoutingHost?: string };
@@ -391,6 +393,7 @@ export interface AppDeps {
    * vars are always derived internally by the composer.
    */
   sessionEnv?: Record<string, string | undefined>;
+  seatLaunchEnvironment?: import("./domain/seat-launch-environment.js").SeatLaunchEnvironment;
   /** Per-runtime launch env merged over sessionEnv (OMP's provider keys). */
   runtimeSessionEnv?: Record<string, Record<string, string | undefined>>;
 }
@@ -513,6 +516,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("tmuxAdapter" as never, deps.tmuxAdapter);
     c.set("tmuxOptionDefaults" as never, deps.tmuxOptionDefaults);
     c.set("sessionEnv" as never, deps.sessionEnv);
+    c.set("seatLaunchEnvironment" as never, deps.seatLaunchEnvironment);
     c.set("runtimeSessionEnv" as never, deps.runtimeSessionEnv);
     c.set("cmuxAdapter" as never, deps.cmuxAdapter);
     // S10 — the in-daemon gateway subsystem handle (health surface + dispatch seam).
@@ -788,6 +792,11 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/stream", streamRoutes());
   app.route("/api/queue", queueRoutes());
   app.route("/api/coordinator", coordinatorRoutes({bearerToken:deps.terminalBearerToken ?? null}));
+  if (deps.nativeDuty) app.route("/api/native-duty", nativeDutySupervisionRoutes({
+    bearerToken: deps.terminalBearerToken ?? null, service: deps.nativeDuty.service,
+    refreshNative: (actor, input) => deps.nativeDuty!.refreshNative(actor, input),
+    enrollment: (actor, input) => deps.nativeDuty!.enrollment(actor, input),
+  }));
   app.route("/api/workspace", workspaceRoutes());
   app.route("/api/projects", projectsRoutes());
   app.route("/api/views", viewsRoutes());

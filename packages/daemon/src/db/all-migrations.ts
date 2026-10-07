@@ -1,4 +1,5 @@
 import { queueRecoveryMembershipSchema } from "./migrations/102_queue_recovery_membership.js";
+import { nativeDutySupervisionSchema } from "./migrations/107_native_duty_supervision.js";
 import { outboxOriginIndexSchema } from "./migrations/096_outbox_origin_index.js";
 import { coordinatorHeldHistorySchema } from "./migrations/095_coordinator_held_history.js";
 import { historicalEffectDispositionsSchema } from "./migrations/094_historical_effect_dispositions.js";
@@ -225,4 +226,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   humanQuestionsSchema,
   nodeEffortSchema,
   usageSamplesLatestIndexesSchema,
+  nativeDutySupervisionSchema,
 ];

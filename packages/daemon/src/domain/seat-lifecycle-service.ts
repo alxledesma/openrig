@@ -134,7 +134,7 @@ export interface SeatLifecycleDeps {
 /** Structural view of the shipped PiResumeAdapter: only `resume` is used, and
  *  only with the exact session file. --resume/--fork are never emitted here. */
 export interface PiRehostResume {
-  resume(tmuxSessionName: string, resumeType: string | null, resumeToken: string | null, cwd: string, model?: string | null, resolvedPosture?: "floor" | "full_bypass"): Promise<{ ok: boolean; code?: string; message?: string }>;
+  resume(tmuxSessionName: string, resumeType: string | null, resumeToken: string | null, cwd: string, model?: string | null, resolvedPosture?: "floor" | "full_bypass", ledgerGeneration?: string): Promise<{ ok: boolean; code?: string; message?: string }>;
 }
 export interface PiRehostProof { state: "present" | "absent"; generation: string; launchId: string | null; fingerprint: string }
 export interface PiRehostRunnerState { ready: boolean; launchId?: string; sessionFile?: string; sessionId?: string; lastEntryId?: string }
@@ -1962,7 +1962,7 @@ export class SeatLifecycleService {
 
       stage = "resume";
       // S3: reopen the SAME file through the shipped resume primitive.
-      const resumed = await piResume.resume(sessionName, "pi_session_file", plan.sessionFile, plan.cwd, plan.model, plan.posture);
+      const resumed = await piResume.resume(sessionName, "pi_session_file", plan.sessionFile, plan.cwd, plan.model, plan.posture, plan.generation);
       if (!resumed.ok) {
         const stoppedTargetFailure = plan.stoppedTargetRecovery ? {
           stoppedTargetRecovery: true,

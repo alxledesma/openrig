@@ -11,10 +11,11 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import type { TmuxAdapter } from "./tmux.js";
+import type { SeatLaunchEnvironment } from "../domain/seat-launch-environment.js";
 import type { ResumeResult } from "./claude-resume.js";
 import { piTrust, yoloEnabled } from "./yolo-mode.js";
 import {
-  piSeatPaths, parsePiRunnerState, buildPiRunnerCommand, buildPendingRunnerState, type RunnerRuntime,
+  piSeatPaths, parsePiRunnerState, buildPiRunnerCommand, buildPiRunnerArgs, buildPendingRunnerState, type RunnerRuntime,
 } from "./pi-runner-protocol.js";
 import { observePiResourceTrust, observeOmpApprovalMode } from "../domain/permission-drift.js";
 
@@ -28,6 +29,7 @@ export interface PiResumeFsOps {
 }
 
 interface PiResumeOptions {
+  seatLaunchEnvironment?: SeatLaunchEnvironment;
   pollMs?: number;
   maxWaitMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -59,6 +61,7 @@ export class PiResumeAdapter {
     model?: string | null,
     // OPR.0.4.8.3 Seam B: persisted resolved posture (resource-trust wording for Pi).
     resolvedPosture?: "floor" | "full_bypass",
+    ledgerGeneration?: string,
   ): Promise<ResumeResult> {
     if (!this.canResume(resumeType, resumeToken)) {
       return { ok: false, code: "no_resume", message: `${this.label} resume not available` };
@@ -92,7 +95,7 @@ export class PiResumeAdapter {
     const appliedLaunch = this.runtime === "omp"
       ? observeOmpApprovalMode(`--approval-mode ${trust === "approve" ? "yolo" : "always-ask"}`)
       : observePiResourceTrust(trust);
-    const cmd = buildPiRunnerCommand({
+    const launchOpts = {
       runtime: this.runtime,
       runnerEntryPath: this.paths.runnerEntryPath,
       sessionName: tmuxSessionName,
@@ -106,7 +109,15 @@ export class PiResumeAdapter {
       trust,
       sessionFile,
       launchId,
-    });
+    };
+    let cmd = buildPiRunnerCommand(launchOpts);
+    try {
+      const env = this.options.seatLaunchEnvironment;
+      if (this.runtime === "pi" && env && await env.usesNativeDuty(tmuxSessionName)) {
+        cmd = await env.structuredCommand(tmuxSessionName, { executable: "node", args: buildPiRunnerArgs(launchOpts), cwd },
+          { runtime: "pi", generation: ledgerGeneration });
+      }
+    } catch { return { ok: false, code: "resume_failed", message: "Native duty launch composition refused" }; }
 
     // Short commands retain the direct path; long commands exec from a private script.
     const textResult = await this.tmux.sendShellCommand(tmuxSessionName, cmd, undefined, { stageIfLong: true, execInScript: true });

@@ -300,27 +300,36 @@ export interface PiRunnerLaunchOpts {
 /** The command typed into the seat's tmux pane. The runner owns everything
  *  past this boundary (pi spawn, env allowlist, RPC, mirror, sidecar). */
 export function buildPiRunnerCommand(opts: PiRunnerLaunchOpts): string {
+  const literal = new Set([1, 3, 5, 7, 9]);
+  if (opts.runtime === "omp") [10, 11, 12].forEach(i => literal.add(i));
+  let next = opts.runtime === "omp" ? 13 : 10;
+  for (const present of [!!opts.model?.trim(), !!opts.sessionFile, !!opts.forkRef]) {
+    if (present) { literal.add(next); next += 2; }
+  }
+  return ["node", ...buildPiRunnerArgs(opts).map((arg, index) => literal.has(index) ? arg : shellQuote(arg))].join(" ");
+}
+
+export function buildPiRunnerArgs(opts: PiRunnerLaunchOpts): string[] {
   const parts = [
-    "node",
-    shellQuote(opts.runnerEntryPath),
-    "--session-name", shellQuote(opts.sessionName),
-    "--state-root", shellQuote(opts.stateRoot),
-    "--cwd", shellQuote(opts.cwd),
-    "--launch-id", shellQuote(opts.launchId),
+    opts.runnerEntryPath,
+    "--session-name", opts.sessionName,
+    "--state-root", opts.stateRoot,
+    "--cwd", opts.cwd,
+    "--launch-id", opts.launchId,
     ...(opts.runtime === "omp"
       ? ["--runtime", "omp", "--approval-mode", opts.trust === "approve" ? "yolo" : "always-ask"]
       : [`--${opts.trust}`]),
   ];
   if (opts.model?.trim()) {
-    parts.push("--model", shellQuote(opts.model.trim()));
+    parts.push("--model", opts.model.trim());
   }
   if (opts.sessionFile) {
-    parts.push("--session", shellQuote(opts.sessionFile));
+    parts.push("--session", opts.sessionFile);
   }
   if (opts.forkRef) {
-    parts.push("--fork", shellQuote(opts.forkRef));
+    parts.push("--fork", opts.forkRef);
   }
-  return parts.join(" ");
+  return parts;
 }
 
 /** Argv for the `pi` child the RUNNER spawns (argv-style, no shell). The

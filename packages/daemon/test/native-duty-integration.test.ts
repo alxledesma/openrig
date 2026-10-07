@@ -1,0 +1,184 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type Database from "better-sqlite3";
+import { createDb } from "../src/db/connection.js";
+import { seed, token } from "./helpers/coordinator-fixture.js";
+import { EventBus } from "../src/domain/event-bus.js";
+import { QueueRepository } from "../src/domain/queue-repository.js";
+import { OutboxHandler } from "../src/domain/outbox-handler.js";
+import { digest } from "../src/domain/coordinator-authority-service.js";
+import { CoordinationRecoveryService, type CoordinationTask, type CoordinationActivity } from "../src/domain/coordination-recovery-service.js";
+import { NativeDutyIntegration } from "../src/domain/native-duty-integration.js";
+import { nativeDutySupervisionRoutes } from "../src/routes/native-duty-supervision.js";
+import { parseRuntimeMigration } from "../src/domain/seat-runtime-migration.js";
+import { canonical } from "../src/domain/seat-dispatch-reservation.js";
+import type { NativeDutyActor, NativeDutyProof, NativeDutyScope } from "../src/domain/native-duty-contract.js";
+
+describe("native duty actual authority integration",()=>{
+ let db:Database.Database,repo:QueueRepository,recovery:CoordinationRecoveryService,integration:NativeDutyIntegration;
+ let app:ReturnType<typeof nativeDutySupervisionRoutes>,now:number,scope:NativeDutyScope,lifecycle:boolean,proofPatch:Partial<NativeDutyProof>,proofMissing:boolean;
+ const operator={session:"operator-agent@kernel",generation:"operator-agent-g1"};
+ const holder={session:"lead@xv",generation:"lead-g1"};
+ const enrollment={scopeId:"scope-worker-plan",launchId:"actual-launch",supervisorPid:710};
+ const enrollmentUrl=()=>"/enrollment?"+new URLSearchParams({...enrollment,supervisorPid:String(enrollment.supervisorPid)});
+ function activity(session:string):CoordinationActivity {
+  const generation=repo.coordinatorAuthority.generation(session)!;
+  return {generation,identityVerified:true,state:{seatNodeId:session,activity:"idle-at-prompt",needsInput:{count:0,reason:null},decidedBy:"window-sampling",seq:1,changedAt:new Date(now).toISOString(),rungs:[],lastSwap:{generation,at:new Date(now).toISOString()}},witness:{seatNodeId:session,sessionName:session,rung:"window-sampling",sourceId:"tmux",seq:1,observedAt:new Date(now).toISOString(),activity:"idle-at-prompt"}};
+ }
+ async function call(route:string,body?:unknown,as:NativeDutyActor=holder,auth=true) {
+  const response=await app.request(route,{method:body===undefined?"GET":"POST",headers:{...(auth?{Authorization:"Bearer private-fixture"}:{}),"X-OpenRig-Session":as.session,"X-OpenRig-Occupant-Generation":as.generation,"Content-Type":"application/json"},...(body===undefined?{}:{body:JSON.stringify(body)})});
+  return {status:response.status,body:await response.json() as any};
+ }
+ async function grantAndRegister() {
+  expect((await call("/grant",scope,operator)).status).toBe(201);
+  const response=await call("/register",enrollment);expect(response.status).toBe(201);return response.body.registrationId as string;
+ }
+ const request=(operationId="bounded-native-resume")=>({rigId:"xv",operationId,leaseMs:10000,expectedEpoch:repo.coordinatorAuthority.get("xv")!.epoch,expectedObligationsDigest:repo.coordinatorAuthority.reconciliationDigest("xv")});
+ beforeEach(async()=>{
+  vi.useFakeTimers({toFake:["Date"]});now=Date.UTC(2026,9,7,16);vi.setSystemTime(now);lifecycle=false;proofPatch={};proofMissing=false;
+  db=createDb();seed(db); // seed applies the actual ALL_MIGRATIONS, including durable intent triggers.
+  db.prepare("UPDATE nodes SET runtime='codex' WHERE id='lead@xv'").run();
+  db.prepare("INSERT INTO self_host_identity VALUES(1,'integration-host',?,?)").run(new Date(now).toISOString(),new Date(now).toISOString());
+  repo=new QueueRepository(db,new EventBus(db),{resolveOccupantGeneration:s=>repo.coordinatorAuthority.generation(s)});repo.attachOutbox(new OutboxHandler(db));
+  await repo.create({qitemId:"baton",sourceSession:operator.session,destinationSession:holder.session,body:"coordinate",nudge:false});
+  repo.coordinatorAuthority.enable(operator.session,operator.generation,{rigId:"xv",batonId:"baton",owner:holder.session,ownerGeneration:holder.generation,coordinators:[holder.session,"peer@xv"],leaseMs:60000,operationId:"enable"});
+  repo.coordinatorAuthority.acknowledge(holder.session,token,{operationId:"ack",obligationsDigest:repo.coordinatorAuthority.reconciliationDigest("xv")});
+  recovery=new CoordinationRecoveryService(repo,activity,()=>now);repo.coordinatorAuthority.coordinationRecovery=recovery;
+  const task=(key:string,owner:string,extra:Partial<CoordinationTask>={}):CoordinationTask=>({key,packageKey:key,owner,action:"Return exact evidence for "+key,body:key,deadline:now+30000,predecessors:[],admission:{generation:repo.coordinatorAuthority.generation(owner)!,configurationDigest:recovery.configurationDigest(owner)!,qualificationRef:"independent/"+key,capacityRef:"capacity/"+key,effortRef:"effort/"+key,validUntil:now+60000},...extra});
+  const tasks=[task("product","builder@xv"),task("repair","architect@xv",{recoveryFor:"product"})];
+  for(const t of tasks)repo.coordinatorAuthority.admit(operator.session,operator.generation,"xv",t.packageKey,{inputDigest:digest(t.key),destination:t.owner,bodyHash:digest(t.body),resources:[],returnContract:{destination:holder.session,evidenceRequired:["report"]}});
+  recovery.configure(operator.session,operator.generation,{rigId:"xv",revision:"actual-worker-plan",operatorGeneration:operator.generation,stallMs:10000,allowIdlePeerTransfer:true,tasks});
+  scope={scopeId:enrollment.scopeId,nodeId:holder.session,sessionName:holder.session,generation:holder.generation,runtime:"codex",rigId:"xv",configurationDigest:recovery.configurationDigest(holder.session)!,validUntil:now+20000,maxLeaseMs:15000,kind:"holder-continuation"};
+  integration=new NativeDutyIntegration({db,authority:repo.coordinatorAuthority,now:()=>now,lifecycleActive:()=>lifecycle,
+   binding:session=>{const row=db.prepare("SELECT n.id nodeId,n.rig_id rigId,n.runtime FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=?").get(session) as {nodeId:string;rigId:string;runtime:string}|undefined;const generation=repo.coordinatorAuthority.generation(session);return row&&generation?{...row,session,generation}:null;},
+   observe:async(current,launchId,supervisorPid)=>proofMissing?null:{nodeId:current.nodeId,sessionName:current.sessionName,generation:current.generation,runtime:current.runtime,launchId,supervisorPid,configurationDigest:current.configurationDigest,fingerprint:"independent-native-sample",observedAt:now,nativePresent:true,supervisorIsNativeAncestor:true,lifecycleReserved:false,...proofPatch},
+  });
+  app=nativeDutySupervisionRoutes({bearerToken:"private-fixture",service:integration.service,refreshNative:(actor,input)=>integration.refreshNative(actor,input),enrollment:(actor,input)=>integration.enrollment(actor,input)});
+ });
+ afterEach(()=>{db?.close();vi.useRealTimers();});
+
+ it("authorizes a coordinating holder for genuine worker-owned bounded work and confirms the actual coordinator receipt",async()=>{
+  expect(recovery.plan("xv")!.tasks.every(t=>t.owner!==holder.session)).toBe(true);
+  const registrationId=await grantAndRegister(),resume=request();
+  expect((await call("/prepare",{registrationId,request:resume})).body.phase).toBe("prepared");
+  expect((await call("/in-flight",{registrationId,operationId:resume.operationId})).body.maySendEffect).toBe(true);
+  repo.coordinatorAuthority.resumeOwned(holder.session,holder.generation,resume);
+  expect((await call("/reconcile",{registrationId,operationId:resume.operationId})).body.phase).toBe("receipt-confirmed");
+  expect(repo.coordinatorAuthority.operationReceipt("xv",resume.operationId)?.kind).toBe("resume-owned");
+ });
+
+ it("ends the work scope only after genuine exact acceptance, including a dormant mandatory recovery backup",async()=>{
+  await repo.create({qitemId:"product-work",sourceSession:holder.session,destinationSession:"builder@xv",body:"product",dispatch:{token,packageKey:"product"},nudge:false});
+  repo.claim({qitemId:"product-work",destinationSession:"builder@xv",identityProvenance:"transport:v1"});
+  repo.update({qitemId:"product-work",actorSession:"builder@xv",state:"done",closureReason:"no-follow-on"});
+  await repo.create({qitemId:"product-return",sourceSession:"builder@xv",destinationSession:holder.session,body:JSON.stringify({packageKey:"product",inputDigest:digest("product"),evidence:[{kind:"report",ref:"actual/product.md"}]}),nudge:false});
+  repo.coordinatorAuthority.dispose("builder@xv","builder-g1","xv","product","product-return");
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  expect((await call("/grant",scope,operator)).status).toBe(201); // done + disposition is not acceptance
+  recovery.accept(holder.session,holder.generation,"xv","product","product-return","actual/independent-acceptance.md");
+  expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='coordination-accept'").get()).toBeTruthy();
+  expect(db.prepare("SELECT 1 FROM coordinator_assignments WHERE package_key='repair'").get()).toBeUndefined();
+  expect((await call("/grant",{...scope,scopeId:"after-exact-acceptance"},operator)).body.error).toBe("native_duty_scope_not_approved");
+ });
+
+ it("waits before grant and recovers a lost registration response through read-only enrollment without duplication",async()=>{
+  expect(await call(enrollmentUrl())).toEqual({status:200,body:{state:"waiting"}});
+  expect(db.prepare("SELECT count(*) n FROM native_duty_grants").get()).toEqual({n:0});
+  expect((await call("/grant",scope,operator)).status).toBe(201);
+  expect(await call(enrollmentUrl())).toEqual({status:200,body:{state:"ready"}});
+  await call("/register",enrollment); // treat the response as lost
+  const existing=db.prepare("SELECT registration_id FROM native_duty_registrations").get() as {registration_id:string};
+  expect(await call(enrollmentUrl())).toEqual({status:200,body:{state:"ready",registrationId:existing.registration_id}});
+  expect(db.prepare("SELECT count(*) n FROM native_duty_registrations").get()).toEqual({n:1});
+  expect((await call(enrollmentUrl(),undefined,{...holder,generation:"wrong-generation"})).body.state).toBe("held");
+  expect((await call(enrollmentUrl()+"&extra=not-allowed")).status).toBe(400);
+  expect((await call(enrollmentUrl(),undefined,holder,false)).status).toBe(401);
+ });
+
+ it.each(["scope-expiry","holder-generation","holder-configuration","worker-configuration","lifecycle-memory","lifecycle-reservation"])("holds %s at authorization and registration boundaries",async(kind)=>{
+  expect((await call("/grant",scope,operator)).status).toBe(201);
+  if(kind==="scope-expiry"){now=scope.validUntil;vi.setSystemTime(now);}
+  if(kind==="holder-generation")db.prepare("UPDATE occupant_tenures SET generation_uuid='lead-g2' WHERE node_id='lead@xv'").run();
+  if(kind==="holder-configuration")db.prepare("UPDATE nodes SET model='changed-model' WHERE id='lead@xv'").run();
+  if(kind==="worker-configuration")db.prepare("UPDATE nodes SET model='changed-model' WHERE id IN ('builder@xv','architect@xv')").run();
+  if(kind==="lifecycle-memory")lifecycle=true;
+  if(kind==="lifecycle-reservation")db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES ('reservation','migration','lead@xv','lead@xv','lead-g1','prior-native','operator-agent@kernel','operator-agent-g1','hash','{}','{}','reserved',?,?)").run(new Date(now).toISOString(),new Date(now).toISOString());
+  expect((await call(enrollmentUrl())).body.state).toBe("held");
+  expect((await call("/register",enrollment)).status).toBeGreaterThanOrEqual(400);
+  expect((await call("/grant",{...scope,scopeId:"new-scope"},operator)).body.error).toBe("native_duty_scope_not_approved");
+  expect(db.prepare("SELECT count(*) n FROM native_duty_registrations").get()).toEqual({n:0});
+ });
+
+ it.each(["stale","identity","configuration"])("does not advertise ready or register with %s native evidence",async(kind)=>{
+  expect((await call("/grant",scope,operator)).status).toBe(201);
+  proofPatch=kind==="stale"?{observedAt:now-3001}:kind==="identity"?{generation:"other-generation"}:{configurationDigest:"different-config"};
+  expect((await call(enrollmentUrl())).body.state).not.toBe("ready");
+  expect((await call("/register",enrollment)).status).toBeGreaterThanOrEqual(400);
+ });
+
+ it("discovers held and expired registrations for receipt-only reconciliation without reviving them",async()=>{
+  const registrationId=await grantAndRegister(),resume=request();
+  expect((await call("/prepare",{registrationId,request:resume})).body.phase).toBe("prepared");
+  await call("/in-flight",{registrationId,operationId:resume.operationId});
+  repo.coordinatorAuthority.resumeOwned(holder.session,holder.generation,resume); // real durable receipt, response lost
+  proofMissing=true;expect((await call("/heartbeat",{registrationId})).status).toBe(409);
+  expect(integration.service.status(registrationId).phase).toBe("held");
+  expect((await call(enrollmentUrl())).body).toEqual({state:"ready",registrationId});
+  now=scope.validUntil+1;vi.setSystemTime(now);
+  expect((await call(enrollmentUrl())).body).toEqual({state:"ready",registrationId});
+  expect((await call("/reconcile",{registrationId,operationId:resume.operationId})).body.phase).toBe("receipt-confirmed");
+  expect(integration.service.status(registrationId).phase).toBe("held");
+  expect((await call("/prepare",{registrationId,request:request("new-effect")})).status).toBeGreaterThanOrEqual(400);
+  expect(db.prepare("SELECT count(*) n FROM native_duty_registrations").get()).toEqual({n:1});
+ });
+
+ it("pins staged migration target digest before launch and equals committed current configuration without granting early scope",async()=>{
+  // The real peer is zero-custody; production migration authorization/native effects are
+  // covered by the accepted migration suite. These rows model its durable begin/commit boundaries.
+  const session="peer@xv",generation="peer-successor-g2",launch={nodeId:session,generation,runtime:"codex"};
+  db.prepare("UPDATE nodes SET runtime='pi',model='old-pi-model',codex_config_profile=NULL WHERE id=?").run(session);
+  const previous=recovery.configurationDigest(session);
+  expect(recovery.configurationDigest(session,launch)).toBeNull(); // no approved staged target
+  const packet=parseRuntimeMigration({operationId:"digest-peer-migration",target:{runtime:"codex",provider:"openai",model:"gpt-6-luna",effort:"high",codexConfigProfile:"conveyor-luna-high"},
+   expected:{nodeId:session,sessionName:session,sessionId:session,generation:"peer-g1",pane:"%42",runtime:"pi",configSha256:"a".repeat(64),nativeFingerprintSha256:"b".repeat(64)}});
+  const prepared={protocol:"runtime-migration-v1",...packet},at=new Date(now).toISOString();
+  db.prepare(`INSERT INTO seat_dispatch_reservations
+   (reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,
+    request_hash,expected_json,frozen_snapshot,state,performer_session,performer_generation,successor_generation,created_at,updated_at)
+   VALUES (?,?,?,?,?,?,?,?,?,?,?,'started',?,?,?,?,?)`).run("digest-reservation",packet.operationId,session,session,"peer-g1","retained-pi-history.jsonl",
+    operator.session,operator.generation,digest(canonical(packet)),JSON.stringify(prepared),"retained-custody-digest",operator.session,operator.generation,generation,at,at);
+  const projected=recovery.configurationDigest(session,launch);
+  expect(projected).toMatch(/^[a-f0-9]{64}$/);expect(projected).not.toBe(previous);
+  expect(recovery.configurationDigest(session)).toBe(previous);
+  expect(repo.coordinatorAuthority.generation(session)).toBe("peer-g1");
+  expect(db.prepare("SELECT runtime,model,codex_config_profile FROM nodes WHERE id=?").get(session)).toEqual({runtime:"pi",model:"old-pi-model",codex_config_profile:null});
+  for(const mismatch of [{...launch,generation:"wrong-successor"},{...launch,nodeId:"other-node"},{...launch,runtime:"pi"}])expect(recovery.configurationDigest(session,mismatch)).toBeNull();
+  for(const expected of [{...packet.expected!,sessionName:"wrong@xv"},{...packet.expected!,nodeId:"wrong-node"}]){
+   db.prepare("UPDATE seat_dispatch_reservations SET expected_json=? WHERE reservation_id='digest-reservation'").run(JSON.stringify({...prepared,expected}));
+   expect(recovery.configurationDigest(session,launch)).toBeNull();
+  }
+  db.prepare("UPDATE seat_dispatch_reservations SET expected_json=? WHERE reservation_id='digest-reservation'").run(JSON.stringify(prepared));
+  const prospective={...scope,scopeId:"projected-peer-scope",nodeId:session,sessionName:session,generation,runtime:"codex",configurationDigest:projected};
+  expect((await call("/grant",prospective,operator)).body.error).toBe("native_duty_scope_not_approved");
+  expect(db.prepare("SELECT count(*) n FROM native_duty_grants WHERE scope_id=?").get(prospective.scopeId)).toEqual({n:0});
+  // Same fields and atomic reservation release as the already-tested migration commit.
+  db.transaction(()=>{
+   db.prepare("UPDATE nodes SET runtime=?,model=?,effort=?,codex_config_profile=? WHERE id=?").run(packet.target.runtime,packet.target.model,packet.target.effort,packet.target.codexConfigProfile,session);
+   db.prepare("UPDATE occupant_tenures SET generation_uuid=? WHERE node_id=?").run(generation,session);
+   db.prepare("UPDATE seat_dispatch_reservations SET state='released',successor_native_id='fresh-codex-thread',release_receipt='exact-commit' WHERE reservation_id='digest-reservation'").run();
+  }).immediate();
+  expect(recovery.configurationDigest(session)).toBe(projected);
+  expect(recovery.configurationDigest(session,launch)).toBe(projected);
+  expect(recovery.configurationDigest(session,{...launch,runtime:"pi"})).toBeNull();
+  // Runtime migration alone never transfers coordinator authority to this peer.
+  expect(repo.coordinatorAuthority.get("xv")!.owner_session).toBe(holder.session);
+  expect((await call("/grant",prospective,operator)).body.error).toBe("native_duty_scope_not_approved");
+ });
+
+ it("rejects authority expiry and changed obligations before native intent preparation",async()=>{
+  const registrationId=await grantAndRegister(),stale=request();
+  expect((await call("/prepare",{registrationId,request:{...stale,expectedObligationsDigest:"f".repeat(64)}})).body.error).toBe("native_duty_authority_changed");
+  db.prepare("UPDATE coordinator_authority SET lease_until=? WHERE rig_id='xv'").run(now);
+  expect((await call("/prepare",{registrationId,request:stale})).body.error).toBe("native_duty_authority_changed");
+  expect(db.prepare("SELECT count(*) n FROM native_duty_intents").get()).toEqual({n:0});
+ });
+});
