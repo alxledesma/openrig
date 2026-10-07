@@ -151,7 +151,8 @@ export class CoordinationRecoveryService {
    if((this.refreshIdentity||this.refreshWorkerActivity)&&!prepared)fail('qualification_duty_worker_not_quiescent','Synchronous assessment staging requires the fresh native observation prepared by its authenticated route');
    const observed=this.activity(input.worker),observedAt=Date.parse(observed?.identityObservedAt??'');
    if(!this.preparedQualificationObservationMatches(prepared,input.worker,input.workerGeneration,now,observed)||!observed?.identityVerified||observed.generation!==input.workerGeneration||!Number.isFinite(observedAt)||observedAt>now||now-observedAt>3000||!coordinationIdle(observed,input.workerGeneration,now))fail('qualification_duty_worker_not_quiescent','Fresh verified idle Worker identity and activity required');
-   const activeCustody=(this.db.prepare("SELECT qitem_id FROM queue_items WHERE destination_session=? AND state IN ('pending','in-progress','blocked')").all(input.worker) as Array<{qitem_id:string}>).some(row=>!(previousRetired&&previousChainIds.includes(row.qitem_id)));
+   const containedCustody=this.containedQualificationCustody(input.rigId,input.worker,input.workerGeneration,input.configurationDigest,previousRetired?previousChainIds:[]);
+   const activeCustody=(this.db.prepare("SELECT qitem_id FROM queue_items WHERE destination_session=? AND state IN ('pending','in-progress','blocked')").all(input.worker) as Array<{qitem_id:string}>).some(row=>!containedCustody.has(row.qitem_id));
    if(this.workerEffectDebt(input.worker)||this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(input.worker,input.worker)||this.db.prepare('SELECT 1 FROM seat_delivery_guards WHERE (desired=1 OR effective=1) AND node_id IN (SELECT node_id FROM sessions WHERE session_name=?)').get(input.worker)||activeCustody)fail('qualification_duty_worker_protected','Worker has unresolved effects, existing custody, a reservation or a delivery guard');
    // A qualification exercise is not a product package and cannot shadow an admitted one.
    const packageKey='qualification-assessment:'+contractDigest;
@@ -1124,6 +1125,22 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
   }
   return ids;
  }
+ /** A completed report-only retirement can retain an expired, unclaimed queue row.
+  * Treat that frozen history like its exact contained assessment predecessor at BOTH
+  * issuance and use. Never release claimed custody, unrelated work or an UNKNOWN wake. */
+ private containedQualificationCustody(rigId:string,worker:string,generation:string,configurationDigest:string,assessmentIds:string[]):Set<string> {
+  const allowed=new Set(assessmentIds);if(allowed.size===0)return allowed;
+  const rows=this.db.prepare("SELECT qitem_id FROM queue_items WHERE destination_session=? AND state='pending' AND claimed_at IS NULL AND expires_at<=?").all(worker,new Date(this.now()).toISOString()) as Array<{qitem_id:string}>;
+  for(const {qitem_id} of rows){
+   const control=this.lifecycleControl(qitem_id),r=control?.receipt;
+   if(!control||control.rigId!==rigId||r.kind!=='qualification-assessment-retirement'||r.recipient!==worker||r.recipientGeneration!==generation||r.configurationDigest!==configurationDigest||!assessmentIds.includes(r.targetQueueId))continue;
+   const target=this.lifecycleControl(r.targetQueueId),q=this.repo.getById(r.targetQueueId);
+   if(!target||target.rigId!==rigId||target.receipt.kind!=='qualification-assessment'||target.receipt.recipient!==worker||target.receipt.recipientGeneration!==generation||target.receipt.configurationDigest!==configurationDigest||!q||digest(q.body)!==r.targetBodyHash)continue;
+   const facts=this.dutyFacts(qitem_id);
+   if(facts.expired&&facts.complete&&facts.retired&&this.dutyNoticeContained(rigId,r))allowed.add(qitem_id);
+  }
+  return allowed;
+ }
  private dutyExcludedNotices(r:any):string[] {
   const ids=['wake-intent-'+r.queueId];if(dutyKinds[r.kind as DutyKind]?.effectClass!=='report-only')return ids;
   for(const c of this.dutyChain(r)){const n=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+c.queueId) as any;if(this.dutyNoticeMatches(c,n)&&['pending','sending','delivered','indeterminate','failed'].includes(n.delivery_state))ids.push(n.outbox_id);}return [...new Set(ids)];
@@ -1144,7 +1161,7 @@ private dutyProtection(rigId:string,r:any):boolean {
   if(!plan&&(r.bootstrap===true||r.bootstrapType==='qualification-assessment-retirement')){
    const a=this.authority.get(rigId),now=this.now();if(!a||a.state!=='active'||a.lease_until<=now||a.epoch!==r.epoch||a.owner_session!==r.holder||a.owner_generation!==r.holderGeneration||this.authority.generation(r.holder)!==r.holderGeneration||this.authority.generation('operator-agent@kernel')!==r.operatorGeneration||r.deadline<=now||this.configurationDigest(r.worker)!==r.configurationDigest)return false;
    const allowed=new Set([r.queueId]);
-   if(r.bootstrap===true)for(const id of this.bootstrapContainedAncestors(rigId,r,'qualification-assessment'))allowed.add(id);
+   if(r.bootstrap===true)for(const id of this.containedQualificationCustody(rigId,r.worker,r.workerGeneration,r.configurationDigest,this.bootstrapContainedAncestors(rigId,r,'qualification-assessment')))allowed.add(id);
    if(r.bootstrapType==='qualification-assessment-retirement')for(const id of this.bootstrapContainedAncestors(rigId,r,'qualification-assessment-retirement'))allowed.add(id);
    const custody=this.db.prepare("SELECT qitem_id,source_session,destination_session,state,claimed_at,expires_at,body FROM queue_items WHERE destination_session=? AND state IN ('pending','in-progress','blocked')").all(r.worker) as Array<any>;
    if(r.bootstrapType==='qualification-assessment-retirement'){
