@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { migrate } from "../src/db/migrate.js";
+import { queueRecoveryMembershipSchema } from "../src/db/migrations/102_queue_recovery_membership.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
@@ -28,7 +29,7 @@ describe("recovery lookup work and fresh disposition", () => {
     const expected = repo.getById("source"); legacy.mockRestore();
     const prepare = db.prepare.bind(db); const calls: unknown[] = [];
     vi.spyOn(db, "prepare").mockImplementation((sql) => {
-      if (sql.includes("json_each(tags)") && sql.includes("ts_updated DESC, qitem_id DESC LIMIT 1")) calls.push(sql);
+      if (sql.includes("FROM queue_recovery_membership m")) calls.push(sql);
       return prepare(sql);
     });
     expect(repo.getById("source")).toEqual(expected);
@@ -88,10 +89,55 @@ describe("recovery lookup work and fresh disposition", () => {
     expect(findQueueRecovery(db, "source")?.qitemId).toBe("disposition");
     const prepare = db.prepare.bind(db);
     vi.spyOn(db, "prepare").mockImplementation(sql => {
-      if (sql.includes("json_each(tags)") && sql.includes("ts_updated DESC, qitem_id DESC LIMIT 1")) throw new Error("fixture lookup unavailable");
+      if (sql.includes("FROM queue_recovery_membership m")) throw new Error("fixture lookup unavailable");
       return prepare(sql);
     });
     expect(() => repo.getById("source")).toThrow("fixture lookup unavailable");
     expect(() => repo.list({ state: "pending" })).toThrow("fixture lookup unavailable");
+  });
+});
+
+
+describe("indexed recovery membership migration", () => {
+  const at = "2026-10-07T12:00:00.000Z";
+  function insert(db: Database.Database, id: string, tags: string | null, state = "pending") {
+    db.prepare("INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,tags,body) VALUES (?,?,?,'source','worker',?,?,'retained')").run(id,at,at,state,tags);
+  }
+  it("backfills decoded legacy membership once without changing canonical bytes, including malformed JSON", () => {
+    const db = new Database(":memory:");
+    try {
+      const prior=ALL_MIGRATIONS.filter(m=>m.name!==queueRecoveryMembershipSchema.name);migrate(db,prior);
+      for(const [id,tags] of [['array','["recovery-for:source","recovery-for:source"]'],['object','{"x":"recovery-for:source"}'],['scalar','"recovery-for:source"'],['escaped','["\\u0072ecovery-for:source"]'],['malformed','{'],['null',null],['nested','[["recovery-for:source"]]'],['nontext','[42,true,null]']] as const)insert(db,id,tags);
+      const before=db.prepare("SELECT * FROM queue_items ORDER BY qitem_id").all();
+      migrate(db,ALL_MIGRATIONS);migrate(db,ALL_MIGRATIONS);
+      expect(db.prepare("SELECT * FROM queue_items ORDER BY qitem_id").all()).toEqual(before);
+      expect(db.prepare("SELECT qitem_id FROM queue_recovery_membership WHERE tag=? ORDER BY qitem_id").all(recoveryTag('source'))).toEqual(['array','escaped','object','scalar'].map(qitem_id=>({qitem_id})));
+    } finally {db.close();}
+  });
+  it("maintains tag removal, malformed edits, state/time/id rank, delete, REPLACE and transaction rollback atomically", () => {
+    const db=new Database(":memory:");try {
+      migrate(db,ALL_MIGRATIONS);insert(db,'a','["recovery-for:source"]');insert(db,'b','["recovery-for:source"]');
+      expect(findQueueRecovery(db,'source')?.qitemId).toBe('b');
+      db.prepare("UPDATE queue_items SET qitem_id='z',state='done',ts_updated='2099-01-01T00:00:00Z' WHERE qitem_id='b'").run();
+      expect(findQueueRecovery(db,'source')?.qitemId).toBe('a');
+      db.prepare("UPDATE queue_items SET tags='{' WHERE qitem_id='a'").run();expect(findQueueRecovery(db,'source')?.qitemId).toBe('z');
+      const before=db.prepare("SELECT * FROM queue_recovery_membership").all();
+      expect(()=>db.transaction(()=>{db.prepare("UPDATE queue_items SET tags='[]' WHERE qitem_id='z'").run();insert(db,'rollback','["recovery-for:source"]');throw new Error('rollback');})()).toThrow('rollback');
+      expect(db.prepare("SELECT * FROM queue_recovery_membership").all()).toEqual(before);
+      db.prepare("INSERT OR REPLACE INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,tags,body) VALUES ('z',?,?,'s','w','blocked','[\"recovery-for:other\"]','retained')").run(at,at);
+      expect(findQueueRecovery(db,'source')).toBeNull();expect(findQueueRecovery(db,'other')?.qitemId).toBe('z');
+      db.prepare("DELETE FROM queue_items WHERE qitem_id='z'").run();expect(findQueueRecovery(db,'other')).toBeNull();
+    } finally {db.close();}
+  });
+  it("uses a tag/rank index seek without scanning all queue rows, parsing JSON or sorting candidates", () => {
+    const db=new Database(":memory:");try {
+      migrate(db,ALL_MIGRATIONS);db.transaction(()=>{for(let i=0;i<8500;i++)insert(db,'unrelated-'+i,'["ordinary"]');insert(db,'match','["recovery-for:source"]');})();
+      const actualPrepare=db.prepare.bind(db);let lookup='';vi.spyOn(db,'prepare').mockImplementation(sql=>{if(sql.includes('FROM queue_recovery_membership m'))lookup=sql;return actualPrepare(sql);});
+      expect(findQueueRecovery(db,'source')).toEqual({qitemId:'match',state:'pending'});
+      const plan=actualPrepare('EXPLAIN QUERY PLAN '+lookup).all(recoveryTag('source')) as Array<{detail:string}>;
+      expect(plan.some(r=>r.detail.includes('SEARCH m USING COVERING INDEX idx_queue_recovery_membership_rank (tag=?)'))).toBe(true);
+      expect(plan.some(r=>/SCAN|TEMP B-TREE|json_each/.test(r.detail))).toBe(false);
+      expect(plan.some(r=>r.detail.includes('SEARCH q USING INDEX sqlite_autoindex_queue_items_1 (qitem_id=?)'))).toBe(true);
+    } finally {vi.restoreAllMocks();db.close();}
   });
 });

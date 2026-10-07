@@ -18,9 +18,10 @@ export function recoveryId(db: Database.Database, qitemId: string): string {
   return `qitem-recovery-${createHash("sha256").update(JSON.stringify([qitemId, lastMeaningfulTransition(db, qitemId)?.id ?? null, failedAttempt(db, qitemId)])).digest("hex").slice(0, 16)}`;
 }
 export function findQueueRecovery(db: Database.Database, qitemId: string): { qitemId: string; state: string } | null {
-  const row = db.prepare(`SELECT qitem_id, state, ts_updated FROM queue_items
-    WHERE json_valid(tags) AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)
-    ORDER BY CASE WHEN state IN ('pending','in-progress','blocked') THEN 0 ELSE 1 END, ts_updated DESC, qitem_id DESC LIMIT 1`)
+  const row = db.prepare(`SELECT q.qitem_id, q.state, q.ts_updated
+    FROM queue_recovery_membership m JOIN queue_items q ON q.qitem_id=m.qitem_id
+    WHERE m.tag = ?
+    ORDER BY m.live_rank, m.ts_updated DESC, m.qitem_id DESC LIMIT 1`)
     .get(recoveryTag(qitemId)) as { qitem_id: string; state: string; ts_updated: string } | undefined;
   if (!row) return null;
   if (!["pending", "in-progress", "blocked"].includes(row.state)) {
