@@ -1,3 +1,4 @@
+import { isCodexUpdateMenu } from "./codex-update-menu.js";
 import { shellQuote } from "../adapters/shell-quote.js";
 import { codexPostureArg } from "../adapters/yolo-mode.js";
 
@@ -202,6 +203,13 @@ export function assessNativeResumeProbe(
         detail: "Codex is waiting for hook trust approval before the session can become interactive.",
       };
     }
+    if (isCodexUpdateMenu(paneContent)) {
+      return {
+        status: "inconclusive",
+        code: "update_gate",
+        detail: "Codex reached an update flow, so process-alive alone is not proof of a restored conversation.",
+      };
+    }
     if (looksLikeCodexTui(paneContent)) {
       return {
         status: "resumed",
@@ -216,7 +224,7 @@ export function assessNativeResumeProbe(
         detail: "Codex is waiting for workspace trust approval before the session can become interactive.",
       };
     }
-    if (paneContent.includes("Update available!") || paneContent.includes("Updating Codex")) {
+    if (paneContent.includes("Updating Codex")) {
       return {
         status: "inconclusive",
         code: "update_gate",
@@ -333,7 +341,7 @@ function looksLikeCodexTui(paneContent: string): boolean {
   // not a model mentioned somewhere in conversation prose.
   // A custom row must not make an unresolved trust/update panel disappear.
   const hasCustomModelFooter = !looksLikeCodexTrustPrompt(current)
-    && !current.includes("Update available!") && !current.includes("Updating Codex")
+    && !isCodexUpdateMenu(current) && !current.includes("Updating Codex")
     && recentLines.split("\n").some((line) => {
       const fields = line.trim().split(" · ");
       return /^[ \t]{2,}\S/.test(line) && fields.length > 1

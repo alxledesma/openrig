@@ -1,3 +1,4 @@
+import { isCodexUpdateMenu } from "../domain/codex-update-menu.js";
 import { readOpenCodexRollout } from "../domain/codex-open-rollout.js";
 import nodePath from "node:path";
 import fs from "node:fs";
@@ -504,7 +505,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       const probe = assessNativeResumeProbe({ runtime: "codex", paneCommand, paneContent });
 
       if (probe.code === "update_gate") {
-        if (updatePrompt.handled || !isSkippableCodexUpdatePrompt(paneContent)) return false;
+        if (updatePrompt.handled || !isCodexUpdateMenu(paneContent)) return false;
         const identity = await this.observeMenuProcess(tmuxSession, paneCommand);
         if (!identity) return false;
         // The npm launcher may be foreground Node with a native Codex child.
@@ -515,7 +516,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           return false;
         }
         const currentScreen = await this.tmux.capturePaneScreen?.(tmuxSession);
-        if (!currentScreen || !isSkippableCodexUpdatePrompt(currentScreen)
+        if (!currentScreen || !isCodexUpdateMenu(currentScreen)
           || assessNativeResumeProbe({ runtime: "codex", paneCommand: currentCommand, paneContent: currentScreen }).code !== "update_gate") {
           updatePrompt.handled = true;
           return false;
@@ -1557,9 +1558,4 @@ function commandLooksLikeCodex(command: string): boolean {
     const base = nodePath.basename(unquoted);
     return base === "codex";
   });
-}
-
-function isSkippableCodexUpdatePrompt(paneContent: string): boolean {
-  return paneContent.includes("Update available!")
-    && /^\s*[›>]?\s*3\. Skip until next version\s*$/m.test(paneContent);
 }

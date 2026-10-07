@@ -102,7 +102,7 @@ describe("native resume probe", () => {
     });
     it.each([
       ["Do you trust the contents of this directory?\n  Yes, continue", "trust_gate"],
-      ["Update available!", "update_gate"],
+      ["Update available!\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  3. Skip until next version", "update_gate"],
     ])("does not let a custom footer dismiss an unresolved gate: %s", (gate, code) => {
       expect(assessNativeResumeProbe({ runtime: "codex", paneCommand: "sh",
         paneContent: `› Earlier conversation prompt\n${gate}\n${reportedFooter}`,
@@ -472,7 +472,7 @@ describe("native resume probe", () => {
       assessNativeResumeProbe({
         runtime: "codex",
         paneCommand: "codex-aarch64-a",
-        paneContent: "✨ Update available! 0.117.0 -> 0.118.0\nPress enter to continue",
+        paneContent: "✨ Update available! 0.117.0 -> 0.118.0\n› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n  3. Skip until next version\nPress enter to continue",
       })
     ).toEqual({
       status: "inconclusive",

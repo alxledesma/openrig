@@ -43,7 +43,7 @@ const processRows = (shape: "wrapper" | "exec-wrapper" | "native"): ProcessRow[]
     { pid: 103, ppid: 102, command: native, pgid: 102, tpgid: 102, executableName: "codex", startedAt: "Sat Jan  1 12:00:00 2000" },
   ];
 };
-function fixture(options: { delay?: number; beforeMenu?: number; failInput?: boolean; screen?: string; command?: string; panePid?: number; processes?: ProcessRow[]; shape?: "wrapper" | "exec-wrapper" | "native" } = {}) {
+function fixture(options: { menu?: string; delay?: number; beforeMenu?: number; failInput?: boolean; screen?: string; command?: string; panePid?: number; processes?: ProcessRow[]; shape?: "wrapper" | "exec-wrapper" | "native" } = {}) {
   let selected = false;
   let ticks = 0;
   let updates = 0;
@@ -52,7 +52,7 @@ function fixture(options: { delay?: number; beforeMenu?: number; failInput?: boo
   const commands: string[] = [];
   const leaked: string[] = [];
   const ready = () => selected && ticks >= (options.delay ?? 0);
-  const screen = () => options.screen ?? (ticks < (options.beforeMenu ?? 0) ? "Starting Codex..." : ready() ? READY : MENU);
+  const screen = () => options.screen ?? (ticks < (options.beforeMenu ?? 0) ? "Starting Codex..." : ready() ? READY : (options.menu ?? MENU));
   const tmux = new TmuxAdapter(async (cmd) => {
     commands.push(cmd);
     if (cmd.includes("paste-buffer")) {
@@ -97,9 +97,11 @@ const paths = [
   { name: "fork", opts: { name: "checker@test", forkSource: { kind: "native_id" as const, value: "parent-thread" } } },
 ];
 
+describe.each([MENU, MENU.replace("✨ Update available! 0.155.1 -> 0.156.1", "Update available · 0.160.0 → 0.160.1")])("Codex menu: %s", menu => {
 describe.each(paths)("Codex update input: $name", ({ opts }) => {
+  const fixtureWithMenu = (options: Parameters<typeof fixture>[0] = {}) => fixture({ ...options, menu });
   it.each([0, 4, 100])("sends one real key, no Enter or retry, with %i delayed ticks", async (delay) => {
-    const f = fixture({ delay });
+    const f = fixtureWithMenu({ delay });
     const result = await f.adapter.launchHarness(binding, opts);
     expect(f.commands).toEqual(["tmux send-keys -t 'checker@test' '3'"]);
     expect(f.counts()).toEqual({ updates: 0, dismissals: 1 });
@@ -110,7 +112,7 @@ describe.each(paths)("Codex update input: $name", ({ opts }) => {
   });
 
   it.each([0, 9])("reports input failure without retry when the menu arrives after %i ticks", async (beforeMenu) => {
-    const f = fixture({ failInput: true, beforeMenu });
+    const f = fixtureWithMenu({ failInput: true, beforeMenu });
     const result = await f.adapter.launchHarness(binding, opts);
     expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
     if (!result.ok) expect(result.error).toContain("input transport failed");
@@ -120,7 +122,7 @@ describe.each(paths)("Codex update input: $name", ({ opts }) => {
   });
 
   it("handles a menu first appearing during later thread/resume polls", async () => {
-    const f = fixture({ beforeMenu: 9 });
+    const f = fixtureWithMenu({ beforeMenu: 9 });
     const result = await f.adapter.launchHarness(binding, opts);
     expect(result.ok).toBe(true);
     expect(f.commands).toEqual(["tmux send-keys -t 'checker@test' '3'"]);
@@ -129,7 +131,7 @@ describe.each(paths)("Codex update input: $name", ({ opts }) => {
   });
 
   it("does not reopen update automation after seeing the conversation", async () => {
-    const f = fixture();
+    const f = fixtureWithMenu();
     vi.mocked(f.tmux.capturePaneScreen).mockResolvedValueOnce(READY).mockResolvedValue(MENU);
     await f.adapter.launchHarness(binding, opts);
     expect(f.commands).toEqual([]);
@@ -142,20 +144,20 @@ describe.each(paths)("Codex update input: $name", ({ opts }) => {
     { screen: MENU, command: "zsh", processes: [{ pid: 101, ppid: 1, command: "-zsh", pgid: 101, tpgid: 101, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" }] },
     { screen: "Unknown screen" },
   ])("leaves unknown/changed/exited or already-ready screens alone: %j", async (options) => {
-    const f = fixture(options);
+    const f = fixtureWithMenu(options);
     await f.adapter.launchHarness(binding, opts);
     expect(f.commands).toEqual([]);
   });
 
   it.each(["wrapper", "exec-wrapper", "native"] as const)("recognizes the live foreground %s identity", async (shape) => {
-    const f = fixture({ shape, command: shape === "native" ? "codex" : "node" });
+    const f = fixtureWithMenu({ shape, command: shape === "native" ? "codex" : "node" });
     await f.adapter.launchHarness(binding, opts);
     expect(f.commands).toEqual(["tmux send-keys -t 'checker@test' '3'"]);
     expect(f.counts()).toEqual({ updates: 0, dismissals: 1 });
   });
 
   it("checks synthetic shell-owned ancestry before selecting one key", async () => {
-    const f = fixture({ command: "bash", panePid: 2001, processes: ordinaryRows });
+    const f = fixtureWithMenu({ command: "bash", panePid: 2001, processes: ordinaryRows });
     await f.adapter.launchHarness(binding, opts);
     expect(f.commands).toEqual(["tmux send-keys -t 'checker@test' '3'"]);
     expect(f.listProcesses.mock.calls.length).toBeGreaterThanOrEqual(2);
@@ -168,7 +170,7 @@ describe.each(paths)("Codex update input: $name", ({ opts }) => {
     { name: "unrelated native", rows: ordinaryRows.map(r => r.pid === 2004 ? { ...r, ppid: 1 } : r) },
     { name: "exited native with stale menu", rows: ordinaryRows.filter(r => r.pid !== 2004) },
   ])("rejects synthetic shell ancestry with $name", async ({ rows }) => {
-    const f = fixture({ command: "bash", panePid: 2001, processes: rows });
+    const f = fixtureWithMenu({ command: "bash", panePid: 2001, processes: rows });
     await f.adapter.launchHarness(binding, opts);
     expect(f.commands).toEqual([]);
   });
@@ -194,7 +196,7 @@ describe.each(paths)("Codex update input: $name", ({ opts }) => {
   });
 
   it.each(["missing pane", "missing pane command", "failed process read", "missing current screen"])("refuses %s", async (failure) => {
-    const f = fixture({ command: "node" });
+    const f = fixtureWithMenu({ command: "node" });
     if (failure === "missing pane") vi.mocked(f.tmux.getPanePid).mockResolvedValue(null);
     if (failure === "missing pane command") vi.mocked(f.tmux.getPaneCommand).mockResolvedValue(null);
     if (failure === "failed process read") f.listProcesses.mockImplementation(() => { throw Error("ps unavailable"); });
@@ -224,7 +226,7 @@ describe.each(paths)("Codex update input: $name", ({ opts }) => {
   });
 
   it("allows one choice on a separately requested new launch", async () => {
-    const f = fixture();
+    const f = fixtureWithMenu();
     await f.adapter.launchHarness(binding, opts);
     f.reset();
     await f.adapter.launchHarness(binding, opts);
@@ -232,6 +234,8 @@ describe.each(paths)("Codex update input: $name", ({ opts }) => {
     expect(f.counts()).toEqual({ updates: 0, dismissals: 2 });
     expect(f.leaked).toEqual([]);
   });
+});
+
 });
 
 it("negative control: real bracketed Paste3 then Enter selects UpdateNow in the pinned model", async () => {
