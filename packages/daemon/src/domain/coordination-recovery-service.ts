@@ -776,14 +776,35 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
  }
  /** Bind only producer-authored assignment pointers to actual native pickup.
   * Historical holder receipts prove origin, never current authority or delivery. */
+ /** Exact native assignment claim, including archived history. The producer's
+  * row timestamp and transition timestamp are independent; the immutable after
+  * snapshot binds the retained claim tuple, never a clock tolerance. */
+ private assignmentNativeClaim(queueId:string,recipient:string,generation:string,source:string,body:string):number|null {
+  const q=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(queueId) as any;
+  if(!q||!['in-progress','blocked','done','failed','canceled'].includes(q.state)||q.source_session!==source||q.destination_session!==recipient||q.body!==body||!q.claimed_at||q.claimed_by_generation_uuid!==generation)return null;
+  const history=this.repo.transitionLog.listForQitem(queueId);
+  for(let i=history.length-1;i>=0;i--){
+   const t=history[i]!;
+   if(t.state!=='in-progress'||t.transitionNote!=='claimed'||t.actorSession!==recipient||t.identityProvenance!=='transport:v1')continue;
+   const r=this.nativeCustodyEvidenceTransition(t);if(!r||r.actorGeneration!==generation)continue;
+   const before=r.beforeQueue,after=r.afterQueue;
+   if(!['pending','blocked'].includes(String(before.state))||after.state!=='in-progress'||
+      [before,after].some(snapshot=>snapshot.qitem_id!==queueId||snapshot.source_session!==source||snapshot.destination_session!==recipient||snapshot.body!==body)||
+      after.claimed_at!==q.claimed_at||after.claimed_by_generation_uuid!==q.claimed_by_generation_uuid)return null;
+   return t.transitionId;
+  }
+  return null;
+ }
+ /** Bind only producer-authored assignment pointers to actual native pickup.
+   * Historical holder receipts prove origin, never current authority or delivery. */
  private assignmentWakeProof(row:any):{rigId:string;queueId:string;bodyHash:string;assignmentHash:string;recipientGeneration:string;claimTransitionId:number}|null {
   if(row.delivery_state!=='indeterminate'||row.identity_provenance!=='system:operator-authorized-coordination')return null;
   const a=this.db.prepare('SELECT a.*,q.body,q.source_session,p.contract,p.contract_hash FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.queue_id=?').get(row.audit_pointer) as any;
   if(!a||a.destination!==row.destination_session||a.source_session!==a.owner_session||a.body_hash!==digest(a.body)||digest(a.contract)!==a.contract_hash)return null;
   let contract:any;try{contract=JSON.parse(a.contract);}catch{return null;}
   if(contract.destination!==a.destination||contract.bodyHash!==a.body_hash)return null;
-  const creation=this.db.prepare('SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1').get(a.queue_id) as any;
-  if(creation?.actor_session!==a.owner_session||creation.identity_provenance!=='system:operator-authorized-coordination')return null;
+  const creation=this.repo.transitionLog.listForQitem(a.queue_id)[0];
+  if(!creation||creation.actorSession!==a.owner_session||creation.identityProvenance!=='system:operator-authorized-coordination')return null;
   let sender=a.owner_session,senderGeneration=a.owner_generation,bareBody='Queue handoff: '+a.queue_id+' - check your queue.';
   let tags:any;try{tags=JSON.parse(row.tags??'[]');}catch{return null;}
   if(!Array.isArray(tags))return null;
@@ -806,12 +827,12 @@ if(action===CoordinationRecoveryService.SYSTEM_WAKE_ROLLOUT){
   const parts=String(row.body??'').split('\n---\n'),header=parts[0]?.split('\n');
   if(parts.length!==3||header?.length!==3||header[0]!=='From: '+sender||header[1]!=='To: '+a.destination||!/^Sent: \d{2}-\d{2} \d{2}:\d{2}Z · gen /.test(header[2]!)||!header[2]!.endsWith(' · gen '+senderGeneration.slice(0,8))||parts[1]!==bareBody||parts[2]!=='↩ Reply: rig send '+sender+' "..."')return null;
   const generation=this.authority.generation(a.destination);
-  if(!generation||!this.systemNativeCustody(a.queue_id,a.destination,generation))return null;
-  const claim=this.db.prepare("SELECT transition_id FROM queue_transitions WHERE qitem_id=? AND state='in-progress' AND transition_note='claimed' AND actor_session=? AND identity_provenance='transport:v1' AND ts=(SELECT claimed_at FROM queue_items WHERE qitem_id=?) ORDER BY transition_id DESC LIMIT 1").get(a.queue_id,a.destination,a.queue_id) as {transition_id:number}|undefined;
-  if(!claim)return null;
+  if(!generation)return null;
+  const claim=this.assignmentNativeClaim(a.queue_id,a.destination,generation,a.source_session,a.body);
+  if(claim===null)return null;
   // disposition_id advances through genuine dispose and is not dispatch identity.
   const {disposition_id:_,body,...immutable}=a;
-  return {rigId:a.rig_id,queueId:a.queue_id,bodyHash:digest(body),assignmentHash:digest(JSON.stringify(immutable)),recipientGeneration:generation,claimTransitionId:claim.transition_id};
+  return {rigId:a.rig_id,queueId:a.queue_id,bodyHash:digest(body),assignmentHash:digest(JSON.stringify(immutable)),recipientGeneration:generation,claimTransitionId:claim};
  }
  private assignmentWakeOutcomeContained(rigId:string,row:any):boolean {
   const proof=this.assignmentWakeProof(row);if(!proof||proof.rigId!==rigId)return false;
