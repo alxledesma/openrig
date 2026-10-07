@@ -897,12 +897,26 @@ describe("seat rehost-runner legacy native witness flag", () => {
     expect(off.bodies[0]).toEqual({ reason: "r", operator: undefined, legacyNativeWitness: false });
     const on = await run(["rehost-runner", "dev-impl@seat-rig", "--reason", "r", "--legacy-native-witness"]);
     expect(on.bodies[0]).toMatchObject({ legacyNativeWitness: true });
+    const stopped = await run(["rehost-runner", "dev-impl@seat-rig", "--reason", "r", "--stopped-target-recovery", "--accept-unpersisted-turn-loss", "owner-decision-17"]);
+    expect(stopped.bodies[0]).toMatchObject({ stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "owner-decision-17", legacyNativeWitness: false });
     // Nothing a daemon would have to trust is ever authored by the client.
-    for (const body of [off.bodies[0], on.bodies[0]] as Array<Record<string, unknown>>) {
+    for (const body of [off.bodies[0], on.bodies[0], stopped.bodies[0]] as Array<Record<string, unknown>>) {
       for (const key of ["witness", "proof", "nativeLeaf", "leaf", "leafId", "lastEntryId", "cursor", "modules", "moduleUrl", "runnerModuleUrl", "piModuleUrl", "modulePath", "scriptPath", "endpoint", "inspectorPort", "port", "pid", "runnerPid", "childPid", "sessionFile", "launchId", "generation"]) {
         expect(key in body, key).toBe(false);
       }
     }
+  });
+
+  it("refuses stopped-target mode without its acceptance reference before making a request", async () => {
+    const paths: string[] = [];
+    const postBodies: unknown[] = [];
+    const command = makeCommand(makeDeps({ status: 200, data: OK }, paths, postBodies));
+    const capture = await captureLogs(async () => {
+      await command.parseAsync(["node", "rig", "seat", "rehost-runner", "dev-impl@seat-rig", "--reason", "r", "--stopped-target-recovery"]);
+    });
+    expect(postBodies).toEqual([]);
+    expect(capture.exitCode).toBe(1);
+    expect(capture.errors.join(" ")).toContain("--accept-unpersisted-turn-loss");
   });
 
   it("refuses a caller-authored proof at the daemon boundary", async () => {

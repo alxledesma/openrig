@@ -321,18 +321,35 @@ export const LEGACY_WITNESS_FORBIDDEN_REQUEST_KEYS = [
   "lastEntryId", "cursor", "modules", "moduleUrl", "runnerModuleUrl", "piModuleUrl",
   "modulePath", "scriptPath", "endpoint", "inspectorPort", "port", "pid",
   "runnerPid", "childPid", "ppid", "sessionFile", "launchId", "generation",
+  "path", "sessionPath", "snapshotPath", "recoverySnapshot", "stoppedTargetLeaf", "leafSource",
+  "startedAt", "runnerStartedAt", "childStartedAt", "timestamp", "timing", "timeout", "waitMs",
 ] as const;
 
 /** Parse the EXPLICIT legacy native-witness option. Absent means the ordinary rehost;
  *  present it must be a real boolean; nothing else about the bridge is settable. */
 export function parseLegacyNativeWitnessRequest(body: Record<string, unknown>): { ok: true; legacyNativeWitness: boolean } | { ok: false; error: string } {
   for (const key of LEGACY_WITNESS_FORBIDDEN_REQUEST_KEYS) {
-    if (key in body) return { ok: false, error: `${key} is not accepted: the legacy native witness is built by the daemon, never supplied by a caller` };
+    if (key in body) return { ok: false, error: `${key} is not accepted: process identity, witness and recovery paths are built by the daemon, never supplied by a caller` };
   }
   const raw = body["legacyNativeWitness"];
   if (raw === undefined) return { ok: true, legacyNativeWitness: false };
   if (typeof raw !== "boolean") return { ok: false, error: "legacyNativeWitness must be a boolean when present" };
   return { ok: true, legacyNativeWitness: raw };
+}
+
+export function parseStoppedTargetRecoveryRequest(body: Record<string, unknown>): { ok: true; legacyNativeWitness: boolean; stoppedTargetRecovery: boolean; stoppedTargetAcceptanceReference?: string } | { ok: false; error: string } {
+  const legacy = parseLegacyNativeWitnessRequest(body);
+  if (!legacy.ok) return legacy;
+  const rawMode = body["stoppedTargetRecovery"];
+  if (rawMode !== undefined && typeof rawMode !== "boolean") return { ok: false, error: "stoppedTargetRecovery must be a boolean when present" };
+  const stoppedTargetRecovery = rawMode === true;
+  const rawAcceptance = body["stoppedTargetAcceptanceReference"];
+  if (rawAcceptance !== undefined && typeof rawAcceptance !== "string") return { ok: false, error: "stoppedTargetAcceptanceReference must be a string when present" };
+  const acceptance = typeof rawAcceptance === "string" ? rawAcceptance.trim() : "";
+  if (legacy.legacyNativeWitness && stoppedTargetRecovery) return { ok: false, error: "legacyNativeWitness and stoppedTargetRecovery are mutually exclusive" };
+  if (stoppedTargetRecovery && !acceptance) return { ok: false, error: "stoppedTargetAcceptanceReference is required and must acknowledge possible loss of an unpersisted in-flight turn" };
+  if (!stoppedTargetRecovery && rawAcceptance !== undefined) return { ok: false, error: "stoppedTargetAcceptanceReference requires stoppedTargetRecovery" };
+  return { ok: true, legacyNativeWitness: legacy.legacyNativeWitness, stoppedTargetRecovery, ...(acceptance ? { stoppedTargetAcceptanceReference: acceptance } : {}) };
 }
 
 // Same-generation Pi runner rehost. The shipped resume primitive, the shipped pi
@@ -344,8 +361,8 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   const body = await c.req.json<Record<string, unknown>>();
   if (typeof body.reason !== "string" || !body.reason.trim()) return c.json({ error: "reason required" }, 400);
   if (body.operator !== undefined && typeof body.operator !== "string") return c.json({ error: "operator must be a string when present" }, 400);
-  const legacyRequest = parseLegacyNativeWitnessRequest(body);
-  if (!legacyRequest.ok) return c.json({ error: legacyRequest.error }, 400);
+  const rehostRequest = parseStoppedTargetRecoveryRequest(body);
+  if (!rehostRequest.ok) return c.json({ error: rehostRequest.error }, 400);
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
   const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter;
   const stateRoot = join(OPENRIG_HOME, "state", "pi");
@@ -400,7 +417,9 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
       const p = piSeatPaths(stateRoot, sessionName).runnerStatePath;
       return existsSync(p) ? parsePiRunnerState(readFileSync(p, "utf-8")) : null;
     },
-    piSessionFileExists: (p: string) => existsSync(p),    // Bounded 64 KiB POSITIONAL tail: read only the last window, never the whole file.
+    piSessionFileExists: (p: string) => existsSync(p),
+    piRecoverySnapshotDirectory: join(stateRoot, "rehost-recovery-snapshots"),
+    // Bounded 64 KiB POSITIONAL tail: read only the last window, never the whole file.
     // An entry larger than the window, or a final line without its terminating newline
     // (a partial/in-progress append), returns null so rehost refuses instead of
     // parsing an optimistic value. No transcript content is ever returned.
@@ -479,7 +498,9 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
     seatRef: decodeURIComponent(c.req.param("seatRef")),
     reason: body.reason,
     operator: (body.operator as string | undefined) ?? null,
-    legacyNativeWitness: legacyRequest.legacyNativeWitness,
+    legacyNativeWitness: rehostRequest.legacyNativeWitness,
+    stoppedTargetRecovery: rehostRequest.stoppedTargetRecovery,
+    ...(rehostRequest.stoppedTargetAcceptanceReference ? { stoppedTargetAcceptanceReference: rehostRequest.stoppedTargetAcceptanceReference } : {}),
     onPreEffectRefusal: refusal => (refusal.code === "rehost_process_identity_unknown" ? { ...refusal, observed: { ...(refusal.observed ?? {}), reasons: [...new Set([...proofReasons.map(r => r.code), ...((refusal.observed?.reasons as string[] | undefined) ?? [])])] } } : refusal),
   });
   return c.json(result, result.ok ? 200 : seatLifecycleStatus(result.code));

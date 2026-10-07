@@ -18,9 +18,9 @@ import { reanchorBuiltinStartupFile, reanchorShippedProjectionEntry } from "./bu
 import type { OccupantInvalidator } from "./occupant-invalidator.js";
 import { rebindAndVerifyPaneIdentity } from "./seat-attention-reconciler.js";
 import { observeSolePane } from "./pane-binding-observation.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -78,6 +78,8 @@ export interface SeatLifecycleDeps {
   piProve?: (session: string) => Promise<PiRehostProof | null>;
   piRunnerState?: (sessionName: string) => PiRehostRunnerState | null;
   piSessionFileExists?: (path: string) => boolean;
+  /** Private daemon-owned directory for stopped-target recovery snapshots. */
+  piRecoverySnapshotDirectory?: string;
   /** Bounded identity digest of the session file the runner will resume. Optional so a
    *  caller may supply its own reader; the default hashes the real bytes. Rehost
    *  refuses rather than fabricating a prefix it could not read. */
@@ -153,6 +155,7 @@ function paneShellBasename(command: string | null | undefined): string | null {
 export interface RehostPlan {
   generation: string; sessionFile: string; launchId: string; lastEntryId: string | null;
   runnerPid: number; runnerChildPid: number | null; sessionFileSha256Prefix: string;
+  runnerStartedAt?: string; childStartedAt?: string; runnerCommand?: string; childCommand?: string;
   model: string | null; cwd: string; posture: "floor" | "full_bypass";
   authority: RehostAuthorityFact | null; sessionId: string | null;
   /** Present ONLY for the explicit legacy native-witness option. Carries the daemon-
@@ -161,6 +164,12 @@ export interface RehostPlan {
   /** The sidecar cursor as OBSERVED, kept beside the carried value so a receipt can
    *  state plainly which cursor was bypassed and which leaf replaced it. */
   sidecarCursorObserved?: string | null;
+  stoppedTargetRecovery?: boolean;
+  stoppedTargetAcceptanceReference?: string;
+  recoverySnapshot?: { path: string; sha256: string; size: number; bytes: Buffer };
+  recoveryAppendedBytes?: number;
+  recoveryAppendedSha256?: string;
+  stoppedTargetLeaf?: string;
 }
 
 /** Why the legacy bridge could not even be ATTEMPTED. A closed vocabulary: an
@@ -283,6 +292,11 @@ export interface SeatRefusal {
     | "rehost_post_proof_failed"
     | "rehost_post_proof_unstable"
     | "rehost_effect_unknown"
+    | "rehost_recovery_acceptance_required"
+    | "rehost_recovery_modes_exclusive"
+    | "rehost_recovery_snapshot_failed"
+    | "rehost_recovery_history_changed"
+    | "rehost_recovery_identity_changed"
     // EXPLICIT legacy native-witness option. Both are PRE-EFFECT refusals: they
     // precede every signal, so the daemon-owned mapping or the fresh witness
     // failing leaves the old runner exactly as it was found.
@@ -424,6 +438,7 @@ export class SeatLifecycleService {
   private readonly piProve?: (session: string) => Promise<PiRehostProof | null>;
   private readonly piRunnerState?: (sessionName: string) => PiRehostRunnerState | null;
   private readonly piSessionFileExists?: (path: string) => boolean;
+  private readonly piRecoverySnapshotDirectory?: string;
   private readonly piSessionFileDigestPrefix?: (sessionFile: string) => string | null;
   private readonly paneRootPid?: (nodeId: string) => Promise<number | null>;
   private readonly piSessionTailEntryId?: (path: string) => string | null;
@@ -468,6 +483,7 @@ export class SeatLifecycleService {
     this.piProve = deps.piProve;
     this.piRunnerState = deps.piRunnerState;
     this.piSessionFileExists = deps.piSessionFileExists;
+    this.piRecoverySnapshotDirectory = deps.piRecoverySnapshotDirectory;
     this.piSessionFileDigestPrefix = deps.piSessionFileDigestPrefix;
     this.paneRootPid = deps.paneRootPid;
     this.piSessionTailEntryId = deps.piSessionTailEntryId;
@@ -1621,13 +1637,21 @@ export class SeatLifecycleService {
    * unverifiable fact refuses, and a failed stop or resume writes a failed
    * event and stops, so a blind retry cannot happen.
    */
-  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null; legacyNativeWitness?: boolean; onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal }): Promise<RehostRunnerResult> {
+  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null; legacyNativeWitness?: boolean; stoppedTargetRecovery?: boolean; stoppedTargetAcceptanceReference?: string; onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal }): Promise<RehostRunnerResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     // EXPLICIT, DEFAULT-OFF. This boolean is the ONLY thing the option adds. No
     // witness, leaf, module path, endpoint, port, pid or cursor may be supplied by a
     // caller, and an absent value is exactly the ordinary rehost.
     const legacyNativeWitness = input.legacyNativeWitness === true;
+    const stoppedTargetRecovery = input.stoppedTargetRecovery === true;
+    const acceptanceReference = input.stoppedTargetAcceptanceReference?.trim() ?? "";
+    if (legacyNativeWitness && stoppedTargetRecovery)
+      return { ok: false, code: "rehost_recovery_modes_exclusive", message: "Legacy native witness and stopped-target recovery are mutually exclusive modes." };
+    if (stoppedTargetRecovery && !acceptanceReference)
+      return { ok: false, code: "rehost_recovery_acceptance_required", message: "Stopped-target recovery requires a nonempty caller acceptance reference acknowledging possible loss of an unpersisted in-flight turn." };
+    if (!stoppedTargetRecovery && input.stoppedTargetAcceptanceReference !== undefined)
+      return { ok: false, code: "rehost_recovery_modes_exclusive", message: "A stopped-target acceptance reference is only valid with stopped-target recovery." };
     const resolved = this.resolveSeat(input.seatRef);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
@@ -1667,11 +1691,17 @@ export class SeatLifecycleService {
       // is never an UNKNOWN: no runner has been touched.
       let plan: RehostPlan | SeatRefusal;
       try {
-        plan = await this.rehostPlan(resolved, sessionName, legacyNativeWitness, input.onPreEffectRefusal);
+        plan = await this.rehostPlan(resolved, sessionName, legacyNativeWitness, stoppedTargetRecovery, acceptanceReference || undefined, input.onPreEffectRefusal);
       } catch (error) {
         return { ok: false, code: "rehost_precondition_failed", message: `A precondition could not be evaluated (${(error as Error).message}); no runner was signalled and nothing was touched.`, guidance: "Read the seat state and retry only after the underlying condition is understood." };
       }
       if ("code" in plan) return plan;
+      if (stoppedTargetRecovery) {
+        try { plan.recoverySnapshot = this.createStoppedTargetSnapshot(plan.sessionFile); }
+        catch (error) {
+          return { ok: false, code: "rehost_recovery_snapshot_failed", message: `The daemon could not create and verify an owner-only pre-stop session snapshot (${(error as Error).message}); no process was signalled.` };
+        }
+      }
       const before = this.rehostCustodySnapshot(resolved.nodeId, plan.sessionFile);
 
       // S1: preserved before-record, appended before anything is stopped.
@@ -1682,7 +1712,8 @@ export class SeatLifecycleService {
         generation: plan.generation,
         sessionFile: plan.sessionFile,
         sessionFileSha256Prefix: plan.sessionFileSha256Prefix,
-        lastEntryId: plan.lastEntryId,
+        lastEntryId: plan.stoppedTargetRecovery ? null : plan.lastEntryId,
+        ...(plan.stoppedTargetRecovery ? { liveSidecarCursorObserved: plan.sidecarCursorObserved ?? null } : {}),
         // The legacy option states BOTH values plainly: the cursor it bypassed and the
         // leaf the daemon proved instead. It never edits the sidecar to match.
         ...(plan.legacyWitness ? {
@@ -1692,6 +1723,13 @@ export class SeatLifecycleService {
           sidecarCursorCarriedForward: false,
           leafSource: "live_child_session",
         } : { legacyNativeWitness: false }),
+        ...(plan.stoppedTargetRecovery ? {
+          stoppedTargetRecovery: true,
+          stoppedTargetAcceptanceReference: plan.stoppedTargetAcceptanceReference,
+          liveIdleProof: "none",
+          possibleUnpersistedTurnLoss: true,
+          preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size },
+        } : { stoppedTargetRecovery: false }),
         launchIdBefore: plan.launchId,
         runnerPid: plan.runnerPid,
         runnerChildPid: plan.runnerChildPid,
@@ -1713,6 +1751,7 @@ export class SeatLifecycleService {
       const planFacts = { generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId };
       let stage = "stop";
       let stopVerified = false;
+      let signalAttempted = false;
       // R3-B2: ONE guarded region covering everything AFTER the began receipt, so the
       // runner may already be gone. Any throw from here - a failed event write at any
       // stage, a throwing resume, a failing post-proof, proof or custody snapshot - is a
@@ -1743,6 +1782,20 @@ export class SeatLifecycleService {
         const rootIsShell = !!rootRow && SHELL_BASENAMES.has(paneShellBasename(rootRow.command) ?? "");
         if (rootPid === null || !this.ancestryReaches(preStopRows, plan.runnerPid, rootPid) || !rootIsShell)
           return { ok: false, code: "rehost_pane_root_unresolved", message: "The authoritative tmux pane pid for this seat could not be resolved, the verified runner does not sit under exactly that pane root, or that root is not a recognisable shell. " + (plan.legacyWitness ? "The legacy witness rounds delivered diagnostic signals whose closes were verified; the runner was not stopped and no resume was typed." : "No runner was signalled and nothing was touched.") + " No substitute root is assumed.", guidance: "Resolve the real pane root, confirm the runner ancestry, and re-read the seat before any rehost." };
+        if (plan.stoppedTargetRecovery) {
+          const exactRunner = !!preStopRunner && preStopRunner.startedAt === plan.runnerStartedAt && preStopRunner.command === plan.runnerCommand;
+          const exactChild = !!preStopChild && preStopChild.startedAt === plan.childStartedAt && preStopChild.command === plan.childCommand;
+          if (!plan.runnerStartedAt || !plan.childStartedAt || !exactRunner || !exactChild)
+            return { ok: false, code: "rehost_recovery_identity_changed", message: "The exact runner and child identities changed or could not be established immediately before the stop signal; no process was signalled." };
+          try {
+            const snapshotBytes = readFileSync(plan.recoverySnapshot!.path);
+            const currentBytes = readFileSync(plan.sessionFile);
+            if (!snapshotBytes.equals(plan.recoverySnapshot!.bytes) || !currentBytes.equals(plan.recoverySnapshot!.bytes))
+              return { ok: false, code: "rehost_recovery_history_changed", message: "The bound session file changed after its pre-stop snapshot; no process was signalled." };
+          } catch {
+            return { ok: false, code: "rehost_recovery_history_changed", message: "The preserved snapshot or bound session file could not be re-read immediately before the stop signal; no process was signalled." };
+          }
+        }
       // The EXPLICIT legacy option takes one FINAL fresh witness here, after every
       // other pre-stop check and immediately before the halt. It never stops the old
       // runner and never types a resume, but its rounds DO deliver diagnostic signals:
@@ -1809,41 +1862,113 @@ export class SeatLifecycleService {
           return { ok: false, code: "rehost_legacy_witness_refused", message: `The final pre-stop witness did not reproduce the accepted binding and leaf (${final.reasons.join(",")}). No NEW signal was delivered by this round, though the legacy witness rounds delivered diagnostic signals whose closes were verified; the old runner was not stopped and no resume was typed.`, guidance: "Read the pane; do not retry a legacy rehost while the runner or its child is changing.", observed: { reasons: final.reasons, rounds: final.rounds } };
         }
       }
+        signalAttempted = true;
         this.killNativeProcess?.(plan.runnerPid);
         stopVerified = await this.rehostRunnerExited(rootPid, plan.runnerPid, plan.runnerChildPid, { runnerStartedAt: preStopRunner?.startedAt, childStartedAt: preStopChild?.startedAt });
       } catch (error) {
         this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
           stage: "stop", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId,
+          ...(plan.stoppedTargetRecovery ? { stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: plan.stoppedTargetAcceptanceReference, liveIdleProof: "none", preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size }, possibleUnpersistedTurnLoss: true } : {}),
           observed: { runnerPid: plan.runnerPid, error: (error as Error).message, runnerGone: false },
           blindRetryAllowed: false, fallbackTaken: "none",
           note: "SIGTERM delivery to the verified runner pid did not complete; the pane may still hold the old runner. A human must read the pane before any further rehost.",
         });
-        return { ok: false, code: "rehost_stop_unverified", message: "Runner stop could not be verified; the old runner may still be live. No resume was attempted, no fallback taken, and a blind retry is not permitted." };
+        return { ok: false, code: "rehost_stop_unverified", message: "Runner stop could not be verified; the old runner may still be live. No resume was attempted, no fallback taken, and a blind retry is not permitted.", ...(plan.stoppedTargetRecovery ? { blindRetryAllowed: false, observed: { outcomeClass: "stop_unknown", stoppedTargetRecovery: true, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } } : {}) };
       }
       if (!stopVerified) {
         this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
           stage: "stop", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId,
+          ...(plan.stoppedTargetRecovery ? { stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: plan.stoppedTargetAcceptanceReference, liveIdleProof: "none", preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size }, possibleUnpersistedTurnLoss: true } : {}),
           observed: { runnerPid: plan.runnerPid, runnerChildPid: plan.runnerChildPid, runnerGone: false, runnerStillListed: true },
           blindRetryAllowed: false, fallbackTaken: "none",
           note: "The runner process was still listed after the bounded wait; stop effect is UNKNOWN. Do not rehost again until the pane is read.",
         });
-        return { ok: false, code: "rehost_stop_unverified", message: "Runner exit was not observed within the bounded wait; the stop effect is UNKNOWN. No resume attempted, no fallback taken, no blind retry." };
+        return { ok: false, code: "rehost_stop_unverified", message: "Runner exit was not observed within the bounded wait; the stop effect is UNKNOWN. No resume attempted, no fallback taken, no blind retry.", ...(plan.stoppedTargetRecovery ? { blindRetryAllowed: false, observed: { outcomeClass: "stop_unknown", stoppedTargetRecovery: true, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } } : {}) };
+      }
+
+      if (plan.stoppedTargetRecovery) {
+        const stoppedBytes = readFileSync(plan.sessionFile);
+        const originalBytes = plan.recoverySnapshot!.bytes;
+        if (stoppedBytes.length < originalBytes.length || !stoppedBytes.subarray(0, originalBytes.length).equals(originalBytes)) {
+          this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
+            stage: "post_exit_history", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId,
+            stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: plan.stoppedTargetAcceptanceReference, liveIdleProof: "none",
+            preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size },
+            observed: { currentSize: stoppedBytes.length, preservedSize: originalBytes.length, preservedPrefixMatches: false },
+            blindRetryAllowed: false, fallbackTaken: "none", possibleUnpersistedTurnLoss: true,
+            note: "The stopped session history was truncated or changed before the preserved snapshot prefix; no resume was attempted. The recovery snapshot remains available.",
+          });
+          return { ok: false, code: "rehost_recovery_history_changed", message: "After both old processes exited, the session file was truncated or changed before the preserved snapshot prefix. No resume was attempted; the private recovery snapshot remains available.", blindRetryAllowed: false, observed: { outcomeClass: "stopped_no_resume", oldProcessesExited: true, resumeAttempted: false, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } };
+        }
+        const leaf = this.piSessionTailEntryId!(plan.sessionFile);
+        if (!leaf) {
+          this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
+            stage: "post_exit_history", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId,
+            stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: plan.stoppedTargetAcceptanceReference, liveIdleProof: "none",
+            preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size },
+            observed: { currentSize: stoppedBytes.length, preservedSize: originalBytes.length, tailAvailable: false },
+            blindRetryAllowed: false, fallbackTaken: "none", possibleUnpersistedTurnLoss: true,
+            note: "No complete post-exit session leaf could be derived; no resume was attempted. The recovery snapshot remains available.",
+          });
+          return { ok: false, code: "rehost_recovery_history_changed", message: "No complete post-exit session leaf could be derived. No resume was attempted; the private recovery snapshot remains available.", blindRetryAllowed: false, observed: { outcomeClass: "stopped_no_resume", oldProcessesExited: true, resumeAttempted: false, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } };
+        }
+        plan.stoppedTargetLeaf = leaf;
+        plan.recoveryAppendedBytes = stoppedBytes.length - originalBytes.length;
+        plan.recoveryAppendedSha256 = createHash("sha256").update(stoppedBytes.subarray(originalBytes.length)).digest("hex");
       }
 
       stage = "resume";
       // S3: reopen the SAME file through the shipped resume primitive.
       const resumed = await piResume.resume(sessionName, "pi_session_file", plan.sessionFile, plan.cwd, plan.model, plan.posture);
       if (!resumed.ok) {
+        const stoppedTargetFailure = plan.stoppedTargetRecovery ? {
+          stoppedTargetRecovery: true,
+          stoppedTargetAcceptanceReference: plan.stoppedTargetAcceptanceReference,
+          liveIdleProof: "none",
+          outcomeClass: "stopped_resume_effect_unknown",
+          oldProcessesExited: true,
+          resumeAttempted: true,
+          leafSource: "post_exit_session_file",
+          stoppedTargetLeaf: plan.stoppedTargetLeaf,
+          preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size },
+          appendedBytes: plan.recoveryAppendedBytes ?? 0,
+          appendedBytesSha256: plan.recoveryAppendedSha256,
+          possibleUnpersistedTurnLoss: true,
+        } : {};
+        const message = plan.stoppedTargetRecovery
+          ? `Both old processes exited and same-file resume was attempted, but the stopped-target outcome is UNKNOWN (${resumed.code ?? "unknown"}). The private recovery snapshot remains available; the typing guard stays ON, no fallback was taken, and a blind retry is not permitted.`
+          : `Same-file resume did not complete (${resumed.code ?? "unknown"}). The typing guard stays ON, nothing was flushed or retried, and no fresh, handover or fork fallback was taken.`;
         this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
           stage: "resume", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId,
-          observed: { code: resumed.code ?? null, message: resumed.message ?? null, runnerGone: true },
-          blindRetryAllowed: resumed.code === "resume_failed" ? false : false,
+          ...stoppedTargetFailure,
+          observed: {
+            code: resumed.code ?? null, message: resumed.message ?? null,
+            ...(plan.stoppedTargetRecovery ? { oldProcessesExited: true, resumeAttempted: true, outcomeClass: "stopped_resume_effect_unknown" } : { runnerGone: true }),
+          },
+          blindRetryAllowed: false,
           fallbackTaken: "none",
-          note: resumed.code === "retry_fresh"
+          note: plan.stoppedTargetRecovery
+            ? "Both exact old processes exited before resume was attempted. The resume primitive reported failure, so the post-signal outcome is UNKNOWN; retain the private snapshot and do not retry or fall back."
+            : resumed.code === "retry_fresh"
             ? "Session file missing: stop-and-ask. This operation never falls back to fresh, handover or fork."
             : "Resume did not complete. The guard stays ON and held messages stay held; no retry from this invocation.",
         });
-        return { ok: false, code: "rehost_resume_failed", message: `Same-file resume did not complete (${resumed.code ?? "unknown"}). The typing guard stays ON, nothing was flushed or retried, and no fresh, handover or fork fallback was taken.` };
+        return {
+          ok: false,
+          code: plan.stoppedTargetRecovery ? "rehost_effect_unknown" : "rehost_resume_failed",
+          message,
+          ...(plan.stoppedTargetRecovery ? {
+            blindRetryAllowed: false,
+            guidance: "Read the pane and runner launch id before any further recovery; do not retry this stopped-target rehost.",
+            observed: {
+              effectApplied: true,
+              fallbackTaken: "none",
+              ...stoppedTargetFailure,
+              resumeCode: resumed.code ?? null,
+              resumeMessage: resumed.message ?? null,
+            },
+          } : {}),
+        };
       }
 
       // S4: post-proof. Process identity, launch scope, file equality, generation,
@@ -1876,7 +2001,8 @@ export class SeatLifecycleService {
           // The EXPLICIT legacy option additionally requires the replacement to have
           // ACTUALLY refreshed its cursor to the bound leaf, which must still be the
           // bounded file tail. A stale or absent cursor is a mismatch, never credit.
-          this.legacyPostCursorAgrees(sessionName, plan);
+          this.legacyPostCursorAgrees(sessionName, plan) &&
+          (!plan.stoppedTargetRecovery || (!!plan.stoppedTargetLeaf && post.lastEntryId === plan.stoppedTargetLeaf && this.piSessionTailEntryId!(plan.sessionFile) === plan.stoppedTargetLeaf));
         const sample: PostSample = { post, proof, launchIdAfter, ok };
         samples.push(sample);
         // Positive identity contradictions are terminal; later agreement cannot
@@ -1924,6 +2050,13 @@ export class SeatLifecycleService {
         const unstable = !postProof && !genuineContradiction && samples.length > 0;
         this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
           stage: "post_proof", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId, launchIdAfter,
+          ...(plan.stoppedTargetRecovery ? {
+            stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: plan.stoppedTargetAcceptanceReference,
+            liveIdleProof: "none", leafSource: "post_exit_session_file", stoppedTargetLeaf: plan.stoppedTargetLeaf,
+            preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size },
+            appendedBytes: plan.recoveryAppendedBytes ?? 0, appendedBytesSha256: plan.recoveryAppendedSha256,
+            possibleUnpersistedTurnLoss: true,
+          } : {}),
           observed: {
             postProof, custodyUnchanged, proofState: proof?.state ?? null, proofGeneration: proof?.generation ?? null,
             proofLaunchId: proof?.launchId ?? null, sidecarReady: post?.ready ?? null, sidecarSessionFile: post?.sessionFile ?? null,
@@ -1944,7 +2077,11 @@ export class SeatLifecycleService {
             : unstable
               ? `Post-resume observation did not settle within ${this.postProofSettleAttempts} read-only samples and shows no proven identity contradiction; reported as unstable only, never repaired and never retried.`
               : "Post-resume process proof failed (launch scope, session-file equality or same-generation proof). Reported only, never repaired.",
-          observed: { settlingSamples: samples.length, disagreementStable, genuineContradiction },
+          observed: {
+            ...(plan.stoppedTargetRecovery ? { outcomeClass: "effect_unknown", oldProcessesExited: true, resumeAttempted: true, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } : {}),
+            settlingSamples: samples.length, disagreementStable, genuineContradiction,
+          },
+          ...(plan.stoppedTargetRecovery ? { blindRetryAllowed: false } : {}),
         };
       }
 
@@ -1967,6 +2104,19 @@ export class SeatLifecycleService {
           cursorRefreshedToLeaf: true,
           historicalProjectionCredit: false,
         } : { legacyNativeWitness: false }),
+        ...(plan.stoppedTargetRecovery ? {
+          stoppedTargetRecovery: true,
+          stoppedTargetAcceptanceReference: plan.stoppedTargetAcceptanceReference,
+          liveIdleProof: "none",
+          stoppedTargetLeaf: plan.stoppedTargetLeaf,
+          leafSource: "post_exit_session_file",
+          replacementCursorMatchesPostExitLeaf: true,
+          preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size },
+          appendedBytes: plan.recoveryAppendedBytes ?? 0,
+          appendedBytesSha256: plan.recoveryAppendedSha256,
+          appendedBytesAcceptedBecauseReplacementCursorBindsLeaf: true,
+          possibleUnpersistedTurnLoss: true,
+        } : { stoppedTargetRecovery: false }),
         authority: plan.authority,
         authorityReadOnly: true,
         leaseRepairedByThisOperation: false,
@@ -1987,24 +2137,54 @@ export class SeatLifecycleService {
         unknownEffectsPreserved: after.unknownEffects,
         authority: plan.authority ? { ...plan.authority, readOnly: true, repairedByThisOperation: false } : null,
         guardLeftEnabled: true,
+        ...(plan.stoppedTargetRecovery ? { stoppedTargetRecovery: true, stoppedTargetLeaf: plan.stoppedTargetLeaf, possibleUnpersistedTurnLoss: true, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } : {}),
         events: ["seat.runner_rehost_began", "seat.runner_rehost_completed"],
       };
       } catch (error) {
+        if (plan.stoppedTargetRecovery && !signalAttempted)
+          return { ok: false, code: "rehost_precondition_failed", message: `A stopped-target precondition could not be re-established (${(error as Error).message}); no process was signalled and the recovery snapshot remains available.` };
         return {
           ok: false,
           code: "rehost_effect_unknown",
           message: "An effect was already applied for this seat (runner signalled or replaced) and a later step failed, so the rehost outcome is UNKNOWN. Do not retry: read the pane and the runner launch id before any further rehost.",
           blindRetryAllowed: false,
           guidance: "Read the pane and the runner launch id before any further rehost.",
-          observed: { stage, effectApplied: true, generation: planFacts.generation, sessionFile: planFacts.sessionFile, launchIdBefore: planFacts.launchIdBefore, guardLeftEnabled: true, fallbackTaken: "none", error: (error as Error).message },
+          observed: { stage, effectApplied: true, generation: planFacts.generation, sessionFile: planFacts.sessionFile, launchIdBefore: planFacts.launchIdBefore, guardLeftEnabled: true, fallbackTaken: "none", ...(plan.stoppedTargetRecovery ? { stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: plan.stoppedTargetAcceptanceReference, liveIdleProof: "none", preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size }, possibleUnpersistedTurnLoss: true } : {}), error: (error as Error).message },
         };
       }
     });
     return outcome;
   }
 
+  /** Create a daemon-owned, owner-only copy of the exact bound session bytes. */
+  private createStoppedTargetSnapshot(sessionFile: string): NonNullable<RehostPlan["recoverySnapshot"]> {
+    const directory = this.piRecoverySnapshotDirectory;
+    if (!directory) throw new Error("private daemon snapshot directory is unavailable");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const directoryStat = lstatSync(directory);
+    if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) throw new Error("snapshot directory is not a real directory");
+    const directoryMode = directoryStat.mode & 0o777;
+    if ((directoryMode & 0o077) !== 0) throw new Error("snapshot directory permissions are not private");
+    const bytes = readFileSync(sessionFile);
+    const path = resolve(directory, `stopped-target-${randomUUID()}.snapshot`);
+    let created = false;
+    try {
+      writeFileSync(path, bytes, { flag: "wx", mode: 0o600 });
+      created = true;
+      const snapshotStat = lstatSync(path);
+      if (!snapshotStat.isFile() || snapshotStat.isSymbolicLink() || (snapshotStat.mode & 0o777) !== 0o600)
+        throw new Error("snapshot file is not a private regular file");
+      const copied = readFileSync(path);
+      if (!bytes.equals(copied)) throw new Error("snapshot bytes failed exact verification");
+      return { path, sha256: createHash("sha256").update(copied).digest("hex"), size: copied.byteLength, bytes: copied };
+    } catch (error) {
+      if (created) try { unlinkSync(path); } catch { /* preserve the original failure */ }
+      throw error;
+    }
+  }
+
   /** Every rehost precondition, proven fresh. No partial acceptance. */
-  private async rehostPlan(resolved: ResolvedSeat, sessionName: string, legacyNativeWitness: boolean, onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal): Promise<RehostPlan | SeatRefusal> {
+  private async rehostPlan(resolved: ResolvedSeat, sessionName: string, legacyNativeWitness: boolean, stoppedTargetRecovery: boolean, stoppedTargetAcceptanceReference?: string, onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal): Promise<RehostPlan | SeatRefusal> {
     const { nodeId } = resolved;
     if (this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE node_id=? AND state <> 'released' LIMIT 1").get(nodeId))
       return { ok: false, code: "rehost_reservation_active", message: "An unreleased dispatch reservation fences rehost; its cutover disposition must be settled first." };
@@ -2067,8 +2247,8 @@ export class SeatLifecycleService {
     // only indirectly, so the cursor is proven stable here. A tail that is overlong or
     // ends in a partial line is refused rather than parsed optimistically.
     const cursorFirst = this.piRunnerState!(sessionName)?.lastEntryId ?? null;
-    const tail = this.piSessionTailEntryId!(sessionFile);
-    const cursorSecond = this.piRunnerState!(sessionName)?.lastEntryId ?? null;
+    const tail = stoppedTargetRecovery ? null : this.piSessionTailEntryId!(sessionFile);
+    const cursorSecond = stoppedTargetRecovery ? cursorFirst : this.piRunnerState!(sessionName)?.lastEntryId ?? null;
 
     const rows = await this.listProcesses!();
     const escaped = sessionName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -2177,7 +2357,7 @@ export class SeatLifecycleService {
         seat: { rigId: resolved.entry.rigId, nodeId: resolved.nodeId, logicalId: resolved.entry.logicalId },
       };
       }
-    } else if (!cursorFirst || cursorFirst !== cursorSecond || !tail || tail !== cursorFirst)
+    } else if (!stoppedTargetRecovery && (!cursorFirst || cursorFirst !== cursorSecond || !tail || tail !== cursorFirst))
       return { ok: false, code: "rehost_not_idle", message: "Idle witness missing or unstable: the runner's last projected entry could not be confirmed twice-stable against the bounded session-file tail, so a turn may be in flight. Refuse rather than abort-then-proceed." };
 
     const digestPrefix = this.piSessionFileDigestPrefix
@@ -2190,8 +2370,9 @@ export class SeatLifecycleService {
       generation, sessionFile, launchId,
       // The ordinary path carries the twice-stable sidecar cursor. The legacy option
       // carries the leaf proven equal to the bounded tail; it never edits the sidecar.
-      lastEntryId: legacyWitness ? legacyWitness.nativeLeaf : cursorFirst,
+      lastEntryId: stoppedTargetRecovery ? null : legacyWitness ? legacyWitness.nativeLeaf : cursorFirst,
       runnerPid: runner.pid, runnerChildPid: child?.pid ?? null, sessionFileSha256Prefix: digestPrefix,
+      ...(stoppedTargetRecovery ? { runnerStartedAt: runner.startedAt, childStartedAt: child?.startedAt, runnerCommand: runner.command, childCommand: child?.command } : {}),
       model: resolved.entry.model ?? null, cwd: resolved.entry.cwd ?? "",
       // NodeInventoryEntry carries no posture; the launch posture comes from the
       // existing policy provenance, exactly as the managed start path derives it.
@@ -2199,6 +2380,8 @@ export class SeatLifecycleService {
       authority, sessionId: session.id ?? null,
       legacyWitness,
       sidecarCursorObserved: cursorFirst,
+      stoppedTargetRecovery,
+      ...(stoppedTargetAcceptanceReference ? { stoppedTargetAcceptanceReference } : {}),
     };
   }
 

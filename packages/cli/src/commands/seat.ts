@@ -659,6 +659,8 @@ Examples:
     .requiredOption("--reason <text>", "Audit reason recorded on the seat.runner_rehost_* events")
     .option("--operator <address>", "Operator recorded on the audit events")
     .option("--legacy-native-witness", "EXPLICIT opt-in: prove the pre-stop idle witness from the daemon's own native evidence for a legacy Pi runner")
+    .option("--stopped-target-recovery", "EXPLICIT opt-in: accept inability to prove live idle and recover only after the exact old runner and child have stopped")
+    .option("--accept-unpersisted-turn-loss <reference>", "Required accountable reference accepting possible loss of an unpersisted in-flight turn")
     .option("--json", "JSON output for agents")
     .description("Rehost a live pi seat's runner onto the SAME session file at the SAME generation")
     .addHelpText("after", `
@@ -684,14 +686,39 @@ no session entry; every other guard, pid, module, endpoint and generation gate
 still applies, and the replacement must be the current fallback-capable runner.
 It requires the typing guard ON exactly as the ordinary rehost does, and it
 credits no continuity or historical projection.
+--stopped-target-recovery is a separate explicit mode for a stopped target whose
+live idle state cannot be proven. It requires --accept-unpersisted-turn-loss with
+a nonempty accountable reference. The daemon snapshots the exact session file
+before signaling and resumes only after both exact old processes exit; any
+unpersisted in-flight turn may be lost. No live idle proof is claimed.
 Examples:
   rig seat rehost-runner intake-lead@app-handy-conveyor --reason "runner qualification upgrade" --json
   rig seat rehost-runner dev.impl --reason "upgrade runner" --operator orch-lead@my-rig
   rig seat rehost-runner legacy@rig --reason "legacy runner bridge" --legacy-native-witness`)
-    .action(async (seat: string, opts: { reason: string; operator?: string; legacyNativeWitness?: boolean; json?: boolean }) => {
+    .action(async (seat: string, opts: { reason: string; operator?: string; legacyNativeWitness?: boolean; stoppedTargetRecovery?: boolean; acceptUnpersistedTurnLoss?: string; json?: boolean }) => {
+      if (opts.stoppedTargetRecovery && opts.legacyNativeWitness) {
+        console.error("Rehost modes are mutually exclusive.");
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.stoppedTargetRecovery && !opts.acceptUnpersistedTurnLoss?.trim()) {
+        console.error("--stopped-target-recovery requires --accept-unpersisted-turn-loss <reference>.");
+        process.exitCode = 1;
+        return;
+      }
+      if (!opts.stoppedTargetRecovery && opts.acceptUnpersistedTurnLoss !== undefined) {
+        console.error("--accept-unpersisted-turn-loss requires --stopped-target-recovery.");
+        process.exitCode = 1;
+        return;
+      }
       // The flag is transported as a STRICT boolean and nothing else. No proof value
       // is ever authored here; the daemon builds the witness itself.
-      await runLifecycleVerb("rehost-runner", seat, { reason: opts.reason, operator: opts.operator, legacyNativeWitness: opts.legacyNativeWitness === true }, opts, (data) => {
+      await runLifecycleVerb("rehost-runner", seat, {
+        reason: opts.reason,
+        operator: opts.operator,
+        legacyNativeWitness: opts.legacyNativeWitness === true,
+        ...(opts.stoppedTargetRecovery ? { stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: opts.acceptUnpersistedTurnLoss!.trim() } : {}),
+      }, opts, (data) => {
         if (!data["ok"]) {
           console.error(`Rehost refused: ${String(data["code"] ?? "unknown")} - ${String(data["message"] ?? "")}`);
           return;

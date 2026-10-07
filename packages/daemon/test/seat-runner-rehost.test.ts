@@ -5,9 +5,9 @@
 // fresh/handover/fork fallback, and no blind retry after a failed stop or resume.
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
-import { mkdtempSync, readSync as readSyncImpl, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readSync as readSyncImpl, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 import { readFileSync as readWholeFile } from "node:fs";
 import { createDb } from "../src/db/connection.js";
@@ -21,7 +21,7 @@ import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { SeatLifecycleService, type PiRehostProof, type PiRehostRunnerState } from "../src/domain/seat-lifecycle-service.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
-import { parseLegacyNativeWitnessRequest } from "../src/routes/seat.js";
+import { parseLegacyNativeWitnessRequest, parseStoppedTargetRecoveryRequest } from "../src/routes/seat.js";
 import { makeLegacyPiNativeWitness } from "../src/domain/legacy-pi-native-witness.js";
 
 const SESSION_FILE = "/state/pi/intake-lead@app-handy-conveyor/sessions/history.jsonl";
@@ -49,6 +49,11 @@ interface Harness {
   runtime: { value: string };
   resumeTokenType: { value: string | null };
   nodeId: string;
+  historyPath: { value: string | null };
+  snapshotDirectory: string;
+  onStop: { value: (() => void) | null };
+  processReadCount: { value: number };
+  onSecondProcessRead: { value: (() => void) | null };
 }
 
 let dirs: string[] = [];
@@ -64,12 +69,19 @@ function harness(): Harness {
   const rigRepo = new RigRepository(db);
   const sessionRegistry = new SessionRegistry(db);
   const eventBus = new EventBus(db);
+  const snapshotDirectory = mkdtempSync(join(tmpdir(), "rehost-snapshots-"));
+  dirs.push(snapshotDirectory);
   const killed: number[] = [];
   const resumeCalls: Harness["resumeCalls"] = [];
   const h: Harness = {
     db,
     killed,
     resumeCalls,
+    historyPath: { value: null },
+    snapshotDirectory,
+    onStop: { value: null },
+    processReadCount: { value: 0 },
+    onSecondProcessRead: { value: null },
     sidecar: { value: { ready: true, launchId: LAUNCH_OLD, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: "tail-1" } },
     proof: { value: { state: "present", generation: GENERATION, launchId: LAUNCH_OLD, fingerprint: "{}" } },
     proofSeq: { queue: [] as Array<PiRehostProof | null> },
@@ -112,19 +124,23 @@ function harness(): Harness {
   const tmuxAdapter = { deliveryGuard: guard } as unknown as TmuxAdapter;
   h.service = new SeatLifecycleService({
     db, rigRepo, sessionRegistry, eventBus, tmuxAdapter,
-    listProcesses: () => h.processes,
+    listProcesses: () => {
+      h.processReadCount.value++;
+      if (h.processReadCount.value === 2) h.onSecondProcessRead.value?.();
+      return h.processes;
+    },
     // The shipped resume primitive mints a NEW launch id and the sidecar/census follow.
     // Modelling that here keeps OLD in force through rehostPlan and the stop witness,
     // and makes NEW appear only at the real transition point.
     piResume: { resume: async (session, type, token, cwd, model) => {
       resumeCalls.push({ session, type, token, cwd, model });
-      h.sidecar.value = { ready: true, launchId: LAUNCH_NEW, sessionFile: SESSION_FILE, sessionId: "sess-1", lastEntryId: "tail-1" };
+      h.sidecar.value = { ready: true, launchId: LAUNCH_NEW, sessionFile: h.historyPath.value ?? SESSION_FILE, sessionId: "sess-1", lastEntryId: h.tail.value };
       h.proof.value = { ...h.proof.value!, launchId: LAUNCH_NEW };
       h.processes = [
         { pid: 4000, ppid: 9100, command: "/bin/zsh", startedAt: "root-boot" },
       // the shared tmux server: NOT a shell, and climbing to it is the R3-B1 defect
       { pid: 9100, ppid: 1, command: "/opt/homebrew/bin/tmux -L openrig-xv new-session -d -s intake-lead@app-handy-conveyor", startedAt: "tmux-boot" },
-        { pid: RUNNER_PID, ppid: 4000, command: `node /x/pi-runner.js --session-name intake-lead@app-handy-conveyor --session ${SESSION_FILE} --launch-id ${LAUNCH_NEW}`, startedAt: "runner-new-boot" },
+        { pid: RUNNER_PID, ppid: 4000, command: `node /x/pi-runner.js --session-name intake-lead@app-handy-conveyor --session ${h.historyPath.value ?? SESSION_FILE} --launch-id ${LAUNCH_NEW}`, startedAt: "runner-new-boot" },
         { pid: CHILD_PID, ppid: RUNNER_PID, command: "pi --session /state/pi/child", startedAt: "child-new-boot" },
       ];
       h.onResume.value?.();
@@ -133,15 +149,25 @@ function harness(): Harness {
     piProve: async () => (h.proofSeq.queue.length ? h.proofSeq.queue.shift()! : h.proof.value),
     piRunnerState: () => h.sidecar.value,
     piSessionFileExists: () => h.fileExists.value,
+    piRecoverySnapshotDirectory: snapshotDirectory,
     // Bounded identity digest seam: the fixture names a session file that does not
     // exist on this host, so the harness supplies the prefix deterministically.
     piSessionFileDigestPrefix: () => "d1g3stpr3f1x0000",
     // R3-B1: the AUTHORITATIVE pane root is the shell at pid 4000. The census also
     // carries the shared tmux server (ppid 1), so a climb-based root would fail.
     paneRootPid: async () => 4000,
-    piSessionTailEntryId: () => h.tail.value,
+    piSessionTailEntryId: (path) => {
+      if (h.historyPath.value && path === h.historyPath.value) {
+        try {
+          const lines = readWholeFile(path, "utf8").split("\n").filter(line => line.trim());
+          const last = JSON.parse(lines[lines.length - 1]!) as { id?: unknown };
+          return typeof last.id === "string" ? last.id : null;
+        } catch { return null; }
+      }
+      return h.tail.value;
+    },
     // Normal shutdown: the pi child exits with its runner, leaving only the pane shell.
-    killNativeProcess: (pid) => { killed.push(pid); h.processes = h.processes.filter(p => p.pid !== pid && p.ppid !== pid); },
+    killNativeProcess: (pid) => { killed.push(pid); h.onStop.value?.(); h.processes = h.processes.filter(p => p.pid !== pid && p.ppid !== pid); },
     rehostPollMs: 1,
     rehostWaitMs: 30,
   });
@@ -166,6 +192,19 @@ function seat(h: Harness, opts?: { leaseUntil?: number; authorityGeneration?: st
   h.db.prepare("INSERT INTO coordinator_authority(rig_id,baton_id,owner_session,owner_generation,epoch,lease_until,operation_id,state,coordinators) VALUES (?,'baton-1','intake-lead@app-handy-conveyor',?,3,?,'prod-active-expiry','reconciling','[]')")
     .run(existing.id, opts?.authorityGeneration ?? GENERATION, opts?.leaseUntil ?? Date.now() + 600_000);
   return { rigId: existing.id as string, nodeId: node.id, sessionId: session.id, sessionName: "intake-lead@app-handy-conveyor" };
+}
+
+function prepareStoppedTargetHistory(h: Harness): { path: string; original: Buffer } {
+  const dir = mkdtempSync(join(tmpdir(), "rehost-history-"));
+  dirs.push(dir);
+  const path = join(dir, "history.jsonl");
+  const original = Buffer.from('{"id":"tail-1","type":"message"}\n');
+  writeFileSync(path, original, { mode: 0o600 });
+  h.historyPath.value = path;
+  h.db.prepare("UPDATE sessions SET resume_token=? WHERE node_id=?").run(path, h.nodeId);
+  h.sidecar.value = { ...h.sidecar.value!, sessionFile: path, lastEntryId: "stale-cursor" };
+  h.processes = h.processes.map(row => ({ ...row, command: row.command.replace(SESSION_FILE, path) }));
+  return { path, original };
 }
 
 const rehost = (h: Harness) => h.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "runner qualification upgrade" });
@@ -224,6 +263,138 @@ describe("same-generation pi runner rehost", () => {
     // The guard is left exactly as found and never flushed by rehost.
     expect(h.guard.leftEnabled()).toBe(true);
     expect(h.guard.lifecycleCalls).toBe(1);
+  });
+
+  it("requires explicit accountable acceptance and keeps the new mode exclusive", async () => {
+    seat(h);
+    const missing = await h.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "stopped target", stoppedTargetRecovery: true });
+    expect(missing).toMatchObject({ ok: false, code: "rehost_recovery_acceptance_required" });
+    const exclusive = await h.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "stopped target", stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "decision-17", legacyNativeWitness: true });
+    expect(exclusive).toMatchObject({ ok: false, code: "rehost_recovery_modes_exclusive" });
+    expect(h.killed).toEqual([]);
+    expect(h.resumeCalls).toEqual([]);
+    expect(events(h, "seat.runner_rehost_began")).toHaveLength(0);
+  });
+
+  it("accepts only append-only post-exit history whose replacement cursor binds its new leaf", async () => {
+    seat(h);
+    const { path, original } = prepareStoppedTargetHistory(h);
+    const appended = Buffer.from('{"id":"tail-2","type":"message"}\n');
+    h.onStop.value = () => {
+      writeFileSync(path, appended, { flag: "a" });
+      h.tail.value = "tail-2";
+    };
+    const out = await h.service.rehostRunner({
+      seatRef: "intake-lead@app-handy-conveyor", reason: "approved stopped-target recovery",
+      stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "owner-decision-17",
+    });
+    expect(out).toMatchObject({ ok: true, generation: GENERATION, generationUnchanged: true, sessionFile: path, launchIdBefore: LAUNCH_OLD, launchIdAfter: LAUNCH_NEW, stoppedTargetRecovery: true, stoppedTargetLeaf: "tail-2", possibleUnpersistedTurnLoss: true });
+    expect(h.killed).toEqual([RUNNER_PID]);
+    expect(h.resumeCalls).toHaveLength(1);
+    expect(h.resumeCalls[0]).toMatchObject({ type: "pi_session_file", token: path });
+    const began = events(h, "seat.runner_rehost_began")[0]!;
+    const completed = events(h, "seat.runner_rehost_completed")[0]!;
+    expect(began).toMatchObject({ stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "owner-decision-17", liveIdleProof: "none", possibleUnpersistedTurnLoss: true, lastEntryId: null });
+    expect(completed).toMatchObject({ stoppedTargetLeaf: "tail-2", leafSource: "post_exit_session_file", replacementCursorMatchesPostExitLeaf: true, appendedBytes: appended.length, appendedBytesSha256: createHash("sha256").update(appended).digest("hex"), appendedBytesAcceptedBecauseReplacementCursorBindsLeaf: true, continuityCredit: false, deliveryOrQualificationCredit: false });
+    const snapshot = completed["preservedSessionSnapshot"] as { path: string; sha256: string; size: number };
+    expect(snapshot).toMatchObject({ sha256: createHash("sha256").update(original).digest("hex"), size: original.length });
+    expect((statSync(snapshot.path).mode & 0o777)).toBe(0o600);
+    expect(readWholeFile(snapshot.path)).toEqual(original);
+    expect(JSON.stringify([began, completed])).not.toContain("tail-1");
+    expect(JSON.stringify([began, completed])).not.toContain('"id":"tail-1"');
+    expect(JSON.stringify([began, completed])).not.toContain('"id":"tail-2"');
+    expect((statSync(dirname(snapshot.path)).mode & 0o077)).toBe(0);
+  });
+
+  it("reports stopped-target resume refusal as unknown, retaining its snapshot without retry", async () => {
+    seat(h);
+    const { path, original } = prepareStoppedTargetHistory(h);
+    h.resumeResult.value = { ok: false, code: "resume_failed", message: "injected resume refusal" };
+
+    const out = await h.service.rehostRunner({
+      seatRef: "intake-lead@app-handy-conveyor", reason: "approved stopped-target recovery",
+      stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "owner-decision-21",
+    });
+
+    expect(out).toMatchObject({
+      ok: false, code: "rehost_effect_unknown", blindRetryAllowed: false,
+      observed: {
+        outcomeClass: "stopped_resume_effect_unknown", oldProcessesExited: true, resumeAttempted: true,
+        stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "owner-decision-21",
+        liveIdleProof: "none", leafSource: "post_exit_session_file", possibleUnpersistedTurnLoss: true,
+        resumeCode: "resume_failed", fallbackTaken: "none",
+      },
+    });
+    expect(h.killed).toEqual([RUNNER_PID]);
+    expect(h.resumeCalls).toHaveLength(1);
+    expect(h.resumeCalls[0]).toMatchObject({ type: "pi_session_file", token: path });
+    expect(events(h, "seat.runner_rehost_completed")).toHaveLength(0);
+    const failed = events(h, "seat.runner_rehost_failed").at(-1)!;
+    expect(failed).toMatchObject({
+      stage: "resume", stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "owner-decision-21",
+      liveIdleProof: "none", outcomeClass: "stopped_resume_effect_unknown", oldProcessesExited: true,
+      resumeAttempted: true, leafSource: "post_exit_session_file", blindRetryAllowed: false,
+      fallbackTaken: "none", possibleUnpersistedTurnLoss: true,
+    });
+    const began = events(h, "seat.runner_rehost_began")[0]!;
+    const snapshot = failed["preservedSessionSnapshot"] as { path: string; sha256: string; size: number };
+    expect(snapshot).toMatchObject({
+      path: (began["preservedSessionSnapshot"] as { path: string }).path,
+      sha256: createHash("sha256").update(original).digest("hex"), size: original.length,
+    });
+    expect(readWholeFile(snapshot.path)).toEqual(original);
+    expect(readWholeFile(path)).toEqual(original);
+    expect(h.guard.leftEnabled()).toBe(true);
+  });
+
+  it("refuses a changed process identity before signaling and preserves the private snapshot", async () => {
+    seat(h);
+    const { path } = prepareStoppedTargetHistory(h);
+    h.onSecondProcessRead.value = () => {
+      h.processes = h.processes.map(row => row.pid === RUNNER_PID ? { ...row, startedAt: "different-incarnation" } : row);
+    };
+    const out = await h.service.rehostRunner({
+      seatRef: "intake-lead@app-handy-conveyor", reason: "identity drift",
+      stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "owner-decision-18",
+    });
+    expect(out).toMatchObject({ ok: false, code: "rehost_recovery_identity_changed" });
+    expect(h.killed).toEqual([]);
+    expect(h.resumeCalls).toEqual([]);
+    expect(statSync(h.snapshotDirectory).isDirectory()).toBe(true);
+    expect(events(h, "seat.runner_rehost_began")[0]?.["preservedSessionSnapshot"]).toBeTruthy();
+    expect(readWholeFile(path).byteLength).toBeGreaterThan(0);
+  });
+
+  it("refuses session-file mutation after snapshot and before the stop signal", async () => {
+    seat(h);
+    const { path } = prepareStoppedTargetHistory(h);
+    h.onSecondProcessRead.value = () => writeFileSync(path, Buffer.from('{"id":"tail-1","type":"changed"}\n'));
+    const out = await h.service.rehostRunner({
+      seatRef: "intake-lead@app-handy-conveyor", reason: "history drift",
+      stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "owner-decision-20",
+    });
+    expect(out).toMatchObject({ ok: false, code: "rehost_recovery_history_changed" });
+    expect(h.killed).toEqual([]);
+    expect(h.resumeCalls).toEqual([]);
+    expect(events(h, "seat.runner_rehost_began")[0]?.["preservedSessionSnapshot"]).toBeTruthy();
+  });
+
+  it("does not resume a truncated post-exit history and retains its original snapshot", async () => {
+    seat(h);
+    const { path, original } = prepareStoppedTargetHistory(h);
+    h.onStop.value = () => writeFileSync(path, Buffer.from('{"id":"tail-2"}\n'));
+    const out = await h.service.rehostRunner({
+      seatRef: "intake-lead@app-handy-conveyor", reason: "truncated history",
+      stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "owner-decision-19",
+    });
+    expect(out).toMatchObject({ ok: false, code: "rehost_recovery_history_changed" });
+    expect(h.killed).toEqual([RUNNER_PID]);
+    expect(h.resumeCalls).toEqual([]);
+    const failed = events(h, "seat.runner_rehost_failed").at(-1)!;
+    expect(failed).toMatchObject({ stage: "post_exit_history", blindRetryAllowed: false, fallbackTaken: "none" });
+    const snapshot = failed["preservedSessionSnapshot"] as { path: string; size: number };
+    expect(snapshot.size).toBe(original.length);
+    expect(readWholeFile(snapshot.path)).toEqual(original);
   });
 
   it("refuses before touching anything when any precondition fails", async () => {
@@ -1993,8 +2164,18 @@ describe("legacy native witness request boundary", () => {
     }
   });
 
+  it("requires a nonempty acceptance reference for the exclusive stopped-target mode", () => {
+    expect(parseStoppedTargetRecoveryRequest({ reason: "r" })).toEqual({ ok: true, legacyNativeWitness: false, stoppedTargetRecovery: false });
+    expect(parseStoppedTargetRecoveryRequest({ stoppedTargetRecovery: true })).toMatchObject({ ok: false });
+    expect(parseStoppedTargetRecoveryRequest({ stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "  " })).toMatchObject({ ok: false });
+    expect(parseStoppedTargetRecoveryRequest({ stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "  decision-17  " })).toEqual({ ok: true, legacyNativeWitness: false, stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "decision-17" });
+    expect(parseStoppedTargetRecoveryRequest({ stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "decision-17", legacyNativeWitness: true })).toMatchObject({ ok: false });
+    expect(parseStoppedTargetRecoveryRequest({ stoppedTargetAcceptanceReference: "decision-17" })).toMatchObject({ ok: false });
+    expect(parseStoppedTargetRecoveryRequest({ stoppedTargetAcceptanceReference: " " })).toMatchObject({ ok: false });
+  });
+
   it("refuses any caller-authored witness, leaf, path, port or pid", () => {
-    for (const key of ["witness", "proof", "nativeLeaf", "leaf", "leafId", "lastEntryId", "cursor", "modules", "moduleUrl", "runnerModuleUrl", "piModuleUrl", "modulePath", "scriptPath", "endpoint", "inspectorPort", "port", "pid", "runnerPid", "childPid", "sessionFile", "launchId", "generation"]) {
+    for (const key of ["witness", "proof", "nativeLeaf", "leaf", "leafId", "lastEntryId", "cursor", "modules", "moduleUrl", "runnerModuleUrl", "piModuleUrl", "modulePath", "scriptPath", "endpoint", "inspectorPort", "port", "pid", "runnerPid", "childPid", "sessionFile", "launchId", "generation", "path", "snapshotPath", "startedAt", "timing", "waitMs"]) {
       const parsed = parseLegacyNativeWitnessRequest({ reason: "r", legacyNativeWitness: true, [key]: "authored" });
       expect(parsed.ok, key).toBe(false);
     }
