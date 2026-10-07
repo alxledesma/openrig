@@ -51,7 +51,16 @@ function qualificationDutyInputError(operation:string,value:unknown):string|unde
   if(!hasExactKeys(value,keys)||!boundedText(value.rigId)||!boundedText(value.targetQueueId)
     ||!boundedText(value.sweepFindingQueueId)||typeof value.targetBodyHash!=="string"||!SHA256_HEX.test(value.targetBodyHash)
     ||typeof value.sweepFindingBodyHash!=="string"||!SHA256_HEX.test(value.sweepFindingBodyHash)||!boundedDutyDeadline(value.deadline))
-   return "retirement stage requires exact target and failed-wake sweep hashes plus a deadline within twenty minutes; nothing was sent";
+  return "retirement stage requires exact target and failed-wake sweep hashes plus a deadline within twenty minutes; nothing was sent";
+ }
+ if(operation==="qualification-assessment-uncertainty-dispose"){
+  const keys=["rigId","rows","deadline"] as const;
+  if(!hasExactKeys(value,keys)||!boundedText(value.rigId)||!boundedDutyDeadline(value.deadline)||!Array.isArray(value.rows)||value.rows.length<1||value.rows.length>4
+    ||value.rows.some(row=>!isRecord(row)||!hasExactKeys(row,["targetQueueId","targetBodyHash","sweepFindingQueueId","sweepFindingBodyHash"])
+      ||!boundedText(row.targetQueueId)||!boundedText(row.sweepFindingQueueId)
+      ||typeof row.targetBodyHash!=="string"||!SHA256_HEX.test(row.targetBodyHash)
+      ||typeof row.sweepFindingBodyHash!=="string"||!SHA256_HEX.test(row.sweepFindingBodyHash)))
+   return "uncertainty disposition requires one to four exact expired legacy target/sweep pairs and a deadline within twenty minutes; it never retries or asserts failed delivery";
  }
  if(operation==="qualification-assessment-return"){
   if(!hasExactKeys(value,["rigId","dutyQueueId","returnQueueId"])||!boundedText(value.rigId)
@@ -161,7 +170,7 @@ export function coordinatorCommand():Command {
    console.log(JSON.stringify({...(receipt&&typeof receipt==="object"?receipt:{}),operationId,operationIdSource:generated?"generated":"supplied",preparedContract:preparedPath,expectedEpoch,expectedObligationsDigest},null,2));if(res.status>=400)process.exitCode=1;
   });
 
-for(const op of ["active-expiry-recover","held-history-adopt","held-history-recovery-bind","held-history-custody-evidence","held-history-custody-attest","outbox-abandon-evidence","outbox-abandon-continue","outcome-qualification-refresh","outcome-recovery-bind","outbox-abandon-authorize","outbox-abandon-notify","enable","transfer","acknowledge","renew","admit","dispose","recover","legacy-inventory","migrate-legacy","diagnostic-wake-dispose","coordination-plan","coordination-reconcile","coordination-accept","coordination-continue-custody","outcome-configure","resilience-materialize","reconciliation-recover","coordination-worker-probe","coordination-return-successor","coordination-return-continue","coordination-return-retire","coordination-return-intake-refresh","coordination-lifecycle-recovery","coordination-frontier-plan","coordination-frontier-admit","coordination-frontier-confirm","coordination-frontier-boundary","coordination-frontier-legacy-classify","coordination-frontier-legacy-revoke","qualification-assessment-stage","qualification-assessment-retirement-stage","qualification-assessment-return","qualification-assessment-review"]){
+for(const op of ["active-expiry-recover","held-history-adopt","held-history-recovery-bind","held-history-custody-evidence","held-history-custody-attest","outbox-abandon-evidence","outbox-abandon-continue","outcome-qualification-refresh","outcome-recovery-bind","outbox-abandon-authorize","outbox-abandon-notify","enable","transfer","acknowledge","renew","admit","dispose","recover","legacy-inventory","migrate-legacy","diagnostic-wake-dispose","coordination-plan","coordination-reconcile","coordination-accept","coordination-continue-custody","outcome-configure","resilience-materialize","reconciliation-recover","coordination-worker-probe","coordination-return-successor","coordination-return-continue","coordination-return-retire","coordination-return-intake-refresh","coordination-lifecycle-recovery","coordination-frontier-plan","coordination-frontier-admit","coordination-frontier-confirm","coordination-frontier-boundary","coordination-frontier-legacy-classify","coordination-frontier-legacy-revoke","qualification-assessment-stage","qualification-assessment-retirement-stage","qualification-assessment-uncertainty-dispose","qualification-assessment-return","qualification-assessment-review"]){
    cmd.command(`${op} <contractFile>`).description(op==="dispose"?'Submit {"rigId":"...","packageKey":"original admitted package key","dispositionId":"new worker-authored JSON return queue ID"}. The original worker may dispose its own terminal return; holder role is not required.':"Submit exact frozen JSON contract; caller identity/generation derive from seat environment")
     .action(async(file:string)=>{
      let contract:Record<string,unknown>;

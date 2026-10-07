@@ -35,6 +35,10 @@ beforeEach(() => {
       calls.push({ operation: "qualification-assessment-retirement-stage", actor: a, generation: g, body });
       return { queueId: "retirement-duty-1", targetQueueId: body.targetQueueId, deadline: body.deadline };
     }),
+    recordQualificationAssessmentUncertainty: vi.fn((a: string, g: string, body: Record<string, unknown>) => {
+      calls.push({ operation: "qualification-assessment-uncertainty-dispose", actor: a, generation: g, body });
+      return { operationId: "uncertainty-1", outcome: "unknown-preserved", wakeReplayed: false, custodyTransferred: false };
+    }),
     recordQualificationAssessmentReturn: vi.fn((a: string, g: string, body: Record<string, unknown>) => {
       calls.push({ operation: "qualification-assessment-return", actor: a, generation: g, body });
       return undefined;
@@ -94,6 +98,11 @@ function validFor(operation: string): Record<string, unknown> {
     sweepFindingBodyHash: "b".repeat(64),
     deadline,
   };
+  if (operation === "qualification-assessment-uncertainty-dispose") return {
+    rigId,
+    rows: [{ targetQueueId: "assessment-old", targetBodyHash: "a".repeat(64), sweepFindingQueueId: "sweep-old", sweepFindingBodyHash: "b".repeat(64) }],
+    deadline,
+  };
   if (operation === "qualification-assessment-return") return {
     rigId,
     dutyQueueId: "assessment-duty-1",
@@ -112,6 +121,7 @@ describe("qualification assessment coordinator CLI verbs", () => {
   const operations = [
     "qualification-assessment-stage",
     "qualification-assessment-retirement-stage",
+    "qualification-assessment-uncertainty-dispose",
     "qualification-assessment-return",
     "qualification-assessment-review",
   ];
@@ -132,6 +142,8 @@ describe("qualification assessment coordinator CLI verbs", () => {
     ["qualification-assessment-stage", { ...validFor("qualification-assessment-stage"), deadline: Date.now() + 1_300_000 }],
     ["qualification-assessment-stage", { ...validFor("qualification-assessment-stage"), configurationDigest: ["c".repeat(64)] }],
     ["qualification-assessment-retirement-stage", { ...validFor("qualification-assessment-retirement-stage"), targetBodyHash: "sending" }],
+    ["qualification-assessment-uncertainty-dispose", { ...validFor("qualification-assessment-uncertainty-dispose"), rows: [{ targetQueueId: "x", targetBodyHash: "indeterminate", sweepFindingQueueId: "y", sweepFindingBodyHash: "b".repeat(64) }] }],
+    ["qualification-assessment-uncertainty-dispose", { ...validFor("qualification-assessment-uncertainty-dispose"), rows: [] }],
     ["qualification-assessment-return", { ...validFor("qualification-assessment-return"), generation: "caller-supplied" }],
     ["qualification-assessment-review", { ...validFor("qualification-assessment-review"), finding: "pass" }],
     ["qualification-assessment-review", { ...validFor("qualification-assessment-review"), finding: ["inconclusive"] }],

@@ -160,8 +160,66 @@ export class CoordinationRecoveryService {
    const notice=this.db.prepare('SELECT body FROM outbox_entries WHERE outbox_id=?').get('wake-intent-'+queueId) as {body:string}|undefined;
    if(!notice||typeof notice.body!=='string')fail('qualification_duty_wake_missing','Durable native duty wake required');
    this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,queueId,'coordinator-lifecycle-control',JSON.stringify({...receipt,noticeBodyHash:digest(notice!.body)}),digest(body));
-   return {queueId,contractDigest,deadline:input.deadline};
+  return {queueId,contractDigest,deadline:input.deadline};
+ }).immediate();
+}
+/** Explicitly contain expired legacy bootstrap rows whose wake linkage is absent.
+ * This does not claim failed delivery or completed execution: it records both as
+ * UNKNOWN, terminalizes only the exact stale queue records, and never retries a wake. */
+ recordQualificationAssessmentUncertainty(actor:string,generation:string,input:{rigId:string;rows:Array<{targetQueueId:string;targetBodyHash:string;sweepFindingQueueId:string;sweepFindingBodyHash:string}>;deadline:number}):{operationId:string;outcome:'unknown-preserved';wakeReplayed:false;custodyTransferred:false} {
+  if(!input||typeof input!=='object'||Array.isArray(input)||typeof (input as any).rigId!=='string'||(input as any).rigId.length<1||(input as any).rigId.length>256)fail('qualification_uncertainty_contract_invalid','A bounded string rigId is required');
+  return this.db.transaction(()=>{
+   const now=this.now(),authority=this.authority.get(input.rigId),plan=this.plan(input.rigId);
+   if(actor!=='operator-agent@kernel'||!generation||this.authority.generation(actor)!==generation||!authority||authority.state!=='active'||authority.lease_until<=now||!authority.owner_session||authority.owner_generation!==this.authority.generation(authority.owner_session)||plan)fail('qualification_uncertainty_operator_required','Current native Operator, live authority and planless qualification bootstrap required');
+   if(!Number.isSafeInteger(input.deadline)||input.deadline<=now||input.deadline>now+1200000||!Array.isArray(input.rows)||input.rows.length<1||input.rows.length>4)fail('qualification_uncertainty_contract_invalid','One to four exact legacy pairs and a finite deadline within twenty minutes are required');
+   if(input.rows.some((row:any)=>!row||typeof row!=='object'||Array.isArray(row)||typeof row.targetQueueId!=='string'||row.targetQueueId.length<1||row.targetQueueId.length>256||typeof row.sweepFindingQueueId!=='string'||row.sweepFindingQueueId.length<1||row.sweepFindingQueueId.length>256||typeof row.targetBodyHash!=='string'||typeof row.sweepFindingBodyHash!=='string'))fail('qualification_uncertainty_contract_invalid','Each legacy pair must contain bounded queue IDs and string body hashes');
+   const rows=[...input.rows].sort((a,b)=>a.targetQueueId.localeCompare(b.targetQueueId));
+   if(new Set(rows.flatMap(r=>[r.targetQueueId,r.sweepFindingQueueId])).size!==rows.length*2||rows.some(r=>r.targetQueueId===r.sweepFindingQueueId||!/^([a-f0-9]{64})$/.test(r.targetBodyHash)||!/^([a-f0-9]{64})$/.test(r.sweepFindingBodyHash)))fail('qualification_uncertainty_contract_invalid','Each legacy target and sweep must have a unique ID and exact SHA-256 body hash');
+   const requestIdentity={rigId:input.rigId,operatorGeneration:generation,rows,deadline:input.deadline};
+   const operationId='qualification-assessment-uncertainty:'+digest(JSON.stringify(requestIdentity)).slice(0,32),requestHash=digest(JSON.stringify(requestIdentity));
+   const previous=this.db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='qualification-assessment-uncertainty'").get(input.rigId,operationId) as {receipt:string;request_hash:string}|undefined;
+   if(previous){if(previous.request_hash!==requestHash)fail('qualification_uncertainty_conflict','A different uncertainty disposition is already recorded');return {operationId,outcome:'unknown-preserved' as const,wakeReplayed:false as const,custodyTransferred:false as const};}
+   const pairs=rows.map(binding=>{
+    const target=this.repo.getById(binding.targetQueueId),sweep=this.repo.getById(binding.sweepFindingQueueId);
+    if(!target)fail('qualification_uncertainty_target_invalid','Exact legacy qualification target is missing');
+    const validTarget=target!;
+    const targetExpiresAt=Date.parse(validTarget.expiresAt??'');
+    if(validTarget.sourceSession!=='operator-agent@kernel'||validTarget.state!=='pending'||validTarget.claimedAt||!Number.isFinite(targetExpiresAt)||targetExpiresAt>now||digest(validTarget.body)!==binding.targetBodyHash||!validTarget.body.toLowerCase().includes('qualification')||!validTarget.body.toLowerCase().includes('assessment'))fail('qualification_uncertainty_target_invalid','Exact expired, unclaimed legacy qualification row and body hash required');
+    if(this.db.prepare('SELECT 1 FROM coordinator_assignments WHERE queue_id=?').get(binding.targetQueueId)||this.db.prepare('SELECT 1 FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(input.rigId,binding.targetQueueId))fail('qualification_uncertainty_target_invalid','Assigned product work remains protected');
+    if(!sweep||sweep.sourceSession!=='operator-agent@kernel'||sweep.destinationSession!==validTarget.destinationSession||sweep.state!=='pending'||sweep.claimedAt||digest(sweep.body)!==binding.sweepFindingBodyHash||!sweep.body.includes('STUCK SWEEP FINDING (undelivered-wake)')||!sweep.body.includes('row: '+binding.targetQueueId))fail('qualification_uncertainty_sweep_invalid','Exact unclaimed sweep finding for the same Worker is required');
+    const validSweep=sweep!,worker=validTarget.destinationSession,generationNow=this.authority.generation(worker),observation=this.activity(worker),observedAt=Date.parse(observation?.identityObservedAt??'');
+    if(this.db.prepare('SELECT 1 FROM coordinator_assignments WHERE queue_id=?').get(binding.sweepFindingQueueId)||this.db.prepare('SELECT 1 FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(input.rigId,binding.sweepFindingQueueId))fail('qualification_uncertainty_sweep_invalid','Assigned sweep work remains protected');
+    if(!this.db.prepare('SELECT 1 FROM sessions s JOIN nodes n ON n.id=s.node_id WHERE s.session_name=? AND n.rig_id=?').get(worker,input.rigId)||!generationNow||!observation?.identityVerified||observation.generation!==generationNow||!Number.isFinite(observedAt)||observedAt>now||now-observedAt>3000||!coordinationIdle(observation,generationNow,now)||!this.configurationDigest(worker))fail('qualification_uncertainty_worker_not_quiescent','Fresh current native idle Worker identity and configuration required');
+    const linked=this.db.prepare('SELECT outbox_id,delivery_state FROM outbox_entries WHERE audit_pointer IN (?,?) OR outbox_id IN (?,?,?)').all(binding.targetQueueId,binding.sweepFindingQueueId,'wake-intent-'+binding.targetQueueId,'wake-intent-'+binding.sweepFindingQueueId,binding.targetQueueId) as Array<{outbox_id:string;delivery_state:string}>;
+    if(linked.length)fail('qualification_uncertainty_effect_linked','A target or sweep wake receipt exists; reconcile its exact delivery state through the existing supported path');
+    return {binding,target:validTarget,sweep:validSweep,worker,workerGeneration:generationNow,configurationDigest:this.configurationDigest(worker)!,observationAt:new Date(observedAt).toISOString()};
+   });
+   const first=pairs[0]!;
+   if(pairs.some(pair=>pair.worker!==first.worker||pair.workerGeneration!==first.workerGeneration||pair.configurationDigest!==first.configurationDigest))fail('qualification_uncertainty_worker_mismatch','All exact legacy pairs must retain one current Worker generation and configuration');
+   const expectedIds=new Set(pairs.flatMap(pair=>[pair.target.qitemId,pair.sweep.qitemId]));
+   const active=this.db.prepare("SELECT qitem_id FROM queue_items WHERE destination_session=? AND state IN ('pending','in-progress','blocked')").all(first.worker) as Array<{qitem_id:string}>;
+   if(active.some(row=>!expectedIds.has(row.qitem_id))||this.workerEffectDebt(first.worker)||this.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE state!='released' AND (session_name=? OR node_id IN (SELECT node_id FROM sessions WHERE session_name=?))").get(first.worker,first.worker)||this.db.prepare('SELECT 1 FROM seat_delivery_guards WHERE (desired=1 OR effective=1) AND node_id IN (SELECT node_id FROM sessions WHERE session_name=?)').get(first.worker))fail('qualification_uncertainty_worker_protected','Worker has unrelated queue custody, unresolved effects, a reservation or a delivery guard');
+   const liveAuthority=authority!;
+   const semantic={...requestIdentity,holder:liveAuthority.owner_session,holderGeneration:liveAuthority.owner_generation,epoch:liveAuthority.epoch,worker:first.worker,workerGeneration:first.workerGeneration,configurationDigest:first.configurationDigest,rows:pairs.map(pair=>pair.binding)};
+   const receipt={...semantic,outcome:'unknown-preserved',queueDisposition:'terminalized-unresolvable',wakeDelivery:'unknown-not-proven-failed',taskExecution:'unknown',wakeReplayed:false,custodyTransferred:false,recordedAt:now,observationAt:first.observationAt};
+   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,operationId,'qualification-assessment-uncertainty',JSON.stringify(receipt),requestHash);
+   for(const pair of pairs){
+    const note=`qualification uncertainty disposition ${operationId}: expired unclaimed legacy queue record terminalized as unresolvable; wake delivery UNKNOWN (no failure inferred), task execution UNKNOWN; no wake replay and no custody transfer`;
+    this.repo.update({qitemId:pair.target.qitemId,actorSession:actor,actorGeneration:generation,identityProvenance:'transport:v1',state:'failed',transitionNote:note});
+    this.repo.update({qitemId:pair.sweep.qitemId,actorSession:actor,actorGeneration:generation,identityProvenance:'transport:v1',state:'failed',transitionNote:note});
+   }
+   return {operationId,outcome:'unknown-preserved' as const,wakeReplayed:false as const,custodyTransferred:false as const};
   }).immediate();
+ }
+ qualificationAssessmentUncertaintyAllows(queueId:string,actor:string,generation:string|null|undefined,provenance:string|null|undefined,nextState:string|undefined):boolean {
+  if(nextState!=='failed'||actor!=='operator-agent@kernel'||provenance!=='transport:v1'||!generation||this.authority.generation(actor)!==generation)return false;
+  const row=this.repo.getById(queueId);if(!row||row.state!=='pending'||row.claimedAt)return false;
+  const rows=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id IN (SELECT n.rig_id FROM sessions s JOIN nodes n ON n.id=s.node_id WHERE s.session_name=?) AND kind='qualification-assessment-uncertainty'").all(row.destinationSession) as Array<{receipt:string}>;
+  return rows.some(entry=>{try{const r=JSON.parse(entry.receipt);return r.operatorGeneration===generation&&r.outcome==='unknown-preserved'&&r.rows.some((binding:any)=>binding.targetQueueId===queueId&&binding.targetBodyHash===digest(row.body)||binding.sweepFindingQueueId===queueId&&binding.sweepFindingBodyHash===digest(row.body));}catch{return false;}});
+ }
+ isQualificationAssessmentUncertaintyTarget(queueId:string):boolean {
+  const rows=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='qualification-assessment-uncertainty'").all() as Array<{receipt:string}>;
+  return rows.some(entry=>{try{const r=JSON.parse(entry.receipt);return r.rows.some((binding:any)=>binding.targetQueueId===queueId||binding.sweepFindingQueueId===queueId);}catch{return false;}});
  }
  /** Give the current Worker a finite, report-only path to retire an expired legacy
   *  qualification task whose original wake is known failed. No effect is replayed and

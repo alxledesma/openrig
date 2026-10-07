@@ -1088,12 +1088,18 @@ export class QueueRepository {
   private assertQualificationAssessmentRetirementTargetNotHandedOff(qitemId:string):void {
     if(this.coordinatorAuthority.coordinationRecovery?.isQualificationAssessmentRetirementTarget(qitemId))throw new QueueRepositoryError('qualification_retirement_handoff_refused','An expired legacy qualification target cannot be handed off or closed through a generic queue path; use its exact live report-only retirement duty');
   }
+  /** An explicit UNKNOWN-preserving legacy disposition is terminal evidence.
+   * Generic handoff cannot turn it into new work or silently transfer custody. */
+  private assertQualificationAssessmentUncertaintyTargetNotHandedOff(qitemId:string):void {
+    if(this.coordinatorAuthority.coordinationRecovery?.isQualificationAssessmentUncertaintyTarget(qitemId))throw new QueueRepositoryError('qualification_uncertainty_handoff_refused','An uncertainty-disposition target cannot be handed off or reopened; preserve its UNKNOWN receipt and original custody');
+  }
   /** Read-only preflight for split, cross-host handoff choreography. Keep the
    *  repository close guard too: the route check prevents an orphan successor,
    *  while this second check protects the source if custody changes meanwhile. */
   assertCoordinatorBatonDispositionAllowed(qitemId:string):void {
     this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(qitemId);
     this.assertQualificationAssessmentRetirementTargetNotHandedOff(qitemId);
+    this.assertQualificationAssessmentUncertaintyTargetNotHandedOff(qitemId);
   }
   private assertNativeTerminalReturnCompleted(qitemId:string):void {
     const ack=this.recipientAckDuty(qitemId);if(ack&&(!this.outbox||this.outbox.getById(ack.effectId)?.deliveryState!=='delivered'||!this.db.prepare("SELECT 1 FROM events WHERE type='outbox.recipient_acknowledged' AND json_extract(payload,'$.outboxId')=? AND json_extract(payload,'$.actor')=? AND json_extract(payload,'$.generation')=?").get(ack.effectId,ack.recipient,ack.recipientGeneration)))throw new QueueRepositoryError('outbox_ack_duty_incomplete','Actual native acknowledgment receipt is required; original message is not work or acceptance authority');
@@ -2090,6 +2096,7 @@ export class QueueRepository {
   */
   async handoff(input: QueueHandoffInput): Promise<{ closed: QueueItem; created: QueueItem }> {
     this.assertQualificationAssessmentRetirementTargetNotHandedOff(input.qitemId);
+    this.assertQualificationAssessmentUncertaintyTargetNotHandedOff(input.qitemId);
     const source = this.getById(input.qitemId);
     if (!source) {
       throw new QueueRepositoryError(
@@ -2148,6 +2155,7 @@ export class QueueRepository {
       const beforeCustody = this.custodySnapshot(input.qitemId);
       const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertQualificationAssessmentRetirementTargetNotHandedOff(input.qitemId);
+      this.assertQualificationAssessmentUncertaintyTargetNotHandedOff(input.qitemId);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
       this.assertNativeTerminalReturnCompleted(input.qitemId);
@@ -2289,6 +2297,7 @@ export class QueueRepository {
   */
   async handoffAndComplete(input: QueueHandoffAndCompleteInput): Promise<{ closed: QueueItem; created: QueueItem }> {
     this.assertQualificationAssessmentRetirementTargetNotHandedOff(input.qitemId);
+    this.assertQualificationAssessmentUncertaintyTargetNotHandedOff(input.qitemId);
     const source = this.getById(input.qitemId);
     if (!source) {
       throw new QueueRepositoryError(
@@ -2345,6 +2354,7 @@ export class QueueRepository {
       const beforeCustody = this.custodySnapshot(input.qitemId);
       const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertQualificationAssessmentRetirementTargetNotHandedOff(input.qitemId);
+      this.assertQualificationAssessmentUncertaintyTargetNotHandedOff(input.qitemId);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
       this.assertNativeTerminalReturnCompleted(input.qitemId);
@@ -2512,6 +2522,7 @@ export class QueueRepository {
     transitionNote?: string;
   }): { item: QueueItem; absorbed: boolean } {
     this.assertQualificationAssessmentRetirementTargetNotHandedOff(input.qitemId);
+    this.assertQualificationAssessmentUncertaintyTargetNotHandedOff(input.qitemId);
     this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
     const source = this.getById(input.qitemId);
     if (!source) {
@@ -2544,6 +2555,7 @@ export class QueueRepository {
       const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
+      this.assertQualificationAssessmentUncertaintyTargetNotHandedOff(input.qitemId);
       this.db
         .prepare(
           `UPDATE queue_items
@@ -2895,7 +2907,10 @@ export class QueueRepository {
     const qualificationRetirementTarget=this.coordinatorAuthority.coordinationRecovery?.isQualificationAssessmentRetirementTarget(input.qitemId)===true;
     const qualificationRetirementAuthorized=this.coordinatorAuthority.coordinationRecovery?.qualificationAssessmentRetirementAllows(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance,input.state)===true;
     if(qualificationRetirementTarget&&input.state!==undefined&&!qualificationRetirementAuthorized)throw new QueueRepositoryError('qualification_retirement_disposition_required','Only the exact failed disposition under its currently claimed finite retirement duty is supported; preserve the legacy row and wake otherwise');
-    if(input.state!==undefined&&!(['failed','canceled'].includes(input.state)&&(this.coordinatorAuthority.coordinationRecovery?.heldHistoryRetirementAllows(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance)||qualificationRetirementAuthorized)))this.assertAdministrativeClaimant(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance);
+    const qualificationUncertaintyTarget=this.coordinatorAuthority.coordinationRecovery?.isQualificationAssessmentUncertaintyTarget(input.qitemId)===true;
+    const qualificationUncertaintyAuthorized=this.coordinatorAuthority.coordinationRecovery?.qualificationAssessmentUncertaintyAllows(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance,input.state)===true;
+    if(qualificationUncertaintyTarget&&input.state!==undefined&&!qualificationUncertaintyAuthorized)throw new QueueRepositoryError('qualification_uncertainty_disposition_required','Only the exact append-only UNKNOWN-preserved disposition may terminalize this legacy row');
+    if(input.state!==undefined&&!(['failed','canceled'].includes(input.state)&&(this.coordinatorAuthority.coordinationRecovery?.heldHistoryRetirementAllows(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance)||qualificationRetirementAuthorized||qualificationUncertaintyAuthorized)))this.assertAdministrativeClaimant(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance);
     if(this.abandonmentAuthorization(input.qitemId)&&input.state!==undefined&&((qitem.claimedAt&&input.state==='pending')||(isTerminalState(qitem.state)&&input.state!==qitem.state)))throw new QueueRepositoryError('outbox_authorization_custody_required','Preserve administrative history; exact current claimant must report own failed/canceled expiry, never unclaim or reopen it');
     if(input.state==='done'||input.state==='handed-off')this.assertNativeTerminalReturnCompleted(input.qitemId);
     const hasNote = typeof input.transitionNote === "string" && input.transitionNote.trim().length > 0;
