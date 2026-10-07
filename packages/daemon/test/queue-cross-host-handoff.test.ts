@@ -55,6 +55,11 @@ function jsonResponse(payload: unknown, status = 201): Response {
 
 function makeHarness(opts?: { fetchImpl?: typeof fetch; registry?: HostRegistry; destinationAdvisory?: QueueRepository["destinationAdvisory"] }) {
   const db = createDb();
+  // The current route/read model consults coordinator_operations even for ordinary
+  // non-coordinator rows. The former five-migration subset fails 22 existing cases
+  // on the unmodified fc610d93 baseline with "no such table: coordinator_operations".
+  // Keep this harness on the supported current schema rather than weakening those
+  // real route paths; the new baton-preflight case additionally needs coordinator_authority.
   migrate(db, ALL_MIGRATIONS);
   const bus = new EventBus(db);
   const repo = new QueueRepository(db, bus, { validateRig: () => true, destinationAdvisory: opts?.destinationAdvisory });
@@ -214,6 +219,22 @@ describe("MH-3 C2 — cross-host handoff (route choreography)", () => {
     const res = await post(h.app, "/api/queue/qitem-source-1/handoff", { ...HANDOFF, hostId: "vps-b", nudge: true });
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ error: "coordinator_baton_terminal_close_requires_authority" });
+    expect(forwarded).toBe(false);
+    expect(h.repo.getById("qitem-source-1")?.state).toBe("pending");
+    expect(rowCount(h.db)).toBe(1);
+  });
+
+  it("cross-host retirement-target preflight refuses before forwarding a successor", async () => {
+    let forwarded = false;
+    h = makeHarness({ fetchImpl: (async () => { forwarded = true; return jsonResponse({}); }) as unknown as typeof fetch });
+    await seedSource(h.repo);
+    vi.spyOn(h.repo as any, "assertQualificationAssessmentRetirementTargetNotHandedOff").mockImplementation(() => {
+      throw new QueueRepositoryError("qualification_retirement_handoff_refused", "protected retirement target");
+    });
+
+    const res = await post(h.app, "/api/queue/qitem-source-1/handoff", { ...HANDOFF, hostId: "vps-b", nudge: true });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "qualification_retirement_handoff_refused" });
     expect(forwarded).toBe(false);
     expect(h.repo.getById("qitem-source-1")?.state).toBe("pending");
     expect(rowCount(h.db)).toBe(1);
