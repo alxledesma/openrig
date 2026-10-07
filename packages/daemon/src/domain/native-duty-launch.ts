@@ -82,19 +82,37 @@ function validConfig(c: NativeDutyLaunchConfig): boolean {
 }
 
 /** Private, immutable opt-in launch intents. No grant, process or effect is created here.
- * Node bytes are hashed once per store instance; subsequent reads require unchanged inode,
- * size, mtime and ctime. A replacement install requires a new store/launch, never silent adoption. */
+ * Installed bytes are hashed once per exact descriptor per store instance; subsequent reads
+ * require unchanged inode, size, mtime and ctime. Historical launches retain their original
+ * verified executable pins across daemon upgrades; new launches use this installation. */
 export class NativeDutyLaunchStore {
   readonly root: string;
   private readonly node: InstalledFile;
   private readonly supervisor: InstalledFile;
+  private readonly verifiedInstalls = new Map<string, InstalledFile>();
   constructor(input:{root:string;nodeExecutable:string;supervisorEntry:string;now?:()=>number}) {
     if(!absolute(input.root) || !absolute(input.nodeExecutable) || !absolute(input.supervisorEntry)) throw new Error("native-duty-absolute-path-required");
     mkdirSync(input.root,{recursive:true,mode:0o700});privatePath(input.root,true);this.root=realpathSync(input.root);
     this.node=installedFile(input.nodeExecutable);accessSync(this.node.path,constants.X_OK);this.supervisor=installedFile(input.supervisorEntry);
+    this.verifiedInstalls.set(canonical(this.node),this.node);
+    this.verifiedInstalls.set(canonical(this.supervisor),this.supervisor);
     this.now=input.now ?? Date.now;
   }
   private readonly now:()=>number;
+  /** Old private intents are evidence of their own install, never a request to execute it. */
+  private verifiedInstalled(value: InstalledFile, executable: boolean): boolean {
+    if(!ownKeys(value,["path","sha256","size","device","inode","modifiedAt","changedAt","mode"])
+      || !absolute(value.path) || !sha(value.sha256))return false;
+    const key=canonical(value),cached=this.verifiedInstalls.get(key);
+    if(cached){if(!unchangedInstalled(cached))return false;}
+    else {
+      const actual=installedFile(value.path);
+      if(!equal(actual,value))return false;
+      this.verifiedInstalls.set(key,actual);
+    }
+    if(executable)accessSync(value.path,constants.X_OK);
+    return true;
+  }
   /** Validate launch dependencies before a recovery stops its current process. */
   assertReady(): void {
     if (!unchangedInstalled(this.node) || !unchangedInstalled(this.supervisor)) throw new Error("native-duty-installed-files-changed");
@@ -142,8 +160,8 @@ export class NativeDutyLaunchStore {
       const intent=JSON.parse(readFileSync(intentPath,"utf8")) as NativeDutyLaunchIntent;
       if(!ownKeys(intent,["schema","scopeId","launchId","nodeId","sessionName","generation","runtime","configurationDigest","createdAt","configPath","configSha256","installedNode","installedSupervisor"])
         || intent.schema!==SCHEMA || !validIdentity(intent) || intent.launchId!==launchId || intent.configPath!==configPath || !sha(intent.configSha256)
-        || !Number.isSafeInteger(intent.createdAt) || intent.createdAt<0 || !equal(intent.installedNode,this.node) || !equal(intent.installedSupervisor,this.supervisor)
-        || !unchangedInstalled(this.node) || !unchangedInstalled(this.supervisor))return null;
+        || !Number.isSafeInteger(intent.createdAt) || intent.createdAt<0
+        || !this.verifiedInstalled(intent.installedNode,true) || !this.verifiedInstalled(intent.installedSupervisor,false))return null;
       const bytes=readFileSync(configPath),config=JSON.parse(bytes.toString("utf8")) as NativeDutyLaunchConfig;
       if(hash(bytes)!==intent.configSha256 || !validConfig(config) || config.launchId!==launchId || config.scopeId!==intent.scopeId || config.journalDir!==path.join(directory,"journal"))return null;
       privatePath(config.journalDir,true);return {intent,config};

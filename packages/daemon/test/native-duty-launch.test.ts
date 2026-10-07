@@ -54,6 +54,26 @@ it("keeps the parent intent observational while a reserved successor generation 
  binding.generation="old-g1";expect(await observe()).toBeNull();expect(store.read(meta.scopeId,meta.launchId)).not.toBeNull();binding.generation=meta.generation;expect(await observe()).not.toBeNull();
  // Grant timing is absent from the launch API. The service, not this proof, owns finite effect authorization.
 });
+it("preserves old supervised ancestry across a daemon installation upgrade while new launches use the new install",async()=>{
+ const oldNode=node,oldEntry=entry;
+ const nextNode=path.join(dir,"new-install","node"),nextEntry=path.join(dir,"new-install","supervisor.js");
+ fs.mkdirSync(path.dirname(nextNode));fs.writeFileSync(nextNode,"new installed Node",{mode:0o700});fs.writeFileSync(nextEntry,"new installed supervisor",{mode:0o600});
+ store=new NativeDutyLaunchStore({root,nodeExecutable:nextNode,supervisorEntry:nextEntry,now:()=>3000});
+ expect(store.latest(meta.nodeId,meta.generation)?.intent).toEqual(prepared.intent);
+ expect(await observe()).toMatchObject({nativePresent:true,supervisorIsNativeAncestor:true});
+ expect(deps.verifyProcessIdentity).toHaveBeenCalledWith(20,prepared.publicEnvironment,[oldNode,oldEntry,"--supervise",prepared.intent.configPath]);
+ const fresh=store.prepare({...meta,launchId:"upgraded-launch",harness:prepared.config.harness,pollMs:1000});
+ expect(fresh.launch.executable).toBe(nextNode);expect(fresh.launch.args[0]).toBe(nextEntry);
+ expect(store.latest(meta.nodeId,meta.generation)?.intent.launchId).toBe("upgraded-launch");
+ // A validated descriptor is not a permanent waiver: later replacement remains refused.
+ fs.appendFileSync(oldEntry," tampered");expect(store.read(meta.scopeId,meta.launchId)).toBeNull();expect(await observe()).toBeNull();
+});
+it("rejects a historical install descriptor with a forged digest before caching it",()=>{
+ const nextEntry=path.join(dir,"new-supervisor.js");fs.writeFileSync(nextEntry,"new supervisor",{mode:0o600});
+ const altered=JSON.parse(fs.readFileSync(prepared.intentPath,"utf8"));altered.installedSupervisor.sha256="f".repeat(64);fs.writeFileSync(prepared.intentPath,JSON.stringify(altered));
+ store=new NativeDutyLaunchStore({root,nodeExecutable:node,supervisorEntry:nextEntry});
+ expect(store.read(meta.scopeId,meta.launchId)).toBeNull();expect(store.latest(meta.nodeId,meta.generation)).toBeNull();
+});
 it.each(["config-bytes","config-mode","config-symlink","install-bytes","partial-intent"])("rejects changed/private-path evidence: %s",async kind=>{
  if(kind==="config-bytes")fs.appendFileSync(prepared.intent.configPath," ");
  if(kind==="config-mode")fs.chmodSync(prepared.intent.configPath,0o644);
