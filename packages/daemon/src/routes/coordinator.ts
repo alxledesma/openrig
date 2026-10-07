@@ -50,8 +50,16 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
      if(operation==="coordination-plan"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');return c.json(svc.coordinationRecovery.configure(actor,generation,b));}
      if(operation==="coordination-reconcile"){const b=await c.req.json();if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');const result=svc.coordinationRecovery.reconcile(actor,generation,b.rigId);await svc.coordinationRecovery.deliverCommitted();return c.json(result);}
      if(operation==="coordination-worker-probe"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError("coordination_unavailable","Service not wired");return c.json(await svc.coordinationRecovery.probeWorker(actor,generation,await c.req.json()));}
-     if(operation==="qualification-assessment-stage"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');const result=svc.coordinationRecovery.stageQualificationAssessment(actor,generation,await c.req.json());await svc.coordinationRecovery.deliverCommitted();return c.json(result,201);}
-     if(operation==="qualification-assessment-retirement-stage"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');const result=svc.coordinationRecovery.stageQualificationAssessmentRetirement(actor,generation,await c.req.json());await svc.coordinationRecovery.deliverCommitted();return c.json(result,201);}
+     if(operation==="qualification-assessment-stage"){
+       if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');
+       const input=await c.req.json(),prepared=await svc.coordinationRecovery.prepareQualificationWorkerStageObservation(actor,generation,input.rigId,input.worker,input.workerGeneration,input.configurationDigest);
+       const result=svc.coordinationRecovery.stageQualificationAssessment(actor,generation,input,prepared);await svc.coordinationRecovery.deliverCommitted();return c.json(result,201);
+     }
+     if(operation==="qualification-assessment-retirement-stage"){
+       if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');
+       const input=await c.req.json(),prepared=await svc.coordinationRecovery.prepareQualificationRetirementStageObservation(actor,generation,input);
+       const result=svc.coordinationRecovery.stageQualificationAssessmentRetirement(actor,generation,input,prepared);await svc.coordinationRecovery.deliverCommitted();return c.json(result,201);
+     }
      if(operation==="qualification-assessment-uncertainty-dispose"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');return c.json(await svc.coordinationRecovery.recordQualificationAssessmentUncertainty(actor,generation,await c.req.json()),201);}
      if(operation==="qualification-assessment-return"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');svc.coordinationRecovery.recordQualificationAssessmentReturn(actor,generation,await c.req.json());return c.json({ok:true,grantsAuthority:false});}
      if(operation==="qualification-assessment-review"){if(!svc.coordinationRecovery)throw new CoordinatorFenceError('coordination_unavailable','Service not wired');return c.json(svc.coordinationRecovery.assessQualificationDuty(actor,generation,await c.req.json()));}

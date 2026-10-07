@@ -659,6 +659,57 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   expect(refusal(()=>svc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',{rigId:'xv',targetQueueId:old,targetBodyHash:digest(repo.getById(old)!.body),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body),deadline:clock+30000})).code).toBe('qualification_retirement_worker_rig_mismatch');
   expect(repo.getById(old)?.state).toBe('pending');expect(repo.getById(sweep)?.state).toBe('pending');
  });
+ it('qualification assessment and retirement stage from refreshed identity and idle activity, rejecting a changed Worker generation',async()=>{
+  const refreshed:string[]=[];
+  const stageSvc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,async sessions=>{
+   for(const session of sessions){
+    refreshed.push('identity:'+session);
+    const current=samples.get(session)!;
+    samples.set(session,{...current,identityVerified:true,identityObservedAt:new Date(clock).toISOString()});
+   }
+  },async session=>{
+   refreshed.push('activity:'+session);
+   const current=samples.get(session)!;
+   const fresh=sample(session);
+   samples.set(session,{...fresh,identityObservedAt:current.identityObservedAt??new Date(clock).toISOString()});
+  });
+  const stale=(session:string)=>{
+   const old=new Date(clock-4001).toISOString(),current=samples.get(session)!;
+   samples.set(session,{...current,identityObservedAt:old,witness:{...current.witness!,observedAt:old}});
+  };
+  const contract={schema:'qualification-assessment-contract.v1' as const,artifactRef:'pilot/qualification-check.json',artifactSha256:'sha256:'+'a'.repeat(64),taskDigest:'sha256:'+'b'.repeat(64),scope:'qualification-only' as const,productAuthority:false as const};
+  stale('builder@xv');
+  const builderConfig=stageSvc.configurationDigest('builder@xv')!;
+  expect(refusal(()=>stageSvc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:builderConfig,deadline:clock+30000,contract})).message).toContain('fresh native observation prepared');
+  const assessmentObservation=await stageSvc.prepareQualificationWorkerStageObservation('operator-agent@kernel','operator-agent-g1','xv','builder@xv','builder-g1',builderConfig);
+  expect(refreshed.slice(0,2)).toEqual(['identity:builder@xv','activity:builder@xv']);
+  const assessment=stageSvc.stageQualificationAssessment('operator-agent@kernel','operator-agent-g1',{rigId:'xv',worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:builderConfig,deadline:clock+30000,contract},assessmentObservation);
+  expect(repo.getById(assessment.queueId)?.destinationSession).toBe('builder@xv');
+
+  const target='legacy-qualification-assessment-fresh-retirement',sweep='qualification-assessment-fresh-retirement-sweep',nowIso=new Date(clock).toISOString(),targetBody='# Legacy qualification assessment\nExpired before pickup.';
+  db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,expires_at,body) VALUES (?,?,?,?,?,?,?,?)').run(target,nowIso,nowIso,'operator-agent@kernel','architect@xv','pending',new Date(clock-1000).toISOString(),targetBody);
+  db.transaction(()=>repo.stageWakeIntent(target,'operator-agent@kernel','architect@xv','system:operator-authorized-coordination',true,'architect-g1'))();
+  db.prepare("UPDATE outbox_entries SET delivery_state='failed' WHERE outbox_id=?").run('wake-intent-'+target);
+  db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES (?,?,?,?,?,?,?)').run(sweep,nowIso,nowIso,'operator-agent@kernel','architect@xv','pending','STUCK SWEEP FINDING (undelivered-wake)\nrow: '+target+'\nwhy: wake failed before delivery; nothing retried it');
+  stale('architect@xv');
+  const retirementInput={rigId:'xv',targetQueueId:target,targetBodyHash:digest(targetBody),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body),deadline:clock+30000};
+  expect(refusal(()=>stageSvc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',retirementInput)).message).toContain('fresh native observation prepared');
+  const retirementObservation=await stageSvc.prepareQualificationRetirementStageObservation('operator-agent@kernel','operator-agent-g1',{rigId:'xv',targetQueueId:target});
+  const retirement=stageSvc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',retirementInput,retirementObservation);
+  expect(repo.getById(retirement.queueId)?.destinationSession).toBe('architect@xv');
+  expect(refreshed.slice(2)).toEqual(['identity:architect@xv','activity:architect@xv']);
+
+  const priorRows=db.prepare('SELECT count(*) n FROM queue_items').get();
+  const changedSvc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,async sessions=>{
+   for(const session of sessions){
+    if(session==='reviewer@xv')db.prepare("UPDATE occupant_tenures SET generation_uuid='reviewer-g2' WHERE node_id='reviewer@xv'").run();
+    const observed=sample(session);samples.set(session,{...observed,identityObservedAt:new Date(clock).toISOString()});
+   }
+  },async session=>{const observed=sample(session);samples.set(session,{...observed,identityObservedAt:new Date(clock).toISOString()});});
+  stale('reviewer@xv');
+  await expect(changedSvc.prepareQualificationWorkerStageObservation('operator-agent@kernel','operator-agent-g1','xv','reviewer@xv','reviewer-g1',changedSvc.configurationDigest('reviewer@xv')!)).rejects.toMatchObject({code:'qualification_duty_worker_stale'});
+  expect(db.prepare('SELECT count(*) n FROM queue_items').get()).toEqual(priorRows);
+ });
  it('qualification retirement does not observe completion after the Operator binding changes',()=>{
   samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});
   const old='legacy-qualification-assessment-operator-rotation',sweep='legacy-qualification-sweep-operator-rotation',nowIso=new Date(clock).toISOString();

@@ -14,6 +14,7 @@ const rigId = "01M4A6883B0J2NZZ22XVH7P4QB";
 let home: string;
 let calls: Array<{ operation: string; actor: string; generation: string; body: Record<string, unknown> }>;
 let recovery: Record<string, (...args: any[]) => unknown>;
+let preparedObservation: { worker: string; generation: string; configurationDigest: string; identityObservedAt: string; activityObservedAt: string };
 let app: Hono;
 
 beforeEach(() => {
@@ -25,8 +26,11 @@ beforeEach(() => {
   vi.stubEnv("OPENRIG_TERMINAL_BEARER_TOKEN", "");
   fs.writeFileSync(path.join(home, "terminal-token"), token, { mode: 0o600 });
   calls = [];
+  preparedObservation = { worker: "queue-worker@kernel", generation: "worker-generation", configurationDigest: "c".repeat(64), identityObservedAt: new Date().toISOString(), activityObservedAt: new Date().toISOString() };
   recovery = {
     deliverCommitted: vi.fn(async () => {}),
+    prepareQualificationWorkerStageObservation: vi.fn(async () => preparedObservation),
+    prepareQualificationRetirementStageObservation: vi.fn(async () => preparedObservation),
     stageQualificationAssessment: vi.fn((a: string, g: string, body: Record<string, unknown>) => {
       calls.push({ operation: "qualification-assessment-stage", actor: a, generation: g, body });
       return { queueId: "assessment-duty-1", contractDigest: "a".repeat(64), deadline: body.deadline };
@@ -133,6 +137,16 @@ describe("qualification assessment coordinator CLI verbs", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.actor).toMatch(/^operator-agent@kernel@.+/);
     expect(calls[0]).toMatchObject({ operation, generation, body });
+    if (operation === "qualification-assessment-stage") {
+      expect(recovery.prepareQualificationWorkerStageObservation).toHaveBeenCalledWith(calls[0]?.actor, generation, rigId, body.worker, body.workerGeneration, body.configurationDigest);
+      expect(recovery.stageQualificationAssessment).toHaveBeenCalledWith(calls[0]?.actor, generation, body, preparedObservation);
+      expect((recovery.prepareQualificationWorkerStageObservation as any).mock.invocationCallOrder[0]).toBeLessThan((recovery.stageQualificationAssessment as any).mock.invocationCallOrder[0]);
+    }
+    if (operation === "qualification-assessment-retirement-stage") {
+      expect(recovery.prepareQualificationRetirementStageObservation).toHaveBeenCalledWith(calls[0]?.actor, generation, body);
+      expect(recovery.stageQualificationAssessmentRetirement).toHaveBeenCalledWith(calls[0]?.actor, generation, body, preparedObservation);
+      expect((recovery.prepareQualificationRetirementStageObservation as any).mock.invocationCallOrder[0]).toBeLessThan((recovery.stageQualificationAssessmentRetirement as any).mock.invocationCallOrder[0]);
+    }
     expect(process.exitCode).toBeUndefined();
     expect(recovery.deliverCommitted).toHaveBeenCalledTimes(operation.endsWith("stage") ? 1 : 0);
   });
@@ -141,7 +155,7 @@ describe("qualification assessment coordinator CLI verbs", () => {
     const body={rigId,targetQueueId:"assessment-old",targetBodyHash:"a".repeat(64),evidenceKind:"operator-accountability",accountabilityControlQueueId:"stuck-sweep-control-1",accountabilityControlBodyHash:"d".repeat(64),deadline:Date.now()+60_000};
     const file=contractFile(body);
     await coordinatorCommand().parseAsync(["node","rig","qualification-assessment-retirement-stage",file]);
-    expect(calls).toHaveLength(1);expect(calls[0]).toMatchObject({operation:"qualification-assessment-retirement-stage",body});expect(process.exitCode).toBeUndefined();
+    expect(calls).toHaveLength(1);expect(calls[0]).toMatchObject({operation:"qualification-assessment-retirement-stage",body});expect(recovery.prepareQualificationRetirementStageObservation).toHaveBeenCalledTimes(1);expect(recovery.stageQualificationAssessmentRetirement).toHaveBeenCalledWith(calls[0]?.actor,generation,body,expect.any(Object));expect(process.exitCode).toBeUndefined();
   });
 
   it.each([
