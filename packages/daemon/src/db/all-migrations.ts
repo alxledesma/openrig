@@ -103,6 +103,7 @@ import { liveProjectionRecoveryLedgerSchema } from "./migrations/097_live_projec
 import { coordinatorOperationLookupIndexSchema } from "./migrations/098_coordinator_operation_lookup_index.js";
 import { lifecycleTargetLookupIndexSchema } from "./migrations/099_lifecycle_target_lookup_index.js";
 import { lifecycleRootLookupIndexSchema } from "./migrations/100_lifecycle_root_lookup_index.js";
+import { nativeQueueCustodyEvidenceSchema } from "./migrations/101_native_queue_custody_evidence.js";
 // Upstream 0.6.5 additive migrations. NUMERIC PREFIXES COLLIDE with the fork's
 // 090/091/092/094 series but identity is the `name` field (e.g.
 // "090_human_reply_to.sql"), which is unique across both series, and the loader
@@ -217,6 +218,7 @@ export const ALL_MIGRATIONS: Migration[] = [
   coordinatorOperationLookupIndexSchema,
   lifecycleTargetLookupIndexSchema,
   lifecycleRootLookupIndexSchema,
+  nativeQueueCustodyEvidenceSchema,
   humanReplyToSchema,
   humanQuestionsSchema,
   nodeEffortSchema,

@@ -2097,6 +2097,8 @@ export class QueueRepository {
     const events: Array<{ name: string; payload: import("./types.js").RigEvent }> = [];
 
     const txn = this.db.transaction(() => {
+      const beforeCustody = this.custodySnapshot(input.qitemId);
+      const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
       this.coordinatorAuthority.reserve(input.fromSession, input.toSession, body, newId, input.dispatch, false, input.qitemId);
       this.db
@@ -2111,7 +2113,7 @@ export class QueueRepository {
         )
         .run(ts, input.toSession, input.toSession, source.qitemId);
 
-      this.transitionLog.append({
+      this.transitionLog.appendNativeCustody({
         qitemId: source.qitemId,
         state: "handed-off",
         actorSession: input.fromSession,
@@ -2119,7 +2121,7 @@ export class QueueRepository {
         closureReason: "handed_off_to",
         closureTarget: input.toSession,
         identityProvenance: input.identityProvenance ?? null, // P21 §4 era-stamp
-      });
+      }, nativeGeneration, beforeCustody);
 
       // OPR.0.5.8.1 S1b — THE ROUTE THE FOUNDING SPECIMEN TOOK. Row b7a70333 went
       // handed-off at 10:02:03Z and its timer still fired at 10:18:07Z, because
@@ -2288,6 +2290,8 @@ export class QueueRepository {
     const events: Array<{ name: string; payload: import("./types.js").RigEvent }> = [];
 
     const txn = this.db.transaction(() => {
+      const beforeCustody = this.custodySnapshot(input.qitemId);
+      const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
       this.coordinatorAuthority.reserve(input.fromSession, input.toSession, body, newId, input.dispatch, false, input.qitemId);
       this.db
@@ -2302,7 +2306,7 @@ export class QueueRepository {
         )
         .run(ts, input.toSession, input.toSession, source.qitemId);
 
-      this.transitionLog.append({
+      this.transitionLog.appendNativeCustody({
         qitemId: source.qitemId,
         state: "done",
         actorSession: input.fromSession,
@@ -2310,7 +2314,7 @@ export class QueueRepository {
         closureReason: "handed_off_to",
         closureTarget: input.toSession,
         identityProvenance: input.identityProvenance ?? null, // P21 §4 era-stamp
-      });
+      }, nativeGeneration, beforeCustody);
 
       // OPR.0.5.8.1 S1b — same structural bypass as handoff(): own transaction,
       // never routes through update().
@@ -2480,6 +2484,8 @@ export class QueueRepository {
     const events: Array<import("./types.js").RigEvent> = [];
 
     const txn = this.db.transaction(() => {
+      const beforeCustody = this.custodySnapshot(input.qitemId);
+      const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
       this.db
         .prepare(
@@ -2493,7 +2499,7 @@ export class QueueRepository {
         )
         .run(input.terminalState, ts, input.toSession, input.closureTarget, input.qitemId);
 
-      this.transitionLog.append({
+      this.transitionLog.appendNativeCustody({
         qitemId: input.qitemId,
         state: input.terminalState,
         actorSession: input.fromSession,
@@ -2503,7 +2509,8 @@ export class QueueRepository {
         transitionNote: input.transitionNote ?? `cross-host handoff to ${input.toSession}`,
         closureReason: "handed_off_to",
         closureTarget: input.closureTarget,
-      });
+        identityProvenance: input.identityProvenance ?? null,
+      }, nativeGeneration, beforeCustody);
 
       // OPR.0.5.8.1 S1b — third member of the handoff family, same bypass.
       this.retireParkGeneratedTimer(input.qitemId, `park_ended:${input.terminalState}`);
@@ -2606,9 +2613,19 @@ export class QueueRepository {
     return rows.map((r) => this.rowToItem(r));
   }
 
-  /**
-   * Mark a qitem `in-progress` (claim). Computes closure_required_at from tier.
-   */
+  /** A current generation label is not transport evidence. Only the actual actor header,
+   * accompanied by its supplied generation and checked against the registered occupant, can stamp it. */
+  private nativeCustodyGeneration(actor: string, generation: string | null | undefined, provenance: string | null | undefined): string | null {
+    if (!this.transitionLog.hasNativeCustodyEvidence || provenance !== "transport:v1" || !generation) return null;
+    if (this.coordinatorAuthority.generation(actor) !== generation)
+      throw new QueueRepositoryError("native_custody_generation_mismatch", "Native custody evidence requires the actual current actor generation");
+    return generation;
+  }
+  private custodySnapshot(queueId: string): Record<string, unknown> {
+    return this.db.prepare("SELECT * FROM queue_items WHERE qitem_id=?").get(queueId) as Record<string, unknown>;
+  }
+
+  /** Mark a qitem in-progress and compute its closure deadline. */
   claim(input: QueueClaimInput): QueueItem {
     const authoring=this.coordinatorAuthority.coordinationRecovery?.lifecycleControlReceipt(input.qitemId);if(authoring&&(input.identityProvenance!=='transport:v1'||input.destinationSession!==authoring.recipient||input.actorGeneration!==authoring.recipientGeneration||!this.coordinatorAuthority.coordinationRecovery?.lifecycleControlClaimAllowed(input.qitemId,input.destinationSession,input.actorGeneration,input.identityProvenance)))throw new QueueRepositoryError('held_authoring_claim_required','Exact current native Lead and live authoring duty proof required');
     const ack=this.recipientAckDuty(input.qitemId);if(ack&&(input.identityProvenance!=='transport:v1'||input.destinationSession!==ack.recipient||input.actorGeneration!==ack.recipientGeneration||this.coordinatorAuthority.generation(input.destinationSession)!==ack.recipientGeneration||ack.deadline<=Date.now()))throw new QueueRepositoryError('outbox_ack_claim_required','Exact current native recipient generation and unexpired acknowledgment duty required');
@@ -2638,11 +2655,14 @@ export class QueueRepository {
     // GHOST-STAGE (e/Class-B): stamp the CLAIMANT's occupant generation. THIS is the ghost
     // discriminator — under a handover the successor reuses the seat name, so a name-scoped release
     // would neutralize the successor's own claims; the retiring generation's claims are released by gen.
-    const claimedByGeneration = this.hasClaimedGenColumn
-      ? (this.resolveOccupantGeneration?.(input.destinationSession) ?? null)
-      : null;
-
     const txn = this.db.transaction(() => {
+      const beforeCustody = this.custodySnapshot(input.qitemId);
+      const nativeGeneration = this.nativeCustodyGeneration(input.destinationSession,input.actorGeneration,input.identityProvenance);
+      const claimedByGeneration = this.hasClaimedGenColumn
+        ? (nativeGeneration ?? this.resolveOccupantGeneration?.(input.destinationSession) ?? null)
+        : null;
+      if (nativeGeneration && (beforeCustody.destination_session !== input.destinationSession || !["pending", "blocked"].includes(String(beforeCustody.state))))
+        throw new QueueRepositoryError("qitem_not_claimable", "Native claim requires current exact destination custody");
       if (this.hasClaimedGenColumn) {
         this.db
           .prepare(
@@ -2662,13 +2682,13 @@ export class QueueRepository {
           .run(ts, ts, closureRequiredAt, input.qitemId);
       }
 
-      this.transitionLog.append({
+      this.transitionLog.appendNativeCustody({
         qitemId: input.qitemId,
         state: "in-progress",
         actorSession: input.destinationSession,
         transitionNote: "claimed",
         identityProvenance: input.identityProvenance ?? null, // P21 §4 era-stamp
-      });
+      }, nativeGeneration, beforeCustody);
 
       // OPR.0.5.8.1 S1b — CLAIM-RESUME. A blocked row is claimable ("only
       // pending/blocked are claimable"), so claiming is a real exit from a park
@@ -2812,6 +2832,8 @@ export class QueueRepository {
         `qitem ${input.qitemId} not found`
       );
     }
+    const beforeCustody = this.custodySnapshot(input.qitemId);
+    const nativeGeneration = this.nativeCustodyGeneration(input.actorSession,input.actorGeneration,input.identityProvenance);
     if(input.state!==undefined&&!(['failed','canceled'].includes(input.state)&&this.coordinatorAuthority.coordinationRecovery?.heldHistoryRetirementAllows(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance)))this.assertAdministrativeClaimant(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance);
     if(this.abandonmentAuthorization(input.qitemId)&&input.state!==undefined&&((qitem.claimedAt&&input.state==='pending')||(isTerminalState(qitem.state)&&input.state!==qitem.state)))throw new QueueRepositoryError('outbox_authorization_custody_required','Preserve administrative history; exact current claimant must report own failed/canceled expiry, never unclaim or reopen it');
     if(input.state==='done'||input.state==='handed-off')this.assertNativeTerminalReturnCompleted(input.qitemId);
@@ -2847,13 +2869,13 @@ export class QueueRepository {
         );
       }
 
-      this.transitionLog.append({
+      this.transitionLog.appendNativeCustody({
         qitemId: input.qitemId,
         state: qitem.state,
         actorSession: input.actorSession,
         transitionNote: input.transitionNote,
         identityProvenance: input.identityProvenance ?? null,
-      });
+      }, nativeGeneration, beforeCustody);
       const persistedEvent = this.eventBus.persistWithinTransaction({
         type: "queue.updated",
         qitemId: input.qitemId,
@@ -3213,7 +3235,7 @@ export class QueueRepository {
       this.persistEvidenceRef(input.qitemId, input.evidenceRef ?? null);
     }
 
-    const transition = this.transitionLog.append({
+    const transition = this.transitionLog.appendNativeCustody({
       qitemId: input.qitemId,
       state: input.state,
       actorSession: input.actorSession,
@@ -3223,7 +3245,7 @@ export class QueueRepository {
       identityProvenance: input.identityProvenance ?? null, // P21 §4 era-stamp
       ownerNotificationKind: notification?.kind,
       ownerNotificationLevel: notification?.level,
-    });
+    }, nativeGeneration, beforeCustody);
     if (parkWake) {
       // OPR.0.5.8.1 S1b addendum — A NEW PARK EPISODE SUPERSEDES THE OLD.
       // Re-parking (blocked -> blocked with a fresh --wake-after) used to arm a

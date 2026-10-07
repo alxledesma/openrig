@@ -2,7 +2,7 @@ import type { RuntimeAvailability } from "./coordinator-runtime-availability.js"
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import type { EventBus } from "./event-bus.js";
-import type { QueueTransitionLog } from "./queue-transition-log.js";
+import { QueueTransitionLog, type NativeQueueCustodyReceipt, type QueueTransition } from "./queue-transition-log.js";
 
 export interface CoordinatorToken { rigId: string; epoch: number; generation: string }
 export interface DispatchEnvelope { token: CoordinatorToken; packageKey: string }
@@ -220,6 +220,7 @@ export class CoordinatorAuthorityService {
        const row=this.db.prepare('SELECT * FROM outbox_entries WHERE outbox_id=?').get(h.outboxId) as Record<string,unknown>;
        const post=this.historyCustody(row);
        this.db.prepare('INSERT INTO coordinator_held_history VALUES (?,?,?,?,?,?,?,?,?,?)').run(input.rigId,h.outboxId,input.operationId,h.rowHash,h.quarantineHash,h.operationHash,h.custodyHash,digest(canonical(post)),input.heldHistoryRecovery!.queueId,JSON.stringify({kind:'coordinator-held-history-adoption.v1',actor,generation,owner:input.owner,ownerGeneration:input.ownerGeneration,pre:h,postCustody:post,recovery:input.heldHistoryRecovery,recoveryBinding,deliveryConclusion:'unknown',originalMutations:0}));
+       this.recordAdoptedOutcomeBase(input.rigId,row);
      }
      const result=this.get(input.rigId)!;this.log(input.rigId,input.operationId,"legacy-enrollment",result,operationRequest);return result;
    }).immediate();
@@ -249,6 +250,7 @@ export class CoordinatorAuthorityService {
      }
      for(const {row,held:h} of rows){const custody=this.historyCustody(row);
        this.db.prepare('INSERT INTO coordinator_held_history VALUES (?,?,?,?,?,?,?,?,?,?)').run(input.rigId,h.outboxId,input.operationId,h.rowHash,h.quarantineHash,h.operationHash,h.custodyHash,h.custodyHash,input.recovery.queueId,JSON.stringify({kind:'coordinator-held-history-adoption.v1',actor,generation,owner:a.owner_session,ownerGeneration:a.owner_generation,epoch:a.epoch,pre:h,postCustody:custody,recovery:input.recovery,recoveryBinding,deliveryConclusion:'unknown',originalMutations:0}));
+       this.recordAdoptedOutcomeBase(input.rigId,row);
      }
      const receipt={kind:'coordinator-current-held-history-adoption.v1',actor,generation,expected:input.expected,effects:input.effects,recoveryBinding,deliveryConclusion:'unknown',originalMutations:0};this.log(input.rigId,input.operationId,'held-history-adoption',receipt,request);return receipt;
    }).immediate();
@@ -274,8 +276,8 @@ export class CoordinatorAuthorityService {
     const base=this.adoptionBase(rigId,row);
     if(!base)return false;
     const live=this.compatibleAdoptedCustody(this.historyCustody(row) as Record<string,unknown>,base.frozen);
-    // Exact frozen custody, OR the exact current custody bytes an Operator attested for THIS adoption.
-    return canonical(live)===canonical(base.frozen)||this.custodyAttested(rigId,String(row.outbox_id),String(base.adopted.post_custody_hash),digest(canonical(live)));
+    // Exact frozen/attested custody, or a complete immutable native outcome chain for THIS adoption.
+    return canonical(live)===canonical(base.frozen)||this.custodyAttested(rigId,String(row.outbox_id),String(base.adopted.post_custody_hash),digest(canonical(live)))||this.adoptedNativeOutcome(rigId,row,base,live);
   }
   /** Every immutable adoption check that does not look at current custody. The frozen reference is the
    *  receipt, hashed at adoption; current bytes are only ever read through it. */
@@ -306,6 +308,119 @@ export class CoordinatorAuthorityService {
       if(!Object.prototype.hasOwnProperty.call(frozen,column)&&queue[column]===null)delete queue[column];
     return {...current,queue};
   }
+
+ /** Generation-bound evidence is prospective and append-only. Old adoption receipts are never
+  * upgraded by a current occupant label; their unproved custody drift remains held. */
+ private outcomeEvidenceAvailable():boolean {
+   return !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='coordinator_held_history_outcome_bases'").get();
+ }
+ private nativeCustodyReceipt(transition:QueueTransition):NativeQueueCustodyReceipt|null {
+   const row=this.db.prepare('SELECT receipt FROM queue_native_custody_evidence WHERE transition_id=? AND qitem_id=?')
+     .get(transition.transitionId,transition.qitemId) as {receipt:string}|undefined;
+   let receipt:NativeQueueCustodyReceipt;try{receipt=JSON.parse(row?.receipt??'null');}catch{return null;}
+   if(!receipt||receipt.kind!=='queue-native-custody.v1'||typeof receipt.actorGeneration!=='string'||!receipt.actorGeneration||
+      canonical(receipt.transition)!==canonical(transition)||!receipt.beforeQueue||!receipt.afterQueue||
+      receipt.beforeQueue.qitem_id!==transition.qitemId||receipt.afterQueue.qitem_id!==transition.qitemId||
+      receipt.afterQueue.state!==transition.state)return null;
+   return receipt;
+ }
+ private compatibleOutcomeQueue(current:Record<string,unknown>,original:Record<string,unknown>):Record<string,unknown> {
+   return this.compatibleAdoptedCustody({queue:current},{queue:original}).queue as Record<string,unknown>;
+ }
+ /** A complete chain, including same-state notes, is required. Missing generations, intermediate
+  * writes, state cycles and non-native actors fail closed; timestamps are not history boundaries. */
+ private nativeCustodyProgress(queueId:string,boundary:number,initial:Record<string,unknown>,generation:string):Record<string,unknown>|null {
+   const history=(this.transitions??new QueueTransitionLog(this.db)).listForQitemAfter(queueId,boundary,2001);
+   if(history.length>2000)return null;
+   let queue=initial;
+   const mutable=new Set(['state','ts_updated','claimed_at','claimed_by_generation_uuid','closure_required_at','closure_reason','closure_target','handed_off_to','blocked_on']);
+   const terminals=['done','failed','denied','canceled','handed-off'];
+   for(const transition of history){
+     const receipt=this.nativeCustodyReceipt(transition);
+     if(!receipt||transition.identityProvenance!=='transport:v1'||transition.actorSession!==initial.destination_session||receipt.actorGeneration!==generation||
+        canonical(this.compatibleOutcomeQueue(receipt.beforeQueue,initial))!==canonical(queue))return null;
+     const after=this.compatibleOutcomeQueue(receipt.afterQueue,initial),before=queue;
+     const changed=Object.keys({...before,...after}).filter(k=>canonical(before[k])!==canonical(after[k]));
+     if(changed.some(k=>!mutable.has(k)))return null;
+     if(before.state===after.state){
+       if(changed.some(k=>k!=='ts_updated'))return null;
+     }else if(before.state==='pending'&&after.state==='in-progress'){
+       if(transition.transitionNote!=='claimed'||before.claimed_at!==null||before.claimed_by_generation_uuid!==null||
+          typeof after.claimed_at!=='string'||after.claimed_by_generation_uuid!==generation)return null;
+     }else if(before.state==='in-progress'&&terminals.includes(String(after.state))){
+       if(after.claimed_at!==before.claimed_at||after.claimed_by_generation_uuid!==generation)return null;
+     }else return null;
+     if(after.state!=='pending'&&(after.claimed_by_generation_uuid!==generation||typeof after.claimed_at!=='string'))return null;
+     queue=after;
+   }
+   return queue;
+ }
+ private recordAdoptedOutcomeBase(rigId:string,row:Record<string,unknown>):void {
+   if(!this.db.inTransaction)reject('coordinator_transaction_required','Adopted outcome boundary must be atomic with adoption');
+   if(!this.outcomeEvidenceAvailable())return;
+   const base=this.adoptionBase(rigId,row),queue=base?.frozen.queue as Record<string,unknown>|null;
+   if(!base||!queue||typeof queue.qitem_id!=='string'||typeof queue.destination_session!=='string'||this.local(queue.destination_session)?.rig_id!==rigId)return;
+   const generation=this.generation(queue.destination_session);
+   if(!generation)return;
+   const log=this.transitions??new QueueTransitionLog(this.db),last=log.latestForQitem(queue.qitem_id);
+   if(!last||last.state!==queue.state)return;
+   if(queue.state==='pending'){
+     if(queue.claimed_at!==null||queue.claimed_by_generation_uuid!==null)return;
+   }else{
+     if(queue.claimed_by_generation_uuid!==generation||typeof queue.claimed_at!=='string')return;
+     // Existing claims require their own immutable generation proof, not a session-only receipt.
+     const claims=this.db.prepare('SELECT transition_id FROM queue_native_custody_evidence WHERE qitem_id=? ORDER BY transition_id').all(queue.qitem_id) as Array<{transition_id:number}>;
+     const claim=claims.find(ref=>{const transition=log.listForQitemAfter(String(queue.qitem_id),ref.transition_id-1,1)[0];
+       const receipt=transition?this.nativeCustodyReceipt(transition):null;
+       return receipt?.actorGeneration===generation&&transition?.transitionNote==='claimed'&&receipt.afterQueue.claimed_at===queue.claimed_at;});
+     const first=claim?log.listForQitemAfter(queue.qitem_id,claim.transition_id-1,1)[0]:undefined;
+     const receipt=first?this.nativeCustodyReceipt(first):null;
+     const proven=receipt?this.nativeCustodyProgress(queue.qitem_id,first!.transitionId-1,receipt.beforeQueue,generation):null;
+     if(!proven||canonical(proven)!==canonical(queue))return;
+   }
+   const receipt={kind:'coordinator-adopted-custody-base.v1',adoptionReceiptHash:digest(String(base.adopted.receipt)),postCustodyHash:base.adopted.post_custody_hash,
+     queueId:queue.qitem_id,destination:queue.destination_session,destinationGeneration:generation,boundaryTransitionId:last.transitionId,
+     deliveryConclusion:'unknown',originalMutations:0,outcomeOnly:true,grantsAuthority:false};
+   this.db.prepare('INSERT INTO coordinator_held_history_outcome_bases(rig_id,outbox_id,receipt) VALUES (?,?,?)').run(rigId,row.outbox_id,JSON.stringify(receipt));
+ }
+ /** Dispose is a worker return, never acceptance. Only its exact immutable operation and typed
+  * return authorize the recorded assignment disposition/resource changes. */
+ private adoptedDisposition(rigId:string,frozen:any,current:any,queue:Record<string,unknown>,generation:string):boolean {
+   if(frozen.disposition_id!==null||typeof current.disposition_id!=='string'||!['done','failed','denied','canceled','handed-off'].includes(String(queue.state)))return false;
+   if(canonical({...current,disposition_id:null})!==canonical(frozen))return false;
+   const op=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='disposition'").get(rigId,current.disposition_id) as {receipt:string}|undefined;
+   let disposition:any;try{disposition=JSON.parse(op?.receipt??'null');}catch{return false;}
+   if(canonical(disposition)!==canonical({packageKey:frozen.package_key,actor:queue.destination_session,generation}))return false;
+   const pkg=this.db.prepare('SELECT contract FROM coordinator_packages WHERE rig_id=? AND package_key=?').get(rigId,frozen.package_key) as {contract:string}|undefined;
+   const returned=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(current.disposition_id) as any;
+   let contract:PackageContract,payload:any;try{contract=JSON.parse(pkg?.contract??'null');payload=JSON.parse(returned?.body??'null');}catch{return false;}
+   return !!contract&&!!contract.returnContract&&!!returned&&contract.destination===queue.destination_session&&contract.bodyHash===digest(String(queue.body))&&
+     frozen.destination===queue.destination_session&&frozen.body_hash===contract.bodyHash&&returned.source_session===queue.destination_session&&
+     returned.destination_session===contract.returnContract.destination&&returned.minting_generation_uuid===generation&&payload?.packageKey===frozen.package_key&&
+     payload.inputDigest===contract.inputDigest&&Array.isArray(payload.evidence)&&Array.isArray(contract.returnContract.evidenceRequired)&&
+     contract.returnContract.evidenceRequired.every(kind=>payload.evidence.some((e:any)=>e&&e.kind===kind&&typeof e.ref==='string'&&e.ref.length>0));
+ }
+ private adoptedNativeOutcome(rigId:string,row:Record<string,unknown>,base:NonNullable<ReturnType<CoordinatorAuthorityService['adoptionBase']>>,live:Record<string,unknown>):boolean {
+   if(!this.outcomeEvidenceAvailable())return false;
+   const stored=this.db.prepare('SELECT receipt FROM coordinator_held_history_outcome_bases WHERE rig_id=? AND outbox_id=?').get(rigId,row.outbox_id) as {receipt:string}|undefined;
+   let proof:any;try{proof=JSON.parse(stored?.receipt??'null');}catch{return false;}
+   const original=base.frozen.queue as Record<string,unknown>|null,current=live.queue as Record<string,unknown>|null;
+   if(!original||!current||!proof||proof.kind!=='coordinator-adopted-custody-base.v1'||proof.adoptionReceiptHash!==digest(String(base.adopted.receipt))||
+      proof.postCustodyHash!==base.adopted.post_custody_hash||proof.queueId!==original.qitem_id||proof.destination!==original.destination_session||
+      typeof proof.destinationGeneration!=='string'||!proof.destinationGeneration||!Number.isSafeInteger(proof.boundaryTransitionId)||proof.boundaryTransitionId<1||
+      proof.deliveryConclusion!=='unknown'||proof.originalMutations!==0||proof.outcomeOnly!==true||proof.grantsAuthority!==false)return false;
+   const progressed=this.nativeCustodyProgress(proof.queueId,proof.boundaryTransitionId,original,proof.destinationGeneration);
+   if(!progressed||canonical(progressed)!==canonical(current))return false;
+   const assignments=base.frozen.assignment as any[],actual=live.assignment as any[],resources=base.frozen.resources as any[];
+   if(!Array.isArray(assignments)||!Array.isArray(actual)||!Array.isArray(resources)||assignments.length!==actual.length)return false;
+   const disposed=new Set<string>();
+   for(let i=0;i<assignments.length;i++){
+     if(canonical(assignments[i])===canonical(actual[i]))continue;
+     if(assignments[i].rig_id!==rigId||!this.adoptedDisposition(rigId,assignments[i],actual[i],current,proof.destinationGeneration))return false;
+     disposed.add(assignments[i].package_key);
+   }
+   return canonical(live.resources)===canonical(resources.filter(resource=>!disposed.has(resource.package_key)));
+ }
 
  // ------------------------------------------------------------ custody attestation
  // An adopted row's frozen custody includes queue.ts_updated, so a recorded same-state touch of the

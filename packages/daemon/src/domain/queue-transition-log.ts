@@ -43,6 +43,16 @@ export interface QueueTransitionInput {
   ownerNotificationLevel?: OwnerNotificationLevel | null;
 }
 
+/** Only a producer that checked the transport actor's supplied generation may append this.
+ * Complete snapshots detect unexplained writes between native transitions. */
+export interface NativeQueueCustodyReceipt {
+  kind: "queue-native-custody.v1";
+  transition: QueueTransition;
+  actorGeneration: string;
+  beforeQueue: Record<string, unknown>;
+  afterQueue: Record<string, unknown>;
+}
+
 export type RecentQueueTransitionTargetKind = "qitem" | "slice" | "mission";
 export type RecentQueueTransitionScope = { kind: "instance" } | { kind: "rig"; rig: string };
 
@@ -138,9 +148,11 @@ export class QueueTransitionLog {
   private readonly hasIdentityProvenanceColumn: boolean;
   private readonly hasOwnerNotificationColumns: boolean;
   private readonly historySource: string;
+  readonly hasNativeCustodyEvidence: boolean;
 
   constructor(db: Database.Database) {
     this.db = db;
+    this.hasNativeCustodyEvidence = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='queue_native_custody_evidence'").get();
     this.hasIdentityProvenanceColumn = (
       this.db.prepare("PRAGMA table_info(queue_transitions)").all() as Array<{ name: string }>
     ).some((c) => c.name === "identity_provenance");
@@ -195,6 +207,36 @@ export class QueueTransitionLog {
       .get(Number(result.lastInsertRowid)) as QueueTransitionRow;
 
     return this.rowToTransition(row);
+  }
+
+  /** Internal producer seam. The queue writer verifies the actual transport-derived actor and
+   * supplied generation inside the same transaction. Missing proof is never retroactively stamped. */
+  appendNativeCustody(input: QueueTransitionInput, actorGeneration: string | null,
+    beforeQueue: Record<string, unknown>): QueueTransition {
+    if (!this.db.inTransaction) throw new Error("native_custody_transaction_required");
+    const transition = this.append(input);
+    if (!actorGeneration || input.identityProvenance !== "transport:v1" || !this.hasNativeCustodyEvidence) return transition;
+    const afterQueue = this.db.prepare("SELECT * FROM queue_items WHERE qitem_id=?").get(input.qitemId) as Record<string, unknown> | undefined;
+    if (!afterQueue || beforeQueue.qitem_id !== input.qitemId || afterQueue.state !== input.state)
+      throw new Error("native_custody_snapshot_required");
+    const receipt: NativeQueueCustodyReceipt = {kind: "queue-native-custody.v1", transition, actorGeneration, beforeQueue, afterQueue};
+    this.db.prepare("INSERT INTO queue_native_custody_evidence(transition_id,qitem_id,receipt) VALUES (?,?,?)")
+      .run(transition.transitionId, input.qitemId, JSON.stringify(receipt));
+    return transition;
+  }
+
+  latestForQitem(qitemId: string): QueueTransition | undefined {
+    const row = this.db.prepare(`SELECT * FROM ${this.historySource} WHERE qitem_id=? ORDER BY transition_id DESC LIMIT 1`)
+      .get(qitemId) as QueueTransitionRow | undefined;
+    return row ? this.rowToTransition(row) : undefined;
+  }
+
+  /** A proof never silently truncates history: callers request a sentinel beyond their budget. */
+  listForQitemAfter(qitemId: string, transitionId: number, limit: number): QueueTransition[] {
+    if (!Number.isSafeInteger(transitionId) || transitionId < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 10001)
+      throw new Error("Invalid custody history boundary");
+    return (this.db.prepare(`SELECT * FROM ${this.historySource} WHERE qitem_id=? AND transition_id>? ORDER BY transition_id LIMIT ?`)
+      .all(qitemId, transitionId, limit) as QueueTransitionRow[]).map(row => this.rowToTransition(row));
   }
 
   listForQitem(qitemId: string): QueueTransition[] {
