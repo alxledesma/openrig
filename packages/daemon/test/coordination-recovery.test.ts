@@ -614,6 +614,44 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   expect(repo.getById(old)).toMatchObject({state:'failed',claimedAt:null});expect(repo.getById(sweep)?.state).toBe('done');expect(svc.dutyFacts(result.queueId).close).toBe(true);
   expect(db.prepare("SELECT count(*) n FROM coordinator_packages WHERE rig_id='xv'").get()).toEqual({n:0});
  });
+ it('qualification retirement accepts the claimed typed accountability control for an exact failed-before-send wake without inventing a Worker finding',async()=>{
+  samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});
+  const old='legacy-qualification-assessment-accountable',control='stuck-sweep-control-accountable',nowIso=new Date(clock).toISOString();
+  const targetBody='# Legacy qualification assessment\nExpired before pickup.';
+  db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,expires_at,body) VALUES (?,?,?,?,?,?,?,?)').run(old,nowIso,nowIso,'watchdog@system','builder@xv','pending',new Date(clock-1000).toISOString(),targetBody);
+  db.transaction(()=>repo.stageWakeIntent(old,'watchdog@system','builder@xv','system:operator-authorized-coordination',true,'builder-g1'))();
+  db.prepare("UPDATE outbox_entries SET delivery_state='failed' WHERE outbox_id=?").run('wake-intent-'+old);
+  const controlBody=JSON.stringify({action:'reconcile-refused-stuck-finding',stuckSweepRecoveryKey:'a'.repeat(64),previousQueueId:null,reason:'coordinator_dispatch_required',kind:'undelivered-wake',original:{qitemId:old,sourceSession:'watchdog@system',destinationSession:'builder@xv',bodyHash:digest(targetBody),state:'pending',evidenceAt:nowIso,factsHash:'b'.repeat(64)},intendedRoute:'builder@xv',recipientGeneration:'operator-agent-g1'});
+  db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES (?,?,?,?,?,?,?)').run(control,nowIso,nowIso,'watchdog@system','operator-agent@kernel','pending',controlBody);
+  repo.claim({qitemId:control,destinationSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1'});
+  const input={rigId:'xv',targetQueueId:old,targetBodyHash:digest(targetBody),evidenceKind:'operator-accountability' as const,accountabilityControlQueueId:control,accountabilityControlBodyHash:digest(controlBody),deadline:clock+30000};
+  expect(refusal(()=>svc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',{...input,sweepFindingQueueId:'invented',sweepFindingBodyHash:'e'.repeat(64)})).code).toBe('qualification_retirement_evidence_invalid');
+  const duty=svc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',input);
+  expect(duty.targetQueueId).toBe(old);expect(repo.getById(old)?.state).toBe('pending');expect(repo.getById(control)?.state).toBe('in-progress');expect(svc.dutyFacts(duty.queueId).send).toBe(true);
+  const receipt=svc.lifecycleControlReceipt(duty.queueId);expect(receipt).toMatchObject({evidenceKind:'operator-accountability',accountabilityControlQueueId:control,accountabilityControlBodyHash:digest(controlBody)});expect(receipt.sweepFindingQueueId).toBeUndefined();
+  repo.claim({qitemId:duty.queueId,destinationSession:'builder@xv',actorGeneration:'builder-g1',identityProvenance:'transport:v1'});
+  expect(svc.qualificationAssessmentRetirementAllows(old,'builder@xv','builder-g1','transport:v1','failed')).toBe(true);
+  repo.update({qitemId:old,actorSession:'builder@xv',actorGeneration:'builder-g1',identityProvenance:'transport:v1',state:'failed',transitionNote:'expired target; exact original wake failed before send; no retry'});
+  expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id='xv' AND operation_id=? AND kind='duty-completion-observation'").get('duty-completion:'+duty.queueId)).toBeTruthy();
+  clock+=30001;vi.setSystemTime(clock);
+  repo.update({qitemId:duty.queueId,actorSession:'builder@xv',actorGeneration:'builder-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on',transitionNote:'exact legacy target terminalized; control and failed wake preserved'});
+  expect(repo.getById(old)).toMatchObject({state:'failed',claimedAt:null,body:targetBody});expect(repo.getById(control)?.state).toBe('in-progress');expect(svc.dutyFacts(duty.queueId).close).toBe(true);
+  expect(db.prepare("SELECT count(*) n FROM queue_items WHERE body LIKE '%STUCK SWEEP FINDING (undelivered-wake)%' AND body LIKE ?").get('%'+old+'%')).toEqual({n:0});
+  expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id=?").get('wake-intent-'+old)).toEqual({delivery_state:'failed'});
+ });
+ it.each(['indeterminate','sending'] as const)('accountability-backed qualification retirement preserves a %s original wake without issuing a duty',async deliveryState=>{
+  samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});
+  const old='legacy-qualification-accountability-unknown-'+deliveryState,control='stuck-sweep-control-unknown-'+deliveryState,nowIso=new Date(clock).toISOString(),targetBody='# Legacy qualification assessment\nExpired before pickup.';
+  db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,expires_at,body) VALUES (?,?,?,?,?,?,?,?)').run(old,nowIso,nowIso,'watchdog@system','builder@xv','pending',new Date(clock-1000).toISOString(),targetBody);
+  db.transaction(()=>repo.stageWakeIntent(old,'watchdog@system','builder@xv','system:operator-authorized-coordination',true,'builder-g1'))();
+  db.prepare('UPDATE outbox_entries SET delivery_state=? WHERE outbox_id=?').run(deliveryState,'wake-intent-'+old);
+  const controlBody=JSON.stringify({action:'reconcile-refused-stuck-finding',stuckSweepRecoveryKey:'c'.repeat(64),reason:'coordinator_dispatch_required',kind:'undelivered-wake',original:{qitemId:old,sourceSession:'watchdog@system',destinationSession:'builder@xv',bodyHash:digest(targetBody),state:'pending',evidenceAt:nowIso,factsHash:'d'.repeat(64)},intendedRoute:'builder@xv',recipientGeneration:'operator-agent-g1'});
+  db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES (?,?,?,?,?,?,?)').run(control,nowIso,nowIso,'watchdog@system','operator-agent@kernel','pending',controlBody);
+  repo.claim({qitemId:control,destinationSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1'});
+  const before=db.prepare('SELECT count(*) n FROM queue_items').get();
+  const result=refusal(()=>svc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',{rigId:'xv',targetQueueId:old,targetBodyHash:digest(targetBody),evidenceKind:'operator-accountability',accountabilityControlQueueId:control,accountabilityControlBodyHash:digest(controlBody),deadline:clock+30000}));
+  expect(result.code).toBe('qualification_retirement_effect_unknown');expect(db.prepare('SELECT count(*) n FROM queue_items').get()).toEqual(before);expect(repo.getById(old)?.state).toBe('pending');expect(repo.getById(control)?.state).toBe('in-progress');
+ });
  it('qualification retirement refuses a target Worker from a different rig',()=>{
   const old='legacy-qualification-assessment-cross-rig',sweep='legacy-qualification-sweep-cross-rig',nowIso=new Date(clock).toISOString();
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,expires_at,body) VALUES (?,?,?,?,?,?,?,?)').run(old,nowIso,nowIso,'operator-agent@kernel','worker@other','pending',new Date(clock-1000).toISOString(),'# Legacy qualification assessment\nExpired before pickup.');
@@ -637,13 +675,15 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id='xv' AND operation_id=? AND kind='duty-completion-observation'").get('duty-completion:'+duty.queueId)).toBeUndefined();
   expect(repo.getById(old)?.state).toBe('failed');expect(repo.getById(sweep)?.state).toBe('done');
  });
- it('qualification-retirement successors preserve multiple expired contained ancestors without duplicating them',()=>{
+ it('pre-upgrade Worker-sweep retirement identity replays and creates a contained successor without duplication',()=>{
   samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});const old='legacy-qualification-assessment-retire-successor',sweep='legacy-qualification-sweep-retire-successor',nowIso=new Date(clock).toISOString();
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,expires_at,body) VALUES (?,?,?,?,?,?,?,?)').run(old,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending',new Date(clock-1000).toISOString(),'# Legacy qualification assessment\nExpired before pickup.');
   db.prepare('INSERT INTO queue_items(qitem_id,ts_created,ts_updated,source_session,destination_session,state,body) VALUES (?,?,?,?,?,?,?)').run(sweep,nowIso,nowIso,'operator-agent@kernel','builder@xv','pending','STUCK SWEEP FINDING (undelivered-wake)\nrow: '+old+'\nwhy: wake failed before delivery; nothing retried it');
   db.transaction(()=>repo.stageWakeIntent(old,'operator-agent@kernel','builder@xv','system:operator-authorized-coordination',true,'builder-g1'))();db.prepare("UPDATE outbox_entries SET delivery_state='failed' WHERE outbox_id=?").run('wake-intent-'+old);
   const input={rigId:'xv',targetQueueId:old,targetBodyHash:digest(repo.getById(old)!.body),sweepFindingQueueId:sweep,sweepFindingBodyHash:digest(repo.getById(sweep)!.body),deadline:clock+1000};
   const first=svc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',input);
+  const firstReceipt=svc.lifecycleControlReceipt(first.queueId),legacySemanticKey=digest(JSON.stringify({rigId:'xv',targetQueueId:old,targetBodyHash:input.targetBodyHash,sweepFindingQueueId:sweep,sweepFindingBodyHash:input.sweepFindingBodyHash,worker:'builder@xv',workerGeneration:'builder-g1',configurationDigest:svc.configurationDigest('builder@xv')})),legacyContractDigest=digest(JSON.stringify({targetQueueId:old,targetBodyHash:input.targetBodyHash,sweepFindingQueueId:sweep,sweepFindingBodyHash:input.sweepFindingBodyHash}));
+  expect(firstReceipt).toMatchObject({semanticKey:legacySemanticKey,contractDigest:legacyContractDigest,sweepFindingQueueId:sweep,sweepFindingBodyHash:input.sweepFindingBodyHash});expect(firstReceipt.evidenceKind).toBeUndefined();
   expect(svc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',input)).toEqual(first);
   db.prepare("UPDATE outbox_entries SET delivery_state='failed' WHERE outbox_id=?").run('wake-intent-'+first.queueId);clock+=1001;vi.setSystemTime(clock);
   samples.set('builder@xv',{...sample('builder@xv'),identityObservedAt:new Date(clock).toISOString()});const next=svc.stageQualificationAssessmentRetirement('operator-agent@kernel','operator-agent-g1',{...input,deadline:clock+20000});

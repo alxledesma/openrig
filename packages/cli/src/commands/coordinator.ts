@@ -47,11 +47,12 @@ function qualificationDutyInputError(operation:string,value:unknown):string|unde
    return "stage requires the exact native Worker binding and qualification-only artifact contract; nothing was sent";
  }
  if(operation==="qualification-assessment-retirement-stage"){
-  const keys=["rigId","targetQueueId","targetBodyHash","sweepFindingQueueId","sweepFindingBodyHash","deadline"] as const;
-  if(!hasExactKeys(value,keys)||!boundedText(value.rigId)||!boundedText(value.targetQueueId)
-    ||!boundedText(value.sweepFindingQueueId)||typeof value.targetBodyHash!=="string"||!SHA256_HEX.test(value.targetBodyHash)
-    ||typeof value.sweepFindingBodyHash!=="string"||!SHA256_HEX.test(value.sweepFindingBodyHash)||!boundedDutyDeadline(value.deadline))
-  return "retirement stage requires exact target and failed-wake sweep hashes plus a deadline within twenty minutes; nothing was sent";
+  const legacyKeys=["rigId","targetQueueId","targetBodyHash","sweepFindingQueueId","sweepFindingBodyHash","deadline"] as const;
+  const accountabilityKeys=["rigId","targetQueueId","targetBodyHash","evidenceKind","accountabilityControlQueueId","accountabilityControlBodyHash","deadline"] as const;
+  const common=boundedText(value.rigId)&&boundedText(value.targetQueueId)&&typeof value.targetBodyHash==="string"&&SHA256_HEX.test(value.targetBodyHash)&&boundedDutyDeadline(value.deadline);
+  const legacy=hasExactKeys(value,legacyKeys)&&common&&boundedText(value.sweepFindingQueueId)&&typeof value.sweepFindingBodyHash==="string"&&SHA256_HEX.test(value.sweepFindingBodyHash);
+  const accountability=hasExactKeys(value,accountabilityKeys)&&common&&value.evidenceKind==="operator-accountability"&&boundedText(value.accountabilityControlQueueId)&&typeof value.accountabilityControlBodyHash==="string"&&SHA256_HEX.test(value.accountabilityControlBodyHash);
+  if(!legacy&&!accountability)return "retirement stage requires an exact failed-wake finding or claimed Operator accountability evidence, target hashes, and a deadline within twenty minutes; nothing was sent";
  }
  if(operation==="qualification-assessment-uncertainty-dispose"){
   const keys=["rigId","rows","deadline"] as const;

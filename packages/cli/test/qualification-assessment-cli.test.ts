@@ -137,11 +137,20 @@ describe("qualification assessment coordinator CLI verbs", () => {
     expect(recovery.deliverCommitted).toHaveBeenCalledTimes(operation.endsWith("stage") ? 1 : 0);
   });
 
+  it("qualification retirement accepts only the bounded Operator-accountability evidence shape", async () => {
+    const body={rigId,targetQueueId:"assessment-old",targetBodyHash:"a".repeat(64),evidenceKind:"operator-accountability",accountabilityControlQueueId:"stuck-sweep-control-1",accountabilityControlBodyHash:"d".repeat(64),deadline:Date.now()+60_000};
+    const file=contractFile(body);
+    await coordinatorCommand().parseAsync(["node","rig","qualification-assessment-retirement-stage",file]);
+    expect(calls).toHaveLength(1);expect(calls[0]).toMatchObject({operation:"qualification-assessment-retirement-stage",body});expect(process.exitCode).toBeUndefined();
+  });
+
   it.each([
     ["qualification-assessment-stage", { ...validFor("qualification-assessment-stage"), contract: { schema: "qualification-assessment-contract.v1", scope: "product", productAuthority: true } }],
     ["qualification-assessment-stage", { ...validFor("qualification-assessment-stage"), deadline: Date.now() + 1_300_000 }],
     ["qualification-assessment-stage", { ...validFor("qualification-assessment-stage"), configurationDigest: ["c".repeat(64)] }],
     ["qualification-assessment-retirement-stage", { ...validFor("qualification-assessment-retirement-stage"), targetBodyHash: "sending" }],
+    ["qualification-assessment-retirement-stage", { rigId,targetQueueId:"assessment-old",targetBodyHash:"a".repeat(64),evidenceKind:"operator-accountability",accountabilityControlQueueId:"control",accountabilityControlBodyHash:"not-a-hash",deadline:Date.now()+60_000 }],
+    ["qualification-assessment-retirement-stage", { rigId,targetQueueId:"assessment-old",targetBodyHash:"a".repeat(64),evidenceKind:"worker-sweep-finding",accountabilityControlQueueId:"control",accountabilityControlBodyHash:"d".repeat(64),deadline:Date.now()+60_000 }],
     ["qualification-assessment-uncertainty-dispose", { ...validFor("qualification-assessment-uncertainty-dispose"), rows: [{ targetQueueId: "x", targetBodyHash: "indeterminate", sweepFindingQueueId: "y", sweepFindingBodyHash: "b".repeat(64) }] }],
     ["qualification-assessment-uncertainty-dispose", { ...validFor("qualification-assessment-uncertainty-dispose"), rows: [] }],
     ["qualification-assessment-return", { ...validFor("qualification-assessment-return"), generation: "caller-supplied" }],
