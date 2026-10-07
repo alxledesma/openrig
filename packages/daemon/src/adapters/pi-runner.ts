@@ -34,6 +34,7 @@ import {
   piSeatPaths, buildPiChildArgs, buildPiChildEnv, buildPendingRunnerState, parsePiRunnerState,
   PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, PI_RUNNER_ERROR_MARKER,
   type PiRunnerState, type RunnerRuntime, type PiQuiescenceEvidence,
+  type PiRuntimeReadinessEvidence, type PiRuntimeFailureCode,
 } from "./pi-runner-protocol.js";
 import { parseNativeModelWindow, parseNativeModelCatalog, type NativeModelWindow } from "../domain/model-window.js";
 
@@ -359,6 +360,12 @@ export class RunnerCore {
   private modelsFetched = false;
   private model: NativeModelWindow | null = null;
   private models: NativeModelWindow[] | null = null;
+  private readinessObservedAt = "";
+  private modelFailure?: { code: PiRuntimeFailureCode; observedAt: string };
+  private compactionFailure?: { code: PiRuntimeFailureCode; observedAt: string };
+  private contextUsage?: PiRuntimeReadinessEvidence["context"];
+  private usageMessageTimestamp?: number;
+  private nativeControl?: string;
 
   constructor(
     private io: RunnerIo,
@@ -456,6 +463,8 @@ export class RunnerCore {
         command = { type: "set_model", provider: match[1], modelId: match[2] };
       } else command = { type: "compact", ...(block === "/compact" ? {} : { customInstructions: block.slice(9) }) };
       this.controlPending = true;
+      this.nativeControl = command.type as string;
+      this.clearContextUsage();
       this.model = null;
       this.invalidateRefresh();
       this.settledProven = false;
@@ -533,6 +542,8 @@ export class RunnerCore {
       const state = data as Record<string, unknown>;
       if (state.sessionFile !== request.sessionFile ||
         (state.sessionId !== undefined && state.sessionId !== request.sessionId)) return;
+      this.observeNativeModel(state.model);
+      this.readinessObservedAt = this.io.now();
       this.processing = piProcessing(state);
       this.settledProven = !this.processing;
       this.writeQuiescence();
@@ -543,6 +554,19 @@ export class RunnerCore {
     // a control refusal still refreshes the cursor from native history.
     if (this.runtime === "pi" && record.id === "pi-runner-native-control") {
       this.controlPending = false;
+      this.readinessObservedAt = this.io.now();
+      const command = this.nativeControl;
+      this.nativeControl = undefined;
+      if (command === "set_model") {
+        if (record.success === true && record.error == null) {
+          // Selecting a model resolves selection failure only, not a failed
+          // provider turn or failed compaction of the retained history.
+          if (this.modelFailure?.code === "model_change_failed") this.modelFailure = undefined;
+        } else this.recordRuntimeFailure("model_change_failed");
+      } else if (command === "compact") {
+        this.observeCompactionResult(record.success === true && record.error == null
+          ? { result: record.data } : { errorMessage: record.error ?? true }, true);
+      }
       const data = record.data as { models?: Array<{ provider?: string; id?: string }> } | undefined;
       this.io.mirrorLine(record.success === true
         ? `[pi-runner] ${String(record.command)} completed${record.command === "get_available_models" ? ": " + (data?.models ?? []).map(m => `${m.provider}/${m.id}`).join(", ") : ""}`
@@ -559,7 +583,8 @@ export class RunnerCore {
       return;
     }
     if (this.runtime === "pi" && record.id === CONTROL_STATE_ID) {
-      this.model = record.success === true ? parseNativeModelWindow((record.data as Record<string, unknown> | undefined)?.model) : null;
+      this.observeNativeModel(record.success === true ? (record.data as Record<string, unknown> | undefined)?.model : null);
+      if (record.success === true && record.error == null) this.readinessObservedAt = this.io.now();
       this.invalidateRefresh();
       this.processing = record.success !== true || piProcessing((record.data ?? {}) as Record<string, unknown>);
       // A failed or missing control-state read proves NOTHING: it leaves the
@@ -615,7 +640,8 @@ export class RunnerCore {
       }
       // Extract model window metadata from native get_state using shared parser.
       // Returns null for invalid/missing/NaN/Infinity/negative limits.
-      this.model = parseNativeModelWindow(data.model);
+      this.observeNativeModel(data.model);
+      if (this.runtime === "pi" && record.success === true) this.readinessObservedAt = this.io.now();
       // Fork quiescence settlement, scoped to Pi ONLY: OMP publishes no native
       // quiescence evidence and must never be read as Pi-proven idle.
       if (this.runtime === "pi") {
@@ -654,6 +680,11 @@ export class RunnerCore {
         ? (last as Record<string, unknown>).id as string
         : undefined;
       if (lastId) {
+        if (this.runtime === "pi" && this.contextUsage) {
+          const message = (last as Record<string, unknown>).message as Record<string, unknown> | undefined;
+          if (message?.role !== "assistant" || message.timestamp !== this.usageMessageTimestamp
+            || message.provider !== this.model?.provider || message.model !== this.model?.id) this.clearContextUsage();
+        }
         this.lastEntryId = lastId;
         this.writeSidecar({});
       }
@@ -701,6 +732,7 @@ export class RunnerCore {
       }
       return;
     }
+    const readinessChanged = this.runtime === "pi" && this.observeRuntimeEvent(event);
     if (this.runtime === "pi") {
       if (event.type === "agent_start" || event.type === "compaction_start") {
         this.markBusy();
@@ -725,6 +757,7 @@ export class RunnerCore {
       // agent_start would leave a stale idle claim on disk.
       this.markBusy();
     }
+    if (readinessChanged) this.writeSidecar({});
     // Only an explicit session-entry ID is durable. Generic event IDs include
     // extension UI request UUIDs (notify/status/dialog), never JSONL entries.
     const entryId = typeof event.entryId === "string" ? event.entryId : undefined;
@@ -777,6 +810,85 @@ export class RunnerCore {
       this.attentionIsLatest = false;
       this.io.postActivity(this.activityPayload(mapped.activity.hookEvent, mapped.activity.subtype));
     }
+  }
+
+  private clearContextUsage(): void {
+    this.contextUsage = undefined;
+    this.usageMessageTimestamp = undefined;
+  }
+
+  private observeNativeModel(value: unknown): void {
+    const model = parseNativeModelWindow(value);
+    if (model?.provider !== this.model?.provider || model?.id !== this.model?.id
+      || model?.contextWindow !== this.model?.contextWindow) this.clearContextUsage();
+    this.model = model;
+  }
+
+  private recordRuntimeFailure(code: PiRuntimeFailureCode): void {
+    const key = code.startsWith("compaction_") ? "compactionFailure" : "modelFailure";
+    // A failed selection cannot supersede an unresolved actual provider error;
+    // selecting a model later is not proof that the provider recovered.
+    if (code === "model_change_failed" && this.modelFailure?.code === "model_error") return;
+    // Duplicate native notifications do not rewrite the original failure time.
+    if (this[key]?.code !== code) this[key] = { code, observedAt: this.io.now() };
+  }
+
+  private observeCompactionResult(event: Record<string, unknown>, rpc = false): void {
+    this.clearContextUsage();
+    if (event.aborted === true) this.recordRuntimeFailure("compaction_aborted");
+    else if (event.errorMessage != null) {
+      // These exact native preconditions mean no summarization was attempted.
+      // A no-op neither creates nor resolves an existing compaction failure.
+      const noAttempt = rpc
+        ? event.errorMessage === "Already compacted" || event.errorMessage === "Nothing to compact (session too small)"
+        : event.reason === "manual" && (event.errorMessage === "Compaction failed: Already compacted"
+          || event.errorMessage === "Compaction failed: Nothing to compact (session too small)");
+      if (noAttempt) return;
+      // A manual RPC error follows the typed compaction_end and must not erase
+      // its more precise cancellation/failure outcome.
+      if (!rpc || !this.compactionFailure) this.recordRuntimeFailure("compaction_failed");
+    } else if (event.result && typeof event.result === "object" && !Array.isArray(event.result)) {
+      this.compactionFailure = undefined;
+    } else this.recordRuntimeFailure("compaction_no_result");
+  }
+
+  private observeRuntimeEvent(event: Record<string, unknown>): boolean {
+    // Native transition observations only; streaming deltas must not introduce
+    // a sidecar filesystem write per token.
+    if (!["agent_start", "agent_end", "agent_settled", "compaction_start", "compaction_end",
+      "entry_appended", "tool_execution_start", "tool_execution_end", "message_start", "message_end",
+      "auto_retry_end"].includes(String(event.type))) return false;
+    this.readinessObservedAt = this.io.now();
+    if (event.type === "compaction_end") this.observeCompactionResult(event);
+    const message = event.message as Record<string, unknown> | undefined;
+    if (event.type === "compaction_start" || event.type === "entry_appended"
+      || event.type === "tool_execution_start" || event.type === "tool_execution_end"
+      || ((event.type === "message_start" || event.type === "message_end") && message?.role !== "assistant")) this.clearContextUsage();
+    if (event.type === "auto_retry_end" && event.success === false) this.recordRuntimeFailure("model_error");
+    if (event.type === "message_end" && message?.role === "assistant") {
+      this.clearContextUsage();
+      if (message.stopReason === "error") this.recordRuntimeFailure("model_error");
+      else if ((message.stopReason === "stop" || message.stopReason === "toolUse")
+        && this.model && message.provider === this.model.provider && message.model === this.model.id) {
+        // A real successful response proves provider recovery, but is not
+        // evidence that a previously requested compaction succeeded.
+        if (this.modelFailure?.code === "model_error") this.modelFailure = undefined;
+        const usage = message.usage as Record<string, unknown> | undefined;
+        // Mirror native calculateContextTokens: totalTokens, else all four
+        // components. Reasoning is already included in output; never add it.
+        const components = usage ? [usage.input, usage.output, usage.cacheRead, usage.cacheWrite] : [];
+        const total = usage && Number.isSafeInteger(usage.totalTokens) && (usage.totalTokens as number) > 0
+          ? usage.totalTokens as number
+          : components.length === 4 && components.every(v => Number.isSafeInteger(v) && (v as number) >= 0)
+            ? (components as number[]).reduce((a, b) => a + b, 0) : 0;
+        if (Number.isSafeInteger(total) && total > 0 && typeof message.timestamp === "number" && Number.isFinite(message.timestamp)) {
+          this.contextUsage = { usedTokens: total, remainingTokens: this.model.contextWindow - total,
+            observedAt: this.io.now(), source: "assistant_usage" };
+          this.usageMessageTimestamp = message.timestamp;
+        }
+      }
+    }
+    return true;
   }
 
   /** Re-deliver OMP identity until the daemon confirms the resume token.
@@ -838,7 +950,15 @@ export class RunnerCore {
       // evidence and force an honest observer back to UNKNOWN. The record is
       // always current by construction: it is derived from the same flags the
       // rest of this write publishes.
-      ...(this.runtime === "pi" ? { quiescence: this.quiescenceEvidence() } : {}),
+      ...(this.runtime === "pi" ? { quiescence: this.quiescenceEvidence(), runtimeReadiness: {
+        launchId: this.identity.launchId,
+        generation: this.identity.generation,
+        sessionFile: this.sessionFile,
+        model: this.model,
+        observedAt: this.readinessObservedAt,
+        failures: [this.modelFailure, this.compactionFailure].filter((f): f is NonNullable<typeof f> => !!f),
+        ...(this.contextUsage ? { context: this.contextUsage } : {}),
+      } } : {}),
       // Publish model window metadata to sidecar for daemon consumption.
       model: this.model,
       models: this.models,
@@ -891,6 +1011,7 @@ export class RunnerCore {
   private markBusy(): void {
     if (this.runtime !== "pi") return;
     this.invalidateRefresh();
+    this.clearContextUsage();
     this.processing = true;
     this.settledProven = false;
     this.writeQuiescence();

@@ -29,6 +29,86 @@ function boundedDutyDeadline(value:unknown):boolean {
  const now=Date.now();
  return Number.isSafeInteger(value)&&(value as number)>now&&(value as number)<=now+MAX_QUALIFICATION_DUTY_MS;
 }
+
+type RecoveryKind = "reconciliation" | "expired";
+type RecoveryEnvelope = {
+ schema:"coordinator-recovery-envelope.v1"; kind:RecoveryKind; operation:string;
+ endpoint:string; rigId:string; request:Record<string,unknown>;
+};
+const recoveryOperation = (kind:RecoveryKind) => kind==="reconciliation"?"reconciliation-recover":"expired-window-recover";
+const validWindow = (value:unknown):value is number => Number.isSafeInteger(value)&&Number(value)>=10000&&Number(value)<=900000;
+const validEpoch = (value:unknown):value is number => Number.isSafeInteger(value)&&Number(value)>=1;
+function recoveryEnvelopeValid(value:unknown,rigId:string,kind:RecoveryKind):value is RecoveryEnvelope {
+ if(!isRecord(value)||!hasExactKeys(value,["schema","kind","operation","endpoint","rigId","request"])
+   ||value.schema!=="coordinator-recovery-envelope.v1"||value.rigId!==rigId||value.kind!==kind
+   ||value.operation!==recoveryOperation(kind)||value.endpoint!==`/api/coordinator/${recoveryOperation(kind)}`||!isRecord(value.request))return false;
+ const r=value.request;
+ if(!boundedText(r.operationId,160)||!validWindow(r.windowMs))return false;
+ if(kind==="reconciliation")return hasExactKeys(r,["token","operationId","obligationsDigest","windowMs"])
+   &&isRecord(r.token)&&hasExactKeys(r.token,["rigId","epoch","generation"])&&r.token.rigId===rigId
+   &&validEpoch(r.token.epoch)&&boundedText(r.token.generation)&&typeof r.obligationsDigest==="string"&&SHA256_HEX.test(r.obligationsDigest);
+ return hasExactKeys(r,["rigId","operationId","windowMs","expectedEpoch","expectedOwnerGeneration","expectedCustodyDigest","conflictOperationId","conflictKind"])
+   &&r.rigId===rigId&&validEpoch(r.expectedEpoch)&&boundedText(r.expectedOwnerGeneration)
+   &&typeof r.expectedCustodyDigest==="string"&&SHA256_HEX.test(r.expectedCustodyDigest)
+   &&boundedText(r.conflictOperationId,160)&&r.conflictKind==="reconciliation-recover";
+}
+
+/** A prepared request is intent, not a grant. Only the daemon checks native custody and readiness. */
+async function recoverWindow(rigId:string,opts:{kind:string;windowMs:string;readTimeoutMs:string;requestTimeoutMs:string;conflictOperationId?:string;replayContract?:string}):Promise<void> {
+ const reject=(message:string)=>{process.stderr.write(`${message}; nothing was sent\n`);process.exitCode=1;};
+ const kind=opts.kind,readMs=readTimeout(opts.readTimeoutMs),requestMs=readTimeout(opts.requestTimeoutMs);
+ if(!boundedText(rigId)||(kind!=="reconciliation"&&kind!=="expired")||readMs===undefined||requestMs===undefined){reject("rigId, explicit kind and integer timeouts 1000-60000 are required");return;}
+ if(opts.replayContract&&(opts.conflictOperationId!==undefined||opts.windowMs!=="900000")){reject("replay cannot reconstruct window or conflict fields");return;}
+ const windowMs=Number(opts.windowMs);
+ if(!opts.replayContract&&(!/^\d+$/.test(opts.windowMs)||!validWindow(windowMs)
+   ||(kind==="expired"&&!boundedText(opts.conflictOperationId,160))||(kind==="reconciliation"&&opts.conflictOperationId!==undefined))){reject("window must be 10000-900000; expired requires conflict-operation-id, reconciliation forbids it");return;}
+ const headers=terminalAuthHeaders();
+ if(!headers.Authorization){reject("genuine terminal authentication is required");return;}
+ const client=new DaemonClient();let envelope:RecoveryEnvelope;
+ if(opts.replayContract){
+  let value:unknown;
+  try{const stat=fs.statSync(opts.replayContract);if(!stat.isFile()||stat.size>16384)throw new Error();value=JSON.parse(fs.readFileSync(opts.replayContract,"utf8"));}
+  catch{reject("prepared envelope is unreadable or oversized");return;}
+  if(!recoveryEnvelopeValid(value,rigId,kind)){reject("prepared envelope does not match the exact rig, kind, endpoint and bounded contract");return;}
+  envelope=value; // No GET, regenerated operation ID, mutable-state reconstruction or automatic retry.
+ }else{
+  let shown;
+  try{shown=await client.get(`/api/coordinator/${encodeURIComponent(rigId)}`,{headers,timeoutMs:readMs});}
+  catch{reject("initial authority read failed");return;}
+  const current=shown.data;
+  if(shown.status<200||shown.status>=300||!isRecord(current)||!isRecord(current.authority)){reject("authority read failed or is incomplete");return;}
+  const a=current.authority;
+  if(a.rig_id!==rigId||a.state!=="reconciling"||!validEpoch(a.epoch)||!boundedText(a.owner_generation)||!boundedText(a.owner_session)
+    ||!Number.isSafeInteger(a.lease_until)||Number(a.lease_until)>Date.now()||typeof current.obligationsDigest!=="string"||!SHA256_HEX.test(current.obligationsDigest)){
+   reject("exact expired reconciling authority and custody digest are required");return;
+  }
+  const operationId=randomUUID();
+  const request=kind==="reconciliation"
+   ?{token:{rigId,epoch:a.epoch,generation:a.owner_generation},operationId,obligationsDigest:current.obligationsDigest,windowMs}
+   :{rigId,operationId,windowMs,expectedEpoch:a.epoch,expectedOwnerGeneration:a.owner_generation,expectedCustodyDigest:current.obligationsDigest,conflictOperationId:opts.conflictOperationId!,conflictKind:"reconciliation-recover"};
+  envelope={schema:"coordinator-recovery-envelope.v1",kind,operation:recoveryOperation(kind),endpoint:`/api/coordinator/${recoveryOperation(kind)}`,rigId,request};
+ }
+ let preparedPath:string,receiptPath:string;
+ const readbackEndpoint=`/api/coordinator/${encodeURIComponent(rigId)}/operations/${encodeURIComponent(String(envelope.request.operationId))}`;
+ const guidance="Read the original operation receipt first. A missing receipt or replay refusal does not prove the original effect absent. No automatic retry; the holder must resume-owned separately.";
+ try{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),"openrig-recover-window-"));fs.chmodSync(dir,0o700);
+  preparedPath=path.join(dir,"prepared-request.json");receiptPath=path.join(dir,"submission-receipt.json");
+  fs.writeFileSync(preparedPath,`${JSON.stringify(envelope,null,2)}\n`,{mode:0o600});
+  // A crash during the single POST leaves UNKNOWN durably, never an invented no-effect failure.
+  fs.writeFileSync(receiptPath,`${JSON.stringify({status:"UNKNOWN",phase:"prepared-before-post",operationId:envelope.request.operationId,preparedContract:preparedPath,replayedFrom:opts.replayContract??null,readbackEndpoint,guidance},null,2)}\n`,{mode:0o600});
+ }catch{reject("could not persist private intent and receipt");return;}
+ process.stderr.write(`prepared request: ${preparedPath}\nreceipt: ${receiptPath}\noperation id: ${envelope.request.operationId}\nread-only operation endpoint: ${readbackEndpoint}\n${guidance}\n`);
+ let result:Record<string,unknown>;
+ try{
+  const response=await client.post(envelope.endpoint,envelope.request,{headers,timeoutMs:requestMs});
+  result={status:response.status>=200&&response.status<300?"COMMITTED":response.status>=400&&response.status<500?"REFUSED":"UNKNOWN",httpStatus:response.status,response:response.data};
+ }catch{result={status:"UNKNOWN",phase:"post-response-unavailable"};}
+ const receipt={...result,operationId:envelope.request.operationId,preparedContract:preparedPath,replayedFrom:opts.replayContract??null,readbackEndpoint,guidance};
+ try{fs.writeFileSync(receiptPath,`${JSON.stringify(receipt,null,2)}\n`,{mode:0o600});}
+ catch{process.stderr.write("receipt update failed; original private UNKNOWN receipt and request are retained\n");process.exitCode=1;}
+ console.log(JSON.stringify({...receipt,receiptPath},null,2));if(result.status!=="COMMITTED")process.exitCode=1;
+}
 /** Local shape bounds prevent malformed or overbroad assessment contracts from reaching the API.
  * The daemon remains authoritative for identity, custody, wake effects, plan and lease fences. */
 function qualificationDutyInputError(operation:string,value:unknown):string|undefined {
@@ -80,6 +160,15 @@ function qualificationDutyInputError(operation:string,value:unknown):string|unde
 /** Exact JSON contracts keep authority and evidence explicit; no implied automatic takeover. */
 export function coordinatorCommand():Command {
  const cmd=new Command("coordinator").description("Rig-scoped durable coordinator authority and admitted packages");
+ cmd.command("recover-window <rigId>")
+  .description("Derive ONE explicit expired reconciling-window recovery under genuine native auth; persist intent before a single POST. Read operation receipt before any deliberate exact replay.")
+  .requiredOption("--kind <kind>","Explicit reconciliation or expired recovery; never auto-selected")
+  .option("--window-ms <ms>","Bounded acknowledgment window (10000-900000)","900000")
+  .option("--conflict-operation-id <id>","Original spent reconciliation recovery operation; required only for expired kind")
+  .option("--replay-contract <file>","Exact prepared envelope; no authority read, new operation ID or automatic resend")
+  .option("--read-timeout-ms <ms>","Initial authority read timeout (1000-60000)",String(DEFAULT_READ_TIMEOUT_MS))
+  .option("--request-timeout-ms <ms>","Single POST timeout (1000-60000)",String(DEFAULT_READ_TIMEOUT_MS))
+  .action(recoverWindow);
  cmd.command("show <rigId>")
   .option("--read-timeout-ms <ms>","Read timeout in milliseconds (1000-60000)",String(DEFAULT_READ_TIMEOUT_MS))
   .action(async(rigId:string,opts:{readTimeoutMs:string})=>{

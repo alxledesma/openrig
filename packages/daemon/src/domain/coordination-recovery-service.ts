@@ -1,3 +1,4 @@
+import { validRuntimeRequirements, type DispatchRuntimeRequirements, type DispatchRuntimeHold } from "./dispatch-runtime-readiness.js";
 import { isContainedExpiredAdministrativeHistory } from "./expired-administrative-history.js";
 import { rotationLocalAddresses } from "./rotation-local-custody.js";
 import type { QueueRepository } from "./queue-repository.js";
@@ -29,7 +30,7 @@ const isBoundPredecessor=(p:CoordinationPredecessor):p is BoundPredecessor=>!!p&
 export interface CoordinationTask {
  key:string; packageKey:string; owner:string; action:string; deadline:number; body:string; recoveryFor?:string;
  predecessors:CoordinationPredecessor[];
- admission:{generation:string;configurationDigest:string;qualificationRef:string;capacityRef:string;effortRef:string;validUntil:number};
+ admission:{generation:string;configurationDigest:string;qualificationRef:string;capacityRef:string;effortRef:string;validUntil:number;runtimeRequirements?:DispatchRuntimeRequirements};
  /** Owner boundary affects this slice only. Recovery work is a separate admitted task. */
  boundary?:"owner-access"|"owner-credential"|"owner-material"|"owner-irreversible";
 }
@@ -47,7 +48,7 @@ export const FRONTIER_INTAKE_ROUTED_REASONS=['frontier-planning-duty-exhausted',
 export const LIFECYCLE_INTAKE_RENEWAL_REASONS=['lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
 /** An expired dispatch scope is an accountable Operator boundary, not a silent hold: the
  *  restriction itself is never renewed or released by the intake it raises. */
-export const INTAKE_ROUTED_REASONS=['uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict','terminal-return-incarnation-changed','terminal-return-contract-drift','terminal-return-duty-exhausted','terminal-return-seat_dispatch_reserved','terminal-return-coordinator_resource_conflict','lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift','dispatch-scope-expired',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
+export const INTAKE_ROUTED_REASONS=['runtime-not-ready','uncertain-worker-effect','existing-queue-without-assignment','deterministic-queue-conflict','terminal-return-incarnation-changed','terminal-return-contract-drift','terminal-return-duty-exhausted','terminal-return-seat_dispatch_reserved','terminal-return-coordinator_resource_conflict','lifecycle-duty-exhausted','lifecycle-duty-expired-unclaimed','lifecycle-recipient-protected','lifecycle-return-contract-drift','dispatch-scope-expired',...FRONTIER_INTAKE_ROUTED_REASONS] as readonly string[];
 function heldDispatchCode(error:unknown):string|undefined {
  const e=error as {code?:string;message?:string};
  if(e.code==='SQLITE_CONSTRAINT_TRIGGER'&&e.message==='seat_dispatch_reserved')return 'seat_dispatch_reserved';
@@ -67,7 +68,7 @@ export function coordinationIdle(sample:CoordinationActivity|null,generation:str
 /** Durable plans use the existing append-only operation store, with queue/resource
  * mutations in one SQLite transaction. Reconciliation never manufactures worker claims. */
 export class CoordinationRecoveryService {
- constructor(private repo:QueueRepository,private activity:(session:string)=>CoordinationActivity|null,private now:()=>number=Date.now,private refreshIdentity?:(sessions:readonly string[])=>Promise<void>,private refreshWorkerActivity?:(session:string)=>Promise<void>){}
+ constructor(private repo:QueueRepository,private activity:(session:string)=>CoordinationActivity|null,private now:()=>number=Date.now,private refreshIdentity?:(sessions:readonly string[])=>Promise<void>,private refreshWorkerActivity?:(session:string)=>Promise<void>,private runtimeReadiness?:(task:CoordinationTask)=>DispatchRuntimeHold|null){}
  authorizeTerminalReturnSuccessor(actor:string,generation:string,input:{rigId:string;intakeQueueId:string;previousControlId:string;previousBodyHash:string;workerGeneration:string;holderGeneration:string;deadline:number;operationId:string}):{queueId:string} {
   return this.db.transaction(()=>{
    if(actor!=='operator-agent@kernel'||!generation||this.authority.generation(actor)!==generation)fail('coordination_operator_required','Current native Operator required');
@@ -1841,6 +1842,7 @@ private dutyProtection(rigId:string,r:any):boolean {
     const retainedExact=!!old&&JSON.stringify(old)===JSON.stringify(t);
     if(!t.key||!t.action.trim()||!Number.isFinite(t.deadline)||(t.deadline<=this.now()&&!prior?.tasks.some(old=>old.key===t.key&&stable(old)===stable(t)))||!t.body||!Array.isArray(t.predecessors))fail("coordination_invalid_task","Concrete action, future deadline, predecessors and exact body required");
     const ad=t.admission;
+    if(!validRuntimeRequirements(ad?.runtimeRequirements))fail("coordination_invalid_runtime_requirements","Runtime requirements must bind a native model and/or nonnegative context token floor");
     if(!historical&&!scopeOnly&&!retainedExact&&(!ad||ad.generation!==this.authority.generation(t.owner)||ad.configurationDigest!==this.configurationDigest(t.owner)||!ad.qualificationRef||!ad.capacityRef||!ad.effortRef||!Number.isFinite(ad.validUntil)||ad.validUntil<=this.now()))fail('coordination_current_admission_required','Exact current generation/configuration, qualification/capacity/effort evidence and expiry required');
     if(t.boundary&&!['owner-access','owner-credential','owner-material','owner-irreversible'].includes(t.boundary))fail("coordination_invalid_boundary","Unknown boundary");
     const row=this.db.prepare("SELECT contract FROM coordinator_packages WHERE rig_id=? AND package_key=?").get(plan.rigId,t.packageKey) as {contract:string}|undefined;
@@ -1930,6 +1932,8 @@ private dutyProtection(rigId:string,r:any):boolean {
     const dispatchHold=this.dispatchScopeHold(plan!,t);
     const assigned=this.db.prepare("SELECT a.queue_id,a.disposition_id,q.state,q.claimed_by_generation_uuid,q.destination_session FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=?").get(rigId,t.packageKey) as {queue_id:string;disposition_id:string|null;state:string;claimed_by_generation_uuid:string|null;destination_session:string}|undefined;
     if(assigned){
+     const runtimeHold=assigned.state==='pending'&&!assigned.claimed_by_generation_uuid&&!assigned.disposition_id?this.runtimeReadiness?.(t):null;
+     if(runtimeHold){result.push({key:t.key,state:'held',queueId:assigned.queue_id,reason:runtimeHold.reason,deadline:t.deadline,activityEvidence:{...runtimeHold}});continue;}
      if((!scope||t.deadline>this.now())&&this.dispatchObservationMatches(scope,t,plan!)&&!dispatchHold&&!t.boundary&&this.predecessorsReady(rigId,t)&&assigned.state==='pending'&&!assigned.claimed_by_generation_uuid&&!assigned.disposition_id&&this.admittedNow(t)&&!this.workerEffectDebt(t.owner)&&coordinationIdle(this.activity(t.owner),this.authority.generation(t.owner)??'',this.now()))this.repo.stageCoordinatorAssignmentWake({rigId,epoch:a!.epoch,generation,actor,queueId:assigned.queue_id,recipient:t.owner,recipientGeneration:t.admission.generation,now:this.now()});
      const picked=assigned.state==='in-progress'&&assigned.claimed_by_generation_uuid===this.authority.generation(t.owner)&&assigned.destination_session===t.owner;
      const semanticRecovery=this.authority.runtimeOutcomeAssessment?.requiresRecovery(rigId,t.packageKey)??false;
@@ -1975,6 +1979,8 @@ private dutyProtection(rigId:string,r:any):boolean {
      if(refresh?.state==='held')
       result.push({key:refresh.key,state:'held',reason:refresh.reason,deadline:refresh.deadline??t.deadline,...(refresh.queueId?{queueId:refresh.queueId}:{}),...(refresh.activityEvidence?{activityEvidence:refresh.activityEvidence}:{})});
      continue;}
+    const runtimeHold=this.runtimeReadiness?.(t);
+    if(runtimeHold){result.push({key:t.key,state:'held',reason:runtimeHold.reason,deadline:t.deadline,activityEvidence:{...runtimeHold}});continue;}
     const gen=this.authority.generation(t.owner);
     const sample=this.activity(t.owner),observedNow=this.now();
     if(!gen||(!!scope&&t.deadline<=observedNow)||!this.dispatchObservationMatches(scope,t,plan!)||!coordinationIdle(sample,gen,observedNow)){

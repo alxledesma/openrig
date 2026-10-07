@@ -85,6 +85,9 @@ export interface PiRunnerState {
    *     compaction continue after it while isStreaming is still true, so
    *     only an explicit agent_settled or a successful get_state may set it. */
   quiescence?: PiQuiescenceEvidence;
+  /** Pi-only negative readiness evidence. Neither presence nor empty failures
+   * grants admission. Old launches and OMP omit this field. */
+  runtimeReadiness?: PiRuntimeReadinessEvidence;
   /** Current model window metadata from native get_state — provider, id,
    *  contextWindow (tokens), maxTokens. Evidence only — no authority,
    *  recovery, queue or send semantics. Absent means UNKNOWN. */
@@ -94,6 +97,24 @@ export interface PiRunnerState {
    *  recovery, queue or send semantics. Absent means the runner has not yet
    *  published the list. */
   models?: NativeModelWindow[] | null;
+}
+
+export type PiRuntimeFailureCode = "model_error" | "model_change_failed"
+  | "compaction_failed" | "compaction_aborted" | "compaction_no_result";
+
+export interface PiRuntimeReadinessEvidence {
+  launchId?: string;
+  generation?: string;
+  sessionFile?: string;
+  model: NativeModelWindow | null;
+  /** Last actual native observation; ordinary sidecar writes do not refresh it. */
+  observedAt: string;
+  /** At most one unresolved failure per model/compaction category. The original
+   * failure timestamp survives idle refreshes; only native resolution clears it. */
+  failures: Array<{ code: PiRuntimeFailureCode; observedAt: string }>;
+  /** Latest successful native assistant usage, only while context is unchanged.
+   * Its timestamp is never refreshed by idle reads. Missing means unknown. */
+  context?: { usedTokens: number; remainingTokens: number; observedAt: string; source: "assistant_usage" };
 }
 
 /** Bounded native quiescence evidence. `settled` is a positive native claim,

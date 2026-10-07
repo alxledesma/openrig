@@ -1,3 +1,4 @@
+import type { DispatchRuntimeHold } from "../src/domain/dispatch-runtime-readiness.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -20,6 +21,7 @@ import { seed, token } from './helpers/coordinator-fixture.js';
 describe('shared prepared dispatch observations', () => {
   let dir: string, db: Database.Database, repo: QueueRepository, svc: CoordinationRecoveryService, clock: number;
   let samples: Map<string, CoordinationActivity>, identities: string[], activities: string[], sent: string[];
+  let runtimeHook: ((task: CoordinationTask) => DispatchRuntimeHold | null) | undefined;
   let identityHook: ((owner: string) => Promise<void>) | undefined;
   let activityHook: ((owner: string) => Promise<void>) | undefined;
   const sessions = ['lead@xv', 'peer@xv', 'builder@xv', 'reviewer@xv', 'architect@xv', 'operator-agent@kernel'];
@@ -77,7 +79,7 @@ describe('shared prepared dispatch observations', () => {
     dir = mkdtempSync(join(tmpdir(), 'dispatch-observation-')); db = createDb(join(dir, 'db')); seed(db);
     db.prepare("INSERT INTO self_host_identity VALUES(1,'fixture-host',?,?)").run(new Date(clock).toISOString(), new Date(clock).toISOString());
     repo = new QueueRepository(db, new EventBus(db), { resolveOccupantGeneration: owner => repo.coordinatorAuthority.generation(owner) });
-    repo.attachOutbox(new OutboxHandler(db)); identities = []; activities = []; sent = []; identityHook = undefined; activityHook = undefined;
+    repo.attachOutbox(new OutboxHandler(db)); identities = []; activities = []; sent = []; identityHook = undefined; activityHook = undefined; runtimeHook = undefined;
     for (const owner of sessions) db.prepare('INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES(?,?,?,?)').run('binding-' + owner, owner, owner, '%1');
     repo.attachTransport({ send: async (owner, _text, opts) => { expect(db.inTransaction).toBe(false); repo.coordinatorAuthority.assertManagedSend(opts?.actorSession, owner, opts?.queueAssignmentId); sent.push(opts!.queueAssignmentId!); return { ok: true, verified: true }; } });
     await repo.create({ qitemId: 'baton', sourceSession: 'operator-agent@kernel', destinationSession: 'lead@xv', body: 'coordinate', nudge: false });
@@ -91,7 +93,7 @@ describe('shared prepared dispatch observations', () => {
       expect(db.inTransaction).toBe(false); activities.push(owner);
       const current = samples.get(owner)!; const fresh = sample(owner, clock);
       samples.set(owner, { ...current, state: fresh.state, witness: fresh.witness }); await activityHook?.(owner);
-    });
+    }, task => runtimeHook?.(task) ?? null);
     repo.coordinatorAuthority.coordinationRecovery = svc;
   });
   afterEach(() => { db.close(); rmSync(dir, { recursive: true, force: true }); vi.useRealTimers(); });
@@ -309,6 +311,28 @@ describe('shared prepared dispatch observations', () => {
     expect(repo.getById(actual.authorizationId)?.state).toBe('in-progress');
     const event = db.prepare("SELECT payload FROM events WHERE type='outbox.uncertain_abandoned'").get() as { payload: string };
     expect(JSON.parse(event.payload)).toMatchObject({ operationId: actual.contract.operationId, deliveryConclusion: 'unknown', authorizationId: actual.authorizationId });
+  });
+  it('SM06 holds an unusable owner while an independent ready owner dispatches and routes recovery intake', async () => {
+    configure([...primary(), task('C','reviewer@xv'), task('C-repair','architect@xv',{recoveryFor:'C'})]);
+    runtimeHook = t => t.owner==='builder@xv' ? {reason:'runtime-not-ready',code:'compaction_failed',launchId:'launch',observedAt:new Date(clock).toISOString()} : null;
+    const result = await post('coordination-reconcile', {rigId:'xv'});
+    expect(result).toEqual(expect.arrayContaining([expect.objectContaining({key:'A',state:'held',reason:'runtime-not-ready'})]));
+    expect(repo.getById(queueId('A'))).toBeNull();
+    expect(repo.getById(queueId('C'))?.state).toBe('pending');
+    expect(sent).not.toContain(queueId('A')); expect(sent).toContain(queueId('C'));
+    const holds=db.prepare("SELECT body FROM queue_items WHERE destination_session='operator-agent@kernel' AND body LIKE '%runtime-not-ready%'").all();
+    expect(holds.length).toBeGreaterThan(0);
+  });
+  it('SM06 blocks a pending assignment wake without changing custody and resumes after native recovery', async () => {
+    configure(); await post('coordination-reconcile', {rigId:'xv'});
+    const wake=vi.spyOn(repo,'stageCoordinatorAssignmentWake'); wake.mockClear();
+    runtimeHook=()=>({reason:'runtime-not-ready',code:'model_error',launchId:'launch',observedAt:new Date(clock).toISOString()});
+    const result=await post('coordination-reconcile',{rigId:'xv'});
+    expect(result).toEqual(expect.arrayContaining([expect.objectContaining({key:'A',state:'held',reason:'runtime-not-ready'})]));
+    expect(wake).not.toHaveBeenCalled(); expect(assignments()).toHaveLength(1);
+    expect(repo.getById(queueId('A'))?.claimedAt).toBeNull();
+    runtimeHook=undefined; await post('coordination-reconcile',{rigId:'xv'});
+    expect(wake).toHaveBeenCalled(); expect(assignments()).toHaveLength(1);
   });
   it('unauthorized registered observation performs no native preparation or assignment', async () => {
     configure(); await expect(svc.supervisePrepared('xv', 'not-registered')).rejects.toMatchObject({ code: 'coordination_observer_not_authorized' });

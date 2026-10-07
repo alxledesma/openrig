@@ -1,3 +1,4 @@
+import { assessPiDispatchReadiness } from "./domain/dispatch-runtime-readiness.js";
 import {makeResilienceRolloutPolicy} from './domain/policies/resilience-rollout.js';
 import {ResilienceRolloutService} from './domain/resilience-rollout-service.js';
 import {RuntimeOutcomeAssessment} from "./domain/runtime-outcome-assessment.js";
@@ -516,6 +517,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   },Date.now,sessions=>seatIdentityReconciler.reconcileFresh(sessions),async session=>{
     const observed=await seatActivityService.pollSeat(session);
     if(!observed)throw new Error('native-worker-activity-unavailable');
+  },task=>{
+    // A launch-bound native sidecar supplements existing identity/activity fences.
+    // Unsupported runtimes and unreadable telemetry retain their existing admission gates.
+    const node=db.prepare('SELECT n.runtime FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(task.owner) as {runtime:string}|undefined;
+    if(node?.runtime!=='pi'||!/^[-a-zA-Z0-9_.@]+$/.test(task.owner))return null;
+    try{return assessPiDispatchReadiness(JSON.parse(fs.readFileSync(nodePath.join(OPENRIG_HOME,'state','pi',task.owner,'runner-state.json'),'utf8')),sessionRegistry.currentOccupantGenerationForSession(task.owner)??'',Date.now(),task.admission.runtimeRequirements);}
+    catch{return null;}
   });
   queueRepoInstance.coordinatorAuthority.runtimeOutcomeAssessment = new RuntimeOutcomeAssessment(queueRepoInstance);
   const resilienceRollout = new ResilienceRolloutService(queueRepoInstance,watchdogJobsRepoInstance);
