@@ -684,6 +684,7 @@ export class QueueRepository {
   private readonly nativeTerminalReturnControls=new WeakSet<QueueCreateInput>();
   private readonly outboxAbandonAuthorizations=new WeakSet<QueueCreateInput>();
   private readonly qualificationAssessmentDuties=new WeakSet<QueueCreateInput>();
+  private readonly qualificationAssessmentRetirementDuties=new WeakSet<QueueCreateInput>();
   readonly db: Database.Database;
   readonly transitionLog: QueueTransitionLog;
   private readonly eventBus: EventBus;
@@ -1082,11 +1083,17 @@ export class QueueRepository {
       {authorityState:authorityBaton.state,qitemId},
     );
   }
+  /** Legacy qualification rows under a report-only retirement contract stay in
+   *  place until their exact guarded failed disposition; they cannot be handed off. */
+  private assertQualificationAssessmentRetirementTargetNotHandedOff(qitemId:string):void {
+    if(this.coordinatorAuthority.coordinationRecovery?.isQualificationAssessmentRetirementTarget(qitemId))throw new QueueRepositoryError('qualification_retirement_handoff_refused','An expired legacy qualification target cannot be handed off or closed through a generic queue path; use its exact live report-only retirement duty');
+  }
   /** Read-only preflight for split, cross-host handoff choreography. Keep the
    *  repository close guard too: the route check prevents an orphan successor,
    *  while this second check protects the source if custody changes meanwhile. */
   assertCoordinatorBatonDispositionAllowed(qitemId:string):void {
     this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(qitemId);
+    this.assertQualificationAssessmentRetirementTargetNotHandedOff(qitemId);
   }
   private assertNativeTerminalReturnCompleted(qitemId:string):void {
     const ack=this.recipientAckDuty(qitemId);if(ack&&(!this.outbox||this.outbox.getById(ack.effectId)?.deliveryState!=='delivered'||!this.db.prepare("SELECT 1 FROM events WHERE type='outbox.recipient_acknowledged' AND json_extract(payload,'$.outboxId')=? AND json_extract(payload,'$.actor')=? AND json_extract(payload,'$.generation')=?").get(ack.effectId,ack.recipient,ack.recipientGeneration)))throw new QueueRepositoryError('outbox_ack_duty_incomplete','Actual native acknowledgment receipt is required; original message is not work or acceptance authority');
@@ -1918,6 +1925,13 @@ export class QueueRepository {
     if(body.schema!=='qualification-assessment-duty.v1'||body.action!=='perform-exact-qualification-only-assessment'||body.scope!=='qualification-only'||body.grantsAuthority!==false||body.contract?.productAuthority!==false||body.contract?.scope!=='qualification-only')throw new QueueRepositoryError('qualification_duty_internal_required','Qualification-only, non-product contract required');
     this.qualificationAssessmentDuties.add(input);try{return this.createWithinTransaction(input);}finally{this.qualificationAssessmentDuties.delete(input);}
   }
+  /** Internal report-only retirement of an expired, unclaimed legacy qualification item. */
+  createQualificationAssessmentRetirementDuty(input:QueueCreateInput) {
+    if(!this.db.inTransaction||input.sourceSession!=='watchdog@system'||input.dispatch||input.identityProvenance!=='system:operator-authorized-coordination'||!input.qitemId?.startsWith('qitem-coordination-lifecycle-'))throw new QueueRepositoryError('qualification_retirement_internal_required','Qualification retirement requires its validated atomic coordinator issue path');
+    let body:any;try{body=JSON.parse(input.body);}catch{throw new QueueRepositoryError('qualification_retirement_internal_required','Qualification retirement body must be valid JSON');}
+    if(body.schema!=='qualification-assessment-retirement-duty.v1'||body.action!=='retire-exact-expired-unclaimed-qualification-task'||body.grantsAuthority!==false||body.productAuthority!==false||!body.targetQueueId||!body.targetBodyHash)throw new QueueRepositoryError('qualification_retirement_internal_required','Report-only, non-product retirement contract required');
+    this.qualificationAssessmentRetirementDuties.add(input);try{return this.createWithinTransaction(input);}finally{this.qualificationAssessmentRetirementDuties.delete(input);}
+  }
   createWithinTransaction(input: QueueCreateInput): {
     qitemId: string;
     persistedEvent: PersistedEvent;
@@ -1988,7 +2002,7 @@ export class QueueRepository {
       humanQuestions = parsed.questions;
     }
     const id = input.qitemId ?? newQitemId();
-    if(!this.recipientAckDuties.has(input)&&!this.nativeTerminalReturnControls.has(input)&&!this.outboxAbandonAuthorizations.has(input)&&!this.qualificationAssessmentDuties.has(input))this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
+    if(!this.recipientAckDuties.has(input)&&!this.nativeTerminalReturnControls.has(input)&&!this.outboxAbandonAuthorizations.has(input)&&!this.qualificationAssessmentDuties.has(input)&&!this.qualificationAssessmentRetirementDuties.has(input))this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
     const ts = new Date().toISOString();
     const priority = input.priority ?? "routine";
     const tier = input.tier ?? null;
@@ -2073,8 +2087,9 @@ export class QueueRepository {
    * Transactional handoff: close the source qitem (state=done,
    * closure_reason=handed_off_to) and create a new qitem owned by `toSession`,
    * with `handed_off_from` recording the chain. One atomic transaction.
-   */
+  */
   async handoff(input: QueueHandoffInput): Promise<{ closed: QueueItem; created: QueueItem }> {
+    this.assertQualificationAssessmentRetirementTargetNotHandedOff(input.qitemId);
     const source = this.getById(input.qitemId);
     if (!source) {
       throw new QueueRepositoryError(
@@ -2132,6 +2147,7 @@ export class QueueRepository {
     const txn = this.db.transaction(() => {
       const beforeCustody = this.custodySnapshot(input.qitemId);
       const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
+      this.assertQualificationAssessmentRetirementTargetNotHandedOff(input.qitemId);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
       this.assertNativeTerminalReturnCompleted(input.qitemId);
@@ -2270,8 +2286,9 @@ export class QueueRepository {
    * close+create, same chain_of_record semantics, same default-nudge behavior.
    * Use when the source seat is fully complete with the work — no follow-up
    * tracking needed against the source qitem.
-   */
+  */
   async handoffAndComplete(input: QueueHandoffAndCompleteInput): Promise<{ closed: QueueItem; created: QueueItem }> {
+    this.assertQualificationAssessmentRetirementTargetNotHandedOff(input.qitemId);
     const source = this.getById(input.qitemId);
     if (!source) {
       throw new QueueRepositoryError(
@@ -2327,6 +2344,7 @@ export class QueueRepository {
     const txn = this.db.transaction(() => {
       const beforeCustody = this.custodySnapshot(input.qitemId);
       const nativeGeneration = this.nativeCustodyGeneration(input.fromSession,input.actorGeneration,input.identityProvenance);
+      this.assertQualificationAssessmentRetirementTargetNotHandedOff(input.qitemId);
       this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
       this.assertCoordinatorBatonTerminalCloseRequiresLifecycle(input.qitemId);
       this.assertNativeTerminalReturnCompleted(input.qitemId);
@@ -2493,6 +2511,7 @@ export class QueueRepository {
     identityProvenance?: string | null;
     transitionNote?: string;
   }): { item: QueueItem; absorbed: boolean } {
+    this.assertQualificationAssessmentRetirementTargetNotHandedOff(input.qitemId);
     this.assertAdministrativeClaimant(input.qitemId,input.fromSession,input.actorGeneration,input.identityProvenance);
     const source = this.getById(input.qitemId);
     if (!source) {
@@ -2674,6 +2693,7 @@ export class QueueRepository {
         `qitem ${input.qitemId} not found`
       );
     }
+    if(this.coordinatorAuthority.coordinationRecovery?.isQualificationAssessmentRetirementTarget(input.qitemId))throw new QueueRepositoryError('qualification_retirement_target_not_claimable','Legacy qualification assessment rows can only receive the exact guarded failure disposition; claim the separate live retirement duty, never the expired target');
     if (qitem.destinationSession !== input.destinationSession) {
       throw new QueueRepositoryError(
         "claim_destination_mismatch",
@@ -2872,7 +2892,10 @@ export class QueueRepository {
     }
     const beforeCustody = this.custodySnapshot(input.qitemId);
     const nativeGeneration = this.nativeCustodyGeneration(input.actorSession,input.actorGeneration,input.identityProvenance);
-    if(input.state!==undefined&&!(['failed','canceled'].includes(input.state)&&this.coordinatorAuthority.coordinationRecovery?.heldHistoryRetirementAllows(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance)))this.assertAdministrativeClaimant(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance);
+    const qualificationRetirementTarget=this.coordinatorAuthority.coordinationRecovery?.isQualificationAssessmentRetirementTarget(input.qitemId)===true;
+    const qualificationRetirementAuthorized=this.coordinatorAuthority.coordinationRecovery?.qualificationAssessmentRetirementAllows(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance,input.state)===true;
+    if(qualificationRetirementTarget&&input.state!==undefined&&!qualificationRetirementAuthorized)throw new QueueRepositoryError('qualification_retirement_disposition_required','Only the exact failed disposition under its currently claimed finite retirement duty is supported; preserve the legacy row and wake otherwise');
+    if(input.state!==undefined&&!(['failed','canceled'].includes(input.state)&&(this.coordinatorAuthority.coordinationRecovery?.heldHistoryRetirementAllows(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance)||qualificationRetirementAuthorized)))this.assertAdministrativeClaimant(input.qitemId,input.actorSession,input.actorGeneration,input.identityProvenance);
     if(this.abandonmentAuthorization(input.qitemId)&&input.state!==undefined&&((qitem.claimedAt&&input.state==='pending')||(isTerminalState(qitem.state)&&input.state!==qitem.state)))throw new QueueRepositoryError('outbox_authorization_custody_required','Preserve administrative history; exact current claimant must report own failed/canceled expiry, never unclaim or reopen it');
     if(input.state==='done'||input.state==='handed-off')this.assertNativeTerminalReturnCompleted(input.qitemId);
     const hasNote = typeof input.transitionNote === "string" && input.transitionNote.trim().length > 0;
@@ -3363,6 +3386,7 @@ export class QueueRepository {
     // A recipient's native failed/canceled report of a lifecycle duty target completes its report-only retirement duty:
     // freeze that completion in this transaction, for this exact target only (indexed target lookup).
     if (input.state === "failed" || input.state === "canceled") this.coordinatorAuthority.coordinationRecovery?.captureNativeRetirementTerminal(input.qitemId);
+    if (input.state !== undefined) this.coordinatorAuthority.coordinationRecovery?.captureQualificationAssessmentRetirementProgress(input.qitemId);
     return { persistedEvent, persistedEvents: [...dependentEvents, persistedEvent] };
   }
 
