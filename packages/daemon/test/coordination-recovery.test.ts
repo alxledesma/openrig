@@ -1,4 +1,4 @@
-import { LIFECYCLE_INTAKE_RENEWAL_REASONS,makeCoordinatorContinuityPolicy} from '../src/domain/policies/coordinator-continuity.js';
+import {makeCoordinatorContinuityPolicy} from '../src/domain/policies/coordinator-continuity.js';
 import type {RuntimeAvailability} from '../src/domain/coordinator-runtime-availability.js';
 import {spawn} from 'node:child_process';
 import {once} from 'node:events';
@@ -229,7 +229,7 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   expect(repo.getById('qitem-coordination-'+digest('xv:product').slice(0,24))).toBeNull();
   const before=db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordination-reconcile'").get();
   s.witness!.observedAt=new Date(clock-4000).toISOString();
-  svc.reconcile('lead@xv','lead-g1','xv');
+  await makeCoordinatorContinuityPolicy(repo.coordinatorAuthority).evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);
   expect(db.prepare("SELECT count(*) n FROM coordinator_operations WHERE kind='coordination-reconcile'").get()).toEqual(before);
  });
  it.each(['idle','busy','stale-witness','unknown','generation','configuration','plan','unavailable-unrelated','unavailable-target'] as const)('automatic continuity refreshes stale activity after exact A acceptance: %s',async outcome=>{
@@ -258,10 +258,11 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
    db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE audit_pointer='unresolved-reviewer-effect'").run();
   }
   const unknownBefore=db.prepare("SELECT * FROM outbox_entries WHERE delivery_state='indeterminate'").all();
-  let identityPending=false,resolveIdentity!:()=>void;const polled:string[]=[];
-  const identity=vi.fn(async()=>{identityPending=true;await new Promise<void>(resolve=>{resolveIdentity=resolve;});identityPending=false;});
+  let identityPending=0,resolveIdentity!:()=>void;const polled:string[]=[];
+  let identityGate=new Promise<void>(resolve=>{resolveIdentity=resolve;});
+  const identity=vi.fn(async(sessions:readonly string[])=>{identityPending++;await identityGate;identityPending--;for(const session of sessions){const current=samples.get(session);if(current)samples.set(session,{...current,identityObservedAt:new Date(clock).toISOString()});}});
   const poll=vi.fn(async(session:string)=>{
-   expect(identityPending).toBe(true);polled.push(session);
+   expect(identityPending).toBeGreaterThan(0);polled.push(session);
    if((outcome==='unavailable-unrelated'&&session==='architect@xv')||(outcome==='unavailable-target'&&session==='reviewer@xv'))throw new Error('native-worker-activity-unavailable');
    const observed=sample(session);
    if(session==='reviewer@xv'){
@@ -277,14 +278,12 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   const policy=makeCoordinatorContinuityPolicy(repo.coordinatorAuthority,async()=>{});
   const evaluation=policy.evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);
   // Availability and the first yield finish before these native observers start.
-  for(let i=0;i<10&&!identityPending;i++)await Promise.resolve();
-  expect(identityPending).toBe(true);expect(polled).toEqual(expect.arrayContaining(['lead@xv','peer@xv','builder@xv','reviewer@xv','architect@xv']));
+  for(let i=0;i<20&&!identityPending;i++)await Promise.resolve();
+  expect(identityPending).toBeGreaterThan(0);expect(polled).toEqual(expect.arrayContaining(['lead@xv','peer@xv','operator-agent@kernel','reviewer@xv']));
+  expect(polled).not.toContain('builder@xv');if(outcome==='unavailable-unrelated')expect(polled).not.toContain('architect@xv');
   resolveIdentity();
-  if(['generation','configuration','plan'].includes(outcome))await expect(evaluation).rejects.toMatchObject({code:'coordination_worker_probe_changed'});
-  else {
-   const observed=await evaluation;
-   if(outcome==='busy'||outcome==='stale-witness'||outcome==='unknown'||outcome==='unavailable-target')expect((observed.notes!.coordination as any[]).find(r=>r.key==='next')).toMatchObject({state:'held',reason:outcome==='unknown'?'uncertain-worker-effect':'fresh-activity-required'});
-  }
+  const observed=await evaluation;
+  if(['generation','configuration','plan','busy','stale-witness','unknown','unavailable-target'].includes(outcome))expect((observed.notes!.coordination as any[]).find(r=>r.key==='next')).toMatchObject({state:'held',reason:outcome==='unknown'?'uncertain-worker-effect':outcome==='generation'||outcome==='configuration'?'current-admission-required':'fresh-activity-required'});
   const next=db.prepare("SELECT queue_id FROM coordinator_assignments WHERE package_key='next'").all() as Array<{queue_id:string}>;
   if(outcome==='idle'||outcome==='unavailable-unrelated'){
    expect(next).toHaveLength(1);expect(next[0].queue_id).not.toBe(a);expect(repo.getById(next[0].queue_id)?.state).toBe('pending');
@@ -292,8 +291,9 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
    expect(resolution.predecessors).toEqual([{packageKey:'product',contractHash:parent.contract_hash,queueId:a,dispositionId:'accepted-A-return',acceptOperationId:'coordination-accept:product'}]);
    expect(db.prepare("SELECT count(*) n FROM outbox_entries WHERE audit_pointer=?").get(next[0].queue_id)).toEqual({n:1});
    // Repeated automatic passes cannot duplicate B or imply its native pickup.
+   identityGate=new Promise<void>(resolve=>{resolveIdentity=resolve;});
    const repeat=policy.evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);
-   for(let i=0;i<10&&!identityPending;i++)await Promise.resolve();resolveIdentity();await repeat;
+   for(let i=0;i<20&&!identityPending;i++)await Promise.resolve();resolveIdentity();await repeat;
    expect(db.prepare("SELECT count(*) n FROM coordinator_assignments WHERE package_key='next'").get()).toEqual({n:1});
    expect(repo.getById(next[0].queue_id)?.state).toBe('pending');
   }else expect(next).toHaveLength(0);
@@ -301,11 +301,15 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
  });
  it('native identity refresh enables only the checkpoint-authorized recovery, with genuine pickup and no Peer takeover',async()=>{
   const tasks=[task('product'),task('unrelated','peer@xv',{recoveryFor:'product'}),task('repair','peer@xv',{recoveryFor:'product'})];
-  const initial=configure(tasks);job();samples.delete('builder@xv');samples.get('peer@xv')!.identityVerified=false;
-  const refreshed=vi.fn(async(_sessions:readonly string[])=>{samples.set('peer@xv',sample('peer@xv'));});svc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,refreshed);repo.coordinatorAuthority.coordinationRecovery=svc;
+  tasks[0].admission.validUntil=clock+1;
+  const initial=configure(tasks);job();clock+=2;vi.setSystemTime(clock);samples.get('peer@xv')!.identityVerified=false;
+  const refreshed=vi.fn(async(sessions:readonly string[])=>{for(const session of sessions)samples.set(session,{...sample(session),identityObservedAt:new Date(clock).toISOString()});});
+  const poll=vi.fn(async(session:string)=>{const current=samples.get(session)!;samples.set(session,{...sample(session),identityObservedAt:current.identityObservedAt});});
+  svc=new CoordinationRecoveryService(repo,s=>samples.get(s)??null,()=>clock,refreshed,poll);repo.coordinatorAuthority.coordinationRecovery=svc;
   svc.configure('operator-agent@kernel','operator-agent-g1',{...initial,revision:'scoped-r2',refreshDispatchIdentity:true,dispatchRestrictions:[{session:'peer@xv',generation:'peer-g1',packageKeys:['repair'],validUntil:clock+30000,evidenceRef:'native/checkpoint-qa-only.json'}]});
   const e=await makeCoordinatorContinuityPolicy(repo.coordinatorAuthority).evaluate({jobId:'j',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any);
-  expect(refreshed).toHaveBeenCalledWith(expect.arrayContaining(['lead@xv','peer@xv','builder@xv']));
+  for(const session of ['lead@xv','peer@xv','builder@xv'])expect(refreshed).toHaveBeenCalledWith([session]);
+  expect(poll).toHaveBeenCalledWith('builder@xv');expect(poll).toHaveBeenCalledWith('peer@xv');
   const results=e.notes!.coordination as any[];
   expect(results.find(r=>r.key==='unrelated')).toMatchObject({state:'held',reason:'checkpoint-quiescence'});
   const repair=results.find(r=>r.key==='repair');expect(repair.state).toBe('pending-pickup');

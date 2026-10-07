@@ -170,6 +170,48 @@ export interface RehostPlan {
   recoveryAppendedBytes?: number;
   recoveryAppendedSha256?: string;
   stoppedTargetLeaf?: string;
+  stoppedTargetBytes?: Buffer;
+}
+
+/** Full-file proof, private to stopped-target recovery. No conversation append is
+ * credited after the old processes have exited. Receipts contain hashes only. */
+function stoppedHistoryProof(plan: RehostPlan, sessionName: string) {
+  const bytes = readFileSync(plan.sessionFile);
+  const stopped = plan.stoppedTargetBytes!;
+  const facts = { stopTimeBytes: stopped.length, stopTimeSha256: createHash("sha256").update(stopped).digest("hex"),
+    finalBytes: bytes.length, finalSha256: createHash("sha256").update(bytes).digest("hex"),
+    startupAppendedBytes: Math.max(0, bytes.length - stopped.length) };
+  const refuse = (reason: string) => ({ ...facts, valid: false, reason, resultingLeaf: null as string | null });
+  if (bytes.length < stopped.length || !bytes.subarray(0, stopped.length).equals(stopped)) return refuse("stop_time_prefix_changed");
+  const parse = (input: Buffer): Array<Record<string, unknown>> => {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(input);
+    if (!text.endsWith("\n")) throw new Error("incomplete_jsonl");
+    return text.slice(0, -1).split("\n").map(line => {
+      const row: unknown = JSON.parse(line);
+      if (!row || typeof row !== "object" || Array.isArray(row)) throw new Error("invalid_entry");
+      return row as Record<string, unknown>;
+    });
+  };
+  try {
+    const historical = parse(stopped);
+    const ids = new Set<string>();
+    for (const row of historical) {
+      if (typeof row.id !== "string" || !row.id || typeof row.type !== "string" || ids.has(row.id)) return refuse("ambiguous_history");
+      ids.add(row.id);
+    }
+    if (historical.at(-1)?.id !== plan.stoppedTargetLeaf) return refuse("stop_time_leaf_mismatch");
+    if (bytes.length === stopped.length) return { ...facts, valid: true, reason: "unchanged", resultingLeaf: plan.stoppedTargetLeaf! };
+    const suffix = bytes.subarray(stopped.length);
+    if (suffix.length > 4096) return refuse("startup_metadata_too_large");
+    const rows = parse(suffix);
+    if (rows.length !== 1) return refuse("multiple_startup_entries");
+    const row = rows[0]!;
+    if (Object.keys(row).sort().join(",") !== "id,name,parentId,timestamp,type" || row.type !== "session_info" ||
+        typeof row.id !== "string" || !row.id || ids.has(row.id) || row.parentId !== plan.stoppedTargetLeaf ||
+        row.name !== sessionName || typeof row.timestamp !== "string" || !Number.isFinite(Date.parse(row.timestamp)))
+      return refuse("invalid_startup_metadata");
+    return { ...facts, valid: true, reason: "linked_native_session_info", resultingLeaf: row.id };
+  } catch { return refuse("malformed_or_truncated_jsonl"); }
 }
 
 /** Why the legacy bridge could not even be ATTEMPTED. A closed vocabulary: an
@@ -1913,6 +1955,7 @@ export class SeatLifecycleService {
           return { ok: false, code: "rehost_recovery_history_changed", message: "No complete post-exit session leaf could be derived. No resume was attempted; the private recovery snapshot remains available.", blindRetryAllowed: false, observed: { outcomeClass: "stopped_no_resume", oldProcessesExited: true, resumeAttempted: false, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } };
         }
         plan.stoppedTargetLeaf = leaf;
+        plan.stoppedTargetBytes = Buffer.from(stoppedBytes);
         plan.recoveryAppendedBytes = stoppedBytes.length - originalBytes.length;
         plan.recoveryAppendedSha256 = createHash("sha256").update(stoppedBytes.subarray(originalBytes.length)).digest("hex");
       }
@@ -1983,7 +2026,7 @@ export class SeatLifecycleService {
       // This widens OBSERVATION only. It never repeats the stop or the resume, and the
       // fences below are unchanged: wrong generation, wrong session file, a launch id
       // that is not new, or the OLD launch still live all still fail closed.
-      type PostSample = { post: PiRehostRunnerState | null; proof: PiRehostProof | null; launchIdAfter: string | null; ok: boolean };
+      type PostSample = { post: PiRehostRunnerState | null; proof: PiRehostProof | null; launchIdAfter: string | null; history: ReturnType<typeof stoppedHistoryProof> | null; ok: boolean };
       const samples: PostSample[] = [];
       let settled: PostSample | null = null;
       for (let attempt = 1; attempt <= this.postProofSettleAttempts; attempt++) {
@@ -1991,6 +2034,7 @@ export class SeatLifecycleService {
         const post = piRunnerState(sessionName);
         const proof = await piProve(sessionName);
         const launchIdAfter = post?.launchId ?? null;
+        const history = plan.stoppedTargetRecovery ? stoppedHistoryProof(plan, sessionName) : null;
         // Agreement = the new launch is published and BOTH readers name the SAME launch
         // id, the session file is the one we resumed, and the prover shows the exact plan
         // generation. A null prover or an unready sidecar is simply not agreement yet.
@@ -2002,12 +2046,12 @@ export class SeatLifecycleService {
           // ACTUALLY refreshed its cursor to the bound leaf, which must still be the
           // bounded file tail. A stale or absent cursor is a mismatch, never credit.
           this.legacyPostCursorAgrees(sessionName, plan) &&
-          (!plan.stoppedTargetRecovery || (!!plan.stoppedTargetLeaf && post.lastEntryId === plan.stoppedTargetLeaf && this.piSessionTailEntryId!(plan.sessionFile) === plan.stoppedTargetLeaf));
-        const sample: PostSample = { post, proof, launchIdAfter, ok };
+          (!plan.stoppedTargetRecovery || (history?.valid === true && post.lastEntryId === history.resultingLeaf && this.piSessionTailEntryId!(plan.sessionFile) === history.resultingLeaf));
+        const sample: PostSample = { post, proof, launchIdAfter, history, ok };
         samples.push(sample);
         // Positive identity contradictions are terminal; later agreement cannot
         // erase a wrong generation/file or a proof of the old launch still present.
-        if ((post?.sessionFile != null && post.sessionFile !== plan.sessionFile) ||
+        if (history?.valid === false || (post?.sessionFile != null && post.sessionFile !== plan.sessionFile) ||
             (proof != null && proof.generation !== plan.generation) ||
             (proof?.state === "present" && proof.launchId === plan.launchId) ||
             // A cursor that has settled on a DIFFERENT entry than the witnessed leaf is
@@ -2036,7 +2080,9 @@ export class SeatLifecycleService {
         samples.some(s => s.proof != null && s.proof.generation !== plan.generation) ||
         samples.some(s => s.proof != null && s.proof.state === "present" && s.proof.launchId === plan.launchId) ||
         (!!post && post.ready && !!launchIdAfter && launchIdAfter === plan.launchId);
-      const postProof = settled?.ok === true && !genuineContradiction;
+      const history = settled?.history ?? samples.at(-1)?.history ?? null;
+      const historyContradiction = samples.some(s => s.history?.valid === false);
+      const postProof = settled?.ok === true && !genuineContradiction && !historyContradiction;
       const after = this.rehostCustodySnapshot(resolved.nodeId, plan.sessionFile);
       const custodyUnchanged =
         after.tenantHash === before.tenantHash && after.resumeTokenHash === before.resumeTokenHash &&
@@ -2047,12 +2093,13 @@ export class SeatLifecycleService {
         // TYPED code and carries the sampled values, so a startup transient is never
         // indistinguishable from a real identity contradiction. The failed receipt is
         // written exactly as before and is preserved; nothing is retried.
-        const unstable = !postProof && !genuineContradiction && samples.length > 0;
+        const unstable = !postProof && !genuineContradiction && !historyContradiction && samples.length > 0;
         this.appendRehostEvent("seat.runner_rehost_failed", seat, input, {
           stage: "post_proof", generation: plan.generation, sessionFile: plan.sessionFile, launchIdBefore: plan.launchId, launchIdAfter,
           ...(plan.stoppedTargetRecovery ? {
             stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: plan.stoppedTargetAcceptanceReference,
             liveIdleProof: "none", leafSource: "post_exit_session_file", stoppedTargetLeaf: plan.stoppedTargetLeaf,
+            historyProof: history,
             preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size },
             appendedBytes: plan.recoveryAppendedBytes ?? 0, appendedBytesSha256: plan.recoveryAppendedSha256,
             possibleUnpersistedTurnLoss: true,
@@ -2078,7 +2125,7 @@ export class SeatLifecycleService {
               ? `Post-resume observation did not settle within ${this.postProofSettleAttempts} read-only samples and shows no proven identity contradiction; reported as unstable only, never repaired and never retried.`
               : "Post-resume process proof failed (launch scope, session-file equality or same-generation proof). Reported only, never repaired.",
           observed: {
-            ...(plan.stoppedTargetRecovery ? { outcomeClass: "effect_unknown", oldProcessesExited: true, resumeAttempted: true, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } : {}),
+            ...(plan.stoppedTargetRecovery ? { outcomeClass: "effect_unknown", oldProcessesExited: true, resumeAttempted: true, historyProof: history, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } : {}),
             settlingSamples: samples.length, disagreementStable, genuineContradiction,
           },
           ...(plan.stoppedTargetRecovery ? { blindRetryAllowed: false } : {}),
@@ -2110,7 +2157,9 @@ export class SeatLifecycleService {
           liveIdleProof: "none",
           stoppedTargetLeaf: plan.stoppedTargetLeaf,
           leafSource: "post_exit_session_file",
-          replacementCursorMatchesPostExitLeaf: true,
+          replacementCursorMatchesPostExitLeaf: history?.resultingLeaf === plan.stoppedTargetLeaf,
+          replacementCursorMatchesValidatedLeaf: true,
+          historyProof: history,
           preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size },
           appendedBytes: plan.recoveryAppendedBytes ?? 0,
           appendedBytesSha256: plan.recoveryAppendedSha256,
@@ -2137,7 +2186,7 @@ export class SeatLifecycleService {
         unknownEffectsPreserved: after.unknownEffects,
         authority: plan.authority ? { ...plan.authority, readOnly: true, repairedByThisOperation: false } : null,
         guardLeftEnabled: true,
-        ...(plan.stoppedTargetRecovery ? { stoppedTargetRecovery: true, stoppedTargetLeaf: plan.stoppedTargetLeaf, possibleUnpersistedTurnLoss: true, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } : {}),
+        ...(plan.stoppedTargetRecovery ? { stoppedTargetRecovery: true, stoppedTargetLeaf: plan.stoppedTargetLeaf, historyProof: history, possibleUnpersistedTurnLoss: true, preservedSessionSnapshot: { path: plan.recoverySnapshot!.path, sha256: plan.recoverySnapshot!.sha256, size: plan.recoverySnapshot!.size } } : {}),
         events: ["seat.runner_rehost_began", "seat.runner_rehost_completed"],
       };
       } catch (error) {

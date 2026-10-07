@@ -16,7 +16,6 @@ import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
-import { EventBus } from "../src/domain/event-bus.js";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { SeatLifecycleService, type PiRehostProof, type PiRehostRunnerState } from "../src/domain/seat-lifecycle-service.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
@@ -52,6 +51,7 @@ interface Harness {
   historyPath: { value: string | null };
   snapshotDirectory: string;
   onStop: { value: (() => void) | null };
+  onResume: { value: (() => void) | null };
   processReadCount: { value: number };
   onSecondProcessRead: { value: (() => void) | null };
 }
@@ -206,6 +206,39 @@ function prepareStoppedTargetHistory(h: Harness): { path: string; original: Buff
   h.processes = h.processes.map(row => ({ ...row, command: row.command.replace(SESSION_FILE, path) }));
   return { path, original };
 }
+
+describe("stopped-target native startup metadata", () => {
+  const startup = { type: "session_info", id: "3fd90b1e", parentId: "tail-1", timestamp: "2026-10-07T18:30:50.397Z", name: "intake-lead@app-handy-conveyor" };
+  async function run(change: (path: string, original: Buffer) => void) {
+    const h = harness(); seat(h);
+    const { path, original } = prepareStoppedTargetHistory(h);
+    h.onResume.value = () => { change(path, original); h.sidecar.value!.lastEntryId = "3fd90b1e"; };
+    const result = await h.service.rehostRunner({ seatRef: startup.name, reason: "native startup metadata proof", stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: "owner-decision-17" });
+    expect(h.resumeCalls).toHaveLength(1); expect(h.killed).toEqual([RUNNER_PID]); expect(h.guard.leftEnabled()).toBe(true);
+    return { h, result };
+  }
+  it("binds the linked native startup metadata cursor and full final bytes", async () => {
+    const { h, result } = await run(path => writeFileSync(path, JSON.stringify(startup) + "\n", { flag: "a" }));
+    expect(result.ok).toBe(true);
+    expect(events(h, "seat.runner_rehost_completed")[0]).toMatchObject({ replacementCursorMatchesPostExitLeaf: false, replacementCursorMatchesValidatedLeaf: true, historyProof: { valid: true, resultingLeaf: startup.id, reason: "linked_native_session_info" } });
+  });
+  it.each(["changed-prefix", "message", "wrong-parent", "wrong-name", "duplicate-id", "malformed", "truncated", "multiple"])("rejects %s after resume without retry", async kind => {
+    const { h, result } = await run((path, original) => {
+      let row = { ...startup };
+      if (kind === "wrong-parent") row.parentId = "wrong";
+      if (kind === "wrong-name") row.name = "other@rig";
+      if (kind === "duplicate-id") row.id = "tail-1";
+      let suffix = JSON.stringify(kind === "message" ? { id: startup.id, type: "message", parentId: "tail-1" } : row) + "\n";
+      if (kind === "malformed") suffix = "{invalid}\n";
+      if (kind === "truncated") suffix = suffix.trimEnd();
+      if (kind === "multiple") suffix += JSON.stringify({ ...startup, id: "other" }) + "\n";
+      writeFileSync(path, Buffer.concat([kind === "changed-prefix" ? Buffer.from(original.toString().replace("message", "changed")) : original, Buffer.from(suffix)]));
+    });
+    expect(result.ok).toBe(false);
+    expect(result).toMatchObject({ blindRetryAllowed: false, observed: { outcomeClass: "effect_unknown" } });
+    expect(events(h, "seat.runner_rehost_completed")).toHaveLength(0);
+  });
+});
 
 const rehost = (h: Harness) => h.service.rehostRunner({ seatRef: "intake-lead@app-handy-conveyor", reason: "runner qualification upgrade" });
 

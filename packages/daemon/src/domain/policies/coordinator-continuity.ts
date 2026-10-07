@@ -7,10 +7,8 @@ export function makeCoordinatorContinuityPolicy(service:CoordinatorAuthorityServ
   if(job.registeredBySession!=="operator-agent@kernel"||job.target.session!=="operator-agent@kernel"||typeof job.context.rigId!=="string")return {action:"skip",reason:"observer-not-authorized"};
   await service.refreshRuntimeAvailability(job.context.rigId);
   await yieldBetweenPhases();
-  await service.coordinationRecovery?.refreshActivity(job.context.rigId);
-  await yieldBetweenPhases();
   // Persisted opt-in recovery reconciles real queue transitions, not reminder replies.
-  const coordination=service.coordinationRecovery?.supervise(job.context.rigId,job.jobId);
+  const coordination=await service.coordinationRecovery?.supervisePrepared(job.context.rigId,job.jobId);
   await yieldBetweenPhases();
   await service.resumeAdministrativeDuties?.(job.context.rigId,job.jobId);
   await yieldBetweenPhases();
