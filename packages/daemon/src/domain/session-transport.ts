@@ -1802,7 +1802,12 @@ export class SessionTransport {
   private async unverifiedShellForeground(sessionName: string, runtime: string, pane: string | null, resumeToken: string | null): Promise<string | null> {
     let paneCommand: string | null;
     try {
-      paneCommand = await this.tmuxAdapter.getPaneCommand(sessionName);
+      // The session name resolves tmux's active pane, which can differ from
+      // the pane frozen in the managed seat binding. Classify and prove the
+      // exact bound pane so a different active window cannot create a false
+      // shell refusal (or clear this guard for the wrong pane).
+      const target = runtime === "codex" && pane ? pane : sessionName;
+      paneCommand = await this.tmuxAdapter.getPaneCommand(target);
     } catch {
       return null;
     }
@@ -1811,7 +1816,7 @@ export class SessionTransport {
       // Reuse stable, foreground, pane-descendant Codex proof. A resumed process
       // must name this session's token. Stale UI, a Node
       // launcher alone, missing observations or a native process elsewhere cannot clear it.
-      const native = await verifyCodexPaneProcess({ target: sessionName, tmux: this.tmuxAdapter,
+      const native = await verifyCodexPaneProcess({ target: pane, tmux: this.tmuxAdapter,
         listProcesses: this.listProcesses, expectedToken: resumeToken });
       if (native && await this.tmuxAdapter.getPanePid(pane).catch(() => null) === native.panePid) return null;
     }

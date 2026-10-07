@@ -130,6 +130,58 @@ describe("#142 transport refuses to type into a bare shell where an agent runtim
     expect(listProcesses).toHaveBeenCalledTimes(2);
   });
 
+  // This isolates the runtime shell/lineage guard; sendText/sendKeys are mock
+  // ports, so it does not claim the production guarded tmux write completed.
+  it("clears target_runtime_unverified for a watchdog wake when Codex is in the frozen bound pane", async () => {
+    const { node, session } = seat("codex", "dev-check@my-rig");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "dev-check@my-rig", tmuxPane: "%2" });
+    sessionRegistry.updateResumeToken(session.id, "codex", nativeToken);
+    const ports = tmuxWithPane(async () => "bash");
+    ports.tmux.listPanes = vi.fn(async () => [{ id: "%0" }, { id: "%2" }]);
+    ports.tmux.getPaneCommand = vi.fn(async () => "bash");
+    ports.tmux.getPanePid = vi.fn(async (target: string) => target === "%2" ? 1135 : 1222);
+    const rows = [
+      ...wrapperProcesses(),
+      { pid: 1222, ppid: 1, pgid: 1222, tpgid: 1222, executableName: "bash", command: "-bash", startedAt: "Tue Sep 29 23:33:00 2026" },
+    ];
+    const listProcesses = vi.fn(async () => rows);
+    const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: ports.tmux, listProcesses });
+
+    expect(await watchdogSend(transport, "dev-check@my-rig")).toMatchObject({ ok: true });
+    expect(ports.tmux.getPaneCommand).toHaveBeenCalledWith("%2");
+    expect(listProcesses).toHaveBeenCalledTimes(2);
+    expect(ports.sendText).toHaveBeenCalledOnce();
+    expect(ports.sendKeys).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the watchdog shell guard closed when Codex is only in the active pane", async () => {
+    const { node, session } = seat("codex", "dev-check@my-rig");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "dev-check@my-rig", tmuxPane: "%2" });
+    sessionRegistry.updateResumeToken(session.id, "codex", nativeToken);
+    const ports = tmuxWithPane(async () => "bash");
+    ports.tmux.listPanes = vi.fn(async () => [{ id: "%0" }, { id: "%2" }]);
+    ports.tmux.getPaneCommand = vi.fn(async (target: string) => target === "%2" ? "bash" : "codex");
+    ports.tmux.getPanePid = vi.fn(async (target: string) => target === "%2" ? 1135 : 1222);
+    const startedAt = "Tue Sep 29 23:33:00 2026";
+    const rows: NativeProcessRow[] = [
+      { pid: 1135, ppid: 1, pgid: 1135, tpgid: 1135, executableName: "bash", command: "-bash", startedAt },
+      { pid: 1222, ppid: 1, pgid: 1222, tpgid: 1223, executableName: "zsh", command: "-zsh", startedAt },
+      { pid: 1223, ppid: 1222, pgid: 1223, tpgid: 1223, executableName: "bash", command: "/bin/sh /tmp/launch.txt", startedAt },
+      { pid: 1224, ppid: 1223, pgid: 1223, tpgid: 1223, executableName: "node", command: `node /opt/bin/codex resume ${nativeToken}`, startedAt },
+      { pid: 1225, ppid: 1224, pgid: 1223, tpgid: 1223, executableName: "codex", command: `/opt/native/codex resume ${nativeToken}`, startedAt },
+    ];
+    const listProcesses = vi.fn(async () => rows);
+    const transport = new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: ports.tmux, listProcesses });
+
+    expect(await watchdogSend(transport, "dev-check@my-rig")).toMatchObject({
+      ok: false, sent: false, reason: "target_runtime_unverified",
+    });
+    expect(ports.tmux.getPaneCommand).toHaveBeenCalledWith("%2");
+    expect(listProcesses).toHaveBeenCalledTimes(2);
+    expect(ports.sendText).not.toHaveBeenCalled();
+    expect(ports.sendKeys).not.toHaveBeenCalled();
+  });
+
   it("sends to the bound Codex wrapper only after an incomplete census is followed by two stable proofs", async () => {
     const listProcesses = vi.fn()
       .mockResolvedValueOnce([])
