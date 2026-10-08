@@ -2930,6 +2930,12 @@ export class QueueRepository {
     return { qitemId: input.qitemId, ...result };
   }
 
+  /** Publish updates composed by an outer transaction only after its commit. */
+  notifyCommittedUpdates(events: readonly PersistedEvent[]): void {
+    if (this.db.inTransaction) throw new Error("Queue updates must be published after the outer transaction commits");
+    for (const event of events) this.eventBus.notifySubscribers(event);
+  }
+
   /**
    * Internal: closure validation + UPDATE + transition log + emit
    * queue.updated event. Caller is responsible for transaction wrapping

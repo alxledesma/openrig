@@ -2,6 +2,7 @@ import { validRuntimeRequirements, type DispatchRuntimeRequirements, type Dispat
 import { isContainedExpiredAdministrativeHistory } from "./expired-administrative-history.js";
 import { rotationLocalAddresses } from "./rotation-local-custody.js";
 import type { QueueRepository } from "./queue-repository.js";
+import type { PersistedEvent } from "./types.js";
 import type { NativeQueueCustodyReceipt, QueueTransition } from "./queue-transition-log.js";
 import { CoordinatorFenceError, digest, type CoordinatorToken } from "./coordinator-authority-service.js";
 import type { ActivityEvidence, ArbitratedSeatState } from "./activity-taxonomy.js";
@@ -2113,8 +2114,10 @@ if(!effectRig)return true;
   this.commitAcceptance(actor,generation,rigId,packageKey,dispositionId,evidenceRef);
   const plan=this.plan(rigId);if(plan&&plan.operatorGeneration===this.authority.generation('operator-agent@kernel'))this.reconcile(actor,generation,rigId);
  }
+ /** Acceptance and release of the accepting holder's exact claimed inputs commit
+  * together. Never claim an unread return or release another generation's work. */
  private commitAcceptance(actor:string,generation:string,rigId:string,packageKey:string,dispositionId:string,evidenceRef:string):void {
-  this.db.transaction(()=>{
+  const events=this.db.transaction(()=>{
    const a=this.authority.get(rigId);
    if(!a||a.owner_session!==actor||a.owner_generation!==generation||a.state!=='active'||this.authority.generation(actor)!==generation||a.lease_until<=this.now())fail('coordinator_retired','Current holder must accept exact return');
    this.authority.runtimeOutcomeAssessment?.assertAcceptance(rigId,packageKey);
@@ -2124,12 +2127,25 @@ if(!effectRig)return true;
    const receipt={queueId:row!.queue_id,dispositionId,actor,generation,evidenceRef};
    const id='coordination-accept:'+packageKey;
    const prior=this.db.prepare('SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(rigId,id) as {receipt:string}|undefined;
-   if(prior){if(JSON.parse(prior.receipt).dispositionId!==dispositionId)fail('coordination_acceptance_conflict','Accepted result cannot change');return;}
-   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,id,'coordination-accept',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
-   // reconcile never revisits an accepted return, so freeze the acceptance duty's completion here, now, before the deadline.
-   this.captureDutyCompletion(rigId,'acceptance',row!.queue_id+':'+dispositionId);
+   if(prior){if(JSON.parse(prior.receipt).dispositionId!==dispositionId)fail('coordination_acceptance_conflict','Accepted result cannot change');}
+   else this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,id,'coordination-accept',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
+   const subject=row!.queue_id+':'+dispositionId;
+   // Capture before closing; expired or superseded duties retain their existing fences.
+   this.captureDutyCompletion(rigId,'acceptance',subject);
+   const dutyId=this.liveDutyLink(rigId,'acceptance',subject);
+   const closeIds=[dispositionId,...(dutyId&&this.dutyFacts(dutyId).close?[dutyId]:[])];
+   const events:PersistedEvent[]=[];
+   for(const queueId of new Set(closeIds)){
+    const q=this.repo.getById(queueId);
+    const claim=this.db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(queueId) as {claimed_by_generation_uuid:string|null}|undefined;
+    if(!q||!q.claimedAt||!['in-progress','blocked'].includes(q.state)||claim?.claimed_by_generation_uuid!==generation||!rotationLocalAddresses(this.db,actor).includes(q.destinationSession))continue;
+    const result=this.repo.updateWithinTransaction({qitemId:queueId,actorSession:actor,actorGeneration:generation,identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on',transitionNote:'Exact result accepted: '+id});
+    events.push(...result.persistedEvents);
+   }
    this.recordProgress(rigId);
+   return events;
   }).immediate();
+  this.repo.notifyCommittedUpdates(events);
  }
  private progressDigest(rigId:string):string {
   // Message text, wake consumption, repeated notes and nudge timestamps do not count.

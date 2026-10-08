@@ -59,7 +59,7 @@ describe('successor bound predecessor — genuine acceptance releases dependent'
  }
  async function originalReturned(state:'done'|'failed'='done'){const first=reconcile().find(r=>r.key==='product')!;expect(first.state).toBe('pending-pickup');await svc.deliverCommitted();await finishTyped('product','builder@xv',first.queueId!,'incomplete-return',state);return first.queueId!;}
  async function claimAcceptance(packageKey:string){const duty=reconcile().find(r=>r.key==='acceptance:'+packageKey)!;expect(duty.state).toBe('pending-native-acceptance');await svc.deliverCommitted();nativeClaim(duty.queueId!,'lead@xv');return duty.queueId!;}
- async function acceptOriginal(){const duty=await claimAcceptance('product');svc.accept('lead@xv','lead-g1','xv','product','incomplete-return','actual/product-accepted.md');repo.update({qitemId:duty,actorSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});await svc.deliverCommitted();}
+ async function acceptOriginal(){const duty=await claimAcceptance('product');svc.accept('lead@xv','lead-g1','xv','product','incomplete-return','actual/product-accepted.md');expect(repo.getById(duty)?.state).toBe('done');await svc.deliverCommitted();}
  function nextAssignment(){return db.prepare("SELECT * FROM coordinator_assignments WHERE rig_id='xv' AND package_key='next'").get() as any;}
  it('genuine acceptance creates real prebound B and freezes exact resolved receipt without reconfigure',async()=>{
   const tasks=prebound(),original=await originalReturned();expect(reconcile().find(r=>r.key==='next')).toMatchObject({state:'held',reason:'predecessor-disposition'});await acceptOriginal();

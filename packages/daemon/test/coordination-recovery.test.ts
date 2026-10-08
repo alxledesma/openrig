@@ -51,7 +51,7 @@ function sample(session:string):CoordinationActivity {const generation=repo.coor
   expect(()=>repo.coordinatorAuthority.assertManagedSend('watchdog@system','lead@xv',duty.queueId)).not.toThrow();repo.claim({qitemId:duty.queueId!,destinationSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1'});
   expect(()=>repo.update({qitemId:duty.queueId!,actorSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'})).toThrow('Exact native acceptance');
   db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();svc.accept('lead@xv','lead-g1','xv','outside','outside-return','actual/outside-acceptance.md');
-  repo.update({qitemId:duty.queueId!,actorSession:'lead@xv',actorGeneration:'lead-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+  expect(repo.getById(duty.queueId!)?.state).toBe('done');
   const next=db.prepare("SELECT queue_id FROM coordinator_assignments WHERE package_key='next'").get() as any;expect(next).toBeTruthy();repo.claim({qitemId:next.queue_id,destinationSession:'reviewer@xv',identityProvenance:'transport:v1'});expect(repo.getById(next.queue_id)?.state).toBe('in-progress');
  });
  it('central lifecycle requires distinct genuinely owned recovery for classifier-incomplete return',async()=>{
