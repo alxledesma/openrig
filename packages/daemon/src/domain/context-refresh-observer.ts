@@ -135,9 +135,13 @@ export class ContextRefreshObserver {
     result.identity = { nodeId, sessionName: b.sessionName, generation: b.generation, runtime: b.runtime,
       nativeId: b.nativeId, configurationDigest: b.configurationDigest };
     result.capability = b.runtime === "codex" ? "codex-reserved-fresh" : "unsupported";
-    const [native, activity] = await Promise.all([
-      this.sources.native(b).catch(() => null), this.sources.activity(b).catch(() => null),
+    let piContractLaunchId: string | null = null;
+    const sample = () => Promise.all([
+      this.sources.native(b!).catch(() => null), this.sources.activity(b!).catch(() => null),
     ]);
+    // Preserve Codex's bounded catch-up scheduling. Pi's native contract also
+    // reads history, so its short-lived proof is sampled after that work.
+    let [native, activity] = b.runtime === "codex" ? await sample() : [null, null];
     if (b.runtime === "codex") {
       try {
         const file = await this.sources.transcriptPath(b);
@@ -162,27 +166,39 @@ export class ContextRefreshObserver {
         }
       } catch { holds.add("compaction-evidence-invalid"); }
     } else {
-      try {
-        const state = await this.sources.piState(b); this.pi(b, state, clock(), result, holds);
-        const contract = await this.sources.piContract?.(b);
-        if (!contract || contract.runtime !== "pi" || contract.generation !== b.generation || contract.sessionFile !== b.nativeId
-          || `${contract.provider}/${contract.model}` !== b.model || contract.launchId !== native?.launchId) holds.add("runtime-unsupported");
-        else {
-          result.capability = "pi-reserved-fresh";
+      let state: unknown;
+      try { state = await this.sources.piState(b); this.pi(b, state, clock(), result, holds); }
+      catch { holds.add("usage-unavailable"); }
+      // A contract refusal is not evidence of malformed compaction history.
+      let contract: PiRotationContract | null = null;
+      try { contract = await this.sources.piContract?.(b) ?? null; }
+      catch { holds.add("runtime-unsupported"); }
+      if (!contract || contract.runtime !== "pi" || contract.generation !== b.generation || contract.sessionFile !== b.nativeId
+        || `${contract.provider}/${contract.model}` !== b.model) holds.add("runtime-unsupported");
+      else {
+        piContractLaunchId = contract.launchId;
+        result.capability = "pi-reserved-fresh";
+        try {
           const scanned = this.scanPi(b, contract), key = `${b.nativeId}\0${b.generation}`, cache = this.piScans.get(key), scan = cache?.scan;
           if (!scanned && scan && !scan.invalid && scan.offset < scan.size) startContextRefreshCatchup(scan, remaining => {
             if (this.piScans.get(key) !== cache || cache!.scan !== scan || this.bindings.get(nodeId) !== bindingKey || this.sources.bindingCurrent?.(b!) === false) return { bytes: 0, complete: true };
             const stat = (this.sources.readTranscript ?? readContextRefreshTranscript)(b!.nativeId, 0, 0);
             if (stat.identity !== scan.identity || stat.size !== scan.size || (stat.revision ?? `${stat.identity}:${stat.size}`) !== scan.revision) return { bytes: 0, complete: true };
-            const before = scan.offset, result = this.scanPi(b!, contract, remaining);
+            const before = scan.offset, result = this.scanPi(b!, contract!, remaining);
             return { bytes: scan.offset - before, complete: !!result || scan.invalid || scan.offset >= scan.size || cache!.scan !== scan };
           });
           if (!scanned || !object(state) || state.lastEntryId !== scanned.cursor.lastEntryId) holds.add("compaction-evidence-invalid");
           else result.compactions = { count: scanned.cursor.compactions.length, observedAt: scanned.at,
             source: "pi_compaction_jsonl", cursor: JSON.stringify(scanned.cursor) };
-        }
-      } catch { holds.add("compaction-evidence-invalid"); }
+        } catch { holds.add("compaction-evidence-invalid"); }
+      }
       if (result.capability === "unsupported") holds.add("runtime-unsupported");
+    }
+    // Sample short-lived native/activity evidence after potentially expensive
+    // history/contract work; never extend the freshness bound to hide latency.
+    if (b.runtime === "pi") [native, activity] = await sample();
+    if (b.runtime === "pi" && piContractLaunchId !== native?.launchId) {
+      result.capability = "unsupported"; holds.add("runtime-unsupported");
     }
     let after: ContextRefreshBinding | null;
     try { after = await this.sources.binding(nodeId); } catch { after = null; }

@@ -1,3 +1,5 @@
+import { PeerServiceDispositionStore, SERVICE_PROCESS_PY } from './peer-service-disposition.js';
+import { OPENRIG_HOME } from '../openrig-compat.js';
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -87,6 +89,40 @@ def foreign_seat_home(identity,expected):
 ok=False
 try:
  expected=json.loads(sys.argv[1]); pane=int(sys.argv[2]); native=sys.argv[3]
+ dispositions=json.loads(sys.argv[5]) if len(sys.argv)>5 else []
+ if not isinstance(dispositions,list) or len(dispositions)>64: raise ValueError()
+ roots={}
+ for disposition in dispositions:
+  if disposition.get('schema')!='peer-service-disposition-v1' or disposition.get('nodeId')!=expected['OPENRIG_NODE_ID'] or disposition.get('sessionName')!=expected['OPENRIG_SESSION_NAME'] or disposition.get('home')!=expected['OPENRIG_HOME']: raise ValueError()
+  root=disposition['process']; pid=root['pid']
+  # Resolve immutable kernel identity before reading argv/image: reused or
+  # foreign instances cannot be poisoned by an old disposition. Unknown holds.
+  try: instance=kernel_instance(pid)
+  except:
+   try: os.kill(pid,0)
+   except ProcessLookupError: continue
+   except PermissionError:
+    # Permission alone is not identity. Confirm the foreign UID independently;
+    # malformed, missing, unreadable or same-UID observations remain UNKNOWN.
+    owner=subprocess.check_output(['/bin/ps','-p',str(pid),'-o','uid='],env={'PATH':'/usr/bin:/bin','LC_ALL':'C'}).decode('ascii').strip()
+    if owner and all('0'<=c<='9' for c in owner) and int(owner)!=os.getuid(): continue
+   raise
+  if any(instance[k]!=root[k] for k in ['pid','uid','boot','start']): continue
+  observed=sample_process(pid)
+  # Old immutable evidence is never rewritten. A changed instance is not
+  # covered; its env conflict below still holds unless separately attested.
+  if observed!=root: continue
+  if pid in roots: raise ValueError() # conflicting/duplicate live instance proofs
+  if not eligible_service(observed) or observed['image']['sha256']!=disposition['approvedArtifactSha256']: raise ValueError()
+  roots[pid]=root
+ def covered_service(pid,argv,env,executable):
+  if not roots: return False
+  current=sample_process(pid)
+  identity_now,loader_now=inherited_identity(env)
+  if current['argvHash']!=proof_hash(argv) or current['identity']!=identity_now or current['loader']!=loader_now or current['image']!=image_stamp(executable): raise ValueError()
+  if not eligible_service(current): return False
+  # Dispositions never confer agency classification on descendants.
+  return pid in roots and current==roots[pid]
  rows=subprocess.check_output(['/bin/ps','-axo','pid=,uid=,stat='],env={'PATH':'/usr/bin:/bin','LC_ALL':'C'}).decode().splitlines()
  for row in rows:
   fields=row.split()
@@ -106,8 +142,8 @@ try:
    identity[k]=values[0].decode('utf8') if values else None
   # Exact node identity is global, including stale-generation wrappers.
   # Only a fully scoped foreign seat may reuse this home's display name.
-  if identity['OPENRIG_NODE_ID']==expected['OPENRIG_NODE_ID']: raise ValueError()
-  if identity['OPENRIG_SESSION_NAME']==expected['OPENRIG_SESSION_NAME'] and not foreign_seat_home(identity,expected): raise ValueError()
+  env_conflict=identity['OPENRIG_NODE_ID']==expected['OPENRIG_NODE_ID'] or (identity['OPENRIG_SESSION_NAME']==expected['OPENRIG_SESSION_NAME'] and not foreign_seat_home(identity,expected))
+  if env_conflict and not covered_service(pid,argv,env,executable): raise ValueError()
   if len(sys.argv)>4 and sys.argv[4]=='pi':
    # The exact saved file is global, including stripped/reparented runners.
    for arg in argv[1:]:
@@ -132,13 +168,16 @@ try:
     if not (omp_native and not pi_runner and not sessions and not implicit_selector):
      if len(sessions)!=1 or not os.path.isabs(sessions[0]): raise ValueError()
   elif os.path.basename(executable)=='codex' and native_thread(argv)==native: raise ValueError()
+ # Bracket each exact-instance waiver by a final root re-sample.
+ for pid,root in roots.items():
+  if sample_process(pid)!=root: raise ValueError()
  ok=True
 except: pass
 print('1' if ok else '0')`;
 
 export async function provePiIdentityAbsent(binding:{nodeId:string;sessionName:string;nativeId:string},panePid:number):Promise<boolean>{
   if(!Number.isSafeInteger(panePid)||panePid!==0&&panePid<=1)return false;
-  try{const r=await promisify(execFile)('python3',['-c',STOPPED_CENSUS_PY,JSON.stringify({OPENRIG_NODE_ID:binding.nodeId,OPENRIG_SESSION_NAME:binding.sessionName,OPENRIG_HOME:process.env.OPENRIG_HOME??null}),String(panePid),binding.nativeId,'pi'],{timeout:5000,maxBuffer:128,encoding:'utf8'});return r.stdout.trim()==='1';}catch{return false;}
+  try{const home=process.env.OPENRIG_HOME??OPENRIG_HOME,records=new PeerServiceDispositionStore(home).read(binding.nodeId,binding.sessionName);const r=await promisify(execFile)('python3',['-c',SERVICE_PROCESS_PY+STOPPED_CENSUS_PY,JSON.stringify({OPENRIG_NODE_ID:binding.nodeId,OPENRIG_SESSION_NAME:binding.sessionName,OPENRIG_HOME:home}),String(panePid),binding.nativeId,'pi',JSON.stringify(records)],{timeout:5000,maxBuffer:128,encoding:'utf8'});return r.stdout.trim()==='1';}catch{return false;}
 }
 
 export async function proveStoppedCodexIdentityAbsent(binding:CodexRehostBinding,panePid:number):Promise<boolean>{
@@ -154,7 +193,7 @@ export async function proveDetachedCodexIdentityAbsent(binding:CodexRehostBindin
 
 async function proveCodexIdentityAbsent(binding:CodexRehostBinding,panePid:number,detached:boolean):Promise<boolean>{
   if(!Number.isSafeInteger(panePid)||(detached?panePid!==0:panePid<=1))return false;
-  try {const result=await promisify(execFile)('python3',['-c',STOPPED_CENSUS_PY,JSON.stringify({OPENRIG_NODE_ID:binding.nodeId,OPENRIG_SESSION_NAME:binding.sessionName,OPENRIG_HOME:process.env.OPENRIG_HOME??null}),String(panePid),binding.nativeId],{timeout:5000,maxBuffer:128,encoding:'utf8'});return result.stdout.trim()==='1';}catch{return false;}
+  try {const home=process.env.OPENRIG_HOME??OPENRIG_HOME,records=new PeerServiceDispositionStore(home).read(binding.nodeId,binding.sessionName);const result=await promisify(execFile)('python3',['-c',SERVICE_PROCESS_PY+STOPPED_CENSUS_PY,JSON.stringify({OPENRIG_NODE_ID:binding.nodeId,OPENRIG_SESSION_NAME:binding.sessionName,OPENRIG_HOME:home}),String(panePid),binding.nativeId,'codex',JSON.stringify(records)],{timeout:5000,maxBuffer:128,encoding:'utf8'});return result.stdout.trim()==='1';}catch{return false;}
 }
 
 /** Retained native records are contract evidence, not a claim of live process

@@ -185,10 +185,33 @@ describe("Pi complete native history and bounded cache",()=>{
   f.raw(f.bytes().toString().replace('"id":"t"','"id":"x"'));
   expect((await o.observe("node")).compactions).toBeNull();
  });
+
+ it("samples native activity after a slow current-contract read",async()=>{
+  const f=piFixture(),contract=f.sources.piContract!;
+  f.sources.piContract=async b=>{f.advance(6000);return contract(b);};
+  const result=await f.observer().observe("node");
+  expect(result.native.verified).toBe(true);
+  expect(result.native.observedAt).toBe(NOW+6000);
+  expect(result.activity.observedAt).toBe(NOW+6000);
+  expect(result.holds).not.toContain("native-proof-unavailable");
+  expect(result.holds).not.toContain("activity-stale");
+ });
+
+ it("classifies Pi contract read failure as unsupported runtime, not corrupt history",async()=>{
+  const f=piFixture();
+  f.sources.piContract=async()=>{throw new Error("native contract unavailable");};
+  const result=await f.observer().observe("node");
+  expect(result.holds).toContain("runtime-unsupported");
+  expect(result.holds).not.toContain("compaction-evidence-invalid");
+  expect(result.compactions).toBeNull();
+ });
 });
 
 it("cold catchup drains both real model metadata and observer history responsively without duplicate jobs, probes or partial decisions",async()=>{
  const tick=()=>new Promise<void>(resolve=>setImmediate(resolve));
+ // Earlier cold-scan fixtures have finished parsing, but their scheduled
+ // cleanup needs an event-loop turn before this test owns both job slots.
+ await tick();
  // The shared limiter deduplicates keys, caps concurrent jobs and stops at its
  // finite work budget. Steps represent already bounded parser chunks.
  const a={},b={},c={};let aCalls=0,bCalls=0,cCalls=0,duplicate=0;

@@ -26,7 +26,7 @@ function fixture() {
   ];
   writeFileSync(sessionFile, rows.map(row => JSON.stringify(row) + "\n").join(""));
   const node: PiRotationNode = { runtime: "pi", model: "anthropic/claude-sonnet", generation: "gen-one", sessionStatus: "running", startupStatus: "ready", resumeType: "pi_session_file", resumeToken: sessionFile, launchPosture: "floor" };
-  const readiness: PiRotationReadiness = { ready: true, launchId: "launch-one", generation: "gen-one", sessionFile, lastEntryId: "e2", model: { provider: "anthropic", id: "claude-sonnet", contextWindow: 200000 }, observedAt: new Date(NOW).toISOString(), failures: [] };
+  const readiness: PiRotationReadiness = { ready: true, launchId: "launch-one", generation: "gen-one", sessionFile, lastEntryId: "e2", model: { provider: "anthropic", id: "claude-sonnet", contextWindow: 200000 }, thinkingLevel: "high", observedAt: new Date(NOW).toISOString(), failures: [] };
   const proof: PiRotationNativeProof = { state: "present", generation: "gen-one", launchId: "launch-one", fingerprint: "runner-child-start", lastEntryId: "e2", quiescence: { settled: true, observedAt: new Date(NOW - 1000).toISOString() }, verifiedLaunch: { generation: "gen-one", launchId: "launch-one", sessionFile, pid: 4321, startFingerprint: "pid-start-fingerprint", trustFlag: "no-approve" } };
   return { root, agentDir, sessionFile, rows, node, readiness, proof };
 }
@@ -42,18 +42,39 @@ describe("Pi rotation native contract", () => {
     expect(result.contract.trust).toBe("no-approve");
   });
 
-  it("holds mismatched model, effective per-model thinking level, posture or unresolved readiness", () => {
+  it("holds a mismatched node model, trust posture or unresolved readiness despite stale defaults", () => {
     const f = fixture();
     f.node.model = "anthropic/other";
     expect(piRotationContract(f.sessionFile, f.readiness, f.proof, f.node, f.agentDir, NOW)).toMatchObject({ ok: false, hold: "binding-changed" });
     f.node.model = "anthropic/claude-sonnet";
     writeFileSync(path.join(f.agentDir, "settings.json"), JSON.stringify({ defaultProvider: "anthropic", defaultModel: "claude-sonnet", defaultThinkingLevel: "high", modelThinkingLevels: { "anthropic/claude-sonnet": "low" } }));
-    expect(piRotationContract(f.sessionFile, f.readiness, f.proof, f.node, f.agentDir, NOW)).toMatchObject({ ok: false, hold: "binding-changed" });
+    const withStaleDefaults = piRotationContract(f.sessionFile, f.readiness, f.proof, f.node, f.agentDir, NOW);
+    expect(withStaleDefaults.ok).toBe(true);
+    if (withStaleDefaults.ok) expect(withStaleDefaults.contract.thinkingLevel).toBe("high");
     f.proof.verifiedLaunch!.trustFlag = "approve";
     expect(piRotationContract(f.sessionFile, f.readiness, f.proof, f.node, f.agentDir, NOW)).toMatchObject({ ok: false, hold: "binding-changed" });
     f.proof.verifiedLaunch!.trustFlag = "no-approve";
     f.readiness.failures = [{ code: "model_error", observedAt: new Date(NOW).toISOString() }];
     expect(piRotationContract(f.sessionFile, f.readiness, f.proof, f.node, f.agentDir, NOW)).toMatchObject({ ok: false, hold: "runtime-not-ready" });
+  });
+
+  it("uses fresh effective RPC model and thinking selection instead of stale session history or defaults", () => {
+    const f = fixture();
+    f.readiness.model = { provider: "openrouter", id: "fresh-model", contextWindow: 128000 };
+    Object.assign(f.readiness, { thinkingLevel: "xhigh" });
+    f.node.model = "openrouter/fresh-model";
+
+    // The immutable history and settings fixture still say Anthropic/Claude + high.
+    // The current child-bound RPC selection is authoritative for the contract.
+    const result = piRotationContract(f.sessionFile, f.readiness, f.proof, f.node, f.agentDir, NOW);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.contract).toMatchObject({ provider: "openrouter", model: "fresh-model", thinkingLevel: "xhigh" });
+  });
+
+  it.each([undefined, "ultra", "HIGH"]) ("holds when current RPC thinking selection is missing or invalid (%s)", thinkingLevel => {
+    const f = fixture();
+    Object.assign(f.readiness, { thinkingLevel });
+    expect(piRotationContract(f.sessionFile, f.readiness, f.proof, f.node, f.agentDir, NOW)).toMatchObject({ ok: false });
   });
 
   it("requires exact session and kernel launch bindings plus fresh positive quiescence", () => {
@@ -64,7 +85,7 @@ describe("Pi rotation native contract", () => {
     f.proof.quiescence!.observedAt = new Date(NOW - 15_001).toISOString();
     expect(piRotationContract(f.sessionFile, f.readiness, f.proof, f.node, f.agentDir, NOW)).toMatchObject({ ok: false, hold: "activity-unknown" });
     f.proof.quiescence!.observedAt = new Date(NOW - 1000).toISOString();
-    writeFileSync(f.sessionFile, JSON.stringify({ type: "session", id: "different-header" }) + "\n");
+    writeFileSync(f.sessionFile, JSON.stringify({ type: "message", id: "not-a-session-header" }) + "\n");
     expect(piRotationContract(f.sessionFile, f.readiness, f.proof, f.node, f.agentDir, NOW)).toMatchObject({ ok: false, hold: "compaction-evidence-invalid" });
   });
 

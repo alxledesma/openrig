@@ -46,7 +46,7 @@ export async function observePiRotationIdentity(deps: PiRotationFactsDeps, seat:
   });
   const after = piRotationSidecar(await deps.piState(seat));
   const identity = (s: PiRunnerState | null) => s && ({ready:s.ready,exited:s.exited,launchId:s.launchId,sessionFile:s.sessionFile,lastEntryId:s.lastEntryId,
-    model:s.model,generation:s.quiescence?.generation,failures:s.runtimeReadiness?.failures});
+    model:s.model,thinkingLevel:s.runtimeReadiness?.thinkingLevel,generation:s.quiescence?.generation,failures:s.runtimeReadiness?.failures});
   if (!launch || JSON.stringify(current(deps,seat))!==JSON.stringify(row) || !canonicalPiSessionFile(row.resumeToken)
     || JSON.stringify(identity(after))!==JSON.stringify(identity(raw))) throw Error("Pi native binding changed during OS observation");
   const model = parseNativeModelWindow(raw.model);
@@ -64,7 +64,7 @@ export async function resolvePiRotationNativeState(deps: PiRotationFactsDeps, se
     throw Error("Fresh exact Pi readiness/model binding unavailable");
   }
   const result = piRotationContract(row.resumeToken!,{ready:state.ready===true&&!state.exited,launchId:state.launchId,generation:r.generation,
-    sessionFile:state.sessionFile,lastEntryId:state.lastEntryId,model:found.model,observedAt:r.observedAt,failures:r.failures},proof,row,found.agentDir,now);
+    sessionFile:state.sessionFile,lastEntryId:state.lastEntryId,model:found.model,thinkingLevel:r.thinkingLevel,observedAt:r.observedAt,failures:r.failures},proof,row,found.agentDir,now);
   if (!result.ok) throw Error(`Pi rotation proof held: ${result.hold}`);
   return {...found,usage:{sessionId:row.resumeToken!,transcriptPath:row.resumeToken!},runtimeContract:result.contract};
 }

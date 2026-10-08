@@ -50,7 +50,7 @@ describe("actual context refresh composition",()=>{
   deps.piState=async()=>({ready:true,launchId:launch,sessionFile:file,lastEntryId:leaf,model:{provider:"provider",id:"model",contextWindow:100},
    quiescence:{launchId:launch,generation:generation(),sessionFile:file,lastEntryId:leaf,settled:activity==="idle-at-prompt",observedAt:new Date(activityAt).toISOString()},
    rpcSessionFileProof:{launchId:launch,generation:generation(),childPid:22,sessionFile:file,responseId:"pi-runner-get-state",observedAt:new Date(activityAt).toISOString()},
-   runtimeReadiness:{launchId:launch,generation:generation(),sessionFile:file,model:{provider:"provider",id:"model",contextWindow:100},observedAt:new Date(activityAt).toISOString(),failures,
+   runtimeReadiness:{launchId:launch,generation:generation(),sessionFile:file,thinkingLevel:"high",model:{provider:"provider",id:"model",contextWindow:100},observedAt:new Date(activityAt).toISOString(),failures,
     ...(used===null?{}:{context:{source:"assistant_usage",usedTokens:used,remainingTokens:100-used,observedAt:new Date(activityAt).toISOString()}})}});
   vi.spyOn(piLaunch,"observePiRotationLaunch").mockImplementation(async input=>present?{generation:input.generation,launchId:launch,sessionFile:file,pid:22,startFingerprint:"kernel-fixture-start",trustFlag:"no-approve"}:null);
   deps.handoverFactory=({dispatchReservations})=>({handover:async(input:any)=>{
@@ -344,10 +344,10 @@ describe("actual context refresh composition",()=>{
   p.fail();expect((await integration.evaluate(operator,selection())).holds).toContain("runtime-not-ready");
   p.absent();expect((await integration.observe(operator,selection())).native.verified).toBe(false);
  });
- it("Pi canonical file and actual pinned settings are mandatory before freezing a checkpoint",async()=>{
+ it("Pi canonical file stays mandatory while defaults do not override native selection",async()=>{
   const p=piTarget();await boundGrant();
   writeFileSync(join(p.agent,"settings.json"),JSON.stringify({defaultProvider:"provider",defaultModel:"model",defaultThinkingLevel:"low"}));
-  expect((await integration.observe(operator,selection())).capability).toBe("unsupported");
+  expect((await integration.observe(operator,selection())).capability).toBe("pi-reserved-fresh");
   const link=join(dir,"aliased-pi.jsonl");symlinkSync(file,link);db.prepare("UPDATE sessions SET resume_token=? WHERE node_id=?").run(link,seat);
   await expect(piFacts.resolvePiRotationNativeState(deps,seat)).rejects.toThrow("canonical Pi");
   expect(db.prepare("SELECT count(*) n FROM context_refresh_attempts").get()).toEqual({n:0});

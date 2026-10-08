@@ -31,7 +31,7 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { formatDaemonHostForUrl } from "./daemon-url.js";
 import {
-  piSeatPaths, buildPiChildArgs, buildPiChildEnv, buildPendingRunnerState, parsePiRunnerState,
+  parsePiThinkingLevel, piSeatPaths, buildPiChildArgs, buildPiChildEnv, buildPendingRunnerState, parsePiRunnerState,
   PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, PI_RUNNER_ERROR_MARKER,
   type PiRunnerState, type RunnerRuntime, type PiQuiescenceEvidence,
   type PiRuntimeReadinessEvidence, type PiRuntimeFailureCode,
@@ -363,6 +363,7 @@ export class RunnerCore {
   private identityInFlight = false;
   private modelsFetched = false;
   private model: NativeModelWindow | null = null;
+  private thinkingLevel: string | null = null;
   private models: NativeModelWindow[] | null = null;
   private readinessObservedAt = "";
   private modelFailure?: { code: PiRuntimeFailureCode; observedAt: string };
@@ -591,6 +592,7 @@ export class RunnerCore {
       if (state.sessionFile !== request.sessionFile ||
         (state.sessionId !== undefined && state.sessionId !== request.sessionId)) return;
       this.observeNativeModel(state.model);
+      this.thinkingLevel = parsePiThinkingLevel(state.thinkingLevel);
       this.readinessObservedAt = this.io.now();
       this.recordRpcSessionFileProof(state.sessionFile as string, record.id as string);
       this.processing = piProcessing(state);
@@ -633,6 +635,7 @@ export class RunnerCore {
     }
     if (this.runtime === "pi" && record.id === CONTROL_STATE_ID) {
       this.observeNativeModel(record.success === true ? (record.data as Record<string, unknown> | undefined)?.model : null);
+      this.thinkingLevel = record.success === true && record.error == null ? parsePiThinkingLevel((record.data as Record<string, unknown> | undefined)?.thinkingLevel) : null;
       if (record.success === true && record.error == null) this.readinessObservedAt = this.io.now();
       this.invalidateRefresh();
       this.processing = record.success !== true || piProcessing((record.data ?? {}) as Record<string, unknown>);
@@ -690,6 +693,7 @@ export class RunnerCore {
       // Extract model window metadata from native get_state using shared parser.
       // Returns null for invalid/missing/NaN/Infinity/negative limits.
       this.observeNativeModel(data.model);
+      this.thinkingLevel = record.success === true && record.error == null ? parsePiThinkingLevel(data.thinkingLevel) : null;
       if (this.runtime === "pi" && record.success === true && record.error == null) {
         this.readinessObservedAt = this.io.now();
         if (sessionFile) this.recordRpcSessionFileProof(sessionFile, GET_STATE_ID);
@@ -771,6 +775,14 @@ export class RunnerCore {
   }
 
   private handleEvent(event: Record<string, unknown>): void {
+    if (this.runtime === "pi" && event.type === "thinking_level_changed") {
+      // An event is not a complete current-child selection proof. Invalidate
+      // until the next successful get_state supplies the effective level.
+      this.thinkingLevel = null;
+      this.writeSidecar({});
+    }
+
+
     if (this.runtime === "omp" && event.type === "extension_ui_request") {
       const method = event.method;
       // RPC does not mount an interactive UI. Reply at once; otherwise the
@@ -1008,6 +1020,7 @@ export class RunnerCore {
         generation: this.identity.generation,
         sessionFile: this.sessionFile,
         model: this.model,
+        thinkingLevel: this.thinkingLevel,
         observedAt: this.readinessObservedAt,
         failures: [this.modelFailure, this.compactionFailure].filter((f): f is NonNullable<typeof f> => !!f),
         ...(this.contextUsage ? { context: this.contextUsage } : {}),
@@ -1084,6 +1097,7 @@ interface RunnerArgs {
   cwd: string;
   launchId: string;
   model?: string;
+  thinkingLevel?: string;
   trust: "approve" | "no-approve";
   sessionFile?: string;
   forkRef?: string;
@@ -1110,6 +1124,12 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
       case "--cwd": args.cwd = next(); break;
       case "--launch-id": args.launchId = next(); break;
       case "--model": args.model = next(); break;
+      case "--thinking": {
+        const value = next();
+        if (!parsePiThinkingLevel(value)) throw new Error("Invalid Pi thinking level");
+        args.thinkingLevel = value;
+        break;
+      }
       case "--session": args.sessionFile = next(); break;
       case "--fork": args.forkRef = next(); break;
       case "--approve": args.trust = "approve"; break;
@@ -1128,6 +1148,7 @@ export function parseRunnerArgs(argv: string[]): RunnerArgs {
   if (!args.cwd) throw new Error("--cwd is required");
   if (!args.launchId) throw new Error("--launch-id is required (launch-attempt scoping)");
   if (args.runtime === "omp") {
+    if (args.thinkingLevel !== undefined) throw new Error("Pi thinking selection is not an OMP option");
     if (!argv.includes("--approval-mode") || argv.some((flag) => flag === "--approve" || flag === "--no-approve")) {
       throw new Error("OMP requires --approval-mode yolo or always-ask, not Pi trust flags");
     }
@@ -1284,6 +1305,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     sessionsDir: paths.sessionsDir,
     sessionName: args.sessionName,
     model: args.model,
+    thinkingLevel: args.thinkingLevel,
     trust: args.trust,
     sessionFile: args.sessionFile,
     forkRef: args.forkRef,

@@ -1,3 +1,4 @@
+import { piReservedLaunchSelection } from "./pi-rotation-native-proof.js";
 import { DeliveryGuardError } from "./seat-delivery-guard.js";
 import { SeatRuntimeMigration, parseRuntimeMigration, runtimeMigrationReservationId, RuntimeMigrationRefusal, type PreparedRuntimeMigration } from "./seat-runtime-migration.js";
 import type { SeatDispatchReservationService, DispatchReservation } from "./seat-dispatch-reservation.js";
@@ -496,6 +497,9 @@ export class SeatHandoverService {
       const effectivePosture=permissionOverride.launchPosture ?? successorPosture;
       assertRotationLaunchPosture(node.runtime, input.rotationExpected["runtimeContract"], effectivePosture);
     }
+    const successorSelection = node.runtime === "pi" && input.rotationExpected
+      ? piReservedLaunchSelection(input.rotationExpected["runtimeContract"])
+      : { model: node.model, effort: node.effort ?? undefined };
     // The successor must carry its own generation from its first byte. This reservation writes no
     // ledger row; commit consumes it, while every failed pre-commit branch remains unregistered.
     const occupantGeneration = this.sessionRegistry.reserveOccupantGeneration();
@@ -515,7 +519,7 @@ export class SeatHandoverService {
       // spec (else the running topology drifts from the founder-designed one at every handover).
       // A4-profile: likewise carry the codex config profile (adapter emits -p) — the restore path
       // already threads it; handover must too, or a profile-pinned codex seat reverts at handover.
-      node: { id: node.id, runtime: node.runtime, cwd: node.cwd, launchPosture: successorPosture, ...permissionOverride, model: node.model, effort: node.effort ?? undefined, codexConfigProfile: node.codex_config_profile ?? undefined },
+      node: { id: node.id, runtime: node.runtime, cwd: node.cwd, launchPosture: successorPosture, ...permissionOverride, ...successorSelection, codexConfigProfile: node.codex_config_profile ?? undefined },
       departingSessionName: latestSession.session_name,
       occupantGeneration,
       ...(input.preparedMigration ? { beforeLaunch: () => input.preparedMigration!.controller.project(input.preparedMigration!.value) } : {}),

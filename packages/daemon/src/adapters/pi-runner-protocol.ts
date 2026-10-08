@@ -115,11 +115,17 @@ export interface PiRunnerState {
 export type PiRuntimeFailureCode = "model_error" | "model_change_failed"
   | "compaction_failed" | "compaction_aborted" | "compaction_no_result";
 
+export function parsePiThinkingLevel(value: unknown): string | null {
+  return typeof value === "string" && ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value) ? value : null;
+}
+
 export interface PiRuntimeReadinessEvidence {
   launchId?: string;
   generation?: string;
   sessionFile?: string;
   model: NativeModelWindow | null;
+  /** Effective selection from this child's successful get_state; defaults/history are not evidence. */
+  thinkingLevel?: string | null;
   /** Last actual native observation; ordinary sidecar writes do not refresh it. */
   observedAt: string;
   /** At most one unresolved failure per model/compaction category. The original
@@ -300,6 +306,8 @@ export interface PiRunnerLaunchOpts {
   cwd: string;
   /** Optional `provider/id` model declaration (FR-7). */
   model?: string;
+  /** Explicit effective Pi thinking selection; never forwarded to OMP. */
+  thinkingLevel?: string;
   /** Explicit posture; OMP maps it to --approval-mode, Pi to resource trust. */
   trust: "approve" | "no-approve";
   /** Exact session file to resume (FR-6). Mutually exclusive with forkRef. */
@@ -316,7 +324,7 @@ export function buildPiRunnerCommand(opts: PiRunnerLaunchOpts): string {
   const literal = new Set([1, 3, 5, 7, 9]);
   if (opts.runtime === "omp") [10, 11, 12].forEach(i => literal.add(i));
   let next = opts.runtime === "omp" ? 13 : 10;
-  for (const present of [!!opts.model?.trim(), !!opts.sessionFile, !!opts.forkRef]) {
+  for (const present of [!!opts.model?.trim(), !!opts.thinkingLevel && opts.runtime !== "omp", !!opts.sessionFile, !!opts.forkRef]) {
     if (present) { literal.add(next); next += 2; }
   }
   return ["node", ...buildPiRunnerArgs(opts).map((arg, index) => literal.has(index) ? arg : shellQuote(arg))].join(" ");
@@ -336,6 +344,10 @@ export function buildPiRunnerArgs(opts: PiRunnerLaunchOpts): string[] {
   if (opts.model?.trim()) {
     parts.push("--model", opts.model.trim());
   }
+  if (opts.thinkingLevel !== undefined && opts.runtime !== "omp") {
+    if (!parsePiThinkingLevel(opts.thinkingLevel)) throw new Error("Invalid Pi thinking level");
+    parts.push("--thinking", opts.thinkingLevel);
+  }
   if (opts.sessionFile) {
     parts.push("--session", opts.sessionFile);
   }
@@ -352,6 +364,7 @@ export function buildPiChildArgs(opts: {
   sessionsDir: string;
   sessionName: string;
   model?: string;
+  thinkingLevel?: string;
   trust: "approve" | "no-approve";
   sessionFile?: string;
   forkRef?: string;
@@ -366,6 +379,10 @@ export function buildPiChildArgs(opts: {
   ];
   if (opts.model?.trim()) {
     args.push("--model", opts.model.trim());
+  }
+  if (opts.thinkingLevel !== undefined && opts.runtime !== "omp") {
+    if (!parsePiThinkingLevel(opts.thinkingLevel)) throw new Error("Invalid Pi thinking level");
+    args.push("--thinking", opts.thinkingLevel);
   }
   if (opts.sessionFile) {
     // Exact file resume — NEVER --resume (interactive picker; forbidden in

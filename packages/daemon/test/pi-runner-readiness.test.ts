@@ -33,7 +33,7 @@ function controlResponse(h: ReturnType<typeof harness>, command: string, success
 describe("native Pi readiness producer", () => {
   it("binds native observations to one launch and generation; pending reset carries no readiness", () => {
     const h = harness();
-    expect(h.evidence()).toEqual({ launchId: "launch", generation: "generation", sessionFile, model,
+    expect(h.evidence()).toEqual({ launchId: "launch", generation: "generation", sessionFile, model, thinkingLevel: null,
       observedAt: h.now(), failures: [] });
     expect(h.evidence().context).toBeUndefined();
     expect(buildPendingRunnerState("next", h.now(), h.latest()).runtimeReadiness).toBeUndefined();

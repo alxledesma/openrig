@@ -144,6 +144,7 @@ function sessionProofStateKey(state: PiRunnerState | null): string | null {
       launchId: state.runtimeReadiness.launchId, generation: state.runtimeReadiness.generation,
       sessionFile: state.runtimeReadiness.sessionFile, observedAt: state.runtimeReadiness.observedAt,
       failures: state.runtimeReadiness.failures,
+      model: state.runtimeReadiness.model, thinkingLevel: state.runtimeReadiness.thinkingLevel,
     } : null,
     quiescence: state.quiescence ? {
       launchId: state.quiescence.launchId, generation: state.quiescence.generation,

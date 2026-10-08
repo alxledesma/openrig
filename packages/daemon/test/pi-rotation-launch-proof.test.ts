@@ -29,7 +29,8 @@ const state: PiRunnerState = {
   },
   runtimeReadiness: {
     launchId: "launch-1", generation: input.generation, sessionFile: input.sessionFile,
-    model: null, observedAt: "2026-10-07T23:00:00.000Z", failures: [],
+    model: { provider: "provider", id: "model", contextWindow: 1000 }, thinkingLevel: "high",
+    observedAt: "2026-10-07T23:00:00.000Z", failures: [],
   },
   quiescence: {
     launchId: "launch-1", generation: input.generation, sessionFile: input.sessionFile,
@@ -81,6 +82,18 @@ describe("Pi rotation OS launch proof", () => {
     await expect(observePiRotationLaunch({ ...input, proof }, deps({ sidecar: async () => {
       read += 1;
       return read === 1 ? state : { ...state, lastEntryId: "entry-moved" };
+  } }))).resolves.toBeNull();
+  });
+
+  it.each([
+    ["model", { provider: "provider", id: "changed", contextWindow: 1000 }],
+    ["thinking level", "low"],
+  ])("holds when effective RPC %s changes during the OS observations", async (field, value) => {
+    let read = 0;
+    await expect(observePiRotationLaunch({ ...input, proof }, deps({ sidecar: async () => {
+      read += 1;
+      if (read === 1) return state;
+      return { ...state, runtimeReadiness: { ...state.runtimeReadiness!, [field === "model" ? "model" : "thinkingLevel"]: value } };
     } }))).resolves.toBeNull();
   });
 

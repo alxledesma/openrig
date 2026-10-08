@@ -1,3 +1,4 @@
+import { PeerServiceDispositionStore } from '../domain/peer-service-disposition.js';
 import { createOperatorMaintenanceAuthority, parseCodexStoppedRecovery, type CodexStoppedRecovery } from "../domain/codex-rehost.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import { SeatDispatchReservationService } from "../domain/seat-dispatch-reservation.js";
@@ -20,7 +21,7 @@ import { SeatSwitchClientService } from "../domain/seat-switch-client-service.js
 import { SeatLifecycleService, type SeatRefusal } from "../domain/seat-lifecycle-service.js";
 import { makePredecessorRecapResolver } from "../domain/predecessor-recap-resolver.js";
 import type { ContextUsageStore } from "../domain/context-usage-store.js";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { resolveAuthoredRecapPointer } from "../domain/context-packs/seat-recap-store.js";
@@ -445,6 +446,35 @@ seatRoutes.post("/operator-maintenance/rehost-runner",async c=>{
       ...(recovery?{codexStoppedRecovery:recovery}:{}),...(detachedResume?{codexDetachedResume:true,actorGeneration:target.occupant}:{})});
     return c.json(result,result.ok?200:seatLifecycleStatus(result.code));
   }catch{return c.json({ok:false,code:"operator_maintenance_binding_unproven"},409);}
+});
+
+/** One authenticated peer judgment, not a service lifecycle or authority grant. */
+seatRoutes.post("/peer-service-disposition/:seatRef",async c=>{
+  const token=c.get("terminalBearerToken" as never) as string|null;
+  if(!token)return c.json({ok:false,code:"peer_service_authenticated_control_required"},503);
+  const denied=await authBearerTokenMiddleware({expectedToken:token})(c,async()=>{});if(denied)return denied;
+  let address:string|undefined;try{address=getConnInfo(c).remote.address;}catch{}
+  if(c.req.header("Origin")||!isRotationLoopback(address))return c.json({ok:false,code:"peer_service_local_only"},403);
+  const body=await c.req.json<Record<string,unknown>>();
+  if(Object.keys(body).sort().join(',')!==['pid','purpose','evidencePath','evidenceSha256','approvedArtifactSha256'].sort().join(',')
+    ||!Number.isSafeInteger(body.pid)||(body.pid as number)<=1||typeof body.purpose!=="string"||!body.purpose.trim()||body.purpose.length>4096
+    ||typeof body.evidencePath!=="string"||!path.isAbsolute(body.evidencePath)||path.normalize(body.evidencePath)!==body.evidencePath||/[\x00-\x1f]/.test(body.evidencePath)
+    ||![body.evidenceSha256,body.approvedArtifactSha256].every(v=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v)))return c.json({ok:false,code:"peer_service_request_invalid"},400);
+  const guard=(c.get("tmuxAdapter" as never) as TmuxAdapter|undefined)?.deliveryGuard;
+  const actor=transportSenderSession(c),generation=c.req.header("X-OpenRig-Occupant-Generation");
+  try{
+    if(!guard)throw new Error('peer-service-guard-unavailable');
+    const target=guard.target(decodeURIComponent(c.req.param("seatRef"))),operator=guard.target("operator-agent@kernel");
+    const authorize=()=>{
+      const now=guard.target(target.nodeId),op=guard.target(operator.nodeId);
+      const session=guard.db.prepare('SELECT status,startup_status FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1').get(op.nodeId) as {status:string;startup_status:string}|undefined;
+      if(actor!=="operator-agent@kernel"||!generation||generation!==op.occupant||op.session!==actor||c.req.header("X-OpenRig-Origin-Unknown")==="true"||op.nodeId===now.nodeId
+        ||now.session!==target.session||now.occupant!==target.occupant||op.occupant!==operator.occupant||session?.status!=="running"||session.startup_status!=="ready")throw new Error('peer-service-current-peer-operator-required');
+    };
+    const home=realpathSync(OPENRIG_HOME);
+    const record=await new PeerServiceDispositionStore(home).record({nodeId:target.nodeId,sessionName:target.session,actor:"operator-agent@kernel",actorGeneration:generation??'',pid:body.pid as number,purpose:body.purpose as string,evidencePath:body.evidencePath as string,evidenceSha256:body.evidenceSha256 as string,approvedArtifactSha256:body.approvedArtifactSha256 as string},authorize);
+    return c.json({ok:true,disposition:record});
+  }catch{return c.json({ok:false,code:"peer_service_disposition_refused"},409);}
 });
 
 seatRoutes.post("/rehost-runner/:seatRef", async c => {
