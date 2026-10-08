@@ -10,6 +10,19 @@ export interface RotationFacts {
   observedAt: number;
   checkpointHash: string | null;
 }
+/** Preserve the actual runtime's permission contract at the fresh launch edge. */
+export function assertRotationLaunchPosture(runtime: string | null, value: unknown, posture: string): void {
+  const contract = value as { runtime?: string; trust?: string; permissions?: { sandbox?: { type?: string }; approval?: string } } | null;
+  let preserved = false;
+  if (runtime === "pi" && contract?.runtime === "pi") {
+    preserved = (posture === "full_bypass" && contract.trust === "approve")
+      || (posture === "floor" && contract.trust === "no-approve");
+  } else if (runtime === "codex" && contract?.runtime === "codex") {
+    preserved = (posture === "full_bypass" && contract.permissions?.sandbox?.type === "danger-full-access" && contract.permissions.approval === "never")
+      || (posture === "floor" && contract.permissions?.sandbox?.type === "workspace-write");
+  }
+  if (!preserved) throw new RotationPreconditionRefusal("Successor launch posture would change native permissions; no process replaced.");
+}
 export function assertRotationPrecondition(expected: Record<string, unknown>, actual: RotationFacts, now = Date.now()): void {
   if (expected.protocol !== "generation-queue-runtime-idle-v1") throw new Error("Unsupported rotation protocol");
   if (!actual.generation || actual.generation !== expected.generation) throw new Error("Rotation native generation changed or unavailable");

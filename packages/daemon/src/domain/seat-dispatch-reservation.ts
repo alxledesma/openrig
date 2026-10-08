@@ -1,7 +1,8 @@
+import { piLaunchConfigurationDigest, piSuccessorMatches, type PiRotationContract } from "./pi-rotation-native-proof.js";
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { readFileSync } from "node:fs";
+import { readFileSync, lstatSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 import { SeatDeliveryGuard, resolveGuardTarget } from "./seat-delivery-guard.js";
@@ -36,6 +37,8 @@ export interface ReservationDeps {
   db: Database.Database; guard: SeatDeliveryGuard;
   verifyPredecessor: (seat: string, expected: Record<string, unknown>) => Promise<void>;
   observeSuccessor: (seat: string) => Promise<ReservationNativeState>;
+  /** Daemon-owned Pi path resolver; API expected bodies cannot select launch files. */
+  piAgentDir?: (session: string, nodeId: string) => string;
   censusFailedAttempt?: (reservation: DispatchReservation, effects: AttemptEffects) => Promise<{remainingPids:number[];observedAt:string}>;
   historicalFailure?: (reference: string, sha256: string, reservation: DispatchReservation) => HistoricalFailureProof;
 }
@@ -61,7 +64,12 @@ export class SeatDispatchReservationService {
     return target;
   }
   private profileHash(nodeId: string): string {
-    const n = this.deps.db.prepare("SELECT codex_config_profile FROM nodes WHERE id=?").get(nodeId) as { codex_config_profile: string | null } | undefined;
+    const n = this.deps.db.prepare("SELECT runtime,codex_config_profile FROM nodes WHERE id=?").get(nodeId) as { runtime: string | null; codex_config_profile: string | null } | undefined;
+    if (n?.runtime === "pi") {
+      if (!this.deps.piAgentDir) this.fail("reservation_profile_unknown", "Managed Pi launch configuration resolver required");
+      try { return piLaunchConfigurationDigest(this.deps.piAgentDir!(this.deps.guard.target(nodeId).session, nodeId)); }
+      catch { return this.fail("reservation_profile_unknown", "Exact managed Pi launch configuration unavailable"); }
+    }
     if (!n?.codex_config_profile || !/^[a-zA-Z0-9_-]+$/.test(n.codex_config_profile)) this.fail("reservation_profile_unknown", "Exact named Codex profile required");
     try { return createHash("sha256").update(readFileSync(resolve(process.env["CODEX_HOME"] ?? resolve(homedir(), ".codex"), `${n.codex_config_profile}.config.toml`))).digest("hex"); }
     catch { return this.fail("reservation_profile_unknown", "Named profile bytes unavailable"); }
@@ -294,10 +302,82 @@ export class SeatDispatchReservationService {
     for (const performer of performers) actors.add(performer.actor_session);
     return actors;
   }
-  private async verifySuccessor(r: DispatchReservation) {
+  private successorContractMatches(r: DispatchReservation, actual: unknown): boolean {
+    const expected = JSON.parse(r.expected_json)["runtimeContract"] as {runtime?:string};
+    if (expected?.runtime !== "pi") return canonical(actual) === canonical(expected);
+    try {
+      const old = expected as PiRotationContract, next = actual as PiRotationContract;
+      const retained = lstatSync(old.sessionFile);
+      return retained.isFile() && !retained.isSymbolicLink() && realpathSync(old.sessionFile) === old.sessionFile
+        && !!r.successor_generation && next?.sessionFile === r.successor_native_id
+        && piSuccessorMatches(old, next, r.successor_generation)
+        && createHash("sha256").update(readFileSync(old.sessionFile)).digest("hex") === old.sessionSha256;
+    } catch { return false; }
+  }
+  private async verifySuccessor(r: DispatchReservation, allowReleasedAccepted = false) {
+    const acceptedRelease = allowReleasedAccepted && r.state === "released" && this.releasedMode(r) === "accepted_successor";
+    if (r.state !== "committed" && !acceptedRelease) this.fail("reservation_successor_mismatch", "Current fresh successor/config/queue continuity proof unavailable; fence retained");
     const target = this.deps.guard.target(r.node_id), native = await this.deps.observeSuccessor(r.session_name);
-    if (r.state !== "committed" || !r.successor_generation || target.occupant !== r.successor_generation || !native.nativeId || native.nativeId === r.predecessor_native_id || (r.successor_native_id && r.successor_native_id !== native.nativeId) || canonical(native.runtimeContract) !== canonical(JSON.parse(r.expected_json)["runtimeContract"]) || !this.committedSnapshotMatches(r)) this.fail("reservation_successor_mismatch", "Current fresh successor/config/queue continuity proof unavailable; fence retained");
+    if (!r.successor_generation || target.occupant !== r.successor_generation || !native.nativeId || native.nativeId === r.predecessor_native_id || (r.successor_native_id && r.successor_native_id !== native.nativeId) || !this.successorContractMatches(r, native.runtimeContract) || !this.committedSnapshotMatches(r)) this.fail("reservation_successor_mismatch", "Current fresh successor/config/queue continuity proof unavailable; fence retained");
     return native;
+  }
+  /** Verify the immutable release receipt before treating a released row as accepted evidence. */
+  private releasedMode(r: DispatchReservation): string | null {
+    if (r.state !== "released" || !r.release_receipt) return null;
+    const row = this.deps.db.prepare("SELECT actor_session,actor_generation,evidence_json FROM seat_dispatch_reservation_audit WHERE reservation_id=? AND action='released' ORDER BY id DESC LIMIT 1")
+      .get(r.reservation_id) as { actor_session: string; actor_generation: string; evidence_json: string } | undefined;
+    if (!row) return null;
+    try {
+      const evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
+      const mode = evidence.mode;
+      if (evidence.operationId !== r.operation_id || typeof evidence.reason !== "string" || !evidence.reason.trim() || evidence.deliveryOrQualificationCredit !== false) return null;
+      const input: Record<string, unknown> = { operationId: evidence.operationId, reason: evidence.reason, mode };
+      for (const key of ["historicalProofRef", "historicalProofSha256"]) if (evidence[key] !== undefined) input[key] = evidence[key];
+      if (digest({ actor: row.actor_session, generation: row.actor_generation, input }) !== r.release_receipt) return null;
+      if (mode === "accepted_successor" && row.actor_session !== "operator-agent@kernel") return null;
+      if (mode === "cancel_before_replacement" && row.actor_session !== "operator-agent@kernel" && (row.actor_session !== r.actor_session || row.actor_generation !== r.actor_generation)) return null;
+      if (mode === "abandon_failed_precommit" && row.actor_session !== "operator-agent@kernel") return null;
+      return typeof mode === "string" ? mode : null;
+    } catch { return null; }
+  }
+  private precommitSnapshotMatches(r: DispatchReservation): boolean {
+    try {
+      const target = this.deps.guard.target(r.node_id);
+      const table = this.deps.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='seat_dispatch_claim_releases'").get();
+      if (!table || this.deps.db.prepare("SELECT 1 FROM seat_dispatch_claim_releases WHERE reservation_id=? LIMIT 1").get(r.reservation_id)) return false;
+      return target.session === r.session_name && target.occupant === r.predecessor_generation
+        && r.successor_generation === null && r.successor_native_id === null
+        && this.snapshot(r.node_id, r.session_name, r.frozen_snapshot) === r.frozen_snapshot;
+    } catch { return false; }
+  }
+  /** Read-only evidence inspection. Call under the exact target lifecycle lease;
+   * started attempts additionally require this service's existing attempt lock. */
+  async inspectEvidence(id: string): Promise<{ reservation: DispatchReservation; successorVerified: boolean; custodyVerified: boolean }> {
+    const r = this.get(id);
+    if (!this.deps.guard.ownsLifecycle(r.node_id)) this.fail("reservation_lifecycle_required", "Exact target lifecycle lease required for reservation evidence inspection");
+    if (r.state === "started" && !this.ownsAttemptLock(id)) this.fail("reservation_attempt_lock_required", "Started reservation evidence requires the exact attempt lock");
+    let custodyVerified = false, successorVerified = false;
+    if (r.state === "reserved" || r.state === "started") {
+      custodyVerified = this.precommitSnapshotMatches(r);
+    } else if (r.state === "committed") {
+      try { custodyVerified = this.committedSnapshotMatches(r); } catch { custodyVerified = false; }
+      if (custodyVerified) {
+        try { await this.verifySuccessor(r); successorVerified = true; } catch { successorVerified = false; }
+      }
+    } else if (r.state === "released") {
+      const mode = this.releasedMode(r);
+      if (mode === "accepted_successor") {
+        try { custodyVerified = this.committedSnapshotMatches(r); } catch { custodyVerified = false; }
+        if (custodyVerified) {
+          try { await this.verifySuccessor(r, true); successorVerified = true; } catch { successorVerified = false; }
+        }
+      } else if (mode === "cancel_before_replacement" || mode === "abandon_failed_precommit") {
+        custodyVerified = this.precommitSnapshotMatches(r);
+      }
+    }
+    const current = this.get(id);
+    if (canonical(current) !== canonical(r)) this.fail("reservation_state_changed", "Reservation changed during read-only evidence inspection");
+    return { reservation: current, successorVerified, custodyVerified };
   }
   async attest(actor: string, generation: string, id: string, input: { operationId: string; checkpointHash: string; kind: "successor_ack" | "independent_acceptance"; evidenceRef: string }): Promise<DispatchReservation> {
     const r = this.get(id), caller = this.actor(actor, generation);

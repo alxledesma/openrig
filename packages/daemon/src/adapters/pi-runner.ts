@@ -282,6 +282,8 @@ export interface RunnerIo {
   postActivity(payload: Record<string, unknown>): void | Promise<Record<string, unknown> | null>;
   /** Persist the runner-state sidecar. */
   writeSidecar(state: PiRunnerState): void;
+  /** Current spawned RPC child's PID, used only to bind successful get_state provenance. */
+  currentChildPid?(): number | undefined;
   /** OMP can announce a path before a session file exists. */
   sessionFileExists?(path: string): boolean;
   /** Terminate OMP when get_state cannot establish a resumable seat. */
@@ -323,6 +325,7 @@ export class RunnerCore {
   private controlPending = false;
   private sessionFile: string | undefined;
   private sessionId: string | undefined;
+  private rpcSessionFileProof: PiRunnerState["rpcSessionFileProof"];
   private lastEntryId: string | undefined;
   private ready = false;
   private assistantErrorShown = false;
@@ -369,7 +372,7 @@ export class RunnerCore {
 
   constructor(
     private io: RunnerIo,
-    private identity: { sessionName: string; nodeId?: string; launchId?: string; generation?: string },
+    private identity: { sessionName: string; nodeId?: string; launchId?: string; generation?: string; childPid?: number },
     private opts: { catchUpSince?: string; runtime?: RunnerRuntime } = {},
   ) {
     // The durable cursor seeds from the carried-over value (FR-5) so this
@@ -447,6 +450,23 @@ export class RunnerCore {
 
   private get runtime(): RunnerRuntime { return this.opts.runtime ?? "pi"; }
 
+  private recordRpcSessionFileProof(sessionFile: string, responseId: string): void {
+    const childPid = this.io.currentChildPid?.();
+    if (!this.identity.launchId || !this.identity.generation || typeof childPid !== "number"
+      || !Number.isSafeInteger(childPid) || childPid !== this.identity.childPid) {
+      this.rpcSessionFileProof = undefined;
+      return;
+    }
+    this.rpcSessionFileProof = {
+      launchId: this.identity.launchId,
+      generation: this.identity.generation,
+      childPid,
+      sessionFile,
+      responseId,
+      observedAt: this.io.now(),
+    };
+  }
+
   /** One aggregated paste block from pane stdin. */
   handleUserBlock(block: string): void {
     const isPi = this.runtime === "pi";
@@ -510,6 +530,7 @@ export class RunnerCore {
   /** Child process exit — honest, loud, durable. */
   handlePiExit(code: number | null): void {
     this.ready = false;
+    this.rpcSessionFileProof = undefined;
     this.invalidateRefresh();
     // Runtime-aware exit marker (upstream). An exited seat is honestly
     // non-running: never a settled one (fork), and the projection is written
@@ -526,6 +547,11 @@ export class RunnerCore {
   }
 
   private handleResponse(record: Record<string, unknown>): void {
+    // A response can only prove this launch's current child. Drop the prior
+    // witness before handling any new startup get_state result so a failure,
+    // malformed response, or late response from a replaced child cannot retain
+    // stale session-file provenance.
+    if (record.id === GET_STATE_ID) this.rpcSessionFileProof = undefined;
     if (this.runtime === "pi" && typeof record.id === "string" &&
       (record.id === QUIESCENCE_REFRESH_ID || record.id.startsWith(`${QUIESCENCE_REFRESH_ID}-`))) {
       const request = this.pendingRefresh;
@@ -544,6 +570,7 @@ export class RunnerCore {
         (state.sessionId !== undefined && state.sessionId !== request.sessionId)) return;
       this.observeNativeModel(state.model);
       this.readinessObservedAt = this.io.now();
+      this.recordRpcSessionFileProof(state.sessionFile as string, record.id as string);
       this.processing = piProcessing(state);
       this.settledProven = !this.processing;
       this.writeQuiescence();
@@ -641,7 +668,10 @@ export class RunnerCore {
       // Extract model window metadata from native get_state using shared parser.
       // Returns null for invalid/missing/NaN/Infinity/negative limits.
       this.observeNativeModel(data.model);
-      if (this.runtime === "pi" && record.success === true) this.readinessObservedAt = this.io.now();
+      if (this.runtime === "pi" && record.success === true && record.error == null) {
+        this.readinessObservedAt = this.io.now();
+        if (sessionFile) this.recordRpcSessionFileProof(sessionFile, GET_STATE_ID);
+      }
       // Fork quiescence settlement, scoped to Pi ONLY: OMP publishes no native
       // quiescence evidence and must never be read as Pi-proven idle.
       if (this.runtime === "pi") {
@@ -940,6 +970,7 @@ export class RunnerCore {
       launchId: this.identity.launchId,
       sessionFile: this.sessionFile,
       sessionId: this.sessionId,
+      ...(this.rpcSessionFileProof ? { rpcSessionFileProof: this.rpcSessionFileProof } : {}),
       lastEntryId: this.lastEntryId,
       updatedAt: this.io.now(),
       ...patch,
@@ -1305,6 +1336,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         fs.writeFileSync(paths.runnerStatePath, JSON.stringify(state));
       } catch { /* best-effort; adapter falls back to pane markers */ }
     },
+    currentChildPid: () => child.pid,
     now: () => new Date().toISOString(),
     stopChild: () => { child.kill(); },
     sessionFileExists: (path) => fs.existsSync(path),
@@ -1312,6 +1344,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   const core = new RunnerCore(io, {
     sessionName: args.sessionName, nodeId: process.env.OPENRIG_NODE_ID, launchId: args.launchId,
+    childPid: child.pid,
     // Carry the emitting tenure; never infer it from a later daemon read or Pi event.
     generation: process.env.OPENRIG_OCCUPANT_GENERATION,
   }, { catchUpSince, runtime });

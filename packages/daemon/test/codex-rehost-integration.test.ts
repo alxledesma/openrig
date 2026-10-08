@@ -108,4 +108,17 @@ describe("S6 inherited native effort production preflight", () => {
     });
     await expect(preflight()).rejects.toThrow("Codex profile changed during preflight");
   });
+  it("managed handover may retain predecessor generation/runtime in tmux", async () => {
+    const getEnv = vi.mocked(factory.deps.tmux.getSessionEnv);
+    getEnv.mockImplementation(async (_seat, key) => ({
+      OPENRIG_NODE_ID: binding.nodeId, OPENRIG_SESSION_NAME: binding.sessionName,
+      OPENRIG_OCCUPANT_GENERATION: "predecessor-generation", OPENRIG_RUNTIME: "pi",
+    } as Record<string, string>)[key]);
+    expect(await preflight()).toMatchObject({ posture: "full_bypass", effective: { effort: "medium" } });
+    expect(getEnv.mock.calls.map(call => call[1])).toEqual(["OPENRIG_NODE_ID", "OPENRIG_SESSION_NAME"]);
+  });
+  it("still refuses a different inherited stable node/session address", async () => {
+    vi.mocked(factory.deps.tmux.getSessionEnv).mockResolvedValue("another-seat");
+    await expect(preflight()).rejects.toThrow("Codex rehost native launch environment mismatch");
+  });
 });

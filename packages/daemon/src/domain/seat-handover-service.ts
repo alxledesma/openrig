@@ -1,7 +1,7 @@
 import { DeliveryGuardError } from "./seat-delivery-guard.js";
 import { SeatRuntimeMigration, parseRuntimeMigration, runtimeMigrationReservationId, RuntimeMigrationRefusal, type PreparedRuntimeMigration } from "./seat-runtime-migration.js";
 import type { SeatDispatchReservationService, DispatchReservation } from "./seat-dispatch-reservation.js";
-import { RotationPreconditionRefusal } from "./rotation-precondition.js";
+import { RotationPreconditionRefusal, assertRotationLaunchPosture } from "./rotation-precondition.js";
 import type Database from "better-sqlite3";
 import { NativePermissionStore } from "./native-permission-store.js";
 import { permissionBindingOverride } from "./native-permission-selection.js";
@@ -493,11 +493,8 @@ export class SeatHandoverService {
     } catch (error) { return { ok: false, code: "successor_create_failed", message: `Permission selection: ${(error as Error).message}`,
       guidance: "No successor was created. Inspect the seat permission selection before a separately authorized retry." }; }
     if (input.rotationExpected) {
-      const contract=input.rotationExpected["runtimeContract"] as {permissions?:{sandbox?:{type?:string};approval?:string}}|undefined;
       const effectivePosture=permissionOverride.launchPosture ?? successorPosture;
-      const nativeSandbox=contract?.permissions?.sandbox?.type;
-      if ((effectivePosture==="full_bypass" && (nativeSandbox!=="danger-full-access" || contract?.permissions?.approval!=="never")) ||
-          (effectivePosture==="floor" && nativeSandbox!=="workspace-write")) throw new RotationPreconditionRefusal("Successor launch posture would change native permissions; no process replaced.");
+      assertRotationLaunchPosture(node.runtime, input.rotationExpected["runtimeContract"], effectivePosture);
     }
     // The successor must carry its own generation from its first byte. This reservation writes no
     // ledger row; commit consumes it, while every failed pre-commit branch remains unregistered.

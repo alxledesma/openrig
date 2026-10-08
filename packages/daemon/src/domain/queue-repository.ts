@@ -1,3 +1,6 @@
+import { contextRefreshDigest, type ContextRefreshCheckpointRequest } from "./context-refresh-service.js";
+import type { ContextRefreshGrant } from "./context-refresh-contract.js";
+import { contextRefreshCheckpointInstructions } from "./context-refresh-checkpoint-instructions.js";
 import {administrativeCliEvidence} from './administrative-cli-evidence.js';
 import type { SeatDeliveryGuard } from './seat-delivery-guard.js';
 import { CoordinatorAuthorityService, CoordinatorFenceError, AssignmentReplay, type DispatchEnvelope } from "./coordinator-authority-service.js";
@@ -680,6 +683,7 @@ export interface QueueDestinationAdvisory {
 }
 
 export class QueueRepository {
+  private readonly contextRefreshDuties=new WeakSet<QueueCreateInput>();
   private readonly recipientAckDuties=new WeakSet<QueueCreateInput>();
   private readonly nativeTerminalReturnControls=new WeakSet<QueueCreateInput>();
   private readonly outboxAbandonAuthorizations=new WeakSet<QueueCreateInput>();
@@ -1913,6 +1917,47 @@ export class QueueRepository {
     }).immediate());
     if(created)this.eventBus.notifySubscribers(created);await this.drainPendingWakeIntents();return result;
   }
+  /** Fixed administrative preparation only. An ordinary queue body cannot obtain
+   * this object-identity capability; all authority comes from the begun CR1 ledger. */
+  async createContextRefreshCheckpoint(operationId: string) {
+    let persistedEvent: PersistedEvent | undefined;
+    const result = this.db.transaction(() => {
+      const row = this.db.prepare("SELECT request_json,request_digest,phase,grant_id FROM context_refresh_checkpoint_requests WHERE operation_id=?").get(operationId) as {request_json:string;request_digest:string;phase:string;grant_id:string}|undefined;
+      const saved = row && this.db.prepare("SELECT grant_json,revoked_at FROM context_refresh_grants WHERE grant_id=?").get(row.grant_id) as {grant_json:string;revoked_at:number|null}|undefined;
+      const fail = (): never => { throw new QueueRepositoryError("context_refresh_checkpoint_forbidden", "Exact live begun administrative checkpoint request required"); };
+      if (!row || !saved || row.phase !== "effect-in-flight") return fail();
+      const request = JSON.parse(row.request_json) as ContextRefreshCheckpointRequest;
+      const grant = JSON.parse(saved.grant_json) as ContextRefreshGrant;
+      const instructions = contextRefreshCheckpointInstructions({ grantId: grant.grantId,
+        nodeId: request.target.nodeId, generation: request.target.generation });
+      const body = instructions.body;
+      if (saved.revoked_at !== null || grant.validUntil <= Date.now() || grant.kind !== "context-refresh"
+        || contextRefreshDigest(request) !== row.request_digest || request.operationId !== operationId || request.grantId !== grant.grantId
+        || request.body !== body || request.qitemId !== instructions.qitemId
+        || request.actor.session !== grant.executor.session || request.actor.generation !== grant.executor.generation
+        || request.actor.session !== "operator-agent@kernel" || request.target.nodeId === grant.executor.nodeId
+        || !grant.targets.some(target => contextRefreshDigest(target) === contextRefreshDigest(request.target))) return fail();
+      this.coordinatorAuthority.assertCurrentOperator(request.actor.session, request.actor.generation);
+      const target = this.db.prepare("SELECT s.session_name,s.resume_token,n.runtime FROM sessions s JOIN nodes n ON n.id=s.node_id WHERE n.id=? ORDER BY s.id DESC LIMIT 1").get(request.target.nodeId) as {session_name:string;resume_token:string;runtime:string}|undefined;
+      if (!target || target.session_name !== request.target.sessionName || target.resume_token !== request.target.nativeId || target.runtime !== request.target.runtime
+        || this.coordinatorAuthority.generation(request.target.sessionName) !== request.target.generation || !this.validateRig(request.target.sessionName)
+        || this.coordinatorAuthority.coordinationRecovery?.configurationDigest(request.target.sessionName) !== request.target.configurationDigest) return fail();
+      // A retained existing queue row is not an invitation to send another wake.
+      if (this.getById(request.qitemId)) return fail();
+      const input: QueueCreateInput = {qitemId:request.qitemId,sourceSession:request.actor.session,destinationSession:request.target.sessionName,
+        body,expiresAt:new Date(grant.validUntil).toISOString(),identityProvenance:"transport:v1",nudge:false,
+        tags:["context-refresh:checkpoint",`queue:recipient-generation:${request.target.generation}`]};
+      this.contextRefreshDuties.add(input);
+      try { persistedEvent = this.createWithinTransaction(input).persistedEvent; }
+      finally { this.contextRefreshDuties.delete(input); }
+      return this.getByIdOrThrow(request.qitemId);
+    }).immediate();
+    if (persistedEvent) this.eventBus.notifySubscribers(persistedEvent);
+    // Use the existing guarded queue wake, never direct harness input.
+    await this.maybeNudge(result.qitemId, result.destinationSession, undefined, result.sourceSession);
+    return result;
+  }
+
   createNativeTerminalReturnDuty(actor:string,generation:string,rigId:string,input:QueueCreateInput) {
     if(!input.qitemId||input.sourceSession!=='watchdog@system'||input.identityProvenance!=='system:operator-authorized-coordination'||input.expiresAt!==new Date(JSON.parse(input.body).deadline).toISOString())throw new QueueRepositoryError('invalid_terminal_return_control','Exact internal finite completion control required');
     this.coordinatorAuthority.registerNativeTerminalReturnControl(actor,generation,rigId,input.qitemId,input.body);
@@ -2008,7 +2053,7 @@ export class QueueRepository {
       humanQuestions = parsed.questions;
     }
     const id = input.qitemId ?? newQitemId();
-    if(!this.recipientAckDuties.has(input)&&!this.nativeTerminalReturnControls.has(input)&&!this.outboxAbandonAuthorizations.has(input)&&!this.qualificationAssessmentDuties.has(input)&&!this.qualificationAssessmentRetirementDuties.has(input))this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
+    if(!this.contextRefreshDuties.has(input)&&!this.recipientAckDuties.has(input)&&!this.nativeTerminalReturnControls.has(input)&&!this.outboxAbandonAuthorizations.has(input)&&!this.qualificationAssessmentDuties.has(input)&&!this.qualificationAssessmentRetirementDuties.has(input))this.coordinatorAuthority.reserve(input.sourceSession, input.destinationSession, input.body, id, input.dispatch);
     const ts = new Date().toISOString();
     const priority = input.priority ?? "routine";
     const tier = input.tier ?? null;

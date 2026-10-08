@@ -1,6 +1,7 @@
 import { dispatchReservationRoutes } from "./routes/dispatch-reservation.js";
 import { coordinatorRoutes } from "./routes/coordinator.js";
 import { nativeDutySupervisionRoutes } from "./routes/native-duty-supervision.js";
+import { contextRefreshRoutes } from "./routes/context-refresh.js";
 import { healthDiagnosisRoutes } from "./routes/health-diagnosis.js";
 import type { HealthDiagnosisService } from "./domain/health-diagnosis.js";
 import type { HealthPolicyStore } from "./domain/health-policy.js";
@@ -149,6 +150,7 @@ import { browserBoundary, type BrowserBoundaryOptions } from "./middleware/brows
 
 export interface AppDeps {
   nativeDuty?: import("./domain/native-duty-integration.js").NativeDutyIntegration;
+  contextRefresh?: import("./domain/context-refresh-integration.js").ContextRefreshFacade;
   proofSourceWatch?: import("./domain/proof/source-watch.js").ProofSourceWatch;
   /** S20 — effective bind plan for the health surface (absent = legacy body). */
   bindPlan?: { mode: "explicit" | "default"; hosts: string[]; tailscaleDetected: boolean; ignoredRoutingHost?: string };
@@ -798,6 +800,9 @@ export function createApp(deps: AppDeps): Hono {
     bearerToken: deps.terminalBearerToken ?? null, service: deps.nativeDuty.service,
     refreshNative: (actor, input) => deps.nativeDuty!.refreshNative(actor, input),
     enrollment: (actor, input) => deps.nativeDuty!.enrollment(actor, input),
+  }));
+  if (deps.contextRefresh) app.route("/api/context-refresh", contextRefreshRoutes({
+    bearerToken: deps.terminalBearerToken ?? null, service: deps.contextRefresh,
   }));
   app.route("/api/workspace", workspaceRoutes());
   app.route("/api/projects", projectsRoutes());

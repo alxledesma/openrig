@@ -82,9 +82,12 @@ export function createCodexRehostIntegration(deps: {
       const daemon = await deps.detectDaemonSupport(binding.cwd);
       if (daemon.kind !== "supported") throw new Error("Supervised Codex rehost requires proven --no-daemon support");
       const harness = structuredNativeExecutable("codex", [], deps.launchPath, binding.cwd);
-      // Neither the pane nor an API caller supplies the successor identity.
+      // tmux retains the predecessor's generation/runtime after a managed
+      // handover. Structured launch overrides those from the proven binding;
+      // only the stable node/session address is inherited from tmux. The rehost
+      // service separately proves current native kernel identity before effects.
       for (const [key, expected] of Object.entries({ OPENRIG_NODE_ID: binding.nodeId,
-        OPENRIG_SESSION_NAME: binding.sessionName, OPENRIG_OCCUPANT_GENERATION: binding.generation, OPENRIG_RUNTIME: "codex" })) {
+        OPENRIG_SESSION_NAME: binding.sessionName })) {
         if (await deps.tmux.getSessionEnv(binding.sessionName, key) !== expected) throw new Error("Codex rehost native launch environment mismatch");
       }
       return { posture, effective: verified.effective, evidenceDigest: createHash("sha256").update(JSON.stringify({

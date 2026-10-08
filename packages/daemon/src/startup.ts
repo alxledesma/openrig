@@ -2,6 +2,12 @@ import { assessPiDispatchReadiness } from "./domain/dispatch-runtime-readiness.j
 import { NativeDutyIntegration } from "./domain/native-duty-integration.js";
 import { NativeDutyLaunchStore, observeNativeDutyLaunch } from "./domain/native-duty-launch.js";
 import { createCodexRehostIntegration } from "./domain/codex-rehost-integration.js";
+import { createContextRefreshIntegration } from "./domain/context-refresh-integration.js";
+import { SeatHandoverService } from "./domain/seat-handover-service.js";
+import { piSeatPaths, parsePiRunnerState } from "./adapters/pi-runner-protocol.js";
+import { makePredecessorRecapResolver } from "./domain/predecessor-recap-resolver.js";
+import { resolveAuthoredRecapPointer } from "./domain/context-packs/seat-recap-store.js";
+import { buildRebuildPrimingChain } from "./domain/rebuild-priming-chain.js";
 import {makeResilienceRolloutPolicy} from './domain/policies/resilience-rollout.js';
 import {ResilienceRolloutService} from './domain/resilience-rollout-service.js';
 import {RuntimeOutcomeAssessment} from "./domain/runtime-outcome-assessment.js";
@@ -2516,6 +2522,48 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // (e/Class-B) queue store — in-progress items claimed by the retiring generation release to pending.
     queue: queueRepoInstance,
     log: (msg) => console.warn(msg),
+  });
+
+  // A separate finite grant controls refresh. This does not start the legacy
+  // rotation scheduler or grant effect authority to holder-continuation scopes.
+  if (nativeDutyStore && terminalBearerToken) deps.contextRefresh = createContextRefreshIntegration({
+    db, queue: queueRepoInstance, guard: deliveryGuard, tmux: tmuxAdapter,
+    whoami: whoamiService, activity: seatActivityService, store: nativeDutyStore,
+    rotationRoot: nodePath.join(OPENRIG_HOME, "state", "context-refresh"),
+    piRotation: { agentDir: session => piSeatPaths(piStateRoot, session).agentDir, runnerEntryPath: piRunnerEntryPath },
+    configurationDigest: session => queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(session),
+    piState: async session => {
+      try { return parsePiRunnerState(fs.readFileSync(piSeatPaths(piStateRoot, session).runnerStatePath, "utf8")); }
+      catch { return null; }
+    },
+    piProof: async (session, generation) => {
+      const proof = await piNativeProver(session);
+      return proof?.generation === generation ? proof : null;
+    },
+    handoverFactory: controls => new SeatHandoverService({
+      ...controls, db, rigRepo, sessionRegistry, discoveryRepo, eventBus, tmuxAdapter,
+      sessionEnv: launchSessionEnv, runtimeSessionEnv, runtimeAdapters: deps.runtimeAdapters,
+      tmuxOptionDefaults, contextUsageStore, resumeTokenCapturer: resumeMetadataRefresher,
+      claudeProcessStartedAt, occupantInvalidator: deps.occupantInvalidator,
+      activityOracle: seatActivityService,
+      migrationPiSkillRoot: session => nodePath.join(piSeatPaths(piStateRoot, session).agentDir, "skills"),
+      migrationPiProve: piNativeProver,
+      piRunnerStateStore: { readSessionFile: session => piAdapter.readSessionFile(session) },
+      ompRunnerStateStore: { readSessionFile: session => ompAdapter.readSessionFile(session) },
+      predecessorRecapResolver: makePredecessorRecapResolver({
+        readClaudeRecord: session => {
+          const record = contextUsageStore.readAndNormalize(session);
+          return { transcriptPath: record.transcriptPath, sessionId: record.sessionId ?? null };
+        },
+        readCodexTranscriptPath: args => contextUsageStore.readCodexAndNormalize(args).transcriptPath,
+        lookupResumeToken: (nodeId, session) => (db.prepare("SELECT resume_token FROM sessions WHERE node_id=? AND session_name=? ORDER BY id DESC LIMIT 1")
+          .get(nodeId, session) as { resume_token: string | null } | undefined)?.resume_token ?? null,
+      }),
+      authoredRecapResolver: seat => resolveAuthoredRecapPointer(seat, String(new ContextPackSettingsStore().resolveOne("topology.root").value)),
+      rebuildPrimingResolver: seat => buildRebuildPrimingChain(seat, {
+        topologyRoot: String(new ContextPackSettingsStore().resolveOne("topology.root").value), openrigHome: OPENRIG_HOME,
+      }),
+    }),
   });
 
   // OPR.0.3.4.9 — periodic snapshot scheduler (crash-insurance floor).

@@ -64,6 +64,19 @@ export interface PiRunnerState {
   sessionFile?: string;
   /** UUIDv7 session id from get_state — display/fallback metadata. */
   sessionId?: string;
+  /** Launch-scoped provenance for the native session-file token. Written only
+   * after this runner receives a successful get_state response from its current
+   * Pi child; the daemon independently binds childPid to kernel process identity.
+   * Older sidecars omit this field and cannot prove the response-to-child link. */
+  rpcSessionFileProof?: {
+    launchId: string;
+    generation: string;
+    childPid: number;
+    sessionFile: string;
+    /** Exact successful get_state RPC id (startup or bounded quiescence refresh). */
+    responseId: string;
+    observedAt: string;
+  };
   /** Durable catch-up cursor: last session-entry id projected to the bus. */
   lastEntryId?: string;
   /** ISO timestamp of the last sidecar write. */

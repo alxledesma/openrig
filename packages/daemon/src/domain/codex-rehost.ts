@@ -8,6 +8,7 @@ import type { ActivityEvidence } from "./activity-taxonomy.js";
 import { listNativeProcesses, observeCodexPaneProcess, type NativeProcessRow } from "./native-process-lineage.js";
 import { verifyNativeDutyProcessIdentity } from "./native-duty-launch.js";
 import { rotationLocalAddresses } from "./rotation-local-custody.js";
+import { forEachJsonlLine } from "./rotation-native-proof.js";
 
 export interface CodexRehostBinding {
   nodeId:string;sessionId:string;sessionName:string;generation:string;runtime:"codex";nativeId:string;
@@ -138,7 +139,20 @@ export class CodexSameGenerationRehost {
     if(!path.isAbsolute(file)||realpathSync(file)!==file)reject("codex_rehost_history_unproven","Exact daemon-observed nonsymlink transcript path required");
     const before=lstatSync(file);if(!before.isFile()||before.isSymbolicLink())reject("codex_rehost_history_unproven","Transcript must be a regular native file");
     const bytes=readFileSync(file),after=lstatSync(file);if(before.ino!==after.ino||before.size!==after.size||before.mtimeMs!==after.mtimeMs||!bytes.length||bytes.at(-1)!==10)reject("codex_rehost_history_unstable","Complete stable native transcript required");
-    let matching=0;for(const line of new TextDecoder('utf-8',{fatal:true}).decode(bytes).trimEnd().split('\n')){const row=JSON.parse(line);if(row.type==='session_meta'){if((row.payload?.id??row.payload?.session_id)!==nativeId)reject("codex_rehost_history_mismatch","Transcript native session ID differs");matching++;}}
+    let matching=0,pendingText:string|undefined,whitespaceOnlyLine=false;
+    const decoder=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true});
+    const parseLine=(text:string)=>{const row=JSON.parse(text);if(row.type==='session_meta'){if((row.payload?.id??row.payload?.session_id)!==nativeId)reject("codex_rehost_history_mismatch","Transcript native session ID differs");matching++;}};
+    let firstLine=true;
+    forEachJsonlLine(bytes,line=>{
+      let text=decoder.decode(line);
+      if(firstLine){if(text.startsWith('\uFEFF'))text=text.slice(1);firstLine=false;}
+      if(!text.trim()){whitespaceOnlyLine=true;return;}
+      if(whitespaceOnlyLine)JSON.parse(''); // Internal blank records remain strict JSON failures; only trimEnd's terminal whitespace is ignored.
+      if(pendingText!==undefined)parseLine(pendingText);
+      pendingText=text;whitespaceOnlyLine=false;
+    });
+    if(pendingText===undefined){JSON.parse('');return bytes;}
+    parseLine(pendingText.trimEnd());
     if(matching!==1)reject("codex_rehost_history_mismatch","Exactly one matching native transcript identity is required");return bytes;
   }
   private prefix(bytes:Buffer,prefix:Buffer){if(bytes.length<prefix.length||!bytes.subarray(0,prefix.length).equals(prefix))reject("codex_rehost_history_changed","Native transcript prefix changed or was truncated; private full backup retained");}

@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { FileContextRefreshJournal, launchContextRefreshLoop,
+  type ContextRefreshTransport } from "./context-refresh-executor.js";
 import {
   NATIVE_DUTY_API, nativeDutyLeaseMs, nativeDutyUnresolved,
   type NativeDutyActor, type NativeDutyRegisterRequest, type NativeDutyResumeRequest,
@@ -320,7 +322,8 @@ export class FileDutyJournal implements DutyJournal {
  * launch channel. No token fallback, env override, remote forwarding or logging.
  * Root wires the paired Node/installed entry; no naked PATH-selected CLI runs.
  */
-export function inheritedNativeDutyTransport(): { actor: NativeDutyActor; transport: NativeDutyTransport } {
+export function inheritedNativeDutyTransport(): { actor: NativeDutyActor; transport: NativeDutyTransport;
+  contextRefreshTransport: ContextRefreshTransport } {
   const env = process.env;
   const session = env.OPENRIG_SESSION_NAME, generation = env.OPENRIG_OCCUPANT_GENERATION;
   const endpoint = env.OPENRIG_URL;
@@ -340,7 +343,27 @@ export function inheritedNativeDutyTransport(): { actor: NativeDutyActor; transp
       return await res.json() as T;
     } catch { throw new Error("native-duty-transport-unresolved"); }
   }
-  return { actor: { session, generation }, transport: {
+  const actor = { session, generation };
+  const assertInheritedActor = (requested: NativeDutyActor): void => {
+    if (requested.session !== session || requested.generation !== generation)
+      throw new Error("context-refresh-inherited-actor-mismatch");
+  };
+  const selectionQuery = (selection: { grantId: string; nodeId: string; operationId?: string }): string =>
+    new URLSearchParams({ grantId: selection.grantId, nodeId: selection.nodeId,
+      ...(selection.operationId === undefined ? {} : { operationId: selection.operationId }) }).toString();
+  const contextRefreshTransport: ContextRefreshTransport = {
+    enrollment: (requested, input) => {
+      assertInheritedActor(requested);
+      return call(`/api/context-refresh/enrollment?${new URLSearchParams({ launchId: input.launchId,
+        supervisorPid: String(input.supervisorPid) })}`);
+    },
+    step: (requested, input) => { assertInheritedActor(requested); return call("/api/context-refresh/step", input); },
+    reconcile: (requested, input) => { assertInheritedActor(requested); return call("/api/context-refresh/reconcile", input); },
+    status: (requested, input) => {
+      assertInheritedActor(requested); return call(`/api/context-refresh/status?${selectionQuery(input)}`);
+    },
+  };
+  return { actor, contextRefreshTransport, transport: {
     enrollment: request => {
       const query = new URLSearchParams({ scopeId: request.scopeId, launchId: request.launchId,
         supervisorPid: String(request.supervisorPid) });
@@ -415,19 +438,30 @@ export async function nativeDutySupervisorEntry(args: string[]): Promise<number>
         args: [fileURLToPath(import.meta.url), "--helper", file, String(process.pid)] }, realProcesses, realClock, abort.signal);
     }
     if (mode !== "--helper" || args.length !== 3 || Number(parent) !== process.ppid) return 1;
-    const { actor, transport } = inheritedNativeDutyTransport();
+    const { actor, transport, contextRefreshTransport } = inheritedNativeDutyTransport();
+    const supervisorPid = Number(parent);
+    const live = () => !abort.signal.aborted && process.ppid === supervisorPid;
+    // The Kernel Operator is the distinct refresh executor, not a coordinator
+    // holder. Its finite refresh enrollment must not wait for a holder grant.
+    // All identity/auth remains inherited; the server verifies the actual launch.
+    if (actor.session === "operator-agent@kernel") {
+      await launchContextRefreshLoop({ actor, transport: contextRefreshTransport,
+        journal: new FileContextRefreshJournal(config.journalDir, actor, config.launchId),
+        clock: realClock, live, launchId: config.launchId, supervisorPid, signal: abort.signal });
+      return 0;
+    }
     const journal = new FileDutyJournal(config.journalDir);
     const registrationId = await resolveNativeDutyRegistration(transport, journal,
       { scopeId: config.scopeId, launchId: config.launchId, supervisorPid: process.ppid },
-      realClock, config.pollMs, () => !abort.signal.aborted, abort.signal);
+      realClock, config.pollMs, live, abort.signal);
     const enrolled = await transport.status(registrationId);
     if (enrolled.scope.scopeId !== config.scopeId || enrolled.launchId !== config.launchId
       || enrolled.scope.nodeId !== process.env.OPENRIG_NODE_ID
       || enrolled.scope.runtime !== process.env.OPENRIG_RUNTIME
       || enrolled.scope.sessionName !== actor.session || enrolled.scope.generation !== actor.generation) return 1;
-    const executor = new HolderContinuationExecutor(transport, journal, actor, realClock, () => !abort.signal.aborted);
+    const executor = new HolderContinuationExecutor(transport, journal, actor, realClock, live);
     try {
-      while (!abort.signal.aborted) {
+      while (live()) {
         const status = await transport.status(registrationId);
         if (status.phase === "stopped" || status.scope.validUntil <= Date.now()) break;
         await executor.step(registrationId);
