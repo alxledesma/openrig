@@ -51,3 +51,18 @@ subprocess.check_output=lambda *a,**k: ('4321 '+str(os.getuid())+' S\n').encode(
  for(const args of [[],['--session'],['--session','relative.jsonl'],['--session='],['--session','--help'],['--session','/other','--session','/third']])expect(run(args)).toBe('0');
  expect(run(['--session','/saved/session.jsonl'])).toBe('0');expect(run(['--session','/other/session.jsonl'])).toBe('1');
 });
+
+it('Pi census distinguishes unrelated absolute Oh My Pi runtime while preserving exact identity and selector holds',()=>{
+ const source=readFileSync(new URL('../src/domain/codex-rehost-integration.ts',import.meta.url),'utf8'),program=source.match(/const STOPPED_CENSUS_PY = String.raw`([\s\S]*?)`;/)![1]!;
+ const fixture=String.raw`
+def argv_env(pid):
+ c=json.loads(os.environ['PI_RUNTIME_FIXTURE'])
+ return c['argv'],[x.encode() for x in c['env']],c['exe']
+subprocess.check_output=lambda *a,**k: ('30717 '+str(os.getuid())+' S\n').encode()
+`;
+ const omp='/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js',pi='/opt/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js';
+ const run=(script:string,args:string[]=[],env:string[]=[],exe='/opt/bin/bun')=>execFileSync('python3',['-c',program.replace('ok=False',fixture+'\nok=False'),JSON.stringify({OPENRIG_NODE_ID:'lead',OPENRIG_SESSION_NAME:'lead@rig',OPENRIG_HOME:null}),'0','/saved/session.jsonl','pi'],{encoding:'utf8',env:{...process.env,PI_RUNTIME_FIXTURE:JSON.stringify({argv:[exe,script,...args],env,exe})}}).trim();
+ expect(run(omp)).toBe('1');expect(run(omp,[],['OPENRIG_NODE_ID=lead'])).toBe('0');expect(run(omp,['--session','/saved/session.jsonl'])).toBe('0');
+ for(const args of [['--session','relative.jsonl'],['--session'],['--session='],['--session','--help'],['--session','/other','--session','/third'],['--continue'],['--resume'],['--session-dir','/other'],['--mode','rpc']])expect(run(omp,args),JSON.stringify(args)).toBe('0');
+ expect(run(pi,[],[],'/usr/bin/node')).toBe('0');expect(run(pi,['--session','relative'],[],'/usr/bin/node')).toBe('0');expect(run('node_modules/pi-coding-agent/dist/cli.js',[],[],'/usr/bin/node')).toBe('0');
+});

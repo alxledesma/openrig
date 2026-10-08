@@ -113,9 +113,19 @@ try:
    for arg in argv[1:]:
     value=arg.split('=',1)[1] if arg.startswith('--session=') else arg
     if os.path.isabs(value) and (os.path.realpath(value)==os.path.realpath(native)): raise ValueError()
-   if os.path.basename(executable)=='pi' or any(os.path.basename(a)=='pi-runner.js' or (os.path.basename(a)=='cli.js' and 'pi-coding-agent' in os.path.normpath(a).split(os.sep)) for a in argv):
+   # Oh My Pi is a separate runtime despite sharing the pi-coding-agent
+   # directory name. Exact target node/file matches above remain global.
+   scripts=[os.path.realpath(a).split(os.sep) for a in argv if os.path.isabs(a) and os.path.basename(a)=='cli.js']
+   omp_native=any(any(parts[i:i+2]==['@oh-my-pi','pi-coding-agent'] for i in range(len(parts)-1)) for parts in scripts)
+   pi_native=os.path.basename(executable)=='pi' or any(os.path.basename(a)=='cli.js' and 'pi-coding-agent' in os.path.normpath(a).split(os.sep) for a in argv)
+   pi_runner=any(os.path.basename(a)=='pi-runner.js' for a in argv)
+   if pi_native or pi_runner:
     sessions=[argv[i+1] for i,a in enumerate(argv[:-1]) if a=='--session']+[a.split('=',1)[1] for a in argv if a.startswith('--session=')]
-    if len(sessions)!=1 or not os.path.isabs(sessions[0]): raise ValueError()
+    # A positively identified foreign runtime with no explicit resume is not
+    # an ambiguous Pi resume. Explicit malformed/relative file selectors hold.
+    implicit_selector=any(a.split('=',1)[0] in ['--session','--continue','-c','--resume','-r','--session-dir','--mode'] for a in argv[1:])
+    if not (omp_native and not pi_runner and not sessions and not implicit_selector):
+     if len(sessions)!=1 or not os.path.isabs(sessions[0]): raise ValueError()
   elif os.path.basename(executable)=='codex' and native_thread(argv)==native: raise ValueError()
  ok=True
 except: pass
