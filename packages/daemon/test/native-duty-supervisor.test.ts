@@ -10,7 +10,7 @@ import { NativeDutySupervisionService, type NativeDutyOperationReceipt } from ".
 import { nativeDutySupervisionRoutes } from "../src/routes/native-duty-supervision.js";
 import {
   FileDutyJournal, HolderContinuationExecutor, superviseNativeHarness,
-  resolveNativeDutyRegistration,
+  resolveNativeDutyRegistration, NativeDutyObservationError, NativeDutyInvalidObservationError, waitNativeDutyObservation,
   inheritedNativeDutyTransport,
   type DutyChild, type DutyClock, type DutyProcesses, type HolderObservation,
   type NativeDutyLaunchConfig, type NativeDutyTransport, NATIVE_DUTY_TRANSPORT_BUDGET_MS,
@@ -122,6 +122,9 @@ describe("launch-bound holder continuation", () => {
       const again = new HolderContinuationExecutor(transport, activeJournal!, actor, clock, () => true, () => { throw new Error("no new op"); });
       expect(await again.step(first)).toBe("watching"); expect(posts).toBe(1);
 
+      // Prepare the independent budget fixture BEFORE introducing UNKNOWN
+      // node debt. New registration after that debt must remain refused.
+      const third = await register("budget-end"), budgetJournal = activeJournal!;
       const second = await register("race"); raceAtInFlight = true;
       shown.authority.lease_until = now + 1000;
       const denied = new HolderContinuationExecutor(transport, activeJournal!, actor, clock, () => true, () => "race-op");
@@ -131,7 +134,13 @@ describe("launch-bound holder continuation", () => {
       expect(service.status(second).phase).toBe("held");
       expect(service.status(second).intent?.phase).toBe("uncertainty-held");
 
-      const third = await register("budget-end");
+      const blocked = await app.request("/register", { method: "POST", headers: {
+        Authorization: "Bearer fixture-auth", "X-OpenRig-Session": actor.session,
+        "X-OpenRig-Occupant-Generation": actor.generation, "Content-Type": "application/json" },
+        body: JSON.stringify({ scopeId: scope.scopeId, launchId: "forbidden-replacement", supervisorPid: 123 }) });
+      expect(blocked.status).toBe(409);
+      expect((await blocked.json()).error).toBe("native_duty_unresolved_intent");
+      activeJournal = budgetJournal;
       now = scope.validUntil - NATIVE_DUTY_TRANSPORT_BUDGET_MS - 999;
       shown.authority.lease_until = now + 1000;
       const tooShort = new HolderContinuationExecutor(transport, activeJournal!, actor, clock, () => true, () => { throw new Error("no sub-minimum lease"); });
@@ -385,4 +394,66 @@ describe("launch-bound holder continuation", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+it('keeps one enrollment resolver observational beyond restart budget and requires fresh ready',async()=>{
+ let polls=0,posts=0,slept=0;
+ const transport={enrollment:async()=>{polls++;if(polls<=3)throw Error('GET unavailable');if(polls<=8)return {state:'held'};return {state:'ready'};},register:async()=>{posts++;return {registrationId:'exact-id'};}} as NativeDutyTransport;
+ const journal={read:()=>null,save:()=>{throw Error('no effect journal expected');}};
+ const clock={now:()=>slept,sleep:async(ms:number)=>{expect(posts).toBe(0);slept+=ms;}};
+ expect(await resolveNativeDutyRegistration(transport,journal,{scopeId:'scope',launchId:'launch',supervisorPid:321},clock,5000,()=>true)).toBe('exact-id');
+ expect(posts).toBe(1);expect(polls).toBe(9);expect(slept).toBe(40000);
+});
+it('held expiry/revocation never authorizes registration and parent stop ends observation',async()=>{
+ let live=true,polls=0,posts=0;
+ const transport={enrollment:async()=>{polls++;return {state:'held'};},register:async()=>{posts++;throw Error('forbidden');}} as NativeDutyTransport;
+ await expect(resolveNativeDutyRegistration(transport,{read:()=>null,save:()=>{}},{scopeId:'scope',launchId:'launch',supervisorPid:321},
+ {now:()=>0,sleep:async()=>{if(polls===6)live=false;}},1000,()=>live)).rejects.toThrow('parent-stopped');
+ expect(polls).toBe(6);expect(posts).toBe(0);
+});
+it('malformed enrollment remains terminal and register UNKNOWN is not observational retry',async()=>{
+ const request={scopeId:'scope',launchId:'launch',supervisorPid:321},journal={read:()=>null,save:()=>{}},clock={now:()=>0,sleep:async()=>{throw Error('must not retry');}};
+ await expect(resolveNativeDutyRegistration({enrollment:async()=>({state:'invalid'})} as unknown as NativeDutyTransport,journal,request,clock,1000,()=>true)).rejects.toThrow('invalid-enrollment');
+ let posts=0;
+ await expect(resolveNativeDutyRegistration({enrollment:async()=>({state:'ready'}),register:async()=>{posts++;throw Error('UNKNOWN register');}} as NativeDutyTransport,journal,request,clock,1000,()=>true)).rejects.toThrow('UNKNOWN register');
+ expect(posts).toBe(1);
+});
+it('retries typed read-only observation errors, never mutation errors, and obeys parent abort',async()=>{
+ let reads=0,sleeps=0;
+ const clock={now:()=>0,sleep:async()=>{sleeps++;}};
+ expect(await waitNativeDutyObservation(async()=>{if(++reads<=5)throw new NativeDutyObservationError();return 'fresh';},clock,1000,()=>true)).toBe('fresh');
+ expect(reads).toBe(6);expect(sleeps).toBe(5);
+ let mutations=0;
+ await expect(waitNativeDutyObservation(async()=>{mutations++;throw Error('native-duty-transport-unresolved');},clock,1000,()=>true)).rejects.toThrow('transport-unresolved');
+ expect(mutations).toBe(1);expect(sleeps).toBe(5);
+ const abort=new AbortController();
+ await expect(waitNativeDutyObservation(async()=>{throw new NativeDutyObservationError();},{now:()=>0,sleep:async()=>{abort.abort();}},1000,()=>true,abort.signal)).rejects.toThrow('parent-stopped');
+});
+it('wire classifies failed GET only; failed POST remains mutation UNKNOWN',async()=>{
+ const values={OPENRIG_SESSION_NAME:'test@rig',OPENRIG_OCCUPANT_GENERATION:'test-gen',OPENRIG_URL:'http://127.0.0.1:12345',OPENRIG_TERMINAL_BEARER_TOKEN:'test-only-token'};
+ const previous=new Map(Object.keys(values).map(k=>[k,process.env[k]]));const oldFetch=globalThis.fetch;const methods:string[]=[];
+ try{
+ Object.assign(process.env,values);globalThis.fetch=(async(_input,init)=>{methods.push(init?.method??'GET');throw Error('synthetic network failure');}) as typeof fetch;
+ const {transport}=inheritedNativeDutyTransport();
+ await expect(transport.status('exact-id')).rejects.toBeInstanceOf(NativeDutyObservationError);
+ await expect(transport.show('rig')).rejects.toBeInstanceOf(NativeDutyObservationError);
+ await expect(transport.register({scopeId:'scope',launchId:'launch',supervisorPid:321})).rejects.not.toBeInstanceOf(NativeDutyObservationError);
+ await expect(transport.heartbeat('exact-id')).rejects.not.toBeInstanceOf(NativeDutyObservationError);
+ expect(methods).toEqual(['GET','GET','POST','POST']);
+ }finally{globalThis.fetch=oldFetch;for(const[k,v]of previous){if(v===undefined)delete process.env[k];else process.env[k]=v;}}
+});
+
+it('successful malformed GET JSON is terminal, while POST malformed JSON remains UNKNOWN',async()=>{
+ const values={OPENRIG_SESSION_NAME:'test@rig',OPENRIG_OCCUPANT_GENERATION:'test-gen',OPENRIG_URL:'http://127.0.0.1:12345',OPENRIG_TERMINAL_BEARER_TOKEN:'test-only-token'};
+ const previous=new Map(Object.keys(values).map(k=>[k,process.env[k]]));const oldFetch=globalThis.fetch;let calls=0;
+ try{
+ Object.assign(process.env,values);globalThis.fetch=(async()=>{calls++;return new Response('{invalid',{status:200});}) as typeof fetch;
+ const {transport}=inheritedNativeDutyTransport();
+ await expect(resolveNativeDutyRegistration(transport,{read:()=>null,save:()=>{}},{scopeId:'scope',launchId:'launch',supervisorPid:321},
+ {now:()=>0,sleep:async()=>{throw Error('must not poll malformed JSON');}},1000,()=>true)).rejects.toBeInstanceOf(NativeDutyInvalidObservationError);
+ expect(calls).toBe(1);
+ await expect(waitNativeDutyObservation(()=>transport.status('exact-id'),{now:()=>0,sleep:async()=>{throw Error('must not retry');}},1000,()=>true)).rejects.toBeInstanceOf(NativeDutyInvalidObservationError);
+ await expect(transport.register({scopeId:'scope',launchId:'launch',supervisorPid:321})).rejects.toThrow('native-duty-transport-unresolved');
+ expect(calls).toBe(3);
+ }finally{globalThis.fetch=oldFetch;for(const[k,v]of previous){if(v===undefined)delete process.env[k];else process.env[k]=v;}}
 });

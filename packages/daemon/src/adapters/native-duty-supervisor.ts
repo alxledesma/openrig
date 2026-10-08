@@ -60,12 +60,23 @@ export async function resolveNativeDutyRegistration(transport: NativeDutyTranspo
     throw new Error("native-duty-invalid-enrollment-request");
   for (;;) {
     if (!live() || signal?.aborted) throw new Error("native-duty-parent-stopped");
-    const state = await transport.enrollment(request);
-    if (state.state === "waiting") {
+    let state: NativeDutyEnrollment;
+    try { state = await transport.enrollment(request); }
+    catch (error) {
+      if (error instanceof NativeDutyInvalidObservationError) throw error;
+      // This catch covers ONLY the read-only enrollment GET, never register.
+      if (!live() || signal?.aborted) throw new Error("native-duty-parent-stopped");
       await clock.sleep(pollMs, signal);
       continue;
     }
-    if (state.state !== "ready") throw new Error("native-duty-enrollment-held");
+    if (!state || !["waiting", "held", "ready"].includes(state.state)
+      || ((state.state === "waiting" || state.state === "held") && state.registrationId !== undefined))
+      throw new Error("native-duty-invalid-enrollment-response");
+    if (!live() || signal?.aborted) throw new Error("native-duty-parent-stopped");
+    if (state.state === "waiting" || state.state === "held") {
+      await clock.sleep(pollMs, signal);
+      continue;
+    }
     if (state.registrationId !== undefined) {
       if (typeof state.registrationId !== "string" || !state.registrationId) throw new Error("native-duty-invalid-registration");
       const local = journal.read();
@@ -81,6 +92,30 @@ export async function resolveNativeDutyRegistration(transport: NativeDutyTranspo
     const local = journal.read();
     if (local && local.registrationId !== enrolled.registrationId) throw new Error("native-duty-registration-mismatch");
     return enrolled.registrationId;
+  }
+}
+
+/** Local transport classification: only GET failures are observational. */
+export class NativeDutyInvalidObservationError extends Error {
+  constructor() { super("native-duty-invalid-observation-response"); }
+}
+export class NativeDutyObservationError extends Error {
+  constructor() { super("native-duty-observation-unresolved"); }
+}
+/** Retry a read, never the executor or any mutation. Parent lifetime bounds it. */
+export async function waitNativeDutyObservation<T>(read: () => Promise<T>, clock: DutyClock,
+  pollMs: number, live: () => boolean, signal?: AbortSignal): Promise<T> {
+  for (;;) {
+    if (!live() || signal?.aborted) throw new Error("native-duty-parent-stopped");
+    try {
+      const result = await read();
+      if (!live() || signal?.aborted) throw new Error("native-duty-parent-stopped");
+      return result;
+    } catch (error) {
+      if (!(error instanceof NativeDutyObservationError)) throw error;
+      if (!live() || signal?.aborted) throw new Error("native-duty-parent-stopped");
+      await clock.sleep(pollMs, signal);
+    }
   }
 }
 
@@ -335,13 +370,17 @@ export function inheritedNativeDutyTransport(): { actor: NativeDutyActor; transp
   const headers = { Authorization: `Bearer ${token}`, "X-OpenRig-Session": session,
     "X-OpenRig-Occupant-Generation": generation, "Content-Type": "application/json" };
   async function call<T>(route: string, body?: unknown): Promise<T> {
+    let res: Response;
     try {
-      const res = await fetch(`${endpoint!.replace(/\/+$/, "")}${route}`, { method: body === undefined ? "GET" : "POST",
+      res = await fetch(`${endpoint!.replace(/\/+$/, "")}${route}`, { method: body === undefined ? "GET" : "POST",
         headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: AbortSignal.timeout(NATIVE_DUTY_REQUEST_TIMEOUT_MS), redirect: "error" });
       if (!res.ok) throw new Error("native-duty-transport-refused");
-      return await res.json() as T;
-    } catch { throw new Error("native-duty-transport-unresolved"); }
+    } catch { throw body === undefined ? new NativeDutyObservationError() : new Error("native-duty-transport-unresolved"); }
+    // A successful HTTP response with invalid JSON is a contract defect, not a
+    // network observation interruption. POST outcome still remains UNKNOWN.
+    try { return await res.json() as T; }
+    catch { throw body === undefined ? new NativeDutyInvalidObservationError() : new Error("native-duty-transport-unresolved"); }
   }
   const actor = { session, generation };
   const assertInheritedActor = (requested: NativeDutyActor): void => {
@@ -450,19 +489,25 @@ export async function nativeDutySupervisorEntry(args: string[]): Promise<number>
         clock: realClock, live, launchId: config.launchId, supervisorPid, signal: abort.signal });
       return 0;
     }
+    // Wrap ONLY status/show GETs. POST methods and executor mutation ordering
+    // are passed through unchanged, including UNKNOWN response handling.
+    const observedTransport: NativeDutyTransport = { ...transport,
+      status: id => waitNativeDutyObservation(() => transport.status(id), realClock, config.pollMs, live, abort.signal),
+      show: rigId => waitNativeDutyObservation(() => transport.show(rigId), realClock, config.pollMs, live, abort.signal),
+    };
     const journal = new FileDutyJournal(config.journalDir);
     const registrationId = await resolveNativeDutyRegistration(transport, journal,
       { scopeId: config.scopeId, launchId: config.launchId, supervisorPid: process.ppid },
       realClock, config.pollMs, live, abort.signal);
-    const enrolled = await transport.status(registrationId);
+    const enrolled = await observedTransport.status(registrationId);
     if (enrolled.scope.scopeId !== config.scopeId || enrolled.launchId !== config.launchId
       || enrolled.scope.nodeId !== process.env.OPENRIG_NODE_ID
       || enrolled.scope.runtime !== process.env.OPENRIG_RUNTIME
       || enrolled.scope.sessionName !== actor.session || enrolled.scope.generation !== actor.generation) return 1;
-    const executor = new HolderContinuationExecutor(transport, journal, actor, realClock, live);
+    const executor = new HolderContinuationExecutor(observedTransport, journal, actor, realClock, live);
     try {
       while (live()) {
-        const status = await transport.status(registrationId);
+        const status = await observedTransport.status(registrationId);
         if (status.phase === "stopped" || status.scope.validUntil <= Date.now()) break;
         await executor.step(registrationId);
         await realClock.sleep(config.pollMs, abort.signal);

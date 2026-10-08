@@ -37,7 +37,7 @@ it("routes only the inherited Operator helper to context refresh and retains ord
       ? { state: "held", reason: "fixture-no-grant" }
       : { state: "held", reason: "fixture-no-holder-grant" };
     const response = new Response(JSON.stringify(payload), { status: 200, headers: { "Content-Type": "application/json" } });
-    if (url.pathname === "/api/context-refresh/enrollment") {
+    if (url.pathname === "/api/context-refresh/enrollment" || requests.filter(r => r.url.pathname === "/api/native-duty/enrollment").length === 2) {
       // Invoke only the helper entry's just-installed local abort callback. This
       // ends its loop without sending an OS signal or affecting other listeners.
       const stop = process.listeners("SIGTERM").find(listener => !listenersBefore.has(listener));
@@ -71,8 +71,10 @@ it("routes only the inherited Operator helper to context refresh and retains ord
     expect(requests).toHaveLength(1); // substitution is refused before fetch
 
     useActor("builder@rig", "builder-native-g3");
-    await expect(nativeDutySupervisorEntry(["--helper", configPath, String(supervisorPid)])).rejects.toThrow("native-duty-enrollment-held");
-    expect(requests).toHaveLength(2);
+    await expect(nativeDutySupervisorEntry(["--helper", configPath, String(supervisorPid)])).rejects.toThrow("native-duty-parent-stopped");
+    expect(requests).toHaveLength(3);
+    expect(requests[2]!.url.pathname).toBe("/api/native-duty/enrollment");
+    expect(requests[2]!.method).toBe("GET");
     expect(requests[1]!.url.pathname).toBe("/api/native-duty/enrollment");
     expect(requests[1]!.url.searchParams.get("launchId")).toBe(launchId);
     expect(requests[1]!.url.searchParams.get("supervisorPid")).toBe(String(supervisorPid));
