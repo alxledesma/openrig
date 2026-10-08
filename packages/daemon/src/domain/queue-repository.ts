@@ -1412,6 +1412,11 @@ export class QueueRepository {
     };
 
     try {
+      // A pending continuation can drain long after its staging observation.
+      // Refresh this exact claimant here rather than borrowing the new-work
+      // frontier's activity cache. Native identity/quiescence is then reobserved
+      // under its guard; the final readiness read and CAS below stay synchronous.
+      if (!await this.coordinatorAuthority.coordinationRecovery?.refreshClaimedContinuationOwner(intent.destinationSession)) return "retained";
       const guardedSend = async (currentObservation?:NativeSettledObservation):Promise<CallbackResult> => {
         // No await is permitted between the final readiness read and the CAS.
         const decision = this.db.transaction(() => {

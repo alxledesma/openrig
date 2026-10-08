@@ -1676,6 +1676,13 @@ private dutyProtection(rigId:string,r:any):boolean {
   ]);
   return results.every(result=>result.status==='fulfilled');
  }
+ /** Retained claims are excluded from the new-assignment frontier. Their
+  * continuation consumer owns fresh identity/activity preparation separately.
+  * This returns observation success only; final custody/readiness still decides
+  * held versus invalid immediately before staging or the guarded send CAS. */
+ async refreshClaimedContinuationOwner(owner:string):Promise<boolean> {
+  return this.refreshDispatchOwner(owner);
+ }
  private dispatchAuthoritySnapshot(rigId:string):string {const a=this.authority.get(rigId);return JSON.stringify(a?{epoch:a.epoch,holder:a.owner_session,generation:a.owner_generation,state:a.state,leaseUntil:a.lease_until,batonId:a.baton_id}:null);}
  private preparedNativeObservationMatches(prepared:PreparedNativeObservation|null|undefined):boolean {
   if(!prepared)return false;
@@ -1985,6 +1992,7 @@ private dutyProtection(rigId:string,r:any):boolean {
   for(const task of plan.tasks){
    const assigned=this.db.prepare('SELECT queue_id,state,claimed_by_generation_uuid,destination_session FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=?').get(rigId,task.packageKey) as {queue_id:string;state:string;claimed_by_generation_uuid:string|null;destination_session:string}|undefined;
    if(!assigned||assigned.state!=='in-progress'||assigned.claimed_by_generation_uuid!==task.admission.generation||assigned.destination_session!==task.owner)continue;
+   if(!await this.refreshClaimedContinuationOwner(task.owner))continue;
    const holder=this.authority.get(rigId);if(!holder)continue;
    if(this.claimedContinuationReady({rigId,task,queueId:assigned.queue_id,holderSession:actor,holderGeneration:generation,epoch:holder.epoch})!=='ready')continue;
    let observation:NativeRecoveryObservation|null=null;try{observation=await runtime.observeRecoveredIncarnation(task.owner);}catch{continue;}
@@ -2064,10 +2072,12 @@ private dutyProtection(rigId:string,r:any):boolean {
   const results:CoordinationResult[]=[];
   for(const task of plan.tasks){
    const assigned=this.db.prepare('SELECT a.queue_id,p.contract_hash,a.body_hash FROM coordinator_assignments a JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.package_key=? AND a.disposition_id IS NULL').get(rigId,task.packageKey) as {queue_id:string;contract_hash:string;body_hash:string}|undefined;
-   if(!assigned||this.claimedContinuationReady({rigId,task,queueId:assigned.queue_id,holderSession:actor,holderGeneration:generation,epoch:authority.epoch})!=='ready')continue;
+   if(!assigned||task.boundary||task.recoveryFor)continue;
    const facts=this.ownedOutcomeFacts(assigned.queue_id,task.owner,task.admission.generation);if(!facts)continue;
    const obligationId=ownedOutcomeContinuationOutboxId({rigId,queueId:assigned.queue_id,claimantGeneration:task.admission.generation,...facts});
    if(this.db.prepare('SELECT 1 FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(rigId,obligationId))continue;
+   if(!await this.refreshClaimedContinuationOwner(task.owner))continue;
+   if(this.claimedContinuationReady({rigId,task,queueId:assigned.queue_id,holderSession:actor,holderGeneration:generation,epoch:authority.epoch})!=='ready')continue;
    let observation:NativeSettledObservation|null;try{observation=await runtime.observeSettledClaimant(task.owner);}catch{continue;}
    if(!observation||!this.settledObservationMatches(rigId,task.owner,task.admission.generation,observation,true))continue;
    const proof:OwnedOutcomeContinuationProof={schema:'owned-outcome-protocol.v1',rigId,queueId:assigned.queue_id,packageKey:task.packageKey,contractHash:assigned.contract_hash,bodyHash:assigned.body_hash,claimantGeneration:task.admission.generation,holderSession:actor,holderGeneration:generation,epoch:authority.epoch,planRevision:plan.revision,admissionHash:digest(JSON.stringify({deadline:task.deadline,admission:task.admission,dispatchRestriction:plan.dispatchRestrictions?.find(r=>r.session===task.owner)??null})),predecessorsHash:digest(JSON.stringify(task.predecessors)),...facts,observation};

@@ -34,7 +34,17 @@ describe('retained claimed native-recovery continuation',()=>{
   await repo.create({qitemId:'baton',sourceSession:'operator-agent@kernel',destinationSession:'lead@xv',body:'coordinate',nudge:false});
   repo.coordinatorAuthority.enable('operator-agent@kernel','operator-agent-g1',{rigId:'xv',batonId:'baton',owner:'lead@xv',ownerGeneration:'lead-g1',coordinators:['lead@xv','peer@xv'],leaseMs:120000,operationId:'enable'});
   repo.coordinatorAuthority.acknowledge('lead@xv',token,{operationId:'ack',obligationsDigest:repo.coordinatorAuthority.reconciliationDigest('xv')});
-  observations=new Map();svc=new CoordinationRecoveryService(repo,s=>observations.get(s)??null,()=>clock,undefined,undefined,undefined,runtime);repo.coordinatorAuthority.coordinationRecovery=svc;refresh();nativeObservation=null;
+  observations=new Map();
+  const refreshIdentity=async(sessions:readonly string[])=>{
+   const observedAt=new Date(clock).toISOString();
+   for(const session of sessions){const old=observations.get(session);if(old)observations.set(session,{...old,identityObservedAt:observedAt});}
+  };
+  const refreshWorkerActivity=async(session:string)=>{
+   const old=observations.get(session);if(!old)return;
+   const observedAt=new Date(clock).toISOString();
+   observations.set(session,{...old,state:{...old.state,changedAt:observedAt,seq:old.state.seq+1},witness:{...old.witness,observedAt}});
+  };
+  svc=new CoordinationRecoveryService(repo,s=>observations.get(s)??null,()=>clock,refreshIdentity,refreshWorkerActivity,undefined,runtime);repo.coordinatorAuthority.coordinationRecovery=svc;refresh();nativeObservation=null;
  });
  afterEach(()=>{db.close();rmSync(dir,{recursive:true,force:true});vi.useRealTimers();});
 
