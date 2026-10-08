@@ -32,7 +32,7 @@ import { seatDeliveryGuardSchema } from "../src/db/migrations/087_seat_delivery_
 
 function fixture() {
   const db = new Database(":memory:");
-  db.exec("CREATE TABLE nodes(id TEXT PRIMARY KEY); INSERT INTO nodes VALUES ('a'),('b');");
+  db.exec("CREATE TABLE nodes(id TEXT PRIMARY KEY, runtime TEXT); INSERT INTO nodes VALUES ('a','codex'),('b','codex');");
   db.exec(outboxEntriesSchema.sql); db.exec(seatDeliveryGuardSchema.sql);
   const targets: Record<string, GuardTarget> = {
     a: { nodeId: "a", session: "a", occupant: "g1", pane: "%1" },
@@ -409,6 +409,27 @@ it("automatic reminder records retained custody and no delivered fire or input",
    expect(await adapter.createSessionForRunnerResume("a","/workspace",env)).toEqual({ok:true});
   });
   expect(commands.filter(command=>command.startsWith("tmux new-session"))).toHaveLength(1);expect(commands.some(command=>command.includes("kill-session"))).toBe(false);f.db.close();
+ });
+ it.each(["codex", "pi"])("bare terminal resume enforces persisted %s runtime and exact identity",async(runtime)=>{
+  const f=fixture();f.db.prepare("UPDATE nodes SET runtime=? WHERE id='a'").run(runtime);
+  const commands:string[]=[];let present=false;
+  const adapter=new TmuxAdapter(async(command:string)=>{commands.push(command);if(command.startsWith("tmux has-session")&&!present)throw new Error("can't find session");return "";});adapter.deliveryGuard=f.guard;
+  const env={OPENRIG_NODE_ID:"a",OPENRIG_SESSION_NAME:"a",OPENRIG_OCCUPANT_GENERATION:"g1",OPENRIG_RUNTIME:runtime};
+  expect(await adapter.createSessionForRunnerResume("a","/workspace",env)).toMatchObject({ok:false,code:"guard_lease_required"});expect(commands).toEqual([]);
+  await f.guard.set("a",true,"operator","detached resume");
+  await f.guard.runnerRehost("a",async()=>{
+   for(const changed of [{OPENRIG_RUNTIME:runtime==="pi"?"codex":"pi"},{OPENRIG_RUNTIME:"claude-code"},{OPENRIG_OCCUPANT_GENERATION:"stale"},{OPENRIG_SESSION_NAME:"b"},{OPENRIG_NODE_ID:"b"}]){
+    expect(await adapter.createSessionForRunnerResume("a","/workspace",{...env,...changed})).toMatchObject({ok:false});expect(commands).toEqual([]);
+   }
+   f.db.prepare("UPDATE nodes SET runtime=NULL WHERE id='a'").run();
+   expect(await adapter.createSessionForRunnerResume("a","/workspace",env)).toMatchObject({ok:false,code:"guard_target_changed"});expect(commands).toEqual([]);
+   f.db.prepare("UPDATE nodes SET runtime=? WHERE id='a'").run(runtime);
+   expect(await adapter.createSessionForRunnerResume("a","/workspace",env)).toEqual({ok:true});
+   present=true;
+   expect(await adapter.createSessionForRunnerResume("a","/workspace",env)).toMatchObject({ok:false,code:"session_exists"});
+  });
+  expect(commands.filter(command=>command.startsWith("tmux new-session"))).toHaveLength(1);
+  expect(commands.some(command=>command.includes("kill-session"))).toBe(false);f.db.close();
  });
  it("fresh launch off rebinds the original lease, then protection prevents lifecycle and stale writes",async()=>{
   const f=queueFixture();f.db.exec("INSERT INTO nodes(id,rig_id,logical_id) VALUES ('c','rig','fresh');");

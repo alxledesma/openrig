@@ -565,7 +565,9 @@ export class TmuxAdapter {
       return { ok: false, code: "guard_lease_required", message: "Same-generation terminal resume requires an owned rehost lease." };
     }
     const target = guard.target(nodeId);
-    if (target.session !== name || env.OPENRIG_SESSION_NAME !== name || env.OPENRIG_RUNTIME !== "codex"
+    const node = guard.db.prepare("SELECT runtime FROM nodes WHERE id = ?").get(nodeId) as { runtime: string | null } | undefined;
+    if (!node || (node.runtime !== "codex" && node.runtime !== "pi") || env.OPENRIG_RUNTIME !== node.runtime
+      || target.session !== name || env.OPENRIG_SESSION_NAME !== name
       || !target.occupant || env.OPENRIG_OCCUPANT_GENERATION !== target.occupant) {
       return { ok: false, code: "guard_target_changed", message: "Terminal resume cannot change the occupant or canonical address." };
     }

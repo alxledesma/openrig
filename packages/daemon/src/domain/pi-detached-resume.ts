@@ -32,8 +32,8 @@ const protectedKeys=["node","sessions","bindings","tenures","permissions","autho
 
 /** One exact retained Pi occupant, with separately durable terminal and resume
  * boundaries. Neither a missing terminal nor a sidecar is native absence proof.
- * A failed create is never replayed; only a proven bound terminal with NO resume
- * intent can be explicitly continued under its immutable original receipt. */
+ * Explicit continuation proves either the original bound bare terminal or
+ * complete pre-terminal absence, always with NO prior native resume intent. */
 export class PiDetachedResume {
  private readonly now:()=>number;private readonly sleep:(ms:number)=>Promise<void>;private readonly census:()=>Promise<NativeProcessRow[]>;
  constructor(private readonly deps:PiDetachedResumeOptions){this.now=deps.now??Date.now;this.sleep=deps.sleep??(ms=>new Promise(r=>setTimeout(r,ms)));this.census=deps.listProcesses??listNativeProcesses;}
@@ -49,24 +49,30 @@ export class PiDetachedResume {
     let expectedStatus=(this.deps.db.prepare('SELECT status FROM sessions WHERE id=?').get(b.sessionId) as {status:string}).status;
     const unchanged=()=>{this.actor(input);const status=(this.deps.db.prepare('SELECT status FROM sessions WHERE id=?').get(b.sessionId) as {status:string}|undefined)?.status;if(status!==expectedStatus||this.pane(b.nodeId)!==expectedPane||digest(this.binding(input))!==digest(b)||digest(this.custody(b))!==digest(before))hold("pi_detached_custody_changed","Retained identity, claims, authority or effects changed");this.gates(b);};
     const state=(this.deps.db.prepare('SELECT status FROM sessions WHERE id=?').get(b.sessionId) as {status:string}).status;
-    if((!input.recovery&&state!=="detached")||(input.recovery&&state!=="running"))hold("pi_detached_binding","Expected exact detached occupant or its bound partial continuation");
+    if(!input.recovery&&state!=="detached")hold("pi_detached_binding","Expected exact detached occupant or its original partial continuation");
     const root=this.root(b);let attemptId:string,backup:{path:string;sha256:string;size:number},began:any,terminal:any;
     let history=this.history(b),preflight:PiDetachedPreflight;
     if(input.recovery){
      attemptId=input.recovery.attemptId;directory=path.join(root,attemptId);privatePath(directory,true);receiptPath=path.join(directory,"began.json");privatePath(receiptPath);
      if(hash(readFileSync(receiptPath))!==input.recovery.beganSha256)hold("pi_detached_receipt_invalid","Original receipt digest differs");
      began=readReceipt(receiptPath);const unknown=readReceipt(path.join(directory,"unknown.json"));
-     terminal=readReceipt(path.join(directory,"terminal-bound.json"));const created=readReceipt(path.join(directory,"terminal-created.json"));
+     const hasBound=existsSync(path.join(directory,"terminal-bound.json")),hasCreated=existsSync(path.join(directory,"terminal-created.json"));
      if(began.protocol!=="pi-detached-resume-v1"||began.attemptId!==attemptId||began.bindingDigest!==digest(b)||began.actor!=="operator-agent@kernel"
-       ||unknown.effectAttempted!==true||unknown.blindRetryAllowed!==false||terminal.attemptId!==attemptId||digest(terminal)!==digest(created)
-       ||terminal.pane!==oldPane||protectedKeys.some(k=>!began.custody?.[k]||digest(began.custody[k])!==digest(before[k]))
-       ||!this.unknownPreserved(began.unknownEffects,b))hold("pi_detached_receipt_invalid","Original retained identity, bound terminal and custody must match");
+       ||unknown.effectAttempted!==true||unknown.blindRetryAllowed!==false
+       ||protectedKeys.some(k=>!began.custody?.[k]||digest(began.custody[k])!==digest(before[k]))
+       ||!this.unknownPreserved(began.unknownEffects,b))hold("pi_detached_receipt_invalid","Original retained identity and custody must match");
+     if(hasBound&&hasCreated){
+      terminal=readReceipt(path.join(directory,"terminal-bound.json"));const created=readReceipt(path.join(directory,"terminal-created.json"));
+      if(state!=="running"||terminal.attemptId!==attemptId||digest(terminal)!==digest(created)||terminal.pane!==oldPane)hold("pi_detached_receipt_invalid","Original bound terminal must match");
+     }else if(hasBound||hasCreated||state!=="detached"||began.oldPane!==oldPane||digest(began.custody)!==digest(before)
+       ||existsSync(path.join(directory,"terminal-recovery-began.json")))hold("pi_detached_receipt_invalid","Pre-terminal continuation requires untouched custody and no prior terminal-recovery intent");
      this.noUnresolved(root,b,directory);backup=began.backup;
      if(backup?.path!==path.join(directory,"transcript.jsonl"))hold("pi_detached_history","Exact original private backup required");
      privatePath(backup.path);const bytes=readFileSync(backup.path);this.deps.validateHistory(b,bytes);
      if(hash(bytes)!==backup.sha256||bytes.length!==backup.size)hold("pi_detached_history","Original backup verification failed");this.prefix(history.bytes,bytes);
      if(history.facts.nativeIdentity!==began.nativeIdentity)hold("pi_detached_history","Retained native header identity changed");
-     preflight=await this.deps.preflight(b,false);if(digest(preflight)!==began.preflightDigest)hold("pi_detached_configuration_changed","Launch contract changed since original intent");
+     if(!terminal&&!history.bytes.equals(bytes))hold("pi_detached_history_changed","Pre-terminal continuation requires the unchanged original full history");
+     preflight=await this.deps.preflight(b,!terminal);if(digest(preflight)!==began.preflightDigest)hold("pi_detached_configuration_changed","Launch contract changed since original intent");
     }else{
      this.noUnresolved(root,b);preflight=await this.deps.preflight(b,true);
      await this.absent(b);await this.sleep(100);await this.absent(b);unchanged();
@@ -77,6 +83,17 @@ export class PiDetachedResume {
      durable(backup.path,history.bytes,true);if(!readFileSync(backup.path).equals(history.bytes))hold("pi_detached_history","Private full history backup failed");
      receiptPath=path.join(directory,"began.json");began={protocol:"pi-detached-resume-v1",attemptId,at:this.now(),actor:input.operator,actorGeneration:input.actorGeneration,reason:input.reason,bindingDigest:digest(b),nativeIdentity:history.facts.nativeIdentity,nativeIdHash:hash(b.nativeId),backup,custody:before,unknownEffects:this.unknownRows(b),preflightDigest:digest(preflight),oldPane};
      durable(receiptPath,began);effectAttempted=true;
+    }
+    if(!terminal){
+     if(input.recovery){
+      await this.absent(b);await this.sleep(100);await this.absent(b);unchanged();
+      const final=await this.deps.preflight(b,true);if(digest(final)!==digest(preflight))hold("pi_detached_configuration_changed","Launch contract changed before terminal continuation");
+      if(!this.history(b).bytes.equals(history.bytes))hold("pi_detached_history_changed","Retained history changed before terminal continuation");
+      await this.absent(b);unchanged();
+      if(hash(readFileSync(receiptPath!))!==input.recovery.beganSha256)hold("pi_detached_receipt_invalid","Original receipt changed before terminal continuation");
+      this.noUnresolved(root,b,directory);
+      durable(path.join(directory!,"terminal-recovery-began.json"),{attemptId,at:this.now(),actor:input.operator,actorGeneration:input.actorGeneration,beganSha256:input.recovery.beganSha256,bindingDigest:digest(b),preflightDigest:digest(preflight)});effectAttempted=true;
+     }
      const created=await this.deps.createTerminal(b);if(!/^%[0-9]+$/.test(created.pane))hold("pi_detached_terminal_unknown","Created pane is not exact");
      const pid=await this.deps.tmux.getPanePid(created.pane),row=(await this.census()).find(x=>x.pid===pid);
      if(!pid||!row?.startedAt)hold("pi_detached_terminal_unknown","Created shell incarnation unavailable");

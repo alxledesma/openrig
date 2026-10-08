@@ -201,6 +201,124 @@ describe("guarded detached Pi continuation engine", () => {
     expect(guard.preference(nodeId)).toMatchObject({ desired: true, effective: true });
   });
 
+  it("continues an original pre-terminal UNKNOWN after exact absence proof, preserving the original receipts and custody", async () => {
+    createTerminal.mockRejectedValueOnce(new Error("Pi runtime rejected before issuing a tmux create command"));
+    const originalHistory = readFileSync(historyPath);
+    const first = await run();
+    expect(first, JSON.stringify(first)).toMatchObject({ ok: false, effectAttempted: true, blindRetryAllowed: false });
+    expect(createTerminal).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+    expect(db.prepare("SELECT status FROM sessions WHERE node_id=?").get(nodeId)).toEqual({ status: "detached" });
+    expect(db.prepare("SELECT tmux_pane FROM bindings WHERE node_id=?").get(nodeId)).toEqual({ tmux_pane: "%1" });
+    const original = beganEvidence();
+    const unknownPath = path.join(original.directory, "unknown.json");
+    const originalUnknown = readFileSync(unknownPath);
+    const originalCustody = custody();
+    expect(files().some(file => file.endsWith("terminal-created.json"))).toBe(false);
+    expect(files().some(file => file.endsWith("terminal-bound.json"))).toBe(false);
+
+    const terminalAbsenceChecks = terminalAbsent.mock.calls.length;
+    const nativeAbsenceChecks = proveNativeAbsent.mock.calls.length;
+    const result = await run(service(), { recovery: { attemptId: original.attemptId, beganSha256: original.beganSha256 } });
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true, generation, generationUnchanged: true, custodyPreserved: true });
+    expect(createTerminal).toHaveBeenCalledTimes(2);
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(readFileSync(path.join(original.directory, "began.json"))).toEqual(original.bytes);
+    expect(readFileSync(unknownPath)).toEqual(originalUnknown);
+    expect(readFileSync(historyPath)).toEqual(originalHistory);
+    expect(readFileSync(result.backup.path)).toEqual(originalHistory);
+    expect(custody()).toBe(originalCustody);
+    expect(files().some(file => file.endsWith("terminal-recovery-began.json"))).toBe(true);
+    expect(files().some(file => file.endsWith("terminal-bound.json"))).toBe(true);
+    expect(terminalAbsent.mock.calls.length - terminalAbsenceChecks).toBeGreaterThanOrEqual(3);
+    expect(proveNativeAbsent.mock.calls.length - nativeAbsenceChecks).toBeGreaterThanOrEqual(3);
+  });
+
+  it.each(["terminal-present", "native-present"] as const)("refuses pre-terminal continuation when %s is not absent", async kind => {
+    createTerminal.mockRejectedValueOnce(new Error("Pi runtime rejected before issuing a tmux create command"));
+    const first = await run();
+    expect(first).toMatchObject({ ok: false, effectAttempted: true });
+    const original = beganEvidence();
+    if (kind === "terminal-present") terminalAbsent.mockResolvedValue(false);
+    else proveNativeAbsent.mockResolvedValue(false);
+
+    const result = await run(service(), { recovery: { attemptId: original.attemptId, beganSha256: original.beganSha256 } });
+    expect(result).toMatchObject({ ok: false, effectAttempted: false, blindRetryAllowed: false });
+    expect(createTerminal).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+    expect(readFileSync(path.join(original.directory, "began.json"))).toEqual(original.bytes);
+    expect(files().some(file => file.endsWith("terminal-recovery-began.json"))).toBe(false);
+  });
+
+  it.each(["history", "custody"] as const)("refuses pre-terminal continuation after original %s drift", async kind => {
+    createTerminal.mockRejectedValueOnce(new Error("Pi runtime rejected before issuing a tmux create command"));
+    const first = await run();
+    expect(first).toMatchObject({ ok: false, effectAttempted: true });
+    const original = beganEvidence();
+    const originalUnknown = readFileSync(path.join(original.directory, "unknown.json"));
+    if (kind === "history") writeFileSync(historyPath, Buffer.concat([history, Buffer.from("{}\n")]));
+    else db.prepare("UPDATE nodes SET cwd='/changed/custody' WHERE id=?").run(nodeId);
+
+    const result = await run(service(), { recovery: { attemptId: original.attemptId, beganSha256: original.beganSha256 } });
+    expect(result).toMatchObject({ ok: false, effectAttempted: false, blindRetryAllowed: false });
+    expect(createTerminal).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+    expect(readFileSync(path.join(original.directory, "began.json"))).toEqual(original.bytes);
+    expect(readFileSync(path.join(original.directory, "unknown.json"))).toEqual(originalUnknown);
+    expect(files().some(file => file.endsWith("terminal-recovery-began.json"))).toBe(false);
+  });
+
+  it.each(["missing-attempt", "bad-began-digest"] as const)("refuses %s pre-terminal recovery evidence without creating a terminal", async kind => {
+    createTerminal.mockRejectedValueOnce(new Error("Pi runtime rejected before issuing a tmux create command"));
+    const first = await run();
+    expect(first).toMatchObject({ ok: false, effectAttempted: true });
+    const original = beganEvidence();
+    const recovery = kind === "missing-attempt"
+      ? { attemptId: "b0067c35-2a34-42c6-a443-54f60370c4fc", beganSha256: "a".repeat(64) }
+      : { attemptId: original.attemptId, beganSha256: "0".repeat(64) };
+    const result = await run(service(), { recovery });
+    expect(result).toMatchObject({ ok: false, effectAttempted: false, blindRetryAllowed: false });
+    expect(createTerminal).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+    expect(readFileSync(path.join(original.directory, "began.json"))).toEqual(original.bytes);
+  });
+
+  it("refuses a genuine terminal-created-only partial attempt on explicit recovery", async () => {
+    db.exec(`CREATE TRIGGER reject_pi_terminal_binding BEFORE UPDATE OF tmux_pane ON bindings WHEN OLD.node_id='${nodeId}' BEGIN SELECT RAISE(ABORT,'fixture binding CAS interruption'); END`);
+    const first = await run();
+    expect(first).toMatchObject({ ok: false, effectAttempted: true, blindRetryAllowed: false });
+    expect(createTerminal).toHaveBeenCalledTimes(1);
+    expect(files().some(file => file.endsWith("terminal-created.json"))).toBe(true);
+    expect(files().some(file => file.endsWith("terminal-bound.json"))).toBe(false);
+    const original = beganEvidence();
+    const result = await run(service(), { recovery: { attemptId: original.attemptId, beganSha256: original.beganSha256 } });
+    expect(result).toMatchObject({ ok: false, effectAttempted: false, blindRetryAllowed: false });
+    expect(createTerminal).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+    expect(readFileSync(path.join(original.directory, "began.json"))).toEqual(original.bytes);
+  });
+
+  it("fences a repeated uncertain pre-terminal recovery create while retaining the first UNKNOWN", async () => {
+    createTerminal.mockRejectedValueOnce(new Error("original Pi pre-terminal refusal"));
+    const first = await run();
+    expect(first).toMatchObject({ ok: false, effectAttempted: true });
+    const original = beganEvidence();
+    const unknownPath = path.join(original.directory, "unknown.json");
+    const originalUnknown = readFileSync(unknownPath);
+    createTerminal.mockRejectedValueOnce(new Error("recovery terminal creation outcome uncertain"));
+    const recovery = { recovery: { attemptId: original.attemptId, beganSha256: original.beganSha256 } };
+    const second = await run(service(), recovery);
+    expect(second).toMatchObject({ ok: false, effectAttempted: true, blindRetryAllowed: false });
+    expect(createTerminal).toHaveBeenCalledTimes(2);
+    expect(files().some(file => file.endsWith("terminal-recovery-began.json"))).toBe(true);
+    const third = await run(service(), recovery);
+    expect(third).toMatchObject({ ok: false, effectAttempted: false, blindRetryAllowed: false });
+    expect(createTerminal).toHaveBeenCalledTimes(2);
+    expect(readFileSync(path.join(original.directory, "began.json"))).toEqual(original.bytes);
+    expect(readFileSync(unknownPath)).toEqual(originalUnknown);
+    expect(resume).not.toHaveBeenCalled();
+  });
+
   it.each(["pane", "status"] as const)("holds external %s drift after binding and before native resume", async kind => {
     let mutated = false;
     proveNativeAbsent.mockImplementation(async (_binding: PiDetachedBinding, pid: number) => {
