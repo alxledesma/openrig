@@ -11,6 +11,8 @@ export class NativeDutyError extends Error { constructor(readonly code:string, m
 export interface NativeDutySupervisionOptions {
   db:Database.Database; now?:()=>number;
   approvedScope:(scopeId:string,candidate?:NativeDutyScope)=>NativeDutyScope|null;
+  /** Temporary native custody exclusion; never invalidates a durable grant. */
+  temporarilyExcluded?:(scope:NativeDutyScope)=>boolean;
   assertCurrentOperator:(actor:NativeDutyActor)=>void;
   observeNative:(scope:NativeDutyScope,launchId:string,supervisorPid:number)=>NativeDutyProof|null;
   assertResumeAuthority:(scope:NativeDutyScope,actor:NativeDutyActor,request:NativeDutyResumeRequest)=>void;
@@ -37,6 +39,7 @@ export class NativeDutySupervisionService {
   grant(actor:NativeDutyActor,input:unknown):NativeDutyGrant {
     this.requireActor(actor);this.opts.assertCurrentOperator(actor);const scope=this.validateScope(input);
     const approved=this.opts.approvedScope(scope.scopeId,scope);if(!approved||!same(scope,approved))fail("native_duty_scope_not_approved","Scope must exactly match current approved work",403);
+    this.assertNotTemporarilyExcluded(scope);
     const scopeDigest=digest(canonical(scope)),at=this.timestamp();
     const row=this.db.transaction(()=>{const old=this.grantRow(scope.scopeId);if(old){if(old.scope_digest!==scopeDigest||old.granted_by_session!==actor.session||old.granted_by_generation!==actor.generation)fail("native_duty_grant_conflict","Scope ID is already bound to another immutable grant");if(old.revoked_at!==null)fail("native_duty_grant_revoked","A revoked scope ID cannot be regranted");return old;}
       this.assertNoUnresolvedNodeIntent(scope.nodeId);
@@ -145,17 +148,21 @@ export class NativeDutySupervisionService {
   }
   private requireLiveGrant(id:string):GrantRow {
     const grant=this.grantRow(id);if(!grant)fail("native_duty_grant_missing","No opt-in grant exists for this scope",403);if(grant.revoked_at!==null){this.stopScope(id,"scope-revoked");fail("native_duty_grant_revoked","Scope grant has been revoked",403);}const scope=JSON.parse(grant.scope_json) as NativeDutyScope;if(this.timestamp()>=scope.validUntil){this.stopScope(id,"scope-expired");fail("native_duty_scope_expired","Approved scope window has expired",403);}
-    try{this.opts.assertCurrentOperator({session:grant.granted_by_session,generation:grant.granted_by_generation});}catch{this.stopScope(id,"grantor-generation-retired");fail("native_duty_grantor_retired","Operator generation that granted this scope is no longer current",403);}const approved=this.opts.approvedScope(id);if(!approved||!same(scope,approved)){this.stopScope(id,"approved-scope-changed");fail("native_duty_scope_changed","Current approved scope no longer matches stored grant",403);}return grant;
+    try{this.opts.assertCurrentOperator({session:grant.granted_by_session,generation:grant.granted_by_generation});}catch{this.stopScope(id,"grantor-generation-retired");fail("native_duty_grantor_retired","Operator generation that granted this scope is no longer current",403);}const approved=this.opts.approvedScope(id);if(!approved||!same(scope,approved)){this.stopScope(id,"approved-scope-changed");fail("native_duty_scope_changed","Current approved scope no longer matches stored grant",403);}this.assertNotTemporarilyExcluded(scope);return grant;
+  }
+  private assertNotTemporarilyExcluded(scope:NativeDutyScope):void {
+    if(this.opts.temporarilyExcluded?.(scope))fail("native_duty_temporary_exclusion","Native lifecycle or reservation currently excludes continuation");
   }
   private stopScope(id:string,reason:string):void{this.db.prepare("UPDATE native_duty_registrations SET phase='stopped',reason=? WHERE scope_id=? AND phase!='stopped'").run(reason,id);}
   private assertNativeProof(scope:NativeDutyScope,launchId:string,pid:number):NativeDutyProof {
     let proof:NativeDutyProof|null;try{proof=this.opts.observeNative(scope,launchId,pid);}catch{proof=null;}if(!proof)fail("native_duty_proof_unavailable","Current native process proof is unavailable; no effect is permitted");
-    const ok=proof.nativePresent&&proof.supervisorIsNativeAncestor&&!proof.lifecycleReserved&&proof.nodeId===scope.nodeId&&proof.sessionName===scope.sessionName&&proof.generation===scope.generation&&proof.runtime===scope.runtime&&proof.launchId===launchId&&proof.supervisorPid===pid&&proof.configurationDigest===scope.configurationDigest&&text(proof.fingerprint)&&Number.isSafeInteger(proof.observedAt)&&proof.observedAt<=this.timestamp();if(!ok)fail("native_duty_proof_mismatch","Independent native identity, configuration or lifecycle proof does not match grant",403);return proof;
+    const ok=proof.nativePresent&&proof.supervisorIsNativeAncestor&&proof.nodeId===scope.nodeId&&proof.sessionName===scope.sessionName&&proof.generation===scope.generation&&proof.runtime===scope.runtime&&proof.launchId===launchId&&proof.supervisorPid===pid&&proof.configurationDigest===scope.configurationDigest&&text(proof.fingerprint)&&Number.isSafeInteger(proof.observedAt)&&proof.observedAt<=this.timestamp();if(!ok)fail("native_duty_proof_mismatch","Independent native identity, configuration or lifecycle proof does not match grant",403);if(proof.lifecycleReserved)fail("native_duty_temporary_exclusion","Native proof observes a temporary lifecycle exclusion");return proof;
   }
   private registrationProof(row:RegistrationRow,scope:NativeDutyScope):NativeDutyProof {
     try{return this.assertNativeProof(scope,row.launch_id,row.supervisor_pid);}
     catch(error){
       const code=error instanceof NativeDutyError?error.code:"native-duty-proof-unavailable";
+      if(code==="native_duty_temporary_exclusion")throw error; // No durable phase change for an observed custody hold.
       this.db.prepare("UPDATE native_duty_registrations SET phase='held',reason=? WHERE registration_id=? AND phase='watching'").run(code,row.registration_id);
       throw error;
     }

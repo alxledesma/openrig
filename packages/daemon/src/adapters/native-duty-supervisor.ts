@@ -99,6 +99,10 @@ export async function resolveNativeDutyRegistration(transport: NativeDutyTranspo
 export class NativeDutyInvalidObservationError extends Error {
   constructor() { super("native-duty-invalid-observation-response"); }
 }
+/** Only the exact server heartbeat refusal, never an arbitrary POST failure. */
+export class NativeDutyTemporaryHoldError extends Error {
+  constructor() { super("native-duty-temporary-exclusion"); }
+}
 export class NativeDutyObservationError extends Error {
   constructor() { super("native-duty-observation-unresolved"); }
 }
@@ -162,6 +166,10 @@ export class HolderContinuationExecutor {
     private readonly actor: NativeDutyActor, private readonly clock: DutyClock,
     private readonly live: () => boolean, private readonly operationId: () => string = randomUUID) {}
 
+  private async observeHeartbeat(registrationId: string): Promise<NativeDutyStatus | null> {
+    try { return await this.transport.heartbeat(registrationId); }
+    catch (error) { if (error instanceof NativeDutyTemporaryHoldError) return null; throw error; }
+  }
   private allowed(status: NativeDutyStatus): boolean {
     const s = status.scope;
     return this.live() && s.kind === "holder-continuation" && s.sessionName === this.actor.session
@@ -196,7 +204,9 @@ export class HolderContinuationExecutor {
     }
     if (!this.live() || status.phase === "stopped") return "stopped";
     // Heartbeat is independent native/config/lifecycle revalidation, not a lease.
-    status = await this.transport.heartbeat(registrationId);
+    const heartbeat = await this.observeHeartbeat(registrationId);
+    if (!heartbeat) return "held";
+    status = heartbeat;
     if (!this.allowed(status) || status.registrationId !== registrationId) return "held";
     const shown = await this.transport.show(status.scope.rigId);
     const a = shown.authority, now = this.clock.now();
@@ -223,7 +233,9 @@ export class HolderContinuationExecutor {
     if (inFlight.maySendEffect !== true || !this.matchesIntent(inFlight.intent, entry, "effect-in-flight")) return "held";
     // Registration proof and intent phase are separate wire contracts. Never
     // promote an intent into native authorization or replay a false send grant.
-    status = await this.transport.heartbeat(registrationId);
+    const finalHeartbeat = await this.observeHeartbeat(registrationId);
+    if (!finalHeartbeat) return "held";
+    status = finalHeartbeat;
     if (!this.allowed(status) || status.registrationId !== registrationId || status.scope.rigId !== request.rigId
       || !status.intent || !this.matchesIntent(status.intent, entry, "effect-in-flight")
       || request.leaseMs > nativeDutyLeaseMs(status.scope, this.clock.now())
@@ -375,8 +387,16 @@ export function inheritedNativeDutyTransport(): { actor: NativeDutyActor; transp
       res = await fetch(`${endpoint!.replace(/\/+$/, "")}${route}`, { method: body === undefined ? "GET" : "POST",
         headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: AbortSignal.timeout(NATIVE_DUTY_REQUEST_TIMEOUT_MS), redirect: "error" });
-      if (!res.ok) throw new Error("native-duty-transport-refused");
     } catch { throw body === undefined ? new NativeDutyObservationError() : new Error("native-duty-transport-unresolved"); }
+    if (!res.ok) {
+      if (route === `${NATIVE_DUTY_API}/heartbeat` && body !== undefined && res.status === 409) {
+        let refusal: unknown;
+        try { refusal = await res.json(); } catch { /* Unknown response stays a mutation failure. */ }
+        if (refusal && typeof refusal === "object" && !Array.isArray(refusal)
+          && (refusal as Record<string, unknown>).error === "native_duty_temporary_exclusion") throw new NativeDutyTemporaryHoldError();
+      }
+      throw body === undefined ? new NativeDutyObservationError() : new Error("native-duty-transport-unresolved");
+    }
     // A successful HTTP response with invalid JSON is a contract defect, not a
     // network observation interruption. POST outcome still remains UNKNOWN.
     try { return await res.json() as T; }

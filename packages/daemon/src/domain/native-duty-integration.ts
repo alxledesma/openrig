@@ -27,6 +27,7 @@ export class NativeDutyIntegration {
     this.service = new NativeDutySupervisionService({
       db: opts.db, now: this.now,
       approvedScope: (id, candidate) => this.approvedScope(id, candidate),
+      temporarilyExcluded: scope => this.temporarilyExcluded(scope.nodeId),
       assertCurrentOperator: actor => opts.authority.assertCurrentOperator(actor.session, actor.generation),
       assertResumeAuthority: (scope, actor, request) => this.assertResume(scope, actor, request),
       observeNative: (scope, launchId, pid) => {
@@ -62,6 +63,7 @@ export class NativeDutyIntegration {
     try { scope = JSON.parse(grant.scope_json) as NativeDutyScope; } catch { return { state: "held" }; }
     if (grant.revoked_at !== null || scope.sessionName !== actor.session || scope.generation !== actor.generation
       || scope.validUntil <= this.now() || !this.approvedScope(input.scopeId)) return { state: "held" };
+    if (this.temporarilyExcluded(scope.nodeId)) return { state: "held" };
     await this.refreshNative(actor, input);
     const proof = this.observations.get(this.key(input.scopeId, input.launchId, input.supervisorPid));
     const matches = proof && proof.nodeId === scope.nodeId && proof.sessionName === scope.sessionName
@@ -78,6 +80,10 @@ export class NativeDutyIntegration {
    * The holder coordinates its rig's workers, so work need not be assigned to
    * the holder itself. Exact acceptance ends the applicable package's work.
    */
+  private temporarilyExcluded(nodeId: string): boolean {
+    return !!this.opts.lifecycleActive?.(nodeId)
+      || !!this.opts.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE node_id=? AND state!='released' LIMIT 1").get(nodeId);
+  }
   private approvedScope(scopeId: string, candidate?: NativeDutyScope): NativeDutyScope | null {
     let scope = candidate;
     if (!scope) {
@@ -97,8 +103,7 @@ export class NativeDutyIntegration {
       || !Number.isSafeInteger(scope.validUntil) || scope.validUntil <= this.now()
       || !Number.isSafeInteger(scope.maxLeaseMs) || scope.maxLeaseMs < 1000 || scope.maxLeaseMs > 3600000) return null;
     // An explicit grant is not a bypass of reservation-based custody exclusion.
-    if (this.opts.lifecycleActive?.(scope.nodeId)
-      || this.opts.db.prepare("SELECT 1 FROM seat_dispatch_reservations WHERE node_id=? AND state!='released' LIMIT 1").get(scope.nodeId)) return null;
+
     const plan = recovery.plan(scope.rigId);
     if (!plan || plan.operatorGeneration !== this.opts.authority.generation("operator-agent@kernel")) return null;
     const boundedWork = recovery.continuationTasks(scope.rigId).some(task => {

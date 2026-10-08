@@ -10,7 +10,7 @@ import { NativeDutySupervisionService, type NativeDutyOperationReceipt } from ".
 import { nativeDutySupervisionRoutes } from "../src/routes/native-duty-supervision.js";
 import {
   FileDutyJournal, HolderContinuationExecutor, superviseNativeHarness,
-  resolveNativeDutyRegistration, NativeDutyObservationError, NativeDutyInvalidObservationError, waitNativeDutyObservation,
+  resolveNativeDutyRegistration, NativeDutyObservationError, NativeDutyInvalidObservationError, NativeDutyTemporaryHoldError, waitNativeDutyObservation,
   inheritedNativeDutyTransport,
   type DutyChild, type DutyClock, type DutyProcesses, type HolderObservation,
   type NativeDutyLaunchConfig, type NativeDutyTransport, NATIVE_DUTY_TRANSPORT_BUDGET_MS,
@@ -455,5 +455,20 @@ it('successful malformed GET JSON is terminal, while POST malformed JSON remains
  await expect(waitNativeDutyObservation(()=>transport.status('exact-id'),{now:()=>0,sleep:async()=>{throw Error('must not retry');}},1000,()=>true)).rejects.toBeInstanceOf(NativeDutyInvalidObservationError);
  await expect(transport.register({scopeId:'scope',launchId:'launch',supervisorPid:321})).rejects.toThrow('native-duty-transport-unresolved');
  expect(calls).toBe(3);
+ }finally{globalThis.fetch=oldFetch;for(const[k,v]of previous){if(v===undefined)delete process.env[k];else process.env[k]=v;}}
+});
+
+it('only exact temporary heartbeat refusal is observational; other POST failures remain UNKNOWN',async()=>{
+ const values={OPENRIG_SESSION_NAME:'test@rig',OPENRIG_OCCUPANT_GENERATION:'test-gen',OPENRIG_URL:'http://127.0.0.1:12345',OPENRIG_TERMINAL_BEARER_TOKEN:'test-only-token'};
+ const previous=new Map(Object.keys(values).map(k=>[k,process.env[k]])),oldFetch=globalThis.fetch;
+ let error='native_duty_temporary_exclusion',status=409;
+ try{
+  Object.assign(process.env,values);globalThis.fetch=(async()=>new Response(JSON.stringify({error}),{status})) as typeof fetch;
+  const {transport}=inheritedNativeDutyTransport();
+  await expect(transport.heartbeat('exact-id')).rejects.toBeInstanceOf(NativeDutyTemporaryHoldError);
+  await expect(transport.register({scopeId:'scope',launchId:'launch',supervisorPid:321})).rejects.toThrow('native-duty-transport-unresolved');
+  await expect(transport.inFlight('exact-id','op')).rejects.toThrow('native-duty-transport-unresolved');
+  error='native_duty_proof_mismatch';await expect(transport.heartbeat('exact-id')).rejects.toThrow('native-duty-transport-unresolved');
+  error='native_duty_temporary_exclusion';status=500;await expect(transport.heartbeat('exact-id')).rejects.toThrow('native-duty-transport-unresolved');
  }finally{globalThis.fetch=oldFetch;for(const[k,v]of previous){if(v===undefined)delete process.env[k];else process.env[k]=v;}}
 });

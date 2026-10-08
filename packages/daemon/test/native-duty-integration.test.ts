@@ -1,3 +1,4 @@
+import { FileDutyJournal, HolderContinuationExecutor, inheritedNativeDutyTransport } from "../src/adapters/native-duty-supervisor.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3";
 import fs from "node:fs";
@@ -154,6 +155,68 @@ describe("native duty actual authority integration",()=>{
   expect((await call("/grant",{...scope,scopeId:"after-exact-acceptance"},operator)).body.error).toBe("native_duty_scope_not_approved");
  });
 
+ it.each(["memory","reservation"])("temporary %s exclusion holds SAME helper then clears without stopping registration or authorizing effects",async(kind)=>{
+  scope={...scope,validUntil:now+30000}; // Inside existing task deadline; leave the unchanged transport budget.
+  const registrationId=await grantAndRegister();
+  const original=db.prepare("SELECT * FROM native_duty_registrations WHERE registration_id=?").get(registrationId);
+  if(kind==="memory")lifecycle=true;
+  else db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES ('busy-reservation','migration','lead@xv','lead@xv','lead-g1','prior-native','operator-agent@kernel','operator-agent-g1','hash','{}','{}','reserved',?,?)").run(new Date(now).toISOString(),new Date(now).toISOString());
+  const journalRoot=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),"temporary-duty-")));fs.chmodSync(journalRoot,0o700);
+  const values={OPENRIG_SESSION_NAME:holder.session,OPENRIG_OCCUPANT_GENERATION:holder.generation,OPENRIG_URL:"http://127.0.0.1:45678",OPENRIG_TERMINAL_BEARER_TOKEN:"private-fixture"};
+  const previous=new Map(Object.keys(values).map(k=>[k,process.env[k]])),oldFetch=globalThis.fetch;const routes:string[]=[];
+  try{
+   Object.assign(process.env,values);
+   globalThis.fetch=(async(input,init)=>{const url=new URL(String(input));const route=url.pathname.replace('/api/native-duty','');routes.push(route);return app.request(route,init);}) as typeof fetch;
+   const transport=inheritedNativeDutyTransport().transport;
+   transport.show=async()=>{const a=repo.coordinatorAuthority.get("xv")!,baton=repo.getById(a.baton_id)!;return {authority:a,obligationsDigest:repo.coordinatorAuthority.reconciliationDigest("xv"),obligations:[{openQueue:[{qitem_id:a.baton_id,destination_session:holder.session,state:baton.state,claimed_by_generation_uuid:holder.generation}]}]};};
+   const journal=new FileDutyJournal(journalRoot),executor=new HolderContinuationExecutor(transport,journal,holder,{now:()=>now,sleep:async()=>{}},()=>true,()=>{throw Error("busy/ample lease cannot prepare");});
+   for(let i=0;i<5;i++){expect(await executor.step(registrationId)).toBe("held");now+=1000;vi.setSystemTime(now);}
+   expect(db.prepare("SELECT * FROM native_duty_registrations WHERE registration_id=?").get(registrationId)).toEqual(original);
+   expect(journal.read()).toBeNull();expect(db.prepare("SELECT count(*) n FROM native_duty_intents").get()).toEqual({n:0});
+   expect((await call("/register",{...enrollment,launchId:"busy-new"})).body.error).toBe("native_duty_temporary_exclusion");
+   expect((await call("/prepare",{registrationId,request:request("busy-prepare")})).body.error).toBe("native_duty_temporary_exclusion");
+   expect((await call("/in-flight",{registrationId,operationId:"busy-prepare"})).body.error).toBe("native_duty_temporary_exclusion");
+   if(kind==="memory")lifecycle=false;else db.prepare("UPDATE seat_dispatch_reservations SET state='released' WHERE reservation_id='busy-reservation'").run();
+   expect(await executor.step(registrationId)).toBe("watching");expect(integration.service.status(registrationId).phase).toBe("watching");
+   expect(routes.filter(r=>r==='/heartbeat')).toHaveLength(6);
+   expect(routes.every(r=>r.startsWith('/status/')||r==='/heartbeat')).toBe(true);
+  }finally{globalThis.fetch=oldFetch;for(const[k,v]of previous){if(v===undefined)delete process.env[k];else process.env[k]=v;}fs.rmSync(journalRoot,{recursive:true,force:true});}
+ });
+ it("temporary native proof exclusion race stays observational and does not waive wrong identity",async()=>{
+  const registrationId=await grantAndRegister();proofPatch={lifecycleReserved:true};
+  expect((await call("/heartbeat",{registrationId})).body.error).toBe("native_duty_temporary_exclusion");
+  expect(integration.service.status(registrationId).phase).toBe("watching");
+  proofPatch={};expect((await call("/heartbeat",{registrationId})).status).toBe(200);
+  proofPatch={lifecycleReserved:true,generation:"wrong"};
+  expect((await call("/heartbeat",{registrationId})).body.error).toBe("native_duty_proof_mismatch");
+  expect(integration.service.status(registrationId).phase).toBe("held");
+ });
+ it("temporary exclusion preserves prepared bytes and never reopens an in-flight send grant",async()=>{
+  const registrationId=await grantAndRegister(),r=request();
+  expect((await call("/prepare",{registrationId,request:r})).status).toBe(201);
+  const original=db.prepare("SELECT * FROM native_duty_intents").get();lifecycle=true;
+  expect((await call("/in-flight",{registrationId,operationId:r.operationId})).body.error).toBe("native_duty_temporary_exclusion");
+  expect(db.prepare("SELECT * FROM native_duty_intents").get()).toEqual(original);
+  expect(integration.service.status(registrationId).phase).toBe("watching");
+  lifecycle=false;expect((await call("/in-flight",{registrationId,operationId:r.operationId})).body.maySendEffect).toBe(true);
+  lifecycle=true;const inFlight=db.prepare("SELECT * FROM native_duty_intents").get();
+  expect((await call("/heartbeat",{registrationId})).body.error).toBe("native_duty_temporary_exclusion");
+  expect(db.prepare("SELECT * FROM native_duty_intents").get()).toEqual(inFlight);
+  lifecycle=false;expect((await call("/in-flight",{registrationId,operationId:r.operationId})).body.maySendEffect).toBe(false);
+ });
+ it.each(["revoked","expired","generation","configuration","work","stopped"])("permanent %s remains terminal even while temporarily busy",async(kind)=>{
+  const registrationId=await grantAndRegister();lifecycle=true;
+  if(kind==="revoked")await call("/revoke",{scopeId:scope.scopeId},operator);
+  if(kind==="expired"){now=scope.validUntil;vi.setSystemTime(now);}
+  if(kind==="generation")db.prepare("UPDATE occupant_tenures SET generation_uuid='retired-holder' WHERE node_id='lead@xv'").run();
+  if(kind==="configuration")db.prepare("UPDATE nodes SET model='changed' WHERE id='lead@xv'").run();
+  if(kind==="work")db.prepare("UPDATE nodes SET model='changed' WHERE id IN ('builder@xv','architect@xv')").run();
+  if(kind==="stopped")await call("/stop",{registrationId,reason:"retained-stop"});
+  expect((await call("/heartbeat",{registrationId})).status).toBeGreaterThanOrEqual(400);
+  expect(integration.service.status(registrationId).phase).toBe("stopped");
+  lifecycle=false;expect((await call("/heartbeat",{registrationId})).status).toBeGreaterThanOrEqual(400);
+  expect(integration.service.status(registrationId).phase).toBe("stopped");
+ });
  it("waits before grant and recovers a lost registration response through read-only enrollment without duplication",async()=>{
   expect(await call(enrollmentUrl())).toEqual({status:200,body:{state:"waiting"}});
   expect(db.prepare("SELECT count(*) n FROM native_duty_grants").get()).toEqual({n:0});
@@ -178,7 +241,7 @@ describe("native duty actual authority integration",()=>{
   if(kind==="lifecycle-reservation")db.prepare("INSERT INTO seat_dispatch_reservations(reservation_id,operation_id,node_id,session_name,predecessor_generation,predecessor_native_id,actor_session,actor_generation,request_hash,expected_json,frozen_snapshot,state,created_at,updated_at) VALUES ('reservation','migration','lead@xv','lead@xv','lead-g1','prior-native','operator-agent@kernel','operator-agent-g1','hash','{}','{}','reserved',?,?)").run(new Date(now).toISOString(),new Date(now).toISOString());
   expect((await call(enrollmentUrl())).body.state).toBe("held");
   expect((await call("/register",enrollment)).status).toBeGreaterThanOrEqual(400);
-  expect((await call("/grant",{...scope,scopeId:"new-scope"},operator)).body.error).toBe("native_duty_scope_not_approved");
+  expect((await call("/grant",{...scope,scopeId:"new-scope"},operator)).body.error).toBe(kind.startsWith("lifecycle-")?"native_duty_temporary_exclusion":"native_duty_scope_not_approved");
   expect(db.prepare("SELECT count(*) n FROM native_duty_registrations").get()).toEqual({n:0});
  });
 
