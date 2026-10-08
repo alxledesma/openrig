@@ -16,6 +16,8 @@ export interface CodexRehostBinding {
 }
 export interface CodexRehostNativeState {
   nodeId:string;sessionName:string;nativeId:string;transcriptPath:string;
+  /** Present only for the independently observed unpinned maintenance predecessor; profile below names the validated future launch. */
+  legacyLaunch?:{observedProfile:string|null};
   runtimeContract:{runtime:string;model:string;provider:string;profile:string;effort:string|null;permissions:{sandbox:unknown;approval:string}};
 }
 export interface CodexRehostPreflight {
@@ -33,16 +35,18 @@ declare const maintenanceBrand:unique symbol;
 export interface OperatorMaintenanceAuthority {
   readonly [maintenanceBrand]:true;
   readonly principal:'local-terminal-maintenance';readonly nodeId:string;readonly sessionName:'operator-agent@kernel';readonly generation:string;
-  readonly mode:'rehost'|'stopped-recovery';readonly attemptId?:string;readonly beganSha256?:string;
+  readonly mode:'rehost'|'stopped-recovery';readonly legacyCodexProfile?:string;readonly enableGuard?:true;readonly attemptId?:string;readonly beganSha256?:string;
 }
 const maintenanceAuthorities=new WeakSet<object>();
 /** Trusted route-only issuer, called after terminal bearer and connection checks.
  * JSON/body lookalikes are never capabilities, even if every field matches. */
-export function createOperatorMaintenanceAuthority(input:{nodeId:string;generation:string;recovery?:CodexStoppedRecovery}):OperatorMaintenanceAuthority {
+export function createOperatorMaintenanceAuthority(input:{nodeId:string;generation:string;recovery?:CodexStoppedRecovery;legacyCodexProfile?:string;enableGuard?:true}):OperatorMaintenanceAuthority {
   if(!input.nodeId||!input.generation)throw new Error('Exact server Operator binding required');
   if(input.recovery)parseCodexStoppedRecovery(input.recovery);
+  if(input.enableGuard!==undefined&&input.enableGuard!==true)throw new Error('Explicit enableGuard true required');
+  if(input.legacyCodexProfile!==undefined&&(input.recovery||! /^[a-zA-Z0-9_-]+$/.test(input.legacyCodexProfile)))throw new Error('Legacy profile requires normal maintenance and a safe named profile');
   const authority=Object.freeze({principal:'local-terminal-maintenance',nodeId:input.nodeId,sessionName:'operator-agent@kernel',generation:input.generation,
-    mode:input.recovery?'stopped-recovery':'rehost',...(input.recovery??{})}) as OperatorMaintenanceAuthority;
+    mode:input.recovery?'stopped-recovery':'rehost',...(input.recovery??{}),...(input.legacyCodexProfile?{legacyCodexProfile:input.legacyCodexProfile}:{}),...(input.enableGuard?{enableGuard:true}:{})}) as OperatorMaintenanceAuthority;
   maintenanceAuthorities.add(authority);return authority;
 }
 export interface CodexRehostInput {nodeId:string;sessionName:string;reason:string;operator?:string|null;maintenanceAuthority?:OperatorMaintenanceAuthority}
@@ -58,6 +62,8 @@ export interface CodexRehostOptions {
   db:Database.Database;guard:SeatDeliveryGuard;tmux:{getPanePid(pane:string):Promise<number|null>};
   resume:Pick<CodexResumeAdapter,"resume">;snapshotRoot:string;
   nativeState:(session:string)=>Promise<CodexRehostNativeState>;
+  /** Maintenance-only exact live identity/history observation without trusting saved model/profile pins. */
+  legacyNativeState?:(session:string,profile:string)=>Promise<CodexRehostNativeState>;
   /** Must refresh the real seat observation before returning its deciding witness. */
   activityWitness:(nodeId:string,pane:string)=>Promise<ActivityEvidence|null>;
   /** Exact launch dependencies, effective profile/posture/model/effort; no native effect. */
@@ -101,29 +107,53 @@ export class CodexSameGenerationRehost {
       if(!input.reason?.trim())reject("codex_rehost_reason_required","An accountable reason is required");
       if(!this.deps.preflightSupervisedLaunch||!this.deps.observeSupervisedReplacement||!this.deps.nativeState||!this.deps.activityWitness||!this.deps.resume)
         reject("codex_rehost_unavailable","Every supervised resume, native and activity proof seam is required");
+      await this.enableMaintenanceGuard(input,'rehost');
       return await this.deps.guard.runnerRehost(input.nodeId,async()=>{
         if(input.maintenanceAuthority)this.maintenanceActor(input,'rehost');
-        const binding=this.binding(input),pane=this.pane(input.nodeId),before=this.custody(binding);
+        const legacyProfile=input.maintenanceAuthority?.legacyCodexProfile;
+        const originalConfig=legacyProfile?this.legacyConfig(input):undefined;
+        if(legacyProfile&&!this.deps.legacyNativeState)reject('codex_rehost_legacy_unavailable','Independent legacy native proof is unavailable');
+        const legacyNative=legacyProfile?await this.deps.legacyNativeState!(input.sessionName,legacyProfile):undefined;
+        if(legacyNative&&legacyNative.runtimeContract.profile!==legacyProfile)reject('codex_rehost_legacy_binding_mismatch','Observed future profile differs from explicit maintenance selection');
+        const binding=this.binding(input,legacyNative),pane=this.pane(input.nodeId);
+        let before=this.custody(binding);
+        const originalCustody=before;
         this.gates(binding);this.assertNoUnresolved(binding);
-        const native=await this.native(binding),preflight=await this.deps.preflightSupervisedLaunch(binding,native);this.preflightMatches(binding,native,preflight);
+        const readNative=async()=>{const n=legacyProfile?await this.deps.legacyNativeState!(input.sessionName,legacyProfile):await this.native(binding);this.nativeMatches(binding,n);return n;};
+        const native=legacyNative??await readNative();this.nativeMatches(binding,native);
+        const preflight=await this.deps.preflightSupervisedLaunch(binding,native);this.preflightMatches(binding,native,preflight);
         const first=await this.prove(binding,pane,false);await this.idle(binding,pane);
         const initial=this.history(native.transcriptPath,binding.nativeId);
         await this.sleep(100);
         const second=await this.prove(binding,pane,false);await this.idle(binding,pane);
         if(first.fingerprint!==second.fingerprint||!initial.equals(this.history(native.transcriptPath,binding.nativeId)))reject("codex_rehost_unstable","Native incarnation or transcript changed during deciding idle proof");
-        this.unchanged(input,binding,before);this.gates(binding);
-        const evidenceNative=await this.native(binding),finalPreflight=await this.deps.preflightSupervisedLaunch(binding,evidenceNative);this.preflightMatches(binding,evidenceNative,finalPreflight);
+        this.unchanged(input,binding,before,legacyNative);this.gates(binding);
+        const evidenceNative=await readNative(),finalPreflight=await this.deps.preflightSupervisedLaunch(binding,evidenceNative);this.preflightMatches(binding,evidenceNative,finalPreflight);
         if(digest(native)!==digest(evidenceNative)||digest(preflight)!==digest(finalPreflight))reject("codex_rehost_configuration_changed","Native profile/model/effort/posture or launch dependencies changed before stop");
         const attemptId=randomUUID(),directory=this.attemptDirectory(binding,second.fingerprint,attemptId);
         const backupPath=path.join(directory,"transcript.jsonl"),backup={path:backupPath,sha256:hash(initial),size:initial.length};
         writeDurable(backupPath,initial);privatePath(backupPath,false);if(!readFileSync(backupPath).equals(initial))reject("codex_rehost_snapshot_failed","Private full transcript backup could not be verified");
-        const final=await this.prove(binding,pane,false);await this.idle(binding,pane);this.unchanged(input,binding,before);this.gates(binding);
+        const final=await this.prove(binding,pane,false);await this.idle(binding,pane);this.unchanged(input,binding,before,legacyNative);this.gates(binding);
         if(final.fingerprint!==second.fingerprint||!this.history(native.transcriptPath,binding.nativeId).equals(initial))reject("codex_rehost_unstable","Native/history changed immediately before the durable stop boundary");
         receiptPath=path.join(directory,"began.json");
-        writeDurable(receiptPath,JSON.stringify({protocol:"codex-same-generation-rehost-v1",attemptId,at:this.now(),reason:input.reason,actor:input.maintenanceAuthority?'local-terminal-maintenance':input.operator??null,
+        const writeBegan=()=>writeDurable(receiptPath!,JSON.stringify({protocol:"codex-same-generation-rehost-v1",attemptId,at:this.now(),reason:input.reason,actor:input.maintenanceAuthority?'local-terminal-maintenance':input.operator??null,
           ...(input.maintenanceAuthority?{maintenanceProvenance:this.maintenanceProvenance(input.maintenanceAuthority)}:{}),
+          ...(originalConfig?{legacyBinding:{originalConfig,targetConfig:{model:binding.model,effort:binding.effort,profile:binding.codexConfigProfile},originalCustody,observedLaunch:native.legacyLaunch}}:{}),
           bindingDigest:digest(binding),nativeIdHash:hash(binding.nativeId),nativeFingerprint:final.fingerprint,backup,custody:before,preflightDigest:preflight.evidenceDigest,
           nativeEvidence:{pane,panePid:final.panePid,processes:final.processes.map(({pid,ppid,startedAt})=>({pid,ppid,startedAt}))}})+"\n");
+        if(originalConfig){
+          // All async validation is complete. SQLite rollback prevents a refused
+          // write-ahead receipt from leaving partial metadata. A crash after the
+          // durable receipt but before commit is conservatively unresolved.
+          this.deps.db.transaction(()=>{
+            this.unchanged(input,binding,before,legacyNative);this.gates(binding);
+            if(digest(this.legacyConfig(input))!==digest(originalConfig))reject('codex_rehost_configuration_changed','Legacy configuration changed before binding');
+            const changed=this.deps.db.prepare('UPDATE nodes SET model=?,effort=?,codex_config_profile=? WHERE id=? AND codex_config_profile IS NULL AND model IS ? AND effort IS ?')
+              .run(binding.model,binding.effort,binding.codexConfigProfile,binding.nodeId,originalConfig.model,originalConfig.effort);
+            if(changed.changes!==1)reject('codex_rehost_configuration_changed','Legacy configuration CAS failed');
+            before=this.custody(binding);writeBegan();
+          }).immediate();
+        }else writeBegan();
         effectAttempted=true; // Durable write-ahead intent: any following uncertainty blocks replay.
         try {
           (this.deps.signal??(pid=>process.kill(pid,"SIGTERM")))(final.pid);
@@ -153,6 +183,7 @@ export class CodexSameGenerationRehost {
     try {
       parseCodexStoppedRecovery({attemptId:input.attemptId,beganSha256:input.beganSha256});
       if(!input.reason?.trim()||!this.deps.stoppedNativeState||!this.deps.proveStoppedIdentityAbsent)reject("codex_rehost_recovery_unavailable","Accountable reason and stopped recovery proof dependencies required");
+      await this.enableMaintenanceGuard(input,'stopped-recovery');
       return await this.deps.guard.runnerRehost(input.nodeId,async()=>{
         this.recoveryActor(input);
         const b=this.binding(input),pane=this.pane(b.nodeId),before=this.custody(b),root=this.nodeDirectory(b);
@@ -211,6 +242,12 @@ export class CodexSameGenerationRehost {
     const t=this.deps.guard.target('operator-agent@kernel'),s=this.deps.db.prepare('SELECT status,startup_status FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1').get(t.nodeId) as {status:string;startup_status:string}|undefined;
     if(input.operator!=='operator-agent@kernel'||!input.actorGeneration||t.session!==input.operator||t.occupant!==input.actorGeneration||s?.status!=='running'||s.startup_status!=='ready')reject('codex_rehost_recovery_actor','Current running ready Operator transport identity and generation required');
   }
+  private async enableMaintenanceGuard(input:CodexRehostInput,mode:OperatorMaintenanceAuthority['mode']){
+    if(!input.maintenanceAuthority?.enableGuard)return;
+    this.maintenanceActor(input,mode);
+    await this.deps.guard.set(input.nodeId,true,'local-terminal-maintenance',input.reason);
+    this.maintenanceActor(input,mode);
+  }
   private maintenanceProvenance(a:OperatorMaintenanceAuthority){return {principal:a.principal,nodeId:a.nodeId,sessionName:a.sessionName,generation:a.generation,mode:a.mode};}
   private maintenanceActor(input:CodexRehostInput,mode:OperatorMaintenanceAuthority['mode']){
     const a=input.maintenanceAuthority,t=this.deps.guard.target('operator-agent@kernel');
@@ -229,12 +266,25 @@ export class CodexSameGenerationRehost {
       ||!await this.deps.proveStoppedIdentityAbsent!(b,panePid)||await this.deps.tmux.getPanePid(pane)!==panePid)reject('codex_rehost_recovery_absence','Stable bare bound pane and global old native identity absence are required');
     return {pane,panePid,startedAt:root.startedAt,ppid:root.ppid,executableName:root.executableName};
   }
-  private binding(input:Pick<CodexRehostInput,"nodeId"|"sessionName">):CodexRehostBinding {
+  private binding(input:Pick<CodexRehostInput,"nodeId"|"sessionName">,legacy?:CodexRehostNativeState):CodexRehostBinding {
     const row=this.deps.db.prepare("SELECT n.id nodeId,n.runtime,n.cwd,n.model,n.effort,n.codex_config_profile codexConfigProfile,s.id sessionId,s.session_name sessionName,s.resume_type resumeType,s.resume_token nativeId,s.status,s.startup_status startupStatus FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE n.id=? ORDER BY s.id DESC LIMIT 1").get(input.nodeId) as Record<string,string|null>|undefined;
     const tenure=this.deps.db.prepare("SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1").get(input.nodeId) as {generation_uuid:string}|undefined;
     if(!row||row.runtime!=="codex"||row.sessionName!==input.sessionName||row.resumeType!=="codex_id"||!row.nativeId||!tenure?.generation_uuid||row.status!=="running"||row.startupStatus!=="ready")reject("codex_rehost_binding_unproven","Current running Codex binding and exact saved codex_id/current tenure are required; no fresh or last-thread fallback");
+    if(legacy){
+      if(row.codexConfigProfile!==null||legacy.nodeId!==row.nodeId||legacy.sessionName!==row.sessionName||legacy.nativeId!==row.nativeId||!legacy.legacyLaunch)
+        reject('codex_rehost_legacy_binding_mismatch','Legacy observation must match the exact unpinned current native binding');
+      row.model=legacy.runtimeContract.model;row.effort=legacy.runtimeContract.effort;row.codexConfigProfile=legacy.runtimeContract.profile;
+    }
     if(!row.cwd||!path.isAbsolute(row.cwd)||!row.model||!row.codexConfigProfile)reject("codex_rehost_configuration_unproven","Persisted absolute cwd, model and named Codex profile are required before any process effect");
     return {nodeId:row.nodeId!,sessionId:row.sessionId!,sessionName:row.sessionName!,generation:tenure.generation_uuid,runtime:"codex",nativeId:row.nativeId,cwd:row.cwd,model:row.model,effort:row.effort??null,codexConfigProfile:row.codexConfigProfile};
+  }
+  private legacyConfig(input:CodexRehostInput){
+    this.maintenanceActor(input,'rehost');
+    if(!input.maintenanceAuthority?.legacyCodexProfile)reject('codex_rehost_maintenance_identity','Explicit maintenance legacy profile required');
+    const row=this.deps.db.prepare('SELECT model,effort,codex_config_profile AS profile FROM nodes WHERE id=?').get(input.nodeId) as {model:string|null;effort:string|null;profile:string|null}|undefined;
+    const startup=this.deps.db.prepare('SELECT * FROM node_startup_context WHERE node_id=?').get(input.nodeId) as {runtime:string}|undefined;
+    if(!row||row.profile!==null||startup&&startup.runtime!=='codex')reject('codex_rehost_legacy_binding_mismatch','Only an unpinned Codex startup context can be bound by legacy maintenance');
+    return {...row,startupDigest:digest(startup??null)};
   }
   private pane(nodeId:string):string {const row=this.deps.db.prepare("SELECT tmux_pane FROM bindings WHERE node_id=?").get(nodeId) as {tmux_pane:string|null}|undefined;if(!row?.tmux_pane)reject("codex_rehost_binding_unproven","Exact managed pane binding required");return row.tmux_pane;}
   private gates(binding:CodexRehostBinding){
@@ -289,7 +339,7 @@ export class CodexSameGenerationRehost {
     outbox:db.prepare('SELECT * FROM outbox_entries WHERE sender_session IN (?,?) OR destination_session IN (?,?) ORDER BY outbox_id').all(...a,...a)};
     return Object.fromEntries(Object.entries(rows).map(([k,v])=>[k,{count:v.length,sha256:digest(v)}]));
   }
-  private unchanged(input:CodexRehostInput,b:CodexRehostBinding,before:unknown){if(input.maintenanceAuthority)this.maintenanceActor(input,input.maintenanceAuthority.mode);if(digest(this.binding(input))!==digest(b)||digest(this.custody(b))!==digest(before))reject("codex_rehost_custody_changed","Exact node/session/generation, authority, claims, resources or retained effects changed; nothing is silently repaired");}
+  private unchanged(input:CodexRehostInput,b:CodexRehostBinding,before:unknown,legacy?:CodexRehostNativeState){if(input.maintenanceAuthority)this.maintenanceActor(input,input.maintenanceAuthority.mode);if(digest(this.binding(input,legacy))!==digest(b)||digest(this.custody(b))!==digest(before))reject("codex_rehost_custody_changed","Exact node/session/generation, authority, claims, resources or retained effects changed; nothing is silently repaired");}
   private nodeDirectory(b:CodexRehostBinding){if(!path.isAbsolute(this.deps.snapshotRoot))reject("codex_rehost_private_store","Absolute private snapshot root required");mkdirSync(this.deps.snapshotRoot,{recursive:true,mode:0o700});privatePath(this.deps.snapshotRoot,true);const directory=path.join(realpathSync(this.deps.snapshotRoot),digest([b.nodeId,b.generation]));mkdirSync(directory,{recursive:true,mode:0o700});privatePath(directory,true);return directory;}
   /** Only the durable write-ahead marker signifies an effect may have begun.
    * A retained backup without it is a pre-effect refusal, never retry debt. */

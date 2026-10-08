@@ -392,20 +392,25 @@ seatRoutes.post("/operator-maintenance/rehost-runner",async c=>{
   if(["X-OpenRig-Session","X-OpenRig-Occupant-Generation","X-OpenRig-Origin-Unknown"].some(k=>c.req.raw.headers.has(k)))
     return c.json({ok:false,code:"operator_maintenance_agent_identity_not_accepted"},400);
   const body=await c.req.json<Record<string,unknown>>().catch(()=>null);
-  if(!body||typeof body!=="object"||Array.isArray(body)||Object.keys(body).some(k=>!["reason","expected","codexStoppedRecovery"].includes(k))
+  if(!body||typeof body!=="object"||Array.isArray(body)||Object.keys(body).some(k=>!["reason","expected","codexStoppedRecovery","legacyCodexProfile","enableGuard"].includes(k))
     ||typeof body.reason!=="string"||!body.reason.trim()||!body.expected||typeof body.expected!=="object"||Array.isArray(body.expected)
     ||Object.keys(body.expected).sort().join(',')!=="generation,nodeId")return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
   const expected=body.expected as {nodeId:unknown;generation:unknown};
   if(typeof expected.nodeId!=="string"||!expected.nodeId||typeof expected.generation!=="string"||!expected.generation)return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
   let recovery:CodexStoppedRecovery|undefined;
   try{if(body.codexStoppedRecovery!==undefined)recovery=parseCodexStoppedRecovery(body.codexStoppedRecovery);}catch{return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);}
+  const legacyCodexProfile=body.legacyCodexProfile;
+  if(legacyCodexProfile!==undefined&&(typeof legacyCodexProfile!=="string"||!/^[a-zA-Z0-9_-]+$/.test(legacyCodexProfile)||recovery))
+    return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
+  if(body.enableGuard!==undefined&&body.enableGuard!==true)return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
   const guard=(c.get("tmuxAdapter" as never) as TmuxAdapter)?.deliveryGuard;
   if(!guard)return c.json({ok:false,code:"operator_maintenance_unavailable"},503);
   try{
     const target=guard.target("operator-agent@kernel");
     if(target.session!=="operator-agent@kernel"||target.nodeId!==expected.nodeId||target.occupant!==expected.generation)
       return c.json({ok:false,code:"operator_maintenance_binding_changed"},409);
-    const maintenanceAuthority=createOperatorMaintenanceAuthority({nodeId:target.nodeId,generation:target.occupant,recovery});
+    const maintenanceAuthority=createOperatorMaintenanceAuthority({nodeId:target.nodeId,generation:target.occupant,recovery,
+      ...(typeof legacyCodexProfile==="string"?{legacyCodexProfile}:{}),...(body.enableGuard===true?{enableGuard:true as const}:{})});
     const result=await seatLifecycleService(c).rehostRunner({seatRef:"operator-agent@kernel",reason:body.reason,maintenanceAuthority,
       ...(recovery?{codexStoppedRecovery:recovery}:{})});
     return c.json(result,result.ok?200:seatLifecycleStatus(result.code));

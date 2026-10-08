@@ -10,6 +10,7 @@ import type { WhoamiService } from "./whoami-service.js";
 import type { SeatDeliveryGuard } from "./seat-delivery-guard.js";
 import type { Binding } from "./types.js";
 import type { CodexDaemonSupportDetector } from "./codex-daemon-support.js";
+import { observeLegacyCodexMaintenance } from "./codex-legacy-maintenance-proof.js";
 import { CodexSameGenerationRehost, type CodexRehostNativeState, type CodexRehostBinding } from "./codex-rehost.js";
 import { forEachJsonlLine } from "./rotation-native-proof.js";
 import { NativeDutyLaunchStore, observeNativeDutyLaunch, verifyNativeDutyProcessIdentity } from "./native-duty-launch.js";
@@ -145,6 +146,7 @@ export function createCodexRehostIntegration(deps: {
   };
   return new CodexSameGenerationRehost({
     db: deps.db, guard: deps.guard, tmux: deps.tmux, resume: deps.resume, snapshotRoot: deps.snapshotRoot,
+    legacyNativeState: (session,profile) => observeLegacyCodexMaintenance(deps,session,profile),
     nativeState: async session => {
       const state = await resolveCodexNativeState(deps, session);
       const contract = state.runtimeContract as CodexRehostNativeState["runtimeContract"];
@@ -172,6 +174,17 @@ export function createCodexRehostIntegration(deps: {
         || !await deps.launchEnvironment.usesNativeDuty(binding.sessionName, binding.nodeId)) throw new Error("Supervised Codex rehost is not enabled");
       deps.store.assertReady();
       const current = await currentBinding(binding.nodeId);
+      let configurationDigest=current?.configurationDigest;
+      if(native.legacyLaunch){
+        // Project the exact established digest before the atomic binding. Check
+        // the current algorithm against its production callback to fail closed
+        // if that contract changes; no temporary DB mutation is used.
+        const row=deps.db.prepare('SELECT n.id,n.runtime,n.model,n.profile,n.codex_config_profile,n.cwd FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1')
+          .get(binding.sessionName) as Record<string,unknown>|undefined;
+        const hash=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
+        if(!row||row.id!==binding.nodeId||hash(row)!==configurationDigest||row.codex_config_profile!==null&&row.codex_config_profile!==binding.codexConfigProfile)throw new Error('Legacy projected configuration drift');
+        configurationDigest=hash({...row,model:binding.model,codex_config_profile:binding.codexConfigProfile});
+      }
       if (!current || current.generation !== binding.generation || current.sessionName !== binding.sessionName
         || current.resumeToken !== binding.nativeId) throw new Error("Codex rehost binding changed");
       const stored = deps.db.prepare(`SELECT id,node_id AS nodeId,attachment_type AS attachmentType,
@@ -203,7 +216,7 @@ export function createCodexRehostIntegration(deps: {
         if (await deps.tmux.getSessionEnv(binding.sessionName, key) !== expected) throw new Error("Codex rehost native launch environment mismatch");
       }
       return { posture, effective: verified.effective, evidenceDigest: createHash("sha256").update(JSON.stringify({
-        configurationDigest: current.configurationDigest, profileSha256: verified.profileSha256,
+        configurationDigest, profileSha256: verified.profileSha256,
         effective: verified.effective, posture, harness, daemon: daemon.kind,
       })).digest("hex") };
     },

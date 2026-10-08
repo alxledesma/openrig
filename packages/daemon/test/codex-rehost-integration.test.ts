@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3";
@@ -64,7 +65,7 @@ describe("S6 inherited native effort production preflight", () => {
       guard: { ownsRunnerRehost: () => true, maybeTarget: () => ({ occupant: binding.generation, pane: "%1", session: binding.sessionName }), protectionFacts: () => null },
       whoami: {}, activity: {}, resume: {}, store: { assertReady: vi.fn() },
       launchEnvironment: { usesNativeDuty: async () => true }, launchPath: "/fixture", snapshotRoot: path.join(dir, "private"),
-      detectDaemonSupport: async () => ({ kind: "supported" }), configurationDigest: () => "a".repeat(64),
+      detectDaemonSupport: async () => ({ kind: "supported" }), configurationDigest: () => createHash('sha256').update(JSON.stringify(db.prepare('SELECT n.id,n.runtime,n.model,n.profile,n.codex_config_profile,n.cwd FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(binding.sessionName))).digest('hex'),
     } as unknown as Parameters<typeof createCodexRehostIntegration>[0];
     factory = createCodexRehostIntegration(options) as unknown as FactorySeams;
   });
@@ -121,4 +122,21 @@ describe("S6 inherited native effort production preflight", () => {
     vi.mocked(factory.deps.tmux.getSessionEnv).mockResolvedValue("another-seat");
     await expect(preflight()).rejects.toThrow("Codex rehost native launch environment mismatch");
   });
+  it("legacy maintenance projects the same production digest before and after binding with real profile/auth preflight",async()=>{
+    db.prepare("UPDATE nodes SET model='gpt-6-sol',effort='xhigh',codex_config_profile=NULL WHERE id='lead@xv'").run();
+    binding.effort='medium';native.legacyLaunch={observedProfile:null};
+    const before=await factory.deps.preflightSupervisedLaunch(binding,native);factory.preflightMatches(binding,native,before);
+    expect(db.prepare("SELECT model,codex_config_profile FROM nodes WHERE id='lead@xv'").get()).toEqual({model:'gpt-6-sol',codex_config_profile:null});
+    db.prepare("UPDATE nodes SET model='gpt-6-luna',effort='medium',codex_config_profile='exact' WHERE id='lead@xv'").run();
+    const after=await factory.deps.preflightSupervisedLaunch(binding,native);expect(after).toEqual(before);
+    const stopped={...native};delete stopped.legacyLaunch;
+    expect(await factory.deps.preflightSupervisedLaunch(binding,stopped)).toEqual(before);
+  });
+  it("legacy maintenance real adapter refuses a future profile changing permissions",async()=>{
+    db.prepare("UPDATE nodes SET model='gpt-6-sol',effort='xhigh',codex_config_profile=NULL WHERE id='lead@xv'").run();
+    binding.effort='medium';native.legacyLaunch={observedProfile:null};writeFileSync(file,profile().replace('danger-full-access','workspace-write'));
+    await expect(factory.deps.preflightSupervisedLaunch(binding,native)).rejects.toThrow('Codex profile changes the persisted launch posture');
+    expect(db.prepare("SELECT codex_config_profile FROM nodes WHERE id='lead@xv'").get()).toEqual({codex_config_profile:null});
+  });
+
 });

@@ -486,8 +486,10 @@ or stopping and relaunching the seat, does not prove continuity.
     .requiredOption("--expected-generation <uuid>", "Exact existing Operator generation")
     .option("--attempt-id <uuid>", "Exact retained stopped-recovery attempt")
     .option("--began-sha256 <hash>", "SHA256 of its immutable began receipt")
+    .option("--legacy-codex-profile <name>", "Bind an unpinned Operator to a named profile matching its observed runtime")
+    .option("--enable-guard", "Enable typing protection before maintenance and leave it enabled afterward")
     .option("--json", "Return server result as JSON")
-    .action(async (opts: { reason: string; expectedNode: string; expectedGeneration: string; attemptId?: string; beganSha256?: string; json?: boolean }) => {
+    .action(async (opts: { reason: string; expectedNode: string; expectedGeneration: string; attemptId?: string; beganSha256?: string; legacyCodexProfile?: string; enableGuard?: boolean; json?: boolean }) => {
       const emit = (data: Record<string, unknown>) => {
         if (opts.json) console.log(JSON.stringify(data, null, 2));
         else console.log(JSON.stringify(data));
@@ -495,11 +497,14 @@ or stopping and relaunching the seat, does not prove continuity.
       const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       if (!opts.reason.trim() || !opts.expectedNode.trim() || !opts.expectedGeneration.trim() ||
           ((opts.attemptId !== undefined) !== (opts.beganSha256 !== undefined)) ||
-          (opts.attemptId !== undefined && (!uuid.test(opts.attemptId) || !/^[0-9a-f]{64}$/.test(opts.beganSha256!)))) {
-        emit({ ok: false, code: "operator_maintenance_contract_required", message: "Nonempty reason/node/generation required; recovery flags must be paired UUID attempt and 64 lowercase hex began hash." });
+          (opts.attemptId !== undefined && (!uuid.test(opts.attemptId) || !/^[0-9a-f]{64}$/.test(opts.beganSha256!))) ||
+          (opts.legacyCodexProfile !== undefined && (!/^[a-zA-Z0-9_-]+$/.test(opts.legacyCodexProfile) || opts.attemptId !== undefined))) {
+        emit({ ok: false, code: "operator_maintenance_contract_required", message: "Nonempty reason/node/generation required; recovery flags must be paired UUID attempt and 64 lowercase hex began hash. Legacy profile must be a safe name and cannot accompany stopped recovery." });
         process.exitCode = 1; return;
       }
       const body = { reason: opts.reason, expected: { nodeId: opts.expectedNode, generation: opts.expectedGeneration },
+        ...(opts.legacyCodexProfile !== undefined ? { legacyCodexProfile: opts.legacyCodexProfile } : {}),
+        ...(opts.enableGuard ? { enableGuard: true } : {}),
         ...(opts.attemptId ? { codexStoppedRecovery: { attemptId: opts.attemptId, beganSha256: opts.beganSha256 } } : {}) };
       try {
         // Resolve the local configured endpoint without any health probe, identity read, or retry.
@@ -514,6 +519,8 @@ or stopping and relaunching the seat, does not prove continuity.
           emit({ ok: false, status: "unknown", code: "operator_maintenance_outcome_unknown",
             message: "The maintenance response was not verified. Do not retry or issue another stop.",
             expected: body.expected, ...(body.codexStoppedRecovery ? { codexStoppedRecovery: body.codexStoppedRecovery } : {}),
+            ...(body.legacyCodexProfile ? { legacyCodexProfile: body.legacyCodexProfile } : {}),
+            ...(body.enableGuard ? { enableGuard: true } : {}),
             guidance: "Reconcile the exact server receipt/attempt before any further operation." });
         }
         process.exitCode = 1;

@@ -48,8 +48,17 @@ it.each([false, true])('registered maintenance command sends one exact authentic
 it.each([
  ['--attempt-id', attempt], ['--began-sha256', hash], ['--attempt-id', 'not-uuid', '--began-sha256', hash],
  ['--attempt-id', attempt, '--began-sha256', 'A'.repeat(64)], ['--reason', ' '], ['--expected-node', ' '], ['--expected-generation', ' '],
+ ['--legacy-codex-profile', '../profile'], ['--legacy-codex-profile', ''],
+ ['--legacy-codex-profile', 'kernel-luna-high', '--attempt-id', attempt, '--began-sha256', hash],
 ].map(extra => [extra]))('malformed flags have no request: %j', async extra => {
   const f = fixture(); await f.run(extra); expect(f.fetchImpl).not.toHaveBeenCalled(); expect(process.exitCode).toBe(1); expect(f.logs.join(' ')).not.toContain(token);
+});
+it('sends an explicit legacy profile and guard request through terminal maintenance with no agent impersonation',async()=>{
+ const f=fixture();await f.run(['--legacy-codex-profile','kernel-luna-high','--enable-guard']);
+ expect(f.fetchImpl).toHaveBeenCalledOnce();const init=f.fetchImpl.mock.calls[0]![1];
+ expect(JSON.parse(String(init?.body))).toEqual({reason:'repair exact retained runner',expected:{nodeId:'operator-node',generation},legacyCodexProfile:'kernel-luna-high',enableGuard:true});
+ const headers=new Headers(init?.headers);expect(headers.get('Authorization')).toBe(`Bearer ${token}`);
+ expect(headers.has('X-OpenRig-Session')).toBe(false);expect(headers.has('X-OpenRig-Occupant-Generation')).toBe(false);
 });
 it.each(['--operator', '--actor'])('does not expose caller actor flag %s', async flag => {
   const f = fixture(); await expect(f.run([flag,'operator-agent@kernel'])).rejects.toThrow(); expect(f.fetchImpl).not.toHaveBeenCalled();
