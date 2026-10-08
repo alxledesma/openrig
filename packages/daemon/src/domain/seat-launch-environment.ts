@@ -1,4 +1,4 @@
-import { accessSync, closeSync, constants, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, statSync, symlinkSync } from "node:fs";
+import { accessSync, closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { TmuxAdapter } from "../adapters/tmux.js";
@@ -151,14 +151,22 @@ export class SeatLaunchEnvironment {
     const cli = realpathSync(this.cliPath ?? pairedCli());
     accessSync(cli, constants.X_OK);
     if (!statSync(cli).isFile() || !this.sessionEnv.OPENRIG_HOME) throw new Error("Paired CLI or instance home unavailable");
-    // Separate aliases for concurrent installed versions; never retarget another
-    // daemon's link. Only rig is exposed, not the other tools in a shared bin.
-    const bin = path.resolve(this.daemonCwd, this.sessionEnv.OPENRIG_HOME, "run", "seat-bin", createHash("sha256").update(cli).digest("hex"));
+    const node = realpathSync(process.execPath);
+    accessSync(node, constants.X_OK);
+    if (!statSync(node).isFile()) throw new Error("Paired CLI interpreter unavailable");
+    // Pin the running daemon's interpreter, not the tool shell's PATH. Version
+    // the launcher semantics as well as both paths; old active aliases stay put.
+    const launcher = `#!/bin/sh\nexec ${shellQuote(node)} ${shellQuote(cli)} "$@"\n`;
+    const identity = JSON.stringify(["paired-node-cli-v1", node, cli, launcher]);
+    const bin = path.resolve(this.daemonCwd, this.sessionEnv.OPENRIG_HOME, "run", "seat-bin", createHash("sha256").update(identity).digest("hex"));
     mkdirSync(bin, { recursive: true });
-    const link = path.join(bin, "rig");
-    try { symlinkSync(cli, link); }
+    const entry = path.join(bin, "rig");
+    try { writeFileSync(entry, launcher, { flag: "wx", mode: 0o700 }); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    if (readlinkSync(link) !== cli || readdirSync(bin).some(name => name !== "rig")) throw new Error("Seat bin is not rig-only");
+    const stat = lstatSync(entry);
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o022) !== 0
+      || readFileSync(entry, "utf8") !== launcher || readdirSync(bin).some(name => name !== "rig")) throw new Error("Seat bin is not the paired rig-only launcher");
+    accessSync(entry, constants.X_OK);
     return bin;
   }
 

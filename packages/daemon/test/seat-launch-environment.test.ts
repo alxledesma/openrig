@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
@@ -68,7 +68,7 @@ function fixture() {
     if (!managed) {
       const [owned, ...rest] = observed.PATH.split(":");
       expect(rest.join(":")).toBe(`${userBin}:${bin}:/usr/bin:/bin`);
-      expect(readlinkSync(path.join(owned, "rig"))).toBe(path.join(bin, "rig"));
+      expect(readFileSync(path.join(owned, "rig"), "utf8")).toContain(`${shellQuote(realpathSync(path.join(bin, "rig")))} "$@"`);
     }
     return observed;
   }
