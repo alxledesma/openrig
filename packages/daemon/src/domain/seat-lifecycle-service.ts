@@ -76,7 +76,7 @@ export interface SeatLifecycleDeps {
    *  the shipped session-file existence check, and the session-file tail reader
    *  used for the idle witness. */
   piResume?: PiRehostResume;
-  codexRehost?: { rehost(input: CodexRehostInput): Promise<CodexRehostResult>; recoverStopped?(input: import("./codex-rehost.js").CodexStoppedRecoveryInput): Promise<CodexRehostResult> };
+  codexRehost?: { rehost(input: CodexRehostInput): Promise<CodexRehostResult>; recoverStopped?(input: import("./codex-rehost.js").CodexStoppedRecoveryInput): Promise<CodexRehostResult>; resumeDetached?(input: import("./codex-rehost.js").CodexDetachedResumeInput): Promise<CodexRehostResult> };
   piProve?: (session: string) => Promise<PiRehostProof | null>;
   piRunnerState?: (sessionName: string) => PiRehostRunnerState | null;
   piSessionFileExists?: (path: string) => boolean;
@@ -1684,7 +1684,7 @@ export class SeatLifecycleService {
    * unverifiable fact refuses, and a failed stop or resume writes a failed
    * event and stops, so a blind retry cannot happen.
    */
-  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null; actorGeneration?: string; maintenanceAuthority?: import("./codex-rehost.js").OperatorMaintenanceAuthority; codexStoppedRecovery?: import("./codex-rehost.js").CodexStoppedRecovery; legacyNativeWitness?: boolean; stoppedTargetRecovery?: boolean; stoppedTargetAcceptanceReference?: string; onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal }): Promise<RehostRunnerResult> {
+  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null; actorGeneration?: string; maintenanceAuthority?: import("./codex-rehost.js").OperatorMaintenanceAuthority; codexStoppedRecovery?: import("./codex-rehost.js").CodexStoppedRecovery; codexDetachedResume?: boolean; legacyNativeWitness?: boolean; stoppedTargetRecovery?: boolean; stoppedTargetAcceptanceReference?: string; onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal }): Promise<RehostRunnerResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     // EXPLICIT, DEFAULT-OFF. This boolean is the ONLY thing the option adds. No
@@ -1692,9 +1692,12 @@ export class SeatLifecycleService {
     // caller, and an absent value is exactly the ordinary rehost.
     const legacyNativeWitness = input.legacyNativeWitness === true;
     const stoppedTargetRecovery = input.stoppedTargetRecovery === true;
+    const codexDetachedResume = input.codexDetachedResume === true;
     const acceptanceReference = input.stoppedTargetAcceptanceReference?.trim() ?? "";
-    if (legacyNativeWitness && stoppedTargetRecovery)
-      return { ok: false, code: "rehost_recovery_modes_exclusive", message: "Legacy native witness and stopped-target recovery are mutually exclusive modes." };
+    if ((legacyNativeWitness && stoppedTargetRecovery)
+      || (codexDetachedResume && (legacyNativeWitness || stoppedTargetRecovery || input.codexStoppedRecovery !== undefined
+        || input.stoppedTargetAcceptanceReference !== undefined || input.maintenanceAuthority?.legacyCodexProfile !== undefined)))
+      return { ok: false, code: "rehost_recovery_modes_exclusive", message: "Detached Codex resume is mutually exclusive with stopped recovery, legacy profile/witness, and Pi recovery modes." };
     if (stoppedTargetRecovery && !acceptanceReference)
       return { ok: false, code: "rehost_recovery_acceptance_required", message: "Stopped-target recovery requires a nonempty caller acceptance reference acknowledging possible loss of an unpersisted in-flight turn." };
     if (!stoppedTargetRecovery && input.stoppedTargetAcceptanceReference !== undefined)
@@ -1710,6 +1713,12 @@ export class SeatLifecycleService {
       const sessionName = resolved.entry.canonicalSessionName ?? (resolved.entry.logicalId ? `${resolved.entry.logicalId}@${resolved.entry.rigName}` : null);
       if (!sessionName)
         return { ok: false, code: "rehost_process_identity_unproven", message: "Seat has no canonical session name to rehost." };
+      if (codexDetachedResume) {
+        if (!this.codexRehost.resumeDetached) return { ok: false, code: "rehost_unavailable", message: "Detached Codex resume is unavailable; no process or terminal touched." };
+        return this.codexRehost.resumeDetached({ nodeId: resolved.nodeId, sessionName, reason: input.reason,
+          operator: input.operator, maintenanceAuthority: input.maintenanceAuthority,
+          actorGeneration: input.actorGeneration ?? "" });
+      }
       if (input.codexStoppedRecovery) {
         if (!this.codexRehost.recoverStopped) return {ok:false,code:"rehost_unavailable",message:"Stopped Codex recovery unavailable"};
         return this.codexRehost.recoverStopped({nodeId:resolved.nodeId,sessionName,reason:input.reason,operator:input.operator,actorGeneration:input.actorGeneration??"",maintenanceAuthority:input.maintenanceAuthority,...input.codexStoppedRecovery});
@@ -1718,6 +1727,7 @@ export class SeatLifecycleService {
     }
     if (input.maintenanceAuthority) return {ok:false,code:"rehost_recovery_modes_exclusive",message:"Operator terminal maintenance requires actual Codex runtime"};
     if (input.codexStoppedRecovery) return {ok:false,code:"rehost_recovery_modes_exclusive",message:"Codex stopped recovery requires actual Codex runtime"};
+    if (codexDetachedResume) return {ok:false,code:"rehost_recovery_modes_exclusive",message:"Detached Codex resume requires actual Codex runtime"};
     if (resolved.entry.runtime !== "pi")
       return { ok: false, code: "rehost_requires_pi_runtime", message: `Same-generation process rehost is unavailable for runtime '${resolved.entry.runtime ?? "unknown"}'.` };
     // The guard gate runs BEFORE the seam gate: a disarmed guard is a refusal on its own

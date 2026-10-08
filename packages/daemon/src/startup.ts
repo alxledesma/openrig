@@ -1231,6 +1231,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     db, guard: deliveryGuard, tmux: tmuxAdapter, whoami: whoamiService, activity: seatActivityService,
     adapter: codexAdapter, resume: codexResume, launchEnvironment: seatLaunchEnvironment, store: nativeDutyStore,
     launchPath: process.env.PATH ?? "", snapshotRoot: nodePath.join(OPENRIG_HOME, "state", "codex-rehost"),
+    sessionEnv: launchSessionEnv, runtimeSessionEnv,
     detectDaemonSupport: codexDaemonSupportProbe(process.env.PATH, undefined, configuredCodexHome),
     configurationDigest: session => queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(session),
   });

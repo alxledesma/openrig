@@ -285,6 +285,20 @@ export class SeatDeliveryGuard {
     lease.target = this.target(nodeId);
   }
 
+  /** Adopt only a physical terminal replacement inside an owned guarded rehost.
+   * The occupant and canonical address cannot change through this capability. */
+  rebindRunnerRehost(nodeId: string): void {
+    const lease = this.scope.getStore()?.get(nodeId);
+    const target = this.target(nodeId);
+    if (!lease?.active || lease.rehost !== true || lease.target.nodeId !== target.nodeId
+      || lease.target.session !== target.session || lease.target.occupant !== target.occupant
+      || this.activeReservation(nodeId)) {
+      throw new DeliveryGuardError("guard_lease_required", "Physical resume binding requires the same occupant under its rehost lease.");
+    }
+    this.assertRehostGuard(nodeId);
+    lease.target = target;
+  }
+
   private activeReservation(nodeId: string): { reservation_id: string } | null {
     if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='seat_dispatch_reservations'").get()) return null;
     return this.db.prepare("SELECT reservation_id FROM seat_dispatch_reservations WHERE node_id=? AND state!='released'").get(nodeId) as {reservation_id:string} | undefined ?? null;

@@ -386,6 +386,30 @@ it("automatic reminder records retained custody and no delivered fire or input",
   expect((await f.app.request("/api/rigs/rig",{method:"DELETE"})).status).toBe(409);
   expect(f.rigRepo.getRig("rig")!.nodes).toHaveLength(2);expect(f.writes).toEqual([]);expect((snapshot as any).capture).not.toHaveBeenCalled();f.db.close();
  });
+ it("runner rehost may rebind a new pane for the same session and occupant only",async()=>{
+  const f=fixture();await f.guard.set("a",true,"operator","detached resume");
+  await f.guard.runnerRehost("a",async()=>{
+   expect(f.guard.ownsRunnerRehost("a")).toBe(true);
+   f.targets.a={...f.targets.a!,pane:"%3"};f.guard.rebindRunnerRehost("a");
+   expect(f.guard.target("a")).toMatchObject({session:"a",occupant:"g1",pane:"%3"});
+   const changed=f.targets.a!;f.targets.a={...changed,session:"successor"};
+   expect(()=>f.guard.rebindRunnerRehost("a")).toThrowError(expect.objectContaining({code:"guard_lease_required"}));
+   f.targets.a=changed;
+  });
+  expect(f.guard.preference("a")).toMatchObject({desired:true,effective:true});expect(f.guard.ownsRunnerRehost("a")).toBe(false);f.db.close();
+ });
+ it("bare terminal resume creation requires its exact rehost lease and refuses a present name",async()=>{
+  const f=fixture(),commands:string[]=[];const exec=vi.fn(async(command:string)=>{commands.push(command);if(command.startsWith("tmux has-session"))throw new Error("can't find session");return "";});
+  const adapter=new TmuxAdapter(exec);adapter.deliveryGuard=f.guard;
+  const env={OPENRIG_NODE_ID:"a",OPENRIG_SESSION_NAME:"a",OPENRIG_OCCUPANT_GENERATION:"g1",OPENRIG_RUNTIME:"codex"};
+  expect(await adapter.createSessionForRunnerResume("a","/workspace",env)).toMatchObject({ok:false,code:"guard_lease_required"});expect(commands).toEqual([]);
+  await f.guard.set("a",true,"operator","detached resume");
+  await f.guard.runnerRehost("a",async()=>{
+   expect(await adapter.createSessionForRunnerResume("a","/workspace",{...env,OPENRIG_OCCUPANT_GENERATION:"stale"})).toMatchObject({ok:false,code:"guard_target_changed"});
+   expect(await adapter.createSessionForRunnerResume("a","/workspace",env)).toEqual({ok:true});
+  });
+  expect(commands.filter(command=>command.startsWith("tmux new-session"))).toHaveLength(1);expect(commands.some(command=>command.includes("kill-session"))).toBe(false);f.db.close();
+ });
  it("fresh launch off rebinds the original lease, then protection prevents lifecycle and stale writes",async()=>{
   const f=queueFixture();f.db.exec("INSERT INTO nodes(id,rig_id,logical_id) VALUES ('c','rig','fresh');");
   vi.mocked(f.tmux.listPanes).mockImplementation(async name=>[{id:name==="r00-test-fresh"?"%3":f.guard.target(name).pane!} as never]);

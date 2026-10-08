@@ -557,6 +557,25 @@ export class TmuxAdapter {
     return result;
   }
 
+  /** Recovery service has durably recorded the effect and proved native absence.
+   * This creates a bare terminal only; it cannot replace an existing session. */
+  async createSessionForRunnerResume(name: string, cwd: string, env: Record<string, string>): Promise<TmuxResult> {
+    const guard = this.deliveryGuard, nodeId = env.OPENRIG_NODE_ID;
+    if (!guard || !nodeId || !guard.ownsRunnerRehost(nodeId)) {
+      return { ok: false, code: "guard_lease_required", message: "Same-generation terminal resume requires an owned rehost lease." };
+    }
+    const target = guard.target(nodeId);
+    if (target.session !== name || env.OPENRIG_SESSION_NAME !== name || env.OPENRIG_RUNTIME !== "codex"
+      || !target.occupant || env.OPENRIG_OCCUPANT_GENERATION !== target.occupant) {
+      return { ok: false, code: "guard_target_changed", message: "Terminal resume cannot change the occupant or canonical address." };
+    }
+    if ((await this.probeSession(name)).state === "present") {
+      return { ok: false, code: "session_exists", message: "A present terminal cannot be replaced by detached resume." };
+    }
+    // new-session is collision-refusing. No kill, attach, or rename fallback.
+    return this.createSessionUnchecked(name, cwd, env);
+  }
+
   /** The committed binding now owns identity; this is not filesystem cleanup. */
   finishLaunchBinding(session: string): void { this.freshManaged.delete(session); }
 

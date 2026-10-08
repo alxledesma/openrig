@@ -361,19 +361,23 @@ export function parseLegacyNativeWitnessRequest(body: Record<string, unknown>): 
   return { ok: true, legacyNativeWitness: raw };
 }
 
-export function parseStoppedTargetRecoveryRequest(body: Record<string, unknown>): { ok: true; legacyNativeWitness: boolean; stoppedTargetRecovery: boolean; stoppedTargetAcceptanceReference?: string } | { ok: false; error: string } {
+export function parseStoppedTargetRecoveryRequest(body: Record<string, unknown>): { ok: true; legacyNativeWitness: boolean; stoppedTargetRecovery: boolean; codexDetachedResume?: true; stoppedTargetAcceptanceReference?: string } | { ok: false; error: string } {
   const legacy = parseLegacyNativeWitnessRequest(body);
   if (!legacy.ok) return legacy;
   const rawMode = body["stoppedTargetRecovery"];
   if (rawMode !== undefined && typeof rawMode !== "boolean") return { ok: false, error: "stoppedTargetRecovery must be a boolean when present" };
   const stoppedTargetRecovery = rawMode === true;
+  const rawDetached = body["codexDetachedResume"];
+  if (rawDetached !== undefined && typeof rawDetached !== "boolean") return { ok: false, error: "codexDetachedResume must be a boolean when present" };
+  const codexDetachedResume = rawDetached === true;
   const rawAcceptance = body["stoppedTargetAcceptanceReference"];
   if (rawAcceptance !== undefined && typeof rawAcceptance !== "string") return { ok: false, error: "stoppedTargetAcceptanceReference must be a string when present" };
   const acceptance = typeof rawAcceptance === "string" ? rawAcceptance.trim() : "";
   if (legacy.legacyNativeWitness && stoppedTargetRecovery) return { ok: false, error: "legacyNativeWitness and stoppedTargetRecovery are mutually exclusive" };
+  if (codexDetachedResume && (legacy.legacyNativeWitness || stoppedTargetRecovery || body["stoppedTargetAcceptanceReference"] !== undefined || body["codexStoppedRecovery"] !== undefined || body["legacyCodexProfile"] !== undefined)) return { ok: false, error: "codexDetachedResume is exclusive with Codex stopped recovery, legacy Codex profile/witness, and Pi recovery modes" };
   if (stoppedTargetRecovery && !acceptance) return { ok: false, error: "stoppedTargetAcceptanceReference is required and must acknowledge possible loss of an unpersisted in-flight turn" };
   if (!stoppedTargetRecovery && rawAcceptance !== undefined) return { ok: false, error: "stoppedTargetAcceptanceReference requires stoppedTargetRecovery" };
-  return { ok: true, legacyNativeWitness: legacy.legacyNativeWitness, stoppedTargetRecovery, ...(acceptance ? { stoppedTargetAcceptanceReference: acceptance } : {}) };
+  return { ok: true, legacyNativeWitness: legacy.legacyNativeWitness, stoppedTargetRecovery, ...(codexDetachedResume ? { codexDetachedResume: true as const } : {}), ...(acceptance ? { stoppedTargetAcceptanceReference: acceptance } : {}) };
 }
 
 // Same-generation Pi runner rehost. The shipped resume primitive, the shipped pi
@@ -392,16 +396,19 @@ seatRoutes.post("/operator-maintenance/rehost-runner",async c=>{
   if(["X-OpenRig-Session","X-OpenRig-Occupant-Generation","X-OpenRig-Origin-Unknown"].some(k=>c.req.raw.headers.has(k)))
     return c.json({ok:false,code:"operator_maintenance_agent_identity_not_accepted"},400);
   const body=await c.req.json<Record<string,unknown>>().catch(()=>null);
-  if(!body||typeof body!=="object"||Array.isArray(body)||Object.keys(body).some(k=>!["reason","expected","codexStoppedRecovery","legacyCodexProfile","enableGuard"].includes(k))
+  if(!body||typeof body!=="object"||Array.isArray(body)||Object.keys(body).some(k=>!["reason","expected","codexStoppedRecovery","codexDetachedResume","legacyCodexProfile","enableGuard"].includes(k))
     ||typeof body.reason!=="string"||!body.reason.trim()||!body.expected||typeof body.expected!=="object"||Array.isArray(body.expected)
     ||Object.keys(body.expected).sort().join(',')!=="generation,nodeId")return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
   const expected=body.expected as {nodeId:unknown;generation:unknown};
   if(typeof expected.nodeId!=="string"||!expected.nodeId||typeof expected.generation!=="string"||!expected.generation)return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
   let recovery:CodexStoppedRecovery|undefined;
   try{if(body.codexStoppedRecovery!==undefined)recovery=parseCodexStoppedRecovery(body.codexStoppedRecovery);}catch{return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);}
+  if(body.codexDetachedResume!==undefined&&typeof body.codexDetachedResume!=="boolean")return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
+  const detachedResume=body.codexDetachedResume===true;
   const legacyCodexProfile=body.legacyCodexProfile;
-  if(legacyCodexProfile!==undefined&&(typeof legacyCodexProfile!=="string"||!/^[a-zA-Z0-9_-]+$/.test(legacyCodexProfile)||recovery))
+  if(legacyCodexProfile!==undefined&&(typeof legacyCodexProfile!=="string"||!/^[a-zA-Z0-9_-]+$/.test(legacyCodexProfile)||recovery||detachedResume))
     return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
+  if(detachedResume&&recovery)return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
   if(body.enableGuard!==undefined&&body.enableGuard!==true)return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
   const guard=(c.get("tmuxAdapter" as never) as TmuxAdapter)?.deliveryGuard;
   if(!guard)return c.json({ok:false,code:"operator_maintenance_unavailable"},503);
@@ -409,10 +416,10 @@ seatRoutes.post("/operator-maintenance/rehost-runner",async c=>{
     const target=guard.target("operator-agent@kernel");
     if(target.session!=="operator-agent@kernel"||target.nodeId!==expected.nodeId||target.occupant!==expected.generation)
       return c.json({ok:false,code:"operator_maintenance_binding_changed"},409);
-    const maintenanceAuthority=createOperatorMaintenanceAuthority({nodeId:target.nodeId,generation:target.occupant,recovery,
+    const maintenanceAuthority=createOperatorMaintenanceAuthority({nodeId:target.nodeId,generation:target.occupant,recovery,...(detachedResume?{detachedResume:true as const}:{}),
       ...(typeof legacyCodexProfile==="string"?{legacyCodexProfile}:{}),...(body.enableGuard===true?{enableGuard:true as const}:{})});
     const result=await seatLifecycleService(c).rehostRunner({seatRef:"operator-agent@kernel",reason:body.reason,maintenanceAuthority,
-      ...(recovery?{codexStoppedRecovery:recovery}:{})});
+      ...(recovery?{codexStoppedRecovery:recovery}:{}),...(detachedResume?{codexDetachedResume:true,actorGeneration:target.occupant}:{})});
     return c.json(result,result.ok?200:seatLifecycleStatus(result.code));
   }catch{return c.json({ok:false,code:"operator_maintenance_binding_unproven"},409);}
 });
@@ -424,16 +431,25 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   const rehostRequest = parseStoppedTargetRecoveryRequest(body);
   if (!rehostRequest.ok) return c.json({ error: rehostRequest.error }, 400);
   let codexStoppedRecovery: CodexStoppedRecovery | undefined;
-  if (body.codexStoppedRecovery !== undefined) {
+  if (body.codexStoppedRecovery !== undefined || rehostRequest.codexDetachedResume) {
     const token = c.get("terminalBearerToken" as never) as string | null;
     if (!token) return c.json({ok:false,code:"codex_rehost_recovery_authenticated_control_required"},503);
     const authResponse = await authBearerTokenMiddleware({expectedToken:token})(c,async()=>{});
     if (authResponse) return authResponse;
     let address:string|undefined;try { address=getConnInfo(c).remote.address; } catch {}
     if(c.req.header("Origin")||!isRotationLoopback(address))return c.json({ok:false,code:"codex_rehost_recovery_local_only"},403);
-    try { codexStoppedRecovery = parseCodexStoppedRecovery(body.codexStoppedRecovery); } catch (error) { return c.json({error:(error as Error).message},400); }
+    if (body.codexStoppedRecovery !== undefined) {
+      try { codexStoppedRecovery = parseCodexStoppedRecovery(body.codexStoppedRecovery); } catch (error) { return c.json({error:(error as Error).message},400); }
+    }
     if (rehostRequest.legacyNativeWitness || rehostRequest.stoppedTargetRecovery || rehostRequest.stoppedTargetAcceptanceReference) return c.json({error:"Codex and Pi recovery modes are exclusive"},400);
-    if (transportSenderSession(c) !== "operator-agent@kernel" || !c.req.header("X-OpenRig-Occupant-Generation") || c.req.header("X-OpenRig-Origin-Unknown") === "true") return c.json({error:"Current Operator transport identity and generation required"},403);
+    const actorGeneration=c.req.header("X-OpenRig-Occupant-Generation");
+    const guard=(c.get("tmuxAdapter" as never) as TmuxAdapter | undefined)?.deliveryGuard;
+    let operatorTarget:import("../domain/seat-delivery-guard.js").GuardTarget|undefined;try{operatorTarget=guard?.target("operator-agent@kernel");}catch{}
+    if (transportSenderSession(c) !== "operator-agent@kernel" || !actorGeneration || actorGeneration!==operatorTarget?.occupant || c.req.header("X-OpenRig-Origin-Unknown") === "true") return c.json({error:"Current Operator transport identity and generation required"},403);
+    if(rehostRequest.codexDetachedResume){
+      let target:import("../domain/seat-delivery-guard.js").GuardTarget|undefined;try{target=guard?.target(decodeURIComponent(c.req.param("seatRef")));}catch{}
+      if(!target||target.nodeId===operatorTarget?.nodeId)return c.json({error:"Detached resume requires a peer target; Operator self-target is forbidden"},403);
+    }
   }
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
   const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter;
@@ -572,8 +588,9 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   const result = await lifecycle.rehostRunner({
     seatRef: decodeURIComponent(c.req.param("seatRef")),
     reason: body.reason,
-    operator: codexStoppedRecovery ? transportSenderSession(c) : (body.operator as string | undefined) ?? null,
+    operator: codexStoppedRecovery || rehostRequest.codexDetachedResume ? transportSenderSession(c) : (body.operator as string | undefined) ?? null,
     ...(codexStoppedRecovery ? {codexStoppedRecovery,actorGeneration:c.req.header("X-OpenRig-Occupant-Generation")} : {}),
+    ...(rehostRequest.codexDetachedResume ? {codexDetachedResume:true,actorGeneration:c.req.header("X-OpenRig-Occupant-Generation")} : {}),
     legacyNativeWitness: rehostRequest.legacyNativeWitness,
     stoppedTargetRecovery: rehostRequest.stoppedTargetRecovery,
     ...(rehostRequest.stoppedTargetAcceptanceReference ? { stoppedTargetAcceptanceReference: rehostRequest.stoppedTargetAcceptanceReference } : {}),

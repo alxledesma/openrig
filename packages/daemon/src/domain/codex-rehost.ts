@@ -35,21 +35,23 @@ declare const maintenanceBrand:unique symbol;
 export interface OperatorMaintenanceAuthority {
   readonly [maintenanceBrand]:true;
   readonly principal:'local-terminal-maintenance';readonly nodeId:string;readonly sessionName:'operator-agent@kernel';readonly generation:string;
-  readonly mode:'rehost'|'stopped-recovery';readonly legacyCodexProfile?:string;readonly enableGuard?:true;readonly attemptId?:string;readonly beganSha256?:string;
+  readonly mode:'rehost'|'stopped-recovery'|'detached-resume';readonly legacyCodexProfile?:string;readonly enableGuard?:true;readonly attemptId?:string;readonly beganSha256?:string;
 }
 const maintenanceAuthorities=new WeakSet<object>();
 /** Trusted route-only issuer, called after terminal bearer and connection checks.
  * JSON/body lookalikes are never capabilities, even if every field matches. */
-export function createOperatorMaintenanceAuthority(input:{nodeId:string;generation:string;recovery?:CodexStoppedRecovery;legacyCodexProfile?:string;enableGuard?:true}):OperatorMaintenanceAuthority {
+export function createOperatorMaintenanceAuthority(input:{nodeId:string;generation:string;recovery?:CodexStoppedRecovery;detachedResume?:true;legacyCodexProfile?:string;enableGuard?:true}):OperatorMaintenanceAuthority {
   if(!input.nodeId||!input.generation)throw new Error('Exact server Operator binding required');
   if(input.recovery)parseCodexStoppedRecovery(input.recovery);
+  if(input.detachedResume!==undefined&&(input.detachedResume!==true||input.recovery||input.legacyCodexProfile))throw new Error('Detached resume cannot select another recovery mode or profile');
   if(input.enableGuard!==undefined&&input.enableGuard!==true)throw new Error('Explicit enableGuard true required');
   if(input.legacyCodexProfile!==undefined&&(input.recovery||! /^[a-zA-Z0-9_-]+$/.test(input.legacyCodexProfile)))throw new Error('Legacy profile requires normal maintenance and a safe named profile');
   const authority=Object.freeze({principal:'local-terminal-maintenance',nodeId:input.nodeId,sessionName:'operator-agent@kernel',generation:input.generation,
-    mode:input.recovery?'stopped-recovery':'rehost',...(input.recovery??{}),...(input.legacyCodexProfile?{legacyCodexProfile:input.legacyCodexProfile}:{}),...(input.enableGuard?{enableGuard:true}:{})}) as OperatorMaintenanceAuthority;
+    mode:input.detachedResume?'detached-resume':input.recovery?'stopped-recovery':'rehost',...(input.recovery??{}),...(input.legacyCodexProfile?{legacyCodexProfile:input.legacyCodexProfile}:{}),...(input.enableGuard?{enableGuard:true}:{})}) as OperatorMaintenanceAuthority;
   maintenanceAuthorities.add(authority);return authority;
 }
 export interface CodexRehostInput {nodeId:string;sessionName:string;reason:string;operator?:string|null;maintenanceAuthority?:OperatorMaintenanceAuthority}
+export interface CodexDetachedResumeInput extends CodexRehostInput {actorGeneration:string}
 export interface CodexStoppedRecovery {attemptId:string;beganSha256:string}
 export interface CodexStoppedRecoveryInput extends CodexRehostInput, CodexStoppedRecovery {actorGeneration:string}
 export function parseCodexStoppedRecovery(value:unknown):CodexStoppedRecovery {
@@ -67,13 +69,16 @@ export interface CodexRehostOptions {
   /** Must refresh the real seat observation before returning its deciding witness. */
   activityWitness:(nodeId:string,pane:string)=>Promise<ActivityEvidence|null>;
   /** Exact launch dependencies, effective profile/posture/model/effort; no native effect. */
-  preflightSupervisedLaunch:(binding:CodexRehostBinding,native:CodexRehostNativeState)=>Promise<CodexRehostPreflight>;
+  preflightSupervisedLaunch:(binding:CodexRehostBinding,native:CodexRehostNativeState,detached?:true)=>Promise<CodexRehostPreflight>;
   /** Must independently prove the new installed supervisor under this exact owned rehost lease. No enrollment/grant. */
   observeSupervisedReplacement:(binding:CodexRehostBinding)=>Promise<{launchId:string;fingerprint:string}|null>;
   /** Recovery-only retained transcript resolution. Never used as living native proof. */
   stoppedNativeState?:(binding:CodexRehostBinding)=>Promise<CodexRehostNativeState>;
   /** Fail-closed global kernel census; bare pane alone cannot exclude a reparented old process. */
   proveStoppedIdentityAbsent?:(binding:CodexRehostBinding,panePid:number)=>Promise<boolean>;
+  detachedTerminalAbsent?:(binding:CodexRehostBinding)=>Promise<boolean>;
+  proveDetachedIdentityAbsent?:(binding:CodexRehostBinding)=>Promise<boolean>;
+  createDetachedTerminal?:(binding:CodexRehostBinding)=>Promise<{pane:string}>;
   listProcesses?:()=>Promise<NativeProcessRow[]>;
   verifyProcessIdentity?:typeof verifyNativeDutyProcessIdentity;
   signal?:(pid:number)=>void;now?:()=>number;sleep?:(ms:number)=>Promise<void>;waitMs?:number;pollMs?:number;
@@ -237,9 +242,95 @@ export class CodexSameGenerationRehost {
       });
     }catch(error){return {ok:false,code:error instanceof Refusal?error.code:effectAttempted?'codex_rehost_recovery_unknown':'codex_rehost_recovery_unproven',message:error instanceof Refusal?error.message:'Stopped recovery proof unavailable; original evidence retained. No blind retry.',effectAttempted,blindRetryAllowed:false,...(receiptPath?{receiptPath}:{})};}
   }
-  private recoveryActor(input:CodexStoppedRecoveryInput){
-    if(input.maintenanceAuthority){this.maintenanceActor(input,'stopped-recovery');return;}
+  /** Resume a detached current occupant after terminal loss, never mint a new tenure.
+   * Native absence is independent of the missing terminal. A durable intent fences
+   * uncertain creation and resume, including a caller losing the response. */
+  async resumeDetached(input:CodexDetachedResumeInput):Promise<CodexRehostResult> {
+    let effectAttempted=false,receiptPath:string|undefined;
+    try {
+      if(!input.reason?.trim()||!this.deps.detachedTerminalAbsent||!this.deps.proveDetachedIdentityAbsent
+        ||!this.deps.createDetachedTerminal||!this.deps.stoppedNativeState||!this.deps.proveStoppedIdentityAbsent
+        ||!this.deps.preflightSupervisedLaunch||!this.deps.observeSupervisedReplacement||!this.deps.resume?.resume)
+        reject('codex_detached_resume_unavailable','Exact detached native recovery dependencies and reason required');
+      this.recoveryActor(input,'detached-resume');
+      await this.enableMaintenanceGuard(input,'detached-resume');
+      return await this.deps.guard.runnerRehost(input.nodeId,async()=>{
+        this.recoveryActor(input,'detached-resume');
+        const binding=this.binding(input,undefined,true);
+        const row=this.deps.db.prepare('SELECT status FROM sessions WHERE id=?').get(binding.sessionId) as {status:string};
+        if(row.status!=='detached')reject('codex_detached_resume_binding','Only an exactly retained detached current session can resume');
+        const oldPane=this.pane(binding.nodeId),before=this.custody(binding,true);
+        this.gates(binding);this.assertNoUnresolved(binding);
+        const unchanged=()=>{
+          this.recoveryActor(input,'detached-resume');
+          if(digest(this.binding(input,undefined,true))!==digest(binding)||digest(this.custody(binding,true))!==digest(before))
+            reject('codex_rehost_custody_changed','Detached native identity, custody or retained effects changed');
+          this.gates(binding);
+        };
+        const absent=async()=>{
+          if(!await this.deps.detachedTerminalAbsent!(binding)||!await this.deps.proveDetachedIdentityAbsent!(binding))
+            reject('codex_detached_resume_absence','Both canonical terminal absence and global native identity absence must be proven');
+        };
+        const native=await this.deps.stoppedNativeState!(binding);this.nativeMatches(binding,native);
+        const preflight=await this.deps.preflightSupervisedLaunch(binding,native,true);this.preflightMatches(binding,native,preflight);
+        const initial=this.history(native.transcriptPath,binding.nativeId);
+        await absent();await this.sleep(100);await absent();unchanged();
+        if(!this.history(native.transcriptPath,binding.nativeId).equals(initial))reject('codex_rehost_history_unstable','Detached transcript changed during absence proof');
+        const fingerprint=digest({binding,oldPane,custody:before,history:hash(initial)}),attemptId=randomUUID();
+        const directory=this.attemptDirectory(binding,fingerprint,attemptId);
+        const backup={path:path.join(directory,'transcript.jsonl'),sha256:hash(initial),size:initial.length};
+        writeDurable(backup.path,initial);
+        if(!readFileSync(backup.path).equals(initial))reject('codex_rehost_snapshot_failed','Detached transcript backup verification failed');
+        const finalPreflight=await this.deps.preflightSupervisedLaunch(binding,native,true);
+        if(digest(finalPreflight)!==digest(preflight))reject('codex_rehost_configuration_changed','Detached launch dependencies changed');
+        await absent();unchanged();
+        if(!this.history(native.transcriptPath,binding.nativeId).equals(initial))reject('codex_rehost_history_unstable','Detached transcript changed before terminal creation');
+        receiptPath=path.join(directory,'began.json');
+        writeDurable(receiptPath,JSON.stringify({protocol:'codex-detached-same-generation-resume-v1',attemptId,at:this.now(),
+          reason:input.reason,actor:input.maintenanceAuthority?'local-terminal-maintenance':input.operator,
+          ...(input.maintenanceAuthority?{maintenanceProvenance:this.maintenanceProvenance(input.maintenanceAuthority)}:{}),
+          bindingDigest:digest(binding),nativeIdHash:hash(binding.nativeId),nativeFingerprint:fingerprint,oldPane,
+          backup,custody:before,preflightDigest:preflight.evidenceDigest})+'\n');
+        effectAttempted=true;
+        try {
+          const created=await this.deps.createDetachedTerminal!(binding);
+          if(!/^%[0-9]+$/.test(created.pane))reject('codex_detached_resume_terminal_unknown','Exact created pane not proven');
+          unchanged();
+          this.deps.db.transaction(()=>{
+            unchanged();
+            const changed=this.deps.db.prepare("UPDATE bindings SET tmux_pane=?,tmux_window='0',updated_at=datetime('now') WHERE node_id=? AND tmux_session=? AND tmux_pane IS ?")
+              .run(created.pane,binding.nodeId,binding.sessionName,oldPane);
+            if(changed.changes!==1)reject('codex_detached_resume_binding_changed','Physical binding CAS failed; created terminal retained');
+            const session=this.deps.db.prepare("UPDATE sessions SET status='running' WHERE id=? AND node_id=? AND session_name=? AND status='detached' AND resume_type='codex_id' AND resume_token=?")
+              .run(binding.sessionId,binding.nodeId,binding.sessionName,binding.nativeId);
+            if(session.changes!==1)reject('codex_detached_resume_binding_changed','Retained session CAS failed; no native resume attempted');
+          }).immediate();
+          this.deps.guard.rebindRunnerRehost(binding.nodeId);
+          const normal=await this.deps.preflightSupervisedLaunch(binding,native);this.preflightMatches(binding,native,normal);
+          if(digest(normal)!==digest(preflight))reject('codex_rehost_configuration_changed','Created terminal launch contract differs from preflight');
+          await this.stoppedProof(binding,created.pane);unchanged();
+          const resumed=await this.deps.resume.resume(binding.sessionName,'codex_id',binding.nativeId,binding.cwd,binding.codexConfigProfile,preflight.posture,binding.model,binding.effort,binding.generation);
+          if(!resumed.ok)reject('codex_detached_resume_unknown','Native resume unconfirmed; no retry or fresh fallback');
+          const replacement=await this.replacement(binding,created.pane,-1);
+          this.prefix(this.history(native.transcriptPath,binding.nativeId),initial);unchanged();
+          const result:Extract<CodexRehostResult,{ok:true}>={ok:true,runtime:'codex',nodeId:binding.nodeId,sessionName:binding.sessionName,
+            generation:binding.generation,generationUnchanged:true,nativeIdHash:hash(binding.nativeId),attemptId,receiptPath,backup,
+            nativeFingerprintBefore:fingerprint,nativeFingerprintAfter:replacement.native.fingerprint,supervisorLaunchId:replacement.supervision.launchId,
+            custodyPreserved:true,guardLeftEnabled:true,authorityRepaired:false};
+          writeDurable(path.join(directory,'completed.json'),JSON.stringify(result)+'\n');return result;
+        }catch(error){
+          try{writeDurable(path.join(directory,'unknown.json'),JSON.stringify({at:this.now(),effectAttempted:true,blindRetryAllowed:false,code:error instanceof Refusal?error.code:'codex_detached_resume_unknown'})+'\n');}catch{}
+          throw error;
+        }
+      });
+    }catch(error){return {ok:false,code:error instanceof Refusal?error.code:effectAttempted?'codex_detached_resume_unknown':'codex_detached_resume_unproven',
+      message:error instanceof Refusal?error.message:'Detached resume unavailable; retain exact history and effect receipt, no blind retry',
+      effectAttempted,blindRetryAllowed:false,...(receiptPath?{receiptPath}:{})};}
+  }
+  private recoveryActor(input:CodexRehostInput & {actorGeneration:string},mode:OperatorMaintenanceAuthority['mode']='stopped-recovery'){
+    if(input.maintenanceAuthority){this.maintenanceActor(input,mode);return;}
     const t=this.deps.guard.target('operator-agent@kernel'),s=this.deps.db.prepare('SELECT status,startup_status FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1').get(t.nodeId) as {status:string;startup_status:string}|undefined;
+    if(input.nodeId===t.nodeId)reject('codex_rehost_recovery_actor','Operator runtime repair requires independent local maintenance');
     if(input.operator!=='operator-agent@kernel'||!input.actorGeneration||t.session!==input.operator||t.occupant!==input.actorGeneration||s?.status!=='running'||s.startup_status!=='ready')reject('codex_rehost_recovery_actor','Current running ready Operator transport identity and generation required');
   }
   private async enableMaintenanceGuard(input:CodexRehostInput,mode:OperatorMaintenanceAuthority['mode']){
@@ -266,10 +357,10 @@ export class CodexSameGenerationRehost {
       ||!await this.deps.proveStoppedIdentityAbsent!(b,panePid)||await this.deps.tmux.getPanePid(pane)!==panePid)reject('codex_rehost_recovery_absence','Stable bare bound pane and global old native identity absence are required');
     return {pane,panePid,startedAt:root.startedAt,ppid:root.ppid,executableName:root.executableName};
   }
-  private binding(input:Pick<CodexRehostInput,"nodeId"|"sessionName">,legacy?:CodexRehostNativeState):CodexRehostBinding {
+  private binding(input:Pick<CodexRehostInput,"nodeId"|"sessionName">,legacy?:CodexRehostNativeState,allowDetached=false):CodexRehostBinding {
     const row=this.deps.db.prepare("SELECT n.id nodeId,n.runtime,n.cwd,n.model,n.effort,n.codex_config_profile codexConfigProfile,s.id sessionId,s.session_name sessionName,s.resume_type resumeType,s.resume_token nativeId,s.status,s.startup_status startupStatus FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE n.id=? ORDER BY s.id DESC LIMIT 1").get(input.nodeId) as Record<string,string|null>|undefined;
     const tenure=this.deps.db.prepare("SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1").get(input.nodeId) as {generation_uuid:string}|undefined;
-    if(!row||row.runtime!=="codex"||row.sessionName!==input.sessionName||row.resumeType!=="codex_id"||!row.nativeId||!tenure?.generation_uuid||row.status!=="running"||row.startupStatus!=="ready")reject("codex_rehost_binding_unproven","Current running Codex binding and exact saved codex_id/current tenure are required; no fresh or last-thread fallback");
+    if(!row||row.runtime!=="codex"||row.sessionName!==input.sessionName||row.resumeType!=="codex_id"||!row.nativeId||!tenure?.generation_uuid||(row.status!=="running"&&!(allowDetached&&row.status==="detached"))||row.startupStatus!=="ready")reject("codex_rehost_binding_unproven","Current running Codex binding and exact saved codex_id/current tenure are required; no fresh or last-thread fallback");
     if(legacy){
       if(row.codexConfigProfile!==null||legacy.nodeId!==row.nodeId||legacy.sessionName!==row.sessionName||legacy.nativeId!==row.nativeId||!legacy.legacyLaunch)
         reject('codex_rehost_legacy_binding_mismatch','Legacy observation must match the exact unpinned current native binding');
@@ -331,12 +422,18 @@ export class CodexSameGenerationRehost {
     if(matching!==1)reject("codex_rehost_history_mismatch","Exactly one matching native transcript identity is required");return bytes;
   }
   private prefix(bytes:Buffer,prefix:Buffer){if(bytes.length<prefix.length||!bytes.subarray(0,prefix.length).equals(prefix))reject("codex_rehost_history_changed","Native transcript prefix changed or was truncated; private full backup retained");}
-  private custody(b:CodexRehostBinding){const db=this.deps.db,a=rotationLocalAddresses(db,b.sessionName);const rows={
+  private custody(b:CodexRehostBinding,physicalResume=false){const db=this.deps.db,a=rotationLocalAddresses(db,b.sessionName);const rows={
     node:db.prepare('SELECT * FROM nodes WHERE id=?').all(b.nodeId),sessions:db.prepare('SELECT * FROM sessions WHERE node_id=? ORDER BY id').all(b.nodeId),bindings:db.prepare('SELECT * FROM bindings WHERE node_id=?').all(b.nodeId),tenures:db.prepare('SELECT * FROM occupant_tenures WHERE node_id=? ORDER BY id').all(b.nodeId),permissions:db.prepare('SELECT * FROM node_permission_selections WHERE node_id=?').all(b.nodeId),
     queue:db.prepare('SELECT * FROM queue_items WHERE destination_session IN (?,?) OR claimed_by_generation_uuid=? ORDER BY qitem_id').all(...a,b.generation),authority:db.prepare('SELECT * FROM coordinator_authority WHERE owner_session IN (?,?) OR owner_generation=? ORDER BY rig_id').all(...a,b.generation),
     assignments:db.prepare('SELECT * FROM coordinator_assignments WHERE destination IN (?,?) ORDER BY rig_id,package_key').all(...a),staged:db.prepare('SELECT * FROM coordinator_stage_assignments WHERE source IN (?,?) OR destination IN (?,?) ORDER BY rig_id,package_key').all(...a,...a),
     resources:db.prepare('SELECT * FROM coordinator_resources WHERE (rig_id,package_key) IN (SELECT rig_id,package_key FROM coordinator_assignments WHERE destination IN (?,?) UNION SELECT rig_id,package_key FROM coordinator_stage_assignments WHERE source IN (?,?) OR destination IN (?,?)) ORDER BY rig_id,resource_key').all(...a,...a,...a),
     outbox:db.prepare('SELECT * FROM outbox_entries WHERE sender_session IN (?,?) OR destination_session IN (?,?) ORDER BY outbox_id').all(...a,...a)};
+    if(physicalResume){
+      // These are physical transport/observation fields, never occupant/custody identity.
+      const omit=(row:unknown,keys:string[])=>Object.fromEntries(Object.entries(row as Record<string,unknown>).filter(([key])=>!keys.includes(key)));
+      rows.sessions=rows.sessions.map(row=>omit(row,['status','last_seen_at','startup_completed_at','resume_last_verified','resume_last_probe_status']));
+      rows.bindings=rows.bindings.map(row=>omit(row,['tmux_pane','tmux_window','updated_at']));
+    }
     return Object.fromEntries(Object.entries(rows).map(([k,v])=>[k,{count:v.length,sha256:digest(v)}]));
   }
   private unchanged(input:CodexRehostInput,b:CodexRehostBinding,before:unknown,legacy?:CodexRehostNativeState){if(input.maintenanceAuthority)this.maintenanceActor(input,input.maintenanceAuthority.mode);if(digest(this.binding(input,legacy))!==digest(b)||digest(this.custody(b))!==digest(before))reject("codex_rehost_custody_changed","Exact node/session/generation, authority, claims, resources or retained effects changed; nothing is silently repaired");}

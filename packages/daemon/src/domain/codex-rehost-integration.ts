@@ -16,6 +16,7 @@ import { forEachJsonlLine } from "./rotation-native-proof.js";
 import { NativeDutyLaunchStore, observeNativeDutyLaunch, verifyNativeDutyProcessIdentity } from "./native-duty-launch.js";
 import { resolveCodexNativeState } from "./rotation-facts-resolver.js";
 import { listNativeProcesses } from "./native-process-lineage.js";
+import { observeSolePane } from "./pane-binding-observation.js";
 import { SeatLaunchEnvironment, structuredNativeExecutable } from "./seat-launch-environment.js";
 
 // No argv/environment values cross this subprocess boundary. Unlike a positive
@@ -104,7 +105,18 @@ except: pass
 print('1' if ok else '0')`;
 
 export async function proveStoppedCodexIdentityAbsent(binding:CodexRehostBinding,panePid:number):Promise<boolean>{
-  if(!Number.isSafeInteger(panePid)||panePid<=1)return false;
+  return proveCodexIdentityAbsent(binding,panePid,false);
+}
+
+/** Detached resume has no pane root to exempt from the global native census.
+ * The zero sentinel is private to this entry point; the shared census otherwise
+ * applies the same exact node/session/native-thread exclusions. */
+export async function proveDetachedCodexIdentityAbsent(binding:CodexRehostBinding):Promise<boolean>{
+  return proveCodexIdentityAbsent(binding,0,true);
+}
+
+async function proveCodexIdentityAbsent(binding:CodexRehostBinding,panePid:number,detached:boolean):Promise<boolean>{
+  if(!Number.isSafeInteger(panePid)||(detached?panePid!==0:panePid<=1))return false;
   try {const result=await promisify(execFile)('python3',['-c',STOPPED_CENSUS_PY,JSON.stringify({OPENRIG_NODE_ID:binding.nodeId,OPENRIG_SESSION_NAME:binding.sessionName}),String(panePid),binding.nativeId],{timeout:5000,maxBuffer:128,encoding:'utf8'});return result.stdout.trim()==='1';}catch{return false;}
 }
 
@@ -127,12 +139,14 @@ export function createCodexRehostIntegration(deps: {
   adapter: CodexRuntimeAdapter; resume: CodexResumeAdapter;
   launchEnvironment: SeatLaunchEnvironment; store?: NativeDutyLaunchStore;
   launchPath: string; snapshotRoot: string; detectDaemonSupport: CodexDaemonSupportDetector;
+  sessionEnv?: Record<string, string | undefined>;
+  runtimeSessionEnv?: Record<string, Record<string, string | undefined>>;
   configurationDigest(session: string): string | null | undefined;
 }) {
-  const currentBinding = async (nodeId: string) => {
+  const currentBinding = async (nodeId: string, allowDetached = false) => {
     if (!deps.guard.ownsRunnerRehost(nodeId)) return null;
     const target = deps.guard.maybeTarget(nodeId);
-    if (!target?.occupant || !target.pane) return null;
+    if (!target?.occupant || (!target.pane && !allowDetached)) return null;
     // Only this exact rehost lease and its required guard are exempted for
     // read-only process proof. Durable reservations still refuse the proof.
     if (deps.guard.protectionFacts(nodeId)?.code === "seat_dispatch_reserved") return null;
@@ -143,6 +157,11 @@ export function createCodexRehostIntegration(deps: {
     return { nodeId, sessionName: target.session, generation: target.occupant,
       runtime: "codex" as const, configurationDigest, pane: target.pane,
       resumeToken: row.resume_token, lifecycleReserved: false };
+  };
+  // Detached preflight can retain a null pane; a live supervisor proof cannot.
+  const managedBinding = async (nodeId: string) => {
+    const current = await currentBinding(nodeId);
+    return current?.pane ? { ...current, pane: current.pane } : null;
   };
   return new CodexSameGenerationRehost({
     db: deps.db, guard: deps.guard, tmux: deps.tmux, resume: deps.resume, snapshotRoot: deps.snapshotRoot,
@@ -162,6 +181,38 @@ export function createCodexRehostIntegration(deps: {
       return {nodeId:binding.nodeId,sessionName:binding.sessionName,nativeId:binding.nativeId,transcriptPath:usage.transcriptPath,runtimeContract:stoppedCodexContract(usage.transcriptPath,binding)};
     },
     proveStoppedIdentityAbsent: proveStoppedCodexIdentityAbsent,
+    detachedTerminalAbsent: async binding => {
+      // probeSession distinguishes an exact missing session from the specific
+      // no-server/socket-absent transport class. Unexpected failures throw and
+      // remain UNKNOWN; the service independently requires global identity
+      // absence and collision-refusing creation before effects.
+      const probe = await deps.tmux.probeSession(binding.sessionName);
+      return probe.state === "absent" || probe.state === "transport_unavailable";
+    },
+    proveDetachedIdentityAbsent: proveDetachedCodexIdentityAbsent,
+    createDetachedTerminal: async binding => {
+      if (!deps.guard.ownsRunnerRehost(binding.nodeId)) throw new Error("Owned recovery lease required");
+      const target = deps.guard.target(binding.nodeId);
+      if (target.nodeId !== binding.nodeId || target.session !== binding.sessionName
+        || target.occupant !== binding.generation) throw new Error("Detached Codex binding changed");
+      // The persisted old pane is retained for the service's binding CAS. It is
+      // not a presence signal; terminal and native absence are proven separately.
+      const env: Record<string, string> = {};
+      for (const source of [deps.sessionEnv, deps.runtimeSessionEnv?.codex]) {
+        for (const [key, value] of Object.entries(source ?? {})) if (value !== undefined) env[key] = value;
+      }
+      Object.assign(env, {
+        OPENRIG_NODE_ID: binding.nodeId,
+        OPENRIG_SESSION_NAME: binding.sessionName,
+        OPENRIG_OCCUPANT_GENERATION: binding.generation,
+        OPENRIG_RUNTIME: "codex",
+      });
+      const created = await deps.tmux.createSessionForRunnerResume(binding.sessionName, binding.cwd, env);
+      if (!created.ok) throw new Error(`Detached Codex terminal creation refused: ${created.code}`);
+      const pane = await observeSolePane(deps.tmux, binding.sessionName);
+      if (!pane.ok) throw new Error("Detached Codex terminal does not have exactly one pane");
+      return { pane: pane.pane };
+    },
     activityWitness: async (nodeId, pane) => {
       if (!deps.guard.ownsRunnerRehost(nodeId)) return null;
       const target = deps.guard.maybeTarget(nodeId);
@@ -169,11 +220,12 @@ export function createCodexRehostIntegration(deps: {
       await deps.activity.pollSeat(target.session);
       return deps.activity.getRotationActivityWitness(nodeId);
     },
-    preflightSupervisedLaunch: async (binding, native) => {
+    preflightSupervisedLaunch: async (binding, native, detached?: true) => {
+      const detachedMode = detached === true;
       if (!deps.store || !deps.guard.ownsRunnerRehost(binding.nodeId)
         || !await deps.launchEnvironment.usesNativeDuty(binding.sessionName, binding.nodeId)) throw new Error("Supervised Codex rehost is not enabled");
       deps.store.assertReady();
-      const current = await currentBinding(binding.nodeId);
+      const current = await currentBinding(binding.nodeId, detachedMode);
       let configurationDigest=current?.configurationDigest;
       if(native.legacyLaunch){
         // Project the exact established digest before the atomic binding. Check
@@ -198,7 +250,9 @@ export function createCodexRehostIntegration(deps: {
       const sandboxType = sandbox && typeof sandbox === "object" ? (sandbox as { type?: unknown }).type : sandbox;
       if (sandboxType !== "workspace-write" && sandboxType !== "danger-full-access") throw new Error("Codex rehost cannot preserve this sandbox posture");
       const posture = sandboxType === "danger-full-access" ? "full_bypass" : "floor";
-      if (!stored || stored.tmuxPane !== current.pane || (node?.policy_launch_posture && node.policy_launch_posture !== posture)) throw new Error("Codex rehost persisted posture or pane mismatch");
+      if (!stored || stored.tmuxSession !== binding.sessionName
+        || (!detachedMode && stored.tmuxPane !== current.pane)
+        || (node?.policy_launch_posture && node.policy_launch_posture !== posture)) throw new Error("Codex rehost persisted posture or pane mismatch");
       const verified = await deps.adapter.preflightRuntimeMigration({ ...stored, cwd: binding.cwd,
         model: binding.model, effort: binding.effort ?? native.runtimeContract.effort ?? undefined, codexConfigProfile: binding.codexConfigProfile,
         launchPosture: posture });
@@ -211,9 +265,11 @@ export function createCodexRehostIntegration(deps: {
       // handover. Structured launch overrides those from the proven binding;
       // only the stable node/session address is inherited from tmux. The rehost
       // service separately proves current native kernel identity before effects.
-      for (const [key, expected] of Object.entries({ OPENRIG_NODE_ID: binding.nodeId,
-        OPENRIG_SESSION_NAME: binding.sessionName })) {
-        if (await deps.tmux.getSessionEnv(binding.sessionName, key) !== expected) throw new Error("Codex rehost native launch environment mismatch");
+      if (!detachedMode) {
+        for (const [key, expected] of Object.entries({ OPENRIG_NODE_ID: binding.nodeId,
+          OPENRIG_SESSION_NAME: binding.sessionName })) {
+          if (await deps.tmux.getSessionEnv(binding.sessionName, key) !== expected) throw new Error("Codex rehost native launch environment mismatch");
+        }
       }
       return { posture, effective: verified.effective, evidenceDigest: createHash("sha256").update(JSON.stringify({
         configurationDigest, profileSha256: verified.profileSha256,
@@ -222,7 +278,7 @@ export function createCodexRehostIntegration(deps: {
     },
     observeSupervisedReplacement: async binding => {
       if (!deps.store) return null;
-      const current = await currentBinding(binding.nodeId);
+      const current = await managedBinding(binding.nodeId);
       const latest = deps.store.latest(binding.nodeId, binding.generation);
       if (!current || !latest || current.resumeToken !== binding.nativeId || current.sessionName !== binding.sessionName
         || latest.intent.configurationDigest !== current.configurationDigest) return null;
@@ -242,7 +298,7 @@ export function createCodexRehostIntegration(deps: {
           [latest.intent.installedNode.path, latest.intent.installedSupervisor.path, "--supervise", latest.intent.configPath])) supervisors.push(row.pid);
       if (supervisors.length !== 1) return null;
       const proof = await observeNativeDutyLaunch(deps.store, { scope: latest.intent,
-        launchId: latest.intent.launchId, supervisorPid: supervisors[0]! }, { currentBinding, tmux: deps.tmux });
+        launchId: latest.intent.launchId, supervisorPid: supervisors[0]! }, { currentBinding: managedBinding, tmux: deps.tmux });
       return proof ? { launchId: proof.launchId, fingerprint: proof.fingerprint } : null;
     },
   });
