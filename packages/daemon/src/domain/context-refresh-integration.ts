@@ -70,7 +70,7 @@ import { resolveCodexNativeState, assertCoordinatorRotationSafe } from "./rotati
 import { canonicalPiSessionFile, observePiRotationIdentity, resolvePiRotationNativeState } from "./pi-rotation-facts-resolver.js";
 import { parseNativeModelWindow } from "./model-window.js";
 import { assertManagedUnattended, assertRotationPrecondition } from "./rotation-precondition.js";
-import { rotationActiveQueueRows, rotationLocalAddresses } from "./rotation-local-custody.js";
+import { rotationActiveQueueRows } from "./rotation-local-custody.js";
 import { listNativeProcesses, verifyCodexPaneProcess } from "./native-process-lineage.js";
 import { observeNativeDutyLaunch, verifyNativeDutyProcessIdentity } from "./native-duty-launch.js";
 import type { NativeDutyProof } from "./native-duty-contract.js";
@@ -257,8 +257,7 @@ export class ContextRefreshIntegration implements ContextRefreshFacade {
     observation.holds = [...new Set(observation.holds)]; return observation;
   }
   private unresolvedEffects(session: string): boolean {
-    const [seat, alias] = rotationLocalAddresses(this.deps.db, session);
-    return Boolean(this.deps.db.prepare("SELECT 1 FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session IN (?,?) OR destination_session IN (?,?)) LIMIT 1").get(seat,alias,seat,alias));
+    return this.deps.queue.coordinatorAuthority.coordinationRecovery?.hasUnresolvedWorkerEffects(session) ?? true;
   }
   private async executorProof(grant: ContextRefreshGrant, requested?: {launchId:string;supervisorPid:number}): Promise<NativeDutyProof | null> {
     const binding = this.currentTarget(grant.executor.nodeId), latest = this.deps.store.latest(grant.executor.nodeId, grant.executor.generation);

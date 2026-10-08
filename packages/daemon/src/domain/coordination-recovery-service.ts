@@ -2084,6 +2084,10 @@ private dutyProtection(rigId:string,r:any):boolean {
   if(r.validUntil<=this.now())return 'dispatch-scope-expired';
   return r.packageKeys.includes(t.packageKey)?null:'checkpoint-quiescence';
  }
+ /** Read-only shared containment decision; never resolves or replays an effect. */
+ hasUnresolvedWorkerEffects(session:string):boolean {
+  return this.workerEffectDebt(session);
+ }
  private workerEffectDebt(session:string,excludeEffect?:string|string[]):boolean {
   const addresses=rotationLocalAddresses(this.db,session);
   const rig=this.db.prepare('SELECT n.rig_id FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(session) as {rig_id:string}|undefined;

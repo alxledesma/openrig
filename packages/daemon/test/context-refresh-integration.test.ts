@@ -7,7 +7,10 @@ import {createDb} from "../src/db/connection.js";
 import {seed,token} from "./helpers/coordinator-fixture.js";
 import {EventBus} from "../src/domain/event-bus.js";
 import {QueueRepository} from "../src/domain/queue-repository.js";
+import {OutboxHandler} from "../src/domain/outbox-handler.js";
 import {CoordinationRecoveryService} from "../src/domain/coordination-recovery-service.js";
+import {digest,legacyProposalDigest,type LegacyEnrollment} from "../src/domain/coordinator-authority-service.js";
+import {HistoricalEffectDispositionService,historicalDigest,type HistoricalPlan} from "../src/domain/historical-effect-disposition.js";
 import {SeatDeliveryGuard,resolveGuardTarget} from "../src/domain/seat-delivery-guard.js";
 import {NativeDutyLaunchStore} from "../src/domain/native-duty-launch.js";
 import * as launches from "../src/domain/native-duty-launch.js";
@@ -23,7 +26,7 @@ const operator={session:"operator-agent@kernel",generation:"operator-agent-g1"},
 const packet:ContextRefreshCheckpointPacket={current_work:"bounded work",decisions:[],memory:[],constraints:[],standing_duties:[],evidence:[],next_action:"continue",outstanding_effects:[]};
 const contract={runtime:"codex",model:"gpt-6-luna",provider:"openai",profile:"refresh-profile",effort:"high",permissions:{sandbox:{type:"workspace-write"},approval:"never"}};
 describe("actual context refresh composition",()=>{
- let db:Database.Database,dir:string,file:string,repo:QueueRepository,guard:SeatDeliveryGuard,integration:ContextRefreshIntegration,deps:ContextRefreshIntegrationDeps,grant:ContextRefreshGrant;
+ let db:Database.Database,dir:string,file:string,repo:QueueRepository,outbox:OutboxHandler,guard:SeatDeliveryGuard,integration:ContextRefreshIntegration,deps:ContextRefreshIntegrationDeps,grant:ContextRefreshGrant;
  let now:number,native:boolean,supervisor:boolean,activity:string,activityAt:number,handoverCount:number,failHandover:boolean,whoamiResolve:ReturnType<typeof vi.fn>;
  const selection=()=>({grantId:grant.grantId,nodeId:seat});
  const line=(type:string,payload:unknown)=>JSON.stringify({timestamp:new Date(now).toISOString(),type,payload})+"\n";
@@ -78,6 +81,7 @@ describe("actual context refresh composition",()=>{
   for(const name of [seat,operator.session])db.prepare("INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES (?,?,?,?)").run(name,name,name,name===seat?'%2':'%1');
   guard=new SeatDeliveryGuard(db,n=>resolveGuardTarget(db,n));
   repo=new QueueRepository(db,new EventBus(db),{resolveOccupantGeneration:s=>repo.coordinatorAuthority.generation(s)});
+  outbox=new OutboxHandler(db);repo.attachOutbox(outbox);
   const recovery=new CoordinationRecoveryService(repo,()=>null,()=>now);repo.coordinatorAuthority.coordinationRecovery=recovery;
   const store=new NativeDutyLaunchStore({root:join(dir,"launches"),nodeExecutable:realpathSync(process.execPath),supervisorEntry:join(dir,"supervisor.js")});
   store.prepare({scopeId:"operator-launch-intent",launchId:"operator-launch",nodeId:operator.session,sessionName:operator.session,generation:operator.generation,runtime:"codex",configurationDigest:recovery.configurationDigest(operator.session)!,harness:{executable:"/fixture/codex",args:["--no-daemon"],cwd:dir},pollMs:1000});
@@ -111,6 +115,30 @@ describe("actual context refresh composition",()=>{
   grant={grantId:"finite-refresh",kind:"context-refresh",executor:{...operator,nodeId:operator.session,launchId:"operator-launch",configurationDigest:deps.configurationDigest(operator.session)!},targets:[target()],policy:{...DEFAULT_CONTEXT_REFRESH_POLICY},policyRevision:"approved-v1",validUntil:now+3600000,validator:{session:"reviewer@xv",generation:"reviewer-g1"},recoveryOwner:operator};
  });
  afterEach(()=>{vi.restoreAllMocks();vi.unstubAllEnvs();vi.useRealTimers();db?.close();rmSync(dir,{recursive:true,force:true});});
+
+ async function adoptContainedUnknownEffect(){
+  const lead="lead@xv",peer="peer@xv",history=new HistoricalEffectDispositionService(db),body="valuable ongoing work";
+  for(const name of [lead,peer])if(!db.prepare("SELECT 1 FROM bindings WHERE node_id=?").get(name))db.prepare("INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES(?,?,?,?)").run(name,name,name,"%3");
+  await repo.create({qitemId:"refresh-baton",sourceSession:operator.session,destinationSession:lead,body:"coordinate",nudge:false,identityProvenance:"transport:v1"});
+  repo.claim({qitemId:"refresh-baton",destinationSession:lead,actorGeneration:"lead-g1",identityProvenance:"transport:v1"});
+  await repo.create({qitemId:"refresh-work",sourceSession:lead,destinationSession:seat,body,nudge:false,identityProvenance:"transport:v1"});
+  outbox.record({outboxId:"wake-intent-refresh-contained",senderSession:lead,destinationSession:seat,body:"UNKNOWN retained input",auditPointer:"refresh-work"});outbox.markIndeterminate("wake-intent-refresh-contained");
+  const plan:HistoricalPlan={rigId:"xv",leadBatonId:"refresh-baton",leadGeneration:"lead-g1",operatorGeneration:operator.generation,operationId:"refresh-hold",authorizationId:"refresh-hold-auth",expiresAt:now+600000,effects:history.inspect("xv",["wake-intent-refresh-contained"])};
+  await repo.create({qitemId:plan.authorizationId,sourceSession:lead,destinationSession:operator.session,body:JSON.stringify({kind:"outbox-historical-quarantine-authorization",requestDigest:historicalDigest({actor:operator.session,generation:operator.generation,input:plan})}),nudge:false,identityProvenance:"transport:v1"});
+  repo.claim({qitemId:plan.authorizationId,destinationSession:operator.session,actorGeneration:operator.generation,identityProvenance:"transport:v1"});history.quarantine(operator.session,operator.generation,plan);
+  const inventory=repo.coordinatorAuthority.legacyInventory("xv","refresh-migration-auth",true),deadline=now+600000;
+  await repo.create({qitemId:"refresh-recovery",sourceSession:lead,destinationSession:operator.session,body:JSON.stringify({kind:"coordinator-held-history-recovery.v1",rigId:"xv",operationId:"refresh-migration",owner:operator.session,generation:operator.generation,lead,leadGeneration:"lead-g1",effects:inventory.heldHistory!.map(h=>h.outboxId),action:"reconcile-preserved-unknown-history",deadline,returnPath:{session:lead,queueId:"refresh-recovery"}}),expiresAt:new Date(deadline).toISOString(),nudge:false,identityProvenance:"transport:v1"});
+  repo.claim({qitemId:"refresh-recovery",destinationSession:operator.session,actorGeneration:operator.generation,identityProvenance:"transport:v1"});
+  const currentInventory=repo.coordinatorAuthority.legacyInventory("xv","refresh-migration-auth",true),workContract={inputDigest:digest("refresh-inputs"),destination:seat,bodyHash:digest(body),resources:["source/a"],returnContract:{destination:lead,evidenceRequired:["tests"]}};
+  const input:LegacyEnrollment={rigId:"xv",batonId:"refresh-baton",owner:lead,ownerGeneration:"lead-g1",coordinators:[lead,peer],leaseMs:60000,operationId:"refresh-migration",authorizationId:"refresh-migration-auth",inventory:currentInventory,heldHistoryRecovery:{queueId:"refresh-recovery",rowHash:historicalDigest(db.prepare("SELECT * FROM queue_items WHERE qitem_id='refresh-recovery'").get())},obligations:currentInventory.rows.map(q=>q.queueId==="refresh-work"?{queueId:q.queueId,kind:"work",evidenceRef:"exact-work-contract",packageKey:"refresh-work-package",resourceScope:"exclusive",contract:workContract}:{queueId:q.queueId,kind:"coordination",evidenceRef:"exact-control-return"})};
+  await repo.create({qitemId:input.authorizationId,sourceSession:lead,destinationSession:operator.session,body:JSON.stringify({kind:"coordinator-legacy-enrollment",proposalDigest:legacyProposalDigest(input)}),nudge:false,identityProvenance:"transport:v1"});
+  repo.claim({qitemId:input.authorizationId,destinationSession:operator.session,actorGeneration:operator.generation,identityProvenance:"transport:v1"});
+  repo.coordinatorAuthority.migrateLegacy(operator.session,operator.generation,input);
+  repo.coordinatorAuthority.acknowledge(lead,token,{operationId:"refresh-ack",obligationsDigest:repo.coordinatorAuthority.reconciliationDigest("xv")});
+  const row=db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='wake-intent-refresh-contained'").get() as Record<string,unknown>;
+  expect(repo.coordinatorAuthority.isAdoptedHistoryContained("xv",row)).toBe(true);
+  return row;
+ }
 
  it("history lookup remains bound to the current node when another rig reuses its session name",async()=>{
   db.prepare("UPDATE sessions SET session_name=? WHERE node_id='worker@other'").run(seat);
@@ -185,6 +213,16 @@ describe("actual context refresh composition",()=>{
   await boundGrant();db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,delivery_state,ts_dispatched) VALUES('unknown',?,?,'private retained','indeterminate',?)").run(seat,operator.session,new Date(now).toISOString());
   expect((await integration.evaluate(operator,selection())).holds).toContain("effects-unresolved");
   expect(db.prepare("SELECT delivery_state,body FROM outbox_entries WHERE outbox_id='unknown'").get()).toEqual({delivery_state:"indeterminate",body:"private retained"});
+ });
+ it("accepts only exact adopted UNKNOWN containment when checking effects debt",async()=>{
+  const original=await adoptContainedUnknownEffect();await boundGrant();
+  expect((await integration.observe(operator,selection())).holds).not.toContain("effects-unresolved");
+  expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id=?").get(original.outbox_id)).toEqual(original);
+  outbox.record({outboxId:"wake-intent-refresh-mismatch",senderSession:"lead@xv",destinationSession:seat,body:"separate UNKNOWN input",auditPointer:"refresh-work"});outbox.markIndeterminate("wake-intent-refresh-mismatch");
+  const unknownBefore=db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='wake-intent-refresh-mismatch'").get();
+  expect((await integration.observe(operator,selection())).holds).toContain("effects-unresolved");
+  expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id=?").get(original.outbox_id)).toEqual(original);
+  expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='wake-intent-refresh-mismatch'").get()).toEqual(unknownBefore);
  });
  it("holds exact unfinished invocation debt across new IDs and grants after a server crash",async()=>{
   await boundGrant();const input={...selection(),operationId:"crashed-server-invocation"};
