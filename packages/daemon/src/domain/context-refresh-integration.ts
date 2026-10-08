@@ -184,7 +184,7 @@ export class ContextRefreshIntegration implements ContextRefreshFacade {
         const witness = deps.activity.getRotationActivityWitness(binding.nodeId);
         return witness ? { value: witness.activity === "idle-at-prompt" ? "idle" : witness.activity === "working" ? "busy" : "unknown", observedAt: Date.parse(witness.observedAt) } : null;
       },
-      transcriptPath: async binding => this.history(binding.sessionName, binding.nativeId),
+      transcriptPath: async binding => this.history(binding.nodeId, binding.sessionName, binding.nativeId),
       piState: binding => deps.piState(binding.sessionName),
       piContract: async binding => (await resolvePiRotationNativeState(deps,binding.sessionName)).runtimeContract,
       piBaseline: binding => (deps.db.prepare("SELECT cursor FROM context_refresh_baselines WHERE node_id=? AND generation=? AND native_id=? AND source='pi_compaction_jsonl'")
@@ -231,10 +231,10 @@ export class ContextRefreshIntegration implements ContextRefreshFacade {
     return target?.occupant && row?.resume_token && (row.runtime === "pi" && row.resume_type === "pi_session_file" && canonicalPiSessionFile(row.resume_token) || row.runtime === "codex" && row.resume_type === "codex_id") && configurationDigest
       ? {nodeId,sessionName:target.session,generation:target.occupant,runtime:row.runtime,nativeId:row.resume_token,configurationDigest} : null;
   }
-  private history(session: string, nativeId: string): string | null {
-    const who = this.deps.whoami.resolve({ sessionName: session, compact: false });
+  private history(nodeId: string, session: string, nativeId: string): string | null {
+    const who = this.deps.whoami.resolve({ nodeId, compact: false });
     const usage = who?.contextUsage as { sessionId?:string; transcriptPath?:string } | undefined;
-    return usage?.sessionId === nativeId && usage.transcriptPath ? usage.transcriptPath : null;
+    return who?.identity.nodeId === nodeId && who.identity.sessionName === session && usage?.sessionId === nativeId && usage.transcriptPath ? usage.transcriptPath : null;
   }
   private async binding(nodeId: string): Promise<ContextRefreshBinding | null> {
     const target = this.currentTarget(nodeId); if (!target) return null;
@@ -243,7 +243,7 @@ export class ContextRefreshIntegration implements ContextRefreshFacade {
       return model && same(target,this.currentTarget(nodeId))
         ? {...target,model:`${model.provider}/${model.id}`,contextWindow:model.contextWindow} : null;
     }
-    const file = this.history(target.sessionName, target.nativeId); if (!file) return null;
+    const file = this.history(target.nodeId, target.sessionName, target.nativeId); if (!file) return null;
     const model = this.modelReader.read(file, target.nativeId, JSON.stringify(target), () => same(target,this.currentTarget(nodeId)));
     return model && same(target, this.currentTarget(nodeId)) ? {...target,...model} : null;
   }

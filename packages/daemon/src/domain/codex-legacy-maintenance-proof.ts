@@ -19,7 +19,7 @@ export async function observeLegacyCodexMaintenance(deps:{db:Database.Database;w
  if(!deps.guard.ownsRunnerRehost(target.nodeId)||!target.pane||!target.occupant)return hold();
  const read=()=>deps.db.prepare(`SELECT n.id,n.runtime,n.model,n.effort,n.codex_config_profile,n.cwd,s.id sessionId,s.session_name,s.resume_type,s.resume_token,s.status,s.startup_status
    FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE n.id=? ORDER BY s.id DESC LIMIT 1`).get(target.nodeId) as Record<string,string|null>|undefined;
- const before=read(),who=deps.whoami.resolve({sessionName:session,compact:false}),usage=who?.contextUsage as {sessionId?:string;transcriptPath?:string}|undefined;
+ const before=read(),who=deps.whoami.resolve({nodeId:target.nodeId,compact:false}),usage=who?.contextUsage as {sessionId?:string;transcriptPath?:string}|undefined;
  if(!before||before.runtime!=='codex'||before.codex_config_profile!==null||before.session_name!==session||before.resume_type!=='codex_id'||before.status!=='running'||before.startup_status!=='ready'
    ||who?.identity.nodeId!==target.nodeId||who.identity.runtime!=='codex'||!usage?.transcriptPath||usage.sessionId!==before.resume_token)return hold();
  const identity={OPENRIG_NODE_ID:target.nodeId,OPENRIG_SESSION_NAME:session,OPENRIG_OCCUPANT_GENERATION:target.occupant,OPENRIG_RUNTIME:'codex'};

@@ -156,9 +156,9 @@ export function createCodexRehostIntegration(deps: {
     },
     stoppedNativeState: async binding => {
       if(!deps.guard.ownsRunnerRehost(binding.nodeId))throw new Error('Owned recovery lease required');
-      const who=deps.whoami.resolve({sessionName:binding.sessionName,compact:false});
+      const who=deps.whoami.resolve({nodeId:binding.nodeId,compact:false});
       const usage=who?.contextUsage as {sessionId?:string;transcriptPath?:string}|undefined;
-      if(who?.identity.nodeId!==binding.nodeId||who.identity.runtime!=='codex'||usage?.sessionId!==binding.nativeId||!usage.transcriptPath)throw new Error('Saved exact native history unavailable');
+      if(who?.identity.nodeId!==binding.nodeId||who.identity.sessionName!==binding.sessionName||who.identity.runtime!=='codex'||usage?.sessionId!==binding.nativeId||!usage.transcriptPath)throw new Error('Saved exact native history unavailable');
       return {nodeId:binding.nodeId,sessionName:binding.sessionName,nativeId:binding.nativeId,transcriptPath:usage.transcriptPath,runtimeContract:stoppedCodexContract(usage.transcriptPath,binding)};
     },
     proveStoppedIdentityAbsent: proveStoppedCodexIdentityAbsent,
@@ -179,8 +179,8 @@ export function createCodexRehostIntegration(deps: {
         // Project the exact established digest before the atomic binding. Check
         // the current algorithm against its production callback to fail closed
         // if that contract changes; no temporary DB mutation is used.
-        const row=deps.db.prepare('SELECT n.id,n.runtime,n.model,n.profile,n.codex_config_profile,n.cwd FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1')
-          .get(binding.sessionName) as Record<string,unknown>|undefined;
+        const row=deps.db.prepare('SELECT n.id,n.runtime,n.model,n.profile,n.codex_config_profile,n.cwd FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE n.id=? AND s.session_name=? ORDER BY s.id DESC LIMIT 1')
+          .get(binding.nodeId,binding.sessionName) as Record<string,unknown>|undefined;
         const hash=(value:unknown)=>createHash('sha256').update(JSON.stringify(value)).digest('hex');
         if(!row||row.id!==binding.nodeId||hash(row)!==configurationDigest||row.codex_config_profile!==null&&row.codex_config_profile!==binding.codexConfigProfile)throw new Error('Legacy projected configuration drift');
         configurationDigest=hash({...row,model:binding.model,codex_config_profile:binding.codexConfigProfile});

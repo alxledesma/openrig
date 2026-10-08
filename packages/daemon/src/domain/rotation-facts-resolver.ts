@@ -5,6 +5,7 @@ import {readFileSync,realpathSync} from 'node:fs';import {resolve,sep} from 'nod
 import type{WhoamiService}from'./whoami-service.js';import type{SeatActivityService}from'./seat-activity-service.js';import type{TmuxAdapter}from'../adapters/tmux.js';import{codexRotationContract}from'./rotation-native-proof.js';import{assertRotationPrecondition,assertManagedUnattended}from'./rotation-precondition.js';
 import { rotationLocalAddresses, rotationActiveQueueRows } from './rotation-local-custody.js';
 import { proveCodexNativeThread } from "./codex-native-thread-proof.js";
+import { resolveGuardTarget } from "./seat-delivery-guard.js";
 const exec=promisify(execFile);
 export function rotationFactsResolver(deps:{db:Database.Database;whoami:WhoamiService;activity:SeatActivityService;tmux:TmuxAdapter;root:string}) {
  return async(seat:string,expected:Record<string,unknown>):Promise<void>=>{
@@ -53,8 +54,11 @@ export async function resolveCodexNativeState(deps: CodexNativeStateDeps, seat: 
 }
 
 async function resolveNativeState(deps: CodexNativeStateDeps, seat: string, requireFreshUsage: boolean) {
-  const who = deps.whoami.resolve({ sessionName: seat, compact: false });
-  if (!who || who.identity.runtime !== "codex") throw new Error("Native rotation proof currently supports Codex only");
+  // Resolve the current managed identity once; retained rigs may share its name.
+  const target = resolveGuardTarget(deps.db, seat);
+  if (!target || target.session !== seat) throw new Error("Current managed Codex identity unavailable");
+  const who = deps.whoami.resolve({ nodeId: target.nodeId, compact: false });
+  if (!who || who.identity.nodeId !== target.nodeId || who.identity.sessionName !== target.session || who.identity.runtime !== "codex") throw new Error("Native rotation proof currently supports Codex only");
   const usage = who.contextUsage as { sessionId?: string; transcriptPath?: string; fresh?: boolean } | undefined;
   if (!usage?.sessionId || !usage.transcriptPath || (requireFreshUsage && !usage.fresh)) {
     throw new Error("Current native generation/checkpoint unavailable");

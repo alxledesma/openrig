@@ -24,7 +24,7 @@ const packet:ContextRefreshCheckpointPacket={current_work:"bounded work",decisio
 const contract={runtime:"codex",model:"gpt-6-luna",provider:"openai",profile:"refresh-profile",effort:"high",permissions:{sandbox:{type:"workspace-write"},approval:"never"}};
 describe("actual context refresh composition",()=>{
  let db:Database.Database,dir:string,file:string,repo:QueueRepository,guard:SeatDeliveryGuard,integration:ContextRefreshIntegration,deps:ContextRefreshIntegrationDeps,grant:ContextRefreshGrant;
- let now:number,native:boolean,supervisor:boolean,activity:string,activityAt:number,handoverCount:number,failHandover:boolean;
+ let now:number,native:boolean,supervisor:boolean,activity:string,activityAt:number,handoverCount:number,failHandover:boolean,whoamiResolve:ReturnType<typeof vi.fn>;
  const selection=()=>({grantId:grant.grantId,nodeId:seat});
  const line=(type:string,payload:unknown)=>JSON.stringify({timestamp:new Date(now).toISOString(),type,payload})+"\n";
  const usage=(used=86)=>line("event_msg",{type:"token_count",info:{last_token_usage:{total_tokens:used},model_context_window:100}});
@@ -81,9 +81,14 @@ describe("actual context refresh composition",()=>{
   const recovery=new CoordinationRecoveryService(repo,()=>null,()=>now);repo.coordinatorAuthority.coordinationRecovery=recovery;
   const store=new NativeDutyLaunchStore({root:join(dir,"launches"),nodeExecutable:realpathSync(process.execPath),supervisorEntry:join(dir,"supervisor.js")});
   store.prepare({scopeId:"operator-launch-intent",launchId:"operator-launch",nodeId:operator.session,sessionName:operator.session,generation:operator.generation,runtime:"codex",configurationDigest:recovery.configurationDigest(operator.session)!,harness:{executable:"/fixture/codex",args:["--no-daemon"],cwd:dir},pollMs:1000});
+  whoamiResolve=vi.fn(({nodeId}:any)=>{
+   if(!nodeId)throw new Error("Exact node lookup required");
+   const row=db.prepare("SELECT n.id nodeId,n.runtime,s.session_name sessionName,s.resume_token nativeId FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE n.id=? ORDER BY s.id DESC LIMIT 1").get(nodeId) as any;
+   return row?{identity:{nodeId:row.nodeId,sessionName:row.sessionName,runtime:row.runtime},contextUsage:{sessionId:row.nativeId,transcriptPath:file,fresh:true}}:null;
+  });
   deps={db,queue:repo,guard,store,rotationRoot:dir,configurationDigest:s=>recovery.configurationDigest(s),
    tmux:{getPanePid:async(pane:string)=>pane==='%1'?10:20} as any,
-   whoami:{resolve:({sessionName}:any)=>({identity:{nodeId:sessionName,sessionName,runtime:"codex"},contextUsage:{sessionId:(db.prepare("SELECT resume_token FROM sessions WHERE session_name=?").get(sessionName) as any)?.resume_token,transcriptPath:file,fresh:true}})} as any,
+   whoami:{resolve:whoamiResolve} as any,
    activity:{pollSeat:async()=>{},getRotationActivityWitness:()=>({activity,observedAt:new Date(activityAt).toISOString()})} as any,piState:async()=>null,piProof:async()=>null,
    handoverFactory:({dispatchReservations})=>({handover:async(input:any)=>{
     handoverCount++;expect(guard.ownsLifecycle(seat)).toBe(true);
@@ -107,6 +112,18 @@ describe("actual context refresh composition",()=>{
  });
  afterEach(()=>{vi.restoreAllMocks();vi.unstubAllEnvs();vi.useRealTimers();db?.close();rmSync(dir,{recursive:true,force:true});});
 
+ it("history lookup remains bound to the current node when another rig reuses its session name",async()=>{
+  db.prepare("UPDATE sessions SET session_name=? WHERE node_id='worker@other'").run(seat);
+  await boundGrant();const observed=await integration.observe(operator,selection());
+  expect(observed.identity).toMatchObject({nodeId:seat,sessionName:seat,nativeId:"native-old"});
+  expect(observed.holds).not.toContain("identity-unavailable");
+  expect(whoamiResolve).toHaveBeenCalledWith({nodeId:seat,compact:false});
+ });
+ it.each(["node","session"])("history lookup rejects a mismatched Whoami %s",async kind=>{
+  await boundGrant();whoamiResolve.mockReturnValue({identity:{nodeId:kind==="node"?"worker@other":seat,
+    sessionName:kind==="session"?"different-session":seat,runtime:"codex"},contextUsage:{sessionId:"native-old",transcriptPath:file,fresh:true}});
+  const observed=await integration.observe(operator,selection());expect(observed.holds).toContain("identity-unavailable");
+ });
  it("derives actual native model/window and raw usage timestamp with current OS and activity proof",async()=>{
   await boundGrant();const observed=await integration.observe(operator,selection());expect(observed.holds).toEqual([]);expect(observed.usage).toMatchObject({usedPercent:86,observedAt:now});
   now+=121000;vi.setSystemTime(now);activityAt=now;

@@ -38,7 +38,7 @@ type FactorySeams = {
 };
 describe("S6 inherited native effort production preflight", () => {
   let db: Database.Database, dir: string, file: string, binding: CodexRehostBinding;
-  let native: CodexRehostNativeState, factory: FactorySeams, adapter: CodexRuntimeAdapter;
+  let native: CodexRehostNativeState, factory: FactorySeams, adapter: CodexRuntimeAdapter, whoamiResolve: ReturnType<typeof vi.fn>;
   const profile = (effort = "medium") => [
     'model="gpt-6-luna"', 'model_provider="openai"', `model_reasoning_effort="${effort}"`,
     'approval_policy="never"', 'sandbox_mode="danger-full-access"',
@@ -56,14 +56,17 @@ describe("S6 inherited native effort production preflight", () => {
     native = { nodeId: binding.nodeId, sessionName: binding.sessionName, nativeId: binding.nativeId, transcriptPath: path.join(dir, "native.jsonl"), runtimeContract: {
       runtime: "codex", model: "gpt-6-luna", provider: "openai", profile: "exact", effort: "medium", permissions: { sandbox: { type: "danger-full-access" }, approval: "never" },
     } };
+    writeFileSync(native.transcriptPath, JSON.stringify({type:"session_meta",payload:{id:"thread",model_provider:"openai"}})+"\n"+
+      JSON.stringify({type:"turn_context",payload:{model:"gpt-6-luna",effort:"medium",approval_policy:"never",sandbox_policy:{type:"danger-full-access"}}})+"\n");
     os.native.mockImplementation(async () => ({ who: { identity: { nodeId: binding.nodeId } }, usage: { sessionId: "thread", transcriptPath: native.transcriptPath }, runtimeContract: native.runtimeContract }));
+    whoamiResolve = vi.fn(({nodeId}:any) => ({identity:{nodeId,sessionName:binding.sessionName,runtime:"codex"},contextUsage:{sessionId:binding.nativeId,transcriptPath:native.transcriptPath}}));
     const identity: Record<string, string> = { OPENRIG_NODE_ID: binding.nodeId, OPENRIG_SESSION_NAME: binding.sessionName, OPENRIG_OCCUPANT_GENERATION: binding.generation, OPENRIG_RUNTIME: "codex" };
     const tmux = { getSessionEnv: vi.fn(async (_seat: string, key: string) => identity[key]) } as unknown as TmuxAdapter;
     adapter = new CodexRuntimeAdapter({ tmux, codexHome: dir, fsOps: { readFile: p => readFileSync(p, "utf8"), writeFile: (p, s) => writeFileSync(p, s), exists: existsSync, mkdirp: p => { mkdirSync(p, { recursive: true }); } } });
     const options = {
       db, tmux, adapter,
       guard: { ownsRunnerRehost: () => true, maybeTarget: () => ({ occupant: binding.generation, pane: "%1", session: binding.sessionName }), protectionFacts: () => null },
-      whoami: {}, activity: {}, resume: {}, store: { assertReady: vi.fn() },
+      whoami: { resolve: whoamiResolve }, activity: {}, resume: {}, store: { assertReady: vi.fn() },
       launchEnvironment: { usesNativeDuty: async () => true }, launchPath: "/fixture", snapshotRoot: path.join(dir, "private"),
       detectDaemonSupport: async () => ({ kind: "supported" }), configurationDigest: () => createHash('sha256').update(JSON.stringify(db.prepare('SELECT n.id,n.runtime,n.model,n.profile,n.codex_config_profile,n.cwd FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(binding.sessionName))).digest('hex'),
     } as unknown as Parameters<typeof createCodexRehostIntegration>[0];
@@ -76,6 +79,18 @@ describe("S6 inherited native effort production preflight", () => {
     factory.preflightMatches(binding, observed, result);
     return result;
   };
+  it("stopped history resolves exact node when a historical rig reuses the session name", async () => {
+    db.prepare("UPDATE sessions SET session_name=? WHERE node_id='worker@other'").run(binding.sessionName);
+    const result = await factory.deps.stoppedNativeState!(binding);
+    expect(whoamiResolve).toHaveBeenCalledWith({nodeId:binding.nodeId,compact:false});
+    expect(result).toMatchObject({nodeId:binding.nodeId,sessionName:binding.sessionName,nativeId:binding.nativeId});
+  });
+  it.each(["node", "session"])("stopped history rejects mismatched returned %s", async kind => {
+    whoamiResolve.mockImplementation(({nodeId}:any) => ({identity:{nodeId:kind==="node"?"worker@other":nodeId,
+      sessionName:kind==="session"?"other-session":binding.sessionName,runtime:"codex"},
+      contextUsage:{sessionId:binding.nativeId,transcriptPath:native.transcriptPath}}));
+    await expect(factory.deps.stoppedNativeState!(binding)).rejects.toThrow("Saved exact native history unavailable");
+  });
   it("null persisted effort inherits independently proven medium through real strict adapter", async () => {
     const call = vi.spyOn(adapter, "preflightRuntimeMigration");
     expect(await preflight()).toMatchObject({ posture: "full_bypass", effective: { effort: "medium", approval: "never", sandbox: "danger-full-access" } });
@@ -86,7 +101,7 @@ describe("S6 inherited native effort production preflight", () => {
   });
   it("explicit pin mismatch refuses before adapter probes", async () => {
     binding.effort = "high";
-    await expect(preflight()).rejects.toThrow("Actual native thread/model/profile/effort differs");
+    await expect(preflight()).rejects.toThrow("Native thread/model/profile/effort differs");
     expect(os.run).not.toHaveBeenCalled();
   });
   it("changed profile effort does not become an inherited fallback", async () => {

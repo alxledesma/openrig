@@ -6,6 +6,10 @@ import type Database from "better-sqlite3";
 import { createDb } from "../src/db/connection.js";
 import { seed } from "./helpers/coordinator-fixture.js";
 import { resolveCodexNativeState, resolveRotationNativeState } from "../src/domain/rotation-facts-resolver.js";
+import { WhoamiService } from "../src/domain/whoami-service.js";
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { SessionRegistry } from "../src/domain/session-registry.js";
+import { TranscriptStore } from "../src/domain/transcript-store.js";
 import type { WhoamiService } from "../src/domain/whoami-service.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 const os = vi.hoisted(() => ({ run: vi.fn() }));
@@ -46,7 +50,7 @@ describe("exact native identity independent of token sample freshness", () => {
     const before = { ...usage }, result = await resolveCodexNativeState(deps, "lead@xv");
     expect(result.runtimeContract).toMatchObject({ runtime: "codex", model: "gpt-6-luna", profile: "exact", effort: "medium" });
     expect(result.usage).toBe(usage); expect(usage).toEqual(before); expect(result.usage.fresh).toBe(false);
-    expect(deps.whoami.resolve).toHaveBeenCalledWith({ sessionName: "lead@xv", compact: false });
+    expect(deps.whoami.resolve).toHaveBeenCalledWith({ nodeId: "lead@xv", compact: false });
   });
   it("fresh launch holds the saved rollout open", async () => {
     argv = "/fixture/codex -p exact -m gpt-6-luna";
@@ -82,8 +86,23 @@ describe("exact native identity independent of token sample freshness", () => {
     inventory = kind === "absent" ? "10 1 /bin/zsh\n20 999 /fixture/codex\n" : inventory + "21 10 /fixture/codex\n";
     await expect(resolveCodexNativeState(deps, "lead@xv")).rejects.toThrow("Exactly one native Codex process required");
   });
-  it.each(["wrong-session", "last-thread", "new-latest-session"])("binds actual latest saved session: %s refuses", async kind => {
-    if (kind === "wrong-session") identity.sessionName = "other@xv";
+  it("resolves exact current Codex node when historical rigs reuse the session name", async () => {
+    db.prepare("UPDATE sessions SET session_name='lead@xv' WHERE node_id='worker@other'").run();
+    const whoami = new WhoamiService({ db, rigRepo: new RigRepository(db), sessionRegistry: new SessionRegistry(db),
+      transcriptStore: new TranscriptStore({ transcriptsRoot: dir, enabled: false }),
+      contextUsageStore: { getForNode: (nodeId: string) => nodeId === "lead@xv" ? usage : null } as never });
+    expect(() => whoami.resolve({ sessionName: "lead@xv", compact: false })).toThrow("ambiguous");
+    deps.whoami = whoami;
+    const result = await resolveCodexNativeState(deps, "lead@xv");
+    expect(result.who.identity).toMatchObject({ nodeId: "lead@xv", sessionName: "lead@xv", runtime: "codex" });
+    expect(result.usage).toBe(usage);
+  });
+  it.each(["wrong-node", "wrong-session"])("rejects a Whoami result with a mismatched %s", async kind => {
+    if (kind === "wrong-node") identity.nodeId = "worker@other";
+    else identity.sessionName = "other@xv";
+    await expect(resolveCodexNativeState(deps, "lead@xv")).rejects.toThrow("Native rotation proof currently supports Codex only");
+  });
+  it.each(["last-thread", "new-latest-session"])("binds actual latest saved session: %s refuses", async kind => {
     if (kind === "last-thread") db.prepare("UPDATE sessions SET resume_type='codex_last' WHERE node_id='lead@xv'").run();
     if (kind === "new-latest-session") db.prepare("UPDATE sessions SET resume_token='new-thread' WHERE node_id='lead@xv'").run();
     await expect(resolveCodexNativeState(deps, "lead@xv")).rejects.toThrow(kind === "new-latest-session" ? "Current native thread differs from saved session" : "Current saved Codex session unavailable");

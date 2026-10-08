@@ -1,3 +1,4 @@
+import { resolveGuardTarget } from "./seat-delivery-guard.js";
 import { validRuntimeRequirements, type DispatchRuntimeRequirements, type DispatchRuntimeHold } from "./dispatch-runtime-readiness.js";
 import { isContainedExpiredAdministrativeHistory } from "./expired-administrative-history.js";
 import { rotationLocalAddresses } from "./rotation-local-custody.js";
@@ -2055,7 +2056,9 @@ private dutyProtection(rigId:string,r:any):boolean {
   }).immediate();
  }
  configurationDigest(session:string,launch?:{nodeId:string;generation:string;runtime:string}):string|null {
-  const row=this.db.prepare('SELECT n.id,n.runtime,n.model,n.profile,n.codex_config_profile,n.cwd FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(session) as {id:string;runtime:string;model:string|null;profile:string|null;codex_config_profile:string|null;cwd:string|null}|undefined;
+  const target=resolveGuardTarget(this.db,session);
+  if(!target||target.session!==session||(launch&&target.nodeId!==launch.nodeId))return null;
+  const row=this.db.prepare('SELECT n.id,n.runtime,n.model,n.profile,n.codex_config_profile,n.cwd FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE n.id=? AND s.session_name=? ORDER BY s.id DESC LIMIT 1').get(target.nodeId,session) as {id:string;runtime:string;model:string|null;profile:string|null;codex_config_profile:string|null;cwd:string|null}|undefined;
   if(!row)return null;
   if(launch){
    if(row.id!==launch.nodeId)return null;

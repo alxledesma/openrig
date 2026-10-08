@@ -96,16 +96,28 @@ describe('independent Operator terminal maintenance',()=>{
   if(kind==='lost-resume'){expect(result.effectAttempted).toBe(true);expect(existsSync(path.join(saved.attempt,'recovery-unknown.json'))).toBe(true);expect(await (await post({...packet(),codexStoppedRecovery:saved.recovery})).json()).toMatchObject({ok:false,code:'codex_rehost_recovery_replay'});expect(resume).toHaveBeenCalledTimes(1);}
   else{expect(resume).not.toHaveBeenCalled();expect(existsSync(path.join(saved.attempt,'recovery-began.json'))).toBe(false);}
  });
- function legacyFixture(){
+ function legacyFixture(resolveWhoami: (query:any)=>any = ({nodeId}:any)=>({identity:{nodeId,sessionName:seat,runtime:'codex'},contextUsage:{sessionId:nativeId,transcriptPath:file}})){
   db.prepare("UPDATE nodes SET model='gpt-6-sol',effort='xhigh',codex_config_profile=NULL WHERE id=?").run(seat);
   processes=tree(20).map(r=>r.pid===20?{...r,command:`/usr/bin/codex --no-daemon -m gpt-6-sol resume ${nativeId}`}:r);
   // A genuine background auxiliary does not become a second foreground TUI.
   processes.push({pid:25,ppid:10,command:'/usr/bin/codex app-server',executableName:'codex',startedAt:'aux',pgid:25,tpgid:20});
   const verify=vi.fn(async()=>true),thread=vi.fn(async()=>async()=>{});
-  options.legacyNativeState=(session,profile)=>observeLegacyCodexMaintenance({db,guard,tmux:options.tmux,whoami:{resolve:()=>({identity:{nodeId:seat,runtime:'codex'},contextUsage:{sessionId:nativeId,transcriptPath:file}})} as never},session,profile,{processes:async()=>processes,verify,thread});
+  options.legacyNativeState=(session,profile)=>observeLegacyCodexMaintenance({db,guard,tmux:options.tmux,whoami:{resolve:resolveWhoami} as never},session,profile,{processes:async()=>processes,verify,thread});
   return {verify,thread};
  }
  const pins=()=>db.prepare('SELECT model,effort,codex_config_profile FROM nodes WHERE id=?').get(seat);
+ it('legacy maintenance resolves the exact guarded node despite a duplicate historical session name',async()=>{
+  const whoami=vi.fn(({nodeId}:any)=>nodeId===seat?{identity:{nodeId,sessionName:seat,runtime:'codex'},contextUsage:{sessionId:nativeId,transcriptPath:file}}:null);
+  legacyFixture(whoami);db.prepare("UPDATE sessions SET session_name=? WHERE node_id='worker@other'").run(seat);
+  const result=await(await post({...packet(),legacyCodexProfile:'exact'})).json();
+  expect(result).toMatchObject({ok:true,generation,custodyPreserved:true});
+  expect(whoami).toHaveBeenCalledWith({nodeId:seat,compact:false});expect(signal).toHaveBeenCalledTimes(1);
+ });
+ it('legacy maintenance rejects a Whoami result for another node',async()=>{
+  const whoami=vi.fn(()=>({identity:{nodeId:'worker@other',sessionName:seat,runtime:'codex'},contextUsage:{sessionId:nativeId,transcriptPath:file}}));
+  legacyFixture(whoami);const result=await(await post({...packet(),legacyCodexProfile:'exact'})).json();
+  expect(result.ok).toBe(false);expect(signal).not.toHaveBeenCalled();expect(resume).not.toHaveBeenCalled();
+ });
  it('legacy maintenance binds observed configuration at the durable boundary and preserves exact history/custody',async()=>{
   const proof=legacyFixture(),before=snapshot();
   const response=await post({...packet(),legacyCodexProfile:'exact'}),result=await response.json();expect(result).toMatchObject({ok:true,generation,custodyPreserved:true});expect(response.status).toBe(200);
