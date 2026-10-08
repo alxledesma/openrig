@@ -1,3 +1,4 @@
+import { CoordinationRecoveryService } from '../src/domain/coordination-recovery-service.js';
 import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest';
 import Database from 'better-sqlite3';
 import {seed,token} from './helpers/coordinator-fixture.js';
@@ -69,6 +70,31 @@ describe('instance sweep isolates refused enabled scope without borrowing dispat
   await setup();const create=repo.create.bind(repo);let changed=false;
   vi.spyOn(repo,'create').mockImplementation(async input=>{try{return await create(input);}catch(error){if(!changed&&input.sourceSession==='lead@xv'){changed=true;db.prepare("UPDATE queue_items SET body='actual late source evidence' WHERE qitem_id='legacy-unadmitted'").run();}throw error;}});
   const {result,status}=await sweep();expect(result.refusals[0].recoveryError).toBe('stuck_sweep_source_changed');expect(result.refusals[0].recoveryQueueId).toBeUndefined();expect(result.findings).toHaveLength(1);expect(result.findings[0].qitemId).toBe('healthy');expect(status.findingsRouted).toBe(1);expect(repo.getById('legacy-unadmitted')?.body).toBe('actual late source evidence');
+ });
+
+ it('expired unclaimed finite control creates exactly one linked successor and preserves original bytes',async()=>{
+  await setup();const first=(await sweep()).result.refusals[0].recoveryQueueId;const original=db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(first);const deadline=JSON.parse(repo.getById(first)!.body).deadline;
+  const run=()=>runStuckSweep({db,queueRepo:repo,now:new Date(deadline),resolveOrchestrator:()=>null,log:()=>{}});
+  const next=(await run()).refusals![0].recoveryQueueId!;expect(next).not.toBe(first);expect(JSON.parse(repo.getById(next)!.body).previousQueueId).toBe(first);expect(JSON.parse(repo.getById(next)!.body).deadline).toBe(deadline+60000);expect((await run()).refusals![0].recoveryQueueId).toBe(next);expect(db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(first)).toEqual(original);
+ });
+ it.each(['claimed','unknown'])('expired %s control remains held without replacement or clearing debt',async mode=>{
+  await setup();const first=(await sweep()).result.refusals[0].recoveryQueueId;const deadline=JSON.parse(repo.getById(first)!.body).deadline;
+  if(mode==='claimed')repo.claim({qitemId:first,destinationSession:'operator-agent@kernel',identityProvenance:'transport:v1'});
+  else db.prepare("UPDATE outbox_entries SET delivery_state='indeterminate' WHERE audit_pointer=?").run(first);
+  const before=db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(first);const effects=db.prepare('SELECT * FROM outbox_entries WHERE audit_pointer=?').all(first);
+  const result=await runStuckSweep({db,queueRepo:repo,now:new Date(deadline),resolveOrchestrator:()=>null,log:()=>{}});
+  expect(result.refusals![0].recoveryError).toBe('stuck_sweep_expired_control_held');expect(result.refusals![0].recoveryQueueId).toBeUndefined();expect(db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(first)).toEqual(before);expect(db.prepare('SELECT * FROM outbox_entries WHERE audit_pointer=?').all(first)).toEqual(effects);
+ });
+ it('only exact durable accepted disposition satisfies terminal seat custody; blocked unaccepted return stays held',async()=>{
+  await setup();repo.claim({qitemId:'legacy-unadmitted',destinationSession:'builder@xv',identityProvenance:'transport:v1'});
+  await repo.create({qitemId:'typed-return',sourceSession:'builder@xv',destinationSession:'lead@xv',body:JSON.stringify({packageKey:'original',inputDigest:digest('actual-prior-inputs'),evidence:[{kind:'report',ref:'actual-report'}]}),identityProvenance:'transport:v1',nudge:false});
+  await repo.update({qitemId:'legacy-unadmitted',actorSession:'builder@xv',state:'done',closureReason:'handed_off_to',closureTarget:'lead@xv',identityProvenance:'transport:v1'});
+  repo.coordinatorAuthority.dispose('builder@xv','builder-g1','xv','original','typed-return');
+  repo.claim({qitemId:'typed-return',destinationSession:'lead@xv',identityProvenance:'transport:v1'});await repo.update({qitemId:'typed-return',actorSession:'lead@xv',state:'blocked',identityProvenance:'transport:v1'});
+  expect(((await sweep()).result.refusals ?? []).some((r:any)=>r.qitemId==='legacy-unadmitted')).toBe(true);
+  const service=new CoordinationRecoveryService(repo,()=>null);service.accept('lead@xv','lead-g1','xv','original','typed-return','actual-technical-acceptance');
+  expect(((await sweep()).result.refusals ?? []).some((r:any)=>r.qitemId==='legacy-unadmitted')).toBe(false);
+  db.prepare("UPDATE queue_items SET body='tampered' WHERE qitem_id='typed-return'").run();expect(((await sweep()).result.refusals ?? []).some((r:any)=>r.qitemId==='legacy-unadmitted')).toBe(true);
  });
 
 });

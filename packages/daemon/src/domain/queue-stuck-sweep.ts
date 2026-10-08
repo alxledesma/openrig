@@ -361,6 +361,31 @@ function evidenceBody(db: Database.Database, c: Candidate): string {
   );
 }
 
+/** Durable acceptance is completion of this exact return, not a seat-role inference.
+ * Historical generations are compared to producer receipts, never current occupants. */
+function hasAcceptedCoordinatorDisposition(db: Database.Database, row: QueueItem, target: string): boolean {
+  const a = db.prepare("SELECT a.*,p.contract,p.contract_hash FROM coordinator_assignments a JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.queue_id=?").get(row.qitemId) as any;
+  if (!a || !a.disposition_id || row.state !== "done" || a.destination !== row.destinationSession || a.body_hash !== digest(row.body)) return false;
+  const returned = db.prepare("SELECT * FROM queue_items WHERE qitem_id=?").get(a.disposition_id) as any;
+  const accepted = db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='coordination-accept'").get(a.rig_id, 'coordination-accept:'+a.package_key) as any;
+  const disposed = db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='disposition'").get(a.rig_id,a.disposition_id) as any;
+  try {
+    const contract=JSON.parse(a.contract), payload=JSON.parse(returned?.body), acceptance=JSON.parse(accepted?.receipt), disposal=JSON.parse(disposed?.receipt);
+    const claim=db.prepare("SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?").get(row.qitemId) as any;
+    const created=db.prepare("SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? ORDER BY transition_id LIMIT 1").get(a.disposition_id) as any;
+    return digest(a.contract)===a.contract_hash && contract.bodyHash===a.body_hash && contract.destination===a.destination &&
+      contract.returnContract.destination===target && returned.source_session===a.destination && returned.destination_session===target &&
+      !!claim?.claimed_by_generation_uuid && returned.minting_generation_uuid===claim.claimed_by_generation_uuid &&
+      created?.actor_session===a.destination && created.identity_provenance==='transport:v1' &&
+      payload.packageKey===a.package_key && payload.inputDigest===contract.inputDigest && Array.isArray(payload.evidence) &&
+      Array.isArray(contract.returnContract.evidenceRequired) && contract.returnContract.evidenceRequired.every((kind:string)=>payload.evidence.some((e:any)=>e.kind===kind&&typeof e.ref==='string'&&e.ref.length>0)) &&
+      disposal.packageKey===a.package_key && disposal.actor===a.destination && disposal.generation===claim.claimed_by_generation_uuid &&
+      acceptance.queueId===row.qitemId && acceptance.dispositionId===a.disposition_id && acceptance.actor===target &&
+      typeof acceptance.generation==='string' && !!acceptance.generation && typeof acceptance.evidenceRef==='string' && !!acceptance.evidenceRef.trim() &&
+      accepted.request_hash===digest(accepted.receipt);
+  } catch { return false; }
+}
+
 const ACCOUNTABILITY_TAG = "stuck-sweep-accountability";
 const OPERATOR = "operator-agent@kernel";
 
@@ -388,12 +413,22 @@ function stageRefusalRecovery(deps: StuckSweepDeps, c: Candidate, code: string, 
       throw new CoordinatorFenceError("stuck_sweep_source_changed", "Source facts changed; next sweep must reconcile current evidence");
     }
     const recoveryKey = digest(JSON.stringify([sourceFacts(current), c.kind, c.evidenceAt, code, generation]));
-    const previous = deps.db.prepare(`SELECT qitem_id,state FROM queue_items
+    const previous = deps.db.prepare(`SELECT qitem_id,state,body,claimed_at FROM queue_items
       WHERE source_session='watchdog@system' AND destination_session=? AND json_valid(body)
         AND json_extract(body,'$.stuckSweepRecoveryKey')=? ORDER BY rowid DESC LIMIT 1`)
-      .get(OPERATOR, recoveryKey) as { qitem_id: string; state: string } | undefined;
+      .get(OPERATOR, recoveryKey) as { qitem_id: string; state: string; body: string; claimed_at: string | null } | undefined;
     if (previous && ["pending", "in-progress", "blocked"].includes(previous.state)) {
-      return { qitemId: previous.qitem_id, action: "refreshed" as const };
+      let deadline: unknown;
+      try { deadline = JSON.parse(previous.body).deadline; } catch { /* malformed history stays held */ }
+      if (!Number.isSafeInteger(deadline)) {
+        throw new CoordinatorFenceError("stuck_sweep_control_unverifiable", "Prior finite control deadline is unverifiable; supported disposition required");
+      }
+      if ((deadline as number) > now.getTime()) return { qitemId: previous.qitem_id, action: "refreshed" as const };
+      const uncertain = deps.db.prepare("SELECT 1 FROM outbox_entries WHERE audit_pointer=? AND delivery_state NOT IN ('pending','failed','delivered') LIMIT 1").get(previous.qitem_id);
+      if (previous.state !== "pending" || previous.claimed_at || uncertain) {
+        throw new CoordinatorFenceError("stuck_sweep_expired_control_held", "Expired claimed or uncertain control requires supported exact disposition; no resend or renewed authority");
+      }
+      // A new linked finite notice leaves the expired unclaimed original and its effects intact.
     }
     const queueId = "qitem-stuck-sweep-control-" + digest(recoveryKey + ":" + (previous?.qitem_id ?? "initial")).slice(0, 24);
     const originalRig=deps.db.prepare("SELECT rig_id FROM coordinator_assignments WHERE queue_id=? UNION ALL SELECT rig_id FROM coordinator_stage_assignments WHERE queue_id=?").get(current.qitemId,current.qitemId) as {rig_id:string}|undefined;
@@ -642,7 +677,7 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
           }
           return !deps.queueRepo.getById(target);
         }
-        return !hasSeatTargetSuccessor(deps.db, row.qitemId, target);
+        return !hasSeatTargetSuccessor(deps.db, row.qitemId, target) && !hasAcceptedCoordinatorDisposition(deps.db, row, target);
       });
       if (verificationTargets.length === 0) continue;
       candidates.push({

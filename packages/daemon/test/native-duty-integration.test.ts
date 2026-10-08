@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import ts from "typescript";
+import { NativeDutyLaunchStore, observeNativeDutyLaunch, type PreparedNativeDutyLaunch } from "../src/domain/native-duty-launch.js";
+import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
 import { createDb } from "../src/db/connection.js";
 import { seed, token } from "./helpers/coordinator-fixture.js";
 import { EventBus } from "../src/domain/event-bus.js";
@@ -55,6 +62,73 @@ describe("native duty actual authority integration",()=>{
   app=nativeDutySupervisionRoutes({bearerToken:"private-fixture",service:integration.service,refreshNative:(actor,input)=>integration.refreshNative(actor,input),enrollment:(actor,input)=>integration.enrollment(actor,input)});
  });
  afterEach(()=>{db?.close();vi.useRealTimers();});
+
+ it("gives each same-generation managed launch an immutable fresh scope and enrolls only its exact intent",async()=>{
+  const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),"native-duty-launch-scope-")));
+  try {
+   const node=path.join(dir,"node"),entry=path.join(dir,"supervisor.js");
+   fs.writeFileSync(node,"pinned fixture node",{mode:0o700});fs.writeFileSync(entry,"pinned fixture supervisor",{mode:0o600});
+   let storedAt=now-10000;
+   const store=new NativeDutyLaunchStore({root:path.join(dir,"intents"),nodeExecutable:node,supervisorEntry:entry,now:()=>++storedAt});
+   const input={nodeId:holder.session,sessionName:holder.session,generation:holder.generation,runtime:"codex" as const,harness:{executable:node,args:["harness.js"],cwd:dir}};
+   // Execute the actual startup composition without starting a daemon or native process.
+   const startup=fs.readFileSync(new URL("../src/startup.ts",import.meta.url),"utf8");
+   const start=startup.indexOf("  const nativeDutyLaunch = {"),end=startup.indexOf("  const seatLaunchEnvironment =",start);
+   expect(start).toBeGreaterThan(0);expect(end).toBeGreaterThan(start);
+   const code=ts.transpileModule(startup.slice(start,end),{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.None}}).outputText;
+   const uuid=vi.fn(randomUUID);
+   const wrap=new Function("nativeDutyStore","nativeDutyNodes","queueRepoInstance","randomUUID",code+"; return nativeDutyLaunch;")(store,new Set([holder.session]),repo,uuid) as {wrap:(launchInput:typeof input)=>Promise<{args:string[]}>};
+   const launch=async()=>{const descriptor=await wrap.wrap(input);const config=JSON.parse(fs.readFileSync(descriptor.args[2]!,"utf8"));const read=store.read(config.scopeId,config.launchId)!;expect(read).not.toBeNull();return {intent:read.intent,config:read.config,publicEnvironment:{OPENRIG_NODE_ID:holder.session,OPENRIG_SESSION_NAME:holder.session,OPENRIG_OCCUPANT_GENERATION:holder.generation,OPENRIG_RUNTIME:"codex"}};};
+   const legacy=store.prepare({...input,scopeId:`native-duty:${holder.session}:${holder.generation}`,launchId:"legacy-launch",configurationDigest:scope.configurationDigest,pollMs:5000});
+   let active:Pick<PreparedNativeDutyLaunch,"intent"|"config"|"publicEnvironment">=legacy,duplicate=false;
+   integration=new NativeDutyIntegration({db,authority:repo.coordinatorAuthority,now:()=>now,
+    binding:session=>session===holder.session?{nodeId:holder.session,session,generation:holder.generation,runtime:"codex",rigId:"xv"}:null,
+    observe:(current,launchId,supervisorPid)=>observeNativeDutyLaunch(store,{scope:current,launchId,supervisorPid},{now:()=>now,
+     currentBinding:async()=>({nodeId:holder.session,sessionName:holder.session,generation:holder.generation,runtime:"codex",configurationDigest:scope.configurationDigest,pane:"%fixture",lifecycleReserved:false}),
+     tmux:{getPanePid:async()=>10},
+     listProcesses:async()=>{const row=(pid:number,ppid:number,name:string,command:string):NativeProcessRow=>({pid,ppid,executableName:name,command,startedAt:"stable-"+pid,pgid:20,tpgid:20});return [row(10,1,"zsh","/bin/zsh"),row(20,10,"node",`${node} ${entry} --supervise ${active.intent.configPath}`),row(30,20,"node",`${node} harness.js`),row(40,30,"codex","/native/codex --no-daemon"),...(duplicate?[row(41,30,"codex","/native/codex --no-daemon")]:[])];},
+     verifyProcessIdentity:async(pid,expected,argv)=>JSON.stringify(expected)===JSON.stringify(active.publicEnvironment)&&(!argv||JSON.stringify(argv)===JSON.stringify(pid===20?[node,entry,"--supervise",active.intent.configPath]:[node,...active.config.harness.args])),
+    }),
+   });
+   app=nativeDutySupervisionRoutes({bearerToken:"private-fixture",service:integration.service,refreshNative:(actor,i)=>integration.refreshNative(actor,i),enrollment:(actor,i)=>integration.enrollment(actor,i)});
+   const reference=(p:typeof active)=>({scopeId:p.intent.scopeId,launchId:p.intent.launchId,supervisorPid:20});
+   const discover=(p:typeof active)=>call("/enrollment?"+new URLSearchParams({...reference(p),supervisorPid:"20"}));
+   const grantScope=(p:typeof active,validUntil:number)=>({...scope,scopeId:p.intent.scopeId,validUntil});
+   // A legacy intent and revoked registration remain readable, without revival.
+   expect((await call("/grant",grantScope(legacy,now+10000),operator)).status).toBe(201);
+   const legacyRegistered=await call("/register",reference(legacy));expect(legacyRegistered.status).toBe(201);
+   expect((await call("/revoke",{scopeId:legacy.intent.scopeId},operator)).status).toBe(200);
+   const legacyGrant=JSON.stringify(db.prepare("SELECT * FROM native_duty_grants WHERE scope_id=?").get(legacy.intent.scopeId));
+   const legacyBytes=fs.readFileSync(legacy.intentPath);
+   const first=await launch();active=first;
+   expect((await discover(first)).body.state).toBe("waiting");
+   expect((await call("/grant",grantScope(first,now+1000),operator)).status).toBe(201);
+   const firstRegistered=await call("/register",reference(first));expect(firstRegistered.status).toBe(201);
+   const firstGrant=JSON.stringify(db.prepare("SELECT * FROM native_duty_grants WHERE scope_id=?").get(first.intent.scopeId)),firstBytes=fs.readFileSync(path.join(path.dirname(first.intent.configPath),"launch-intent.json"));
+   now+=1001;vi.setSystemTime(now);
+   const second=await launch();active=second;
+   expect(uuid).toHaveBeenCalledTimes(2);expect(second.intent.scopeId).not.toBe(first.intent.scopeId);expect(second.intent.launchId).not.toBe(first.intent.launchId);
+   for(const p of [first,second]){expect(p.intent.scopeId).toBe(`native-duty:${p.intent.launchId}`);expect(p.intent.nodeId).toBe(holder.session);expect(p.intent.generation).toBe(holder.generation);}
+   expect((await call("/grant",grantScope(first,now+10000),operator)).body.error).toBe("native_duty_grant_conflict");
+   expect((await call("/grant",grantScope(second,now+10000),operator)).status).toBe(201);
+   expect((await discover(second)).body.state).toBe("ready");
+   expect((await call("/enrollment?"+new URLSearchParams({...reference(second),launchId:first.intent.launchId,supervisorPid:"20"}))).body.state).toBe("waiting");
+   duplicate=true;expect((await discover(second)).body.state).toBe("waiting");duplicate=false;
+   const secondRegistered=await call("/register",reference(second));expect(secondRegistered.status).toBe(201);
+   expect((await discover(second)).body.registrationId).toBe(secondRegistered.body.registrationId);
+   expect((await discover(first)).body.registrationId).toBe(firstRegistered.body.registrationId);expect((await discover(legacy)).body.registrationId).toBe(legacyRegistered.body.registrationId);
+   expect(store.read(legacy.intent.scopeId,legacy.intent.launchId)?.intent).toEqual(legacy.intent);expect(fs.readFileSync(legacy.intentPath)).toEqual(legacyBytes);
+   expect(fs.readFileSync(path.join(path.dirname(first.intent.configPath),"launch-intent.json"))).toEqual(firstBytes);
+   expect(JSON.stringify(db.prepare("SELECT * FROM native_duty_grants WHERE scope_id=?").get(first.intent.scopeId))).toBe(firstGrant);
+   expect(JSON.stringify(db.prepare("SELECT * FROM native_duty_grants WHERE scope_id=?").get(legacy.intent.scopeId))).toBe(legacyGrant);
+   // A third fresh scope is not a bypass of unresolved node-wide effect debt.
+   const operation=request("scope-lifetime-unknown");expect((await call("/prepare",{registrationId:secondRegistered.body.registrationId,request:operation})).status).toBe(201);
+   expect((await call("/in-flight",{registrationId:secondRegistered.body.registrationId,operationId:operation.operationId})).body.maySendEffect).toBe(true);
+   const debt=JSON.stringify(db.prepare("SELECT * FROM native_duty_intents").all()),third=await launch();
+   expect((await call("/grant",grantScope(third,now+10000),operator)).body.error).toBe("native_duty_unresolved_intent");
+   expect(JSON.stringify(db.prepare("SELECT * FROM native_duty_intents").all())).toBe(debt);
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
+ });
 
  it("authorizes a coordinating holder for genuine worker-owned bounded work and confirms the actual coordinator receipt",async()=>{
   expect(recovery.plan("xv")!.tasks.every(t=>t.owner!==holder.session)).toBe(true);

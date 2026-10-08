@@ -654,8 +654,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     wrap: async (input: { nodeId: string; sessionName: string; generation: string; runtime: "codex" | "pi"; harness: { executable: string; args: string[]; cwd: string } }) => {
       const configurationDigest = queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(input.sessionName, input);
       if (!nativeDutyStore || !nativeDutyNodes.has(input.nodeId) || !configurationDigest) throw new Error("Native duty launch configuration unavailable");
-      return nativeDutyStore.prepare({ ...input, configurationDigest,
-        scopeId: `native-duty:${input.nodeId}:${input.generation}`, pollMs: 5000 }).launch;
+      // A finite grant belongs to one launch, not to the whole occupant tenure.
+      // Persist both IDs together; grants/enrollment read this exact intent.
+      const launchId = randomUUID();
+      return nativeDutyStore.prepare({ ...input, configurationDigest, launchId,
+        scopeId: `native-duty:${launchId}`, pollMs: 5000 }).launch;
     },
   };
   const seatLaunchEnvironment = new SeatLaunchEnvironment(tmuxAdapter, launchSessionEnv, process.cwd(), undefined, configuredCodexHome, nativeDutyNodes.size ? nativeDutyLaunch : undefined);
