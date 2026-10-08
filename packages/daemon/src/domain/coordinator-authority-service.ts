@@ -1111,9 +1111,16 @@ export class CoordinatorAuthorityService {
    if(queueAssignmentId&&this.coordinationRecovery?.isLifecycleControl(queueAssignmentId)){if(this.coordinationRecovery.validLifecycleControlWake(source,destination,queueAssignmentId))return;reject('coordinator_lifecycle_wake_invalid','Exact current finite lifecycle duty proof required');}
    if(queueAssignmentId&&this.coordinationRecovery?.validTerminalReturnContinuationWake(source,destination,queueAssignmentId))return;
    if(queueAssignmentId&&this.validNativeTerminalReturnWake(source,destination,queueAssignmentId))return;
-   if(!this.scope(source,destination))return;
+   const managedScope=this.scope(source,destination);
+   if(!managedScope&&(!queueAssignmentId||!this.available()))return;
    if(queueAssignmentId){
      const a=this.db.prepare(`SELECT a.rig_id,a.destination,a.owner_session,a.body_hash,q.body,q.state FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.queue_id=? UNION ALL SELECT a.rig_id,a.destination,a.source AS owner_session,a.body_hash,q.body,q.state FROM coordinator_stage_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.queue_id=?`).get(queueAssignmentId,queueAssignmentId) as {rig_id:string;destination:string;owner_session:string;body_hash:string;body:string;state:string}|undefined;
+     if(a){
+       const task=this.coordinationRecovery?.plan(a.rig_id)?.tasks.find(t=>'qitem-coordination-'+digest(a.rig_id+':'+t.packageKey).slice(0,24)===queueAssignmentId);
+       const frozenReturned=this.db.prepare("SELECT 1 FROM coordinator_operations o,json_each(o.receipt,'$.predecessors') p WHERE o.rig_id=? AND o.operation_id=(SELECT 'coordination-predecessor-resolution:'||rig_id||':'||package_key FROM coordinator_assignments WHERE rig_id=? AND queue_id=?) AND o.kind='coordination-predecessor-resolution' AND json_extract(p.value,'$.milestone')='returned'").get(a.rig_id,a.rig_id,queueAssignmentId);
+       if((frozenReturned||task?.predecessors.some(p=>'milestone' in p&&p.milestone==='returned'))&&!this.coordinationRecovery?.assignmentPredecessorsReady(queueAssignmentId))reject('coordinator_predecessor_changed','Exact frozen returned predecessor must remain valid at delivery');
+     }
+     if(!managedScope)return;
      if(a && a.destination===destination && a.owner_session===source && a.body_hash===digest(a.body) && ["pending","in-progress","blocked"].includes(a.state))return;
      const holder=a?this.get(a.rig_id):undefined;
      if(a&&a.destination===destination&&a.body_hash===digest(a.body)&&a.state==='pending'&&holder?.state==='active'&&holder.owner_session===source&&holder.owner_generation===this.generation(source!)&&holder.lease_until>this.now())return;

@@ -27,9 +27,10 @@ interface PreparedNativeObservation { owner:string; generation:string; configura
 interface PreparedDispatchObservation extends PreparedNativeObservation { plan:string; authority:string; recoveryTargets:Record<string,PreparedNativeObservation|null> }
 type DispatchScope=ReadonlyMap<string,PreparedDispatchObservation|null>;
 export interface QualificationWorkerStageObservation { worker:string; generation:string; configurationDigest:string; identityObservedAt:string; activityObservedAt:string }
-/** Exact retained-history form, or a pre-bound product successor naming an immutable admitted package instance. Only the accepted disposition is resolved later, from that exact instance. */
-export type CoordinationPredecessor={queueId:string;dispositionId:string}|{packageKey:string;contractHash:string;queueId:string};
+/** Exact retained-history form, or a pre-bound product successor naming an immutable admitted package instance. The milestone is resolved later from that exact instance; omission means accepted. */
+export type CoordinationPredecessor={queueId:string;dispositionId:string}|{packageKey:string;contractHash:string;queueId:string;milestone?:'returned'|'accepted'};
 type BoundPredecessor=Extract<CoordinationPredecessor,{packageKey:string}>;
+interface ReturnedPredecessorResolution { dispositionId:string; milestone:'returned'; originalBodyHash:string; worker:string; claimedGeneration:string; returnBodyHash:string; returnDestination:string; contractBodyHash:string; dispositionReceiptHash:string }
 const isBoundPredecessor=(p:CoordinationPredecessor):p is BoundPredecessor=>!!p&&typeof p==='object'&&'packageKey' in p;
 export interface CoordinationTask {
  key:string; packageKey:string; owner:string; action:string; deadline:number; body:string; recoveryFor?:string;
@@ -1865,6 +1866,8 @@ private dutyProtection(rigId:string,r:any):boolean {
     // activation gates, and any later byte change makes it a changed task under the full gate.
     const retainedExact=!!old&&JSON.stringify(old)===JSON.stringify(t);
     if(!t.key||!t.action.trim()||!Number.isFinite(t.deadline)||(t.deadline<=this.now()&&!prior?.tasks.some(old=>old.key===t.key&&stable(old)===stable(t)))||!t.body||!Array.isArray(t.predecessors))fail("coordination_invalid_task","Concrete action, future deadline, predecessors and exact body required");
+    const assignedPrior=prior?.tasks.find(previous=>previous.packageKey===t.packageKey);
+    if(assignedPrior&&JSON.stringify(assignedPrior.predecessors)!==JSON.stringify(t.predecessors)&&this.db.prepare('SELECT 1 FROM coordinator_assignments WHERE rig_id=? AND package_key=?').get(plan.rigId,t.packageKey))fail('coordination_invalid_predecessor','Predecessor references cannot change after assignment');
     const ad=t.admission;
     if(!validRuntimeRequirements(ad?.runtimeRequirements))fail("coordination_invalid_runtime_requirements","Runtime requirements must bind a native model and/or nonnegative context token floor");
     if(!historical&&!scopeOnly&&!retainedExact&&(!ad||ad.generation!==this.authority.generation(t.owner)||ad.configurationDigest!==this.configurationDigest(t.owner)||!ad.qualificationRef||!ad.capacityRef||!ad.effortRef||!Number.isFinite(ad.validUntil)||ad.validUntil<=this.now()))fail('coordination_current_admission_required','Exact current generation/configuration, qualification/capacity/effort evidence and expiry required');
@@ -1876,7 +1879,7 @@ private dutyProtection(rigId:string,r:any):boolean {
     for(const pred of t.predecessors){
      if(!pred||typeof pred!=='object'||!pred.queueId)fail("coordination_invalid_predecessor","Exact disposition receipt required");
      if(isBoundPredecessor(pred))this.validateBoundPredecessor(plan,t,pred,old);
-     else if(!pred.dispositionId)fail("coordination_invalid_predecessor","Exact disposition receipt required");
+     else if(Object.keys(pred).sort().join(',')!=='dispositionId,queueId'||!pred.dispositionId)fail("coordination_invalid_predecessor","Exact disposition receipt required");
     }
     if(t.recoveryFor&&(!keys.has(t.recoveryFor)||t.recoveryFor===t.key))fail("coordination_invalid_recovery","Recovery must name another exact plan task");
     if(!t.recoveryFor&&!t.boundary&&!plan.tasks.some(r=>r.recoveryFor===t.key))fail("coordination_recovery_required","Every ordinary task needs a distinct admitted recovery task with concrete owner/action/deadline");
@@ -2406,9 +2409,35 @@ if(!effectRig)return true;
    this.repo.createWithinTransaction({qitemId:queueId,sourceSession:actor,destinationSession:parent!.destination,body:input.body,dispatch:{token:{rigId:input.rigId,epoch:input.epoch,generation},packageKey:input.feedbackPackageKey},identityProvenance:'transport:v1',nudge:true});return {queueId};
   }).immediate();
  }
- private predecessorsReady(rigId:string,t:CoordinationTask):boolean {return t.predecessors.every(p=>isBoundPredecessor(p)?this.boundPredecessorReady(rigId,p):!!this.db.prepare("SELECT 1 FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.queue_id=? AND a.disposition_id=? AND q.state IN ('done','handed-off') AND EXISTS (SELECT 1 FROM coordinator_operations o WHERE o.rig_id=a.rig_id AND o.kind='coordination-accept' AND json_extract(o.receipt,'$.queueId')=a.queue_id AND json_extract(o.receipt,'$.dispositionId')=a.disposition_id)").get(rigId,p.queueId,p.dispositionId));}
-/** Keyed lookups only, scoped to this rig. Ready only for the exact bound instance and contract, a successful released return, and the exact coordination-accept receipt that accept() alone writes. Nothing is created or inferred here. */
- private boundPredecessorResolution(rigId:string,p:BoundPredecessor):{dispositionId:string}|undefined {
+ /** Read-only final dispatch integration: no authority or custody is granted by this proof. */
+ assignmentPredecessorsReady(queueId:string):boolean {
+  const assignment=this.db.prepare('SELECT rig_id,package_key FROM coordinator_assignments WHERE queue_id=?').get(queueId) as {rig_id:string;package_key:string}|undefined;
+  if(!assignment)return false;
+  const task=this.plan(assignment.rig_id)?.tasks.find(t=>t.packageKey===assignment.package_key);
+  return !!task&&this.predecessorsReady(assignment.rig_id,task);
+ }
+ private predecessorsReady(rigId:string,t:CoordinationTask):boolean {
+  if(!(t.predecessors.every(p=>isBoundPredecessor(p)?this.boundPredecessorReady(rigId,p):!!this.db.prepare("SELECT 1 FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.queue_id=? AND a.disposition_id=? AND q.state IN ('done','handed-off') AND EXISTS (SELECT 1 FROM coordinator_operations o WHERE o.rig_id=a.rig_id AND o.kind='coordination-accept' AND json_extract(o.receipt,'$.queueId')=a.queue_id AND json_extract(o.receipt,'$.dispositionId')=a.disposition_id)").get(rigId,p.queueId,p.dispositionId))))return false;
+  if(!t.predecessors.some(isBoundPredecessor)||!this.db.prepare('SELECT 1 FROM coordinator_assignments WHERE rig_id=? AND package_key=?').get(rigId,t.packageKey))return true;
+  const frozen=this.db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='coordination-predecessor-resolution'").get(rigId,`coordination-predecessor-resolution:${rigId}:${t.packageKey}`) as {receipt:string;request_hash:string}|undefined;
+  if(!frozen||digest(frozen.receipt)!==frozen.request_hash)return false;
+  try{return JSON.stringify(JSON.parse(frozen.receipt).predecessors)===JSON.stringify(t.predecessors.filter(isBoundPredecessor).map(p=>this.boundPredecessorProof(rigId,p)));}catch{return false;}
+ }
+/** Keyed, same-rig historical proof; returned is independent of acceptance. */
+ private returnedPredecessorResolution(rigId:string,p:BoundPredecessor):ReturnedPredecessorResolution|undefined {
+  if(p.queueId!=='qitem-coordination-'+digest(rigId+':'+p.packageKey).slice(0,24))return undefined;
+  const row=this.db.prepare("SELECT k.contract,a.destination,a.body_hash,a.disposition_id,q.body,q.claimed_by_generation_uuid FROM coordinator_packages k JOIN coordinator_assignments a ON a.rig_id=k.rig_id AND a.package_key=k.package_key JOIN queue_items q ON q.qitem_id=a.queue_id WHERE k.rig_id=? AND k.package_key=? AND k.contract_hash=? AND a.queue_id=? AND a.disposition_id IS NOT NULL AND q.destination_session=a.destination AND q.state IN ('done','handed-off')").get(rigId,p.packageKey,p.contractHash,p.queueId) as any;
+  if(!row||row.disposition_id===p.queueId||!row.claimed_by_generation_uuid||digest(row.body)!==row.body_hash)return undefined;
+  let contract:any;try{contract=JSON.parse(row.contract);}catch{return undefined;}
+  if(contract.destination!==row.destination||contract.bodyHash!==row.body_hash||!Array.isArray(contract.returnContract?.evidenceRequired)||!contract.returnContract.evidenceRequired.length||!this.validContinuationReturn(row.disposition_id,row.destination,row.claimed_by_generation_uuid,p.packageKey,contract))return undefined;
+  const op=this.db.prepare("SELECT receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='disposition'").get(rigId,row.disposition_id) as {receipt:string}|undefined;
+  let receipt:any;try{receipt=op?JSON.parse(op.receipt):null;}catch{return undefined;}
+  if(receipt?.packageKey!==p.packageKey||receipt.actor!==row.destination||receipt.generation!==row.claimed_by_generation_uuid)return undefined;
+  const returned=this.db.prepare('SELECT body FROM queue_items WHERE qitem_id=?').get(row.disposition_id) as {body:string};
+  return {dispositionId:row.disposition_id,milestone:'returned',originalBodyHash:row.body_hash,worker:row.destination,claimedGeneration:row.claimed_by_generation_uuid,returnBodyHash:digest(returned.body),returnDestination:contract.returnContract.destination,contractBodyHash:digest(row.contract),dispositionReceiptHash:digest(op!.receipt)};
+ }
+ private boundPredecessorResolution(rigId:string,p:BoundPredecessor):{dispositionId:string}|ReturnedPredecessorResolution|undefined {
+  if(p.milestone==='returned')return this.returnedPredecessorResolution(rigId,p);
   const resolved=this.db.prepare("SELECT a.disposition_id dispositionId FROM coordinator_packages k JOIN coordinator_assignments a ON a.rig_id=k.rig_id AND a.package_key=k.package_key JOIN queue_items q ON q.qitem_id=a.queue_id WHERE k.rig_id=? AND k.package_key=? AND k.contract_hash=? AND a.queue_id=? AND a.disposition_id IS NOT NULL AND q.state IN ('done','handed-off') AND EXISTS (SELECT 1 FROM coordinator_operations o WHERE o.rig_id=a.rig_id AND o.operation_id='coordination-accept:'||a.package_key AND o.kind='coordination-accept' AND json_extract(o.receipt,'$.queueId')=a.queue_id AND json_extract(o.receipt,'$.dispositionId')=a.disposition_id)").get(rigId,p.packageKey,p.contractHash,p.queueId) as {dispositionId:string}|undefined;
   if(!resolved)return undefined;
   // Reuse the acceptance contract, including genuinely accepted repair. The
@@ -2418,16 +2447,22 @@ if(!effectRig)return true;
   return resolved;
  }
  private boundPredecessorReady(rigId:string,p:BoundPredecessor):boolean {return !!this.boundPredecessorResolution(rigId,p);}
- /** Inside the successor's creation transaction: freeze the exact resolved accepted-predecessor receipt. Any failure rolls the successor's creation back. */
+ private boundPredecessorProof(rigId:string,p:BoundPredecessor):any|undefined {
+  const r=this.boundPredecessorResolution(rigId,p);if(!r)return undefined;
+  const binding={packageKey:p.packageKey,contractHash:p.contractHash,queueId:p.queueId};
+  if(p.milestone==='returned')return {...binding,...r};
+  return {...binding,dispositionId:r.dispositionId,acceptOperationId:'coordination-accept:'+p.packageKey,...(p.milestone==='accepted'?{milestone:'accepted'}:{})};
+ }
+ /** Inside successor creation: freeze exact milestone proof atomically with the queue item. */
  private freezeBoundPredecessorResolution(rigId:string,t:CoordinationTask,planRevision:string):void {
   const bound=t.predecessors.filter(isBoundPredecessor);if(!bound.length)return;
-  const predecessors=bound.map(p=>{const r=this.boundPredecessorResolution(rigId,p);if(!r)fail('coordination_predecessor_unresolved','Bound predecessor lost its exact accepted return before successor creation');return {packageKey:p.packageKey,contractHash:p.contractHash,queueId:p.queueId,dispositionId:r!.dispositionId,acceptOperationId:'coordination-accept:'+p.packageKey};});
+  const predecessors=bound.map(p=>{const proof=this.boundPredecessorProof(rigId,p);if(!proof)fail('coordination_predecessor_unresolved','Bound predecessor lost its exact milestone before successor creation');return proof;});
   const receipt={predecessors,planRevision};
   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,`coordination-predecessor-resolution:${rigId}:${t.packageKey}`,'coordination-predecessor-resolution',JSON.stringify(receipt),digest(JSON.stringify(receipt)));
  }
  private validateBoundPredecessor(plan:CoordinationPlan,t:CoordinationTask,pred:BoundPredecessor,old?:CoordinationTask):void {
   const bad=(reason:string):never=>fail('coordination_invalid_predecessor','Pre-bound successor reference refused: '+reason);
-  if(Object.keys(pred).sort().join(',')!=='contractHash,packageKey,queueId'||typeof pred.packageKey!=='string'||!pred.packageKey||typeof pred.contractHash!=='string'||!pred.contractHash||typeof pred.queueId!=='string'||!pred.queueId||'dispositionId' in pred)bad('exactly packageKey, contractHash and queueId required');
+  if(Object.keys(pred).some(key=>!['contractHash','packageKey','queueId','milestone'].includes(key))||(pred.milestone!==undefined&&!['returned','accepted'].includes(pred.milestone))||typeof pred.packageKey!=='string'||!pred.packageKey||typeof pred.contractHash!=='string'||!pred.contractHash||typeof pred.queueId!=='string'||!pred.queueId||'dispositionId' in pred)bad('packageKey, contractHash and queueId plus optional returned/accepted milestone required');
   if(t.recoveryFor)bad('a recovery task cannot use a bound predecessor');
   if(pred.packageKey===t.packageKey)bad('self reference');
   const target=plan.tasks.find(other=>other.packageKey===pred.packageKey);
