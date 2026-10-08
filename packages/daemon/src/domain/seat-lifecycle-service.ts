@@ -1684,7 +1684,7 @@ export class SeatLifecycleService {
    * unverifiable fact refuses, and a failed stop or resume writes a failed
    * event and stops, so a blind retry cannot happen.
    */
-  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null; actorGeneration?: string; codexStoppedRecovery?: import("./codex-rehost.js").CodexStoppedRecovery; legacyNativeWitness?: boolean; stoppedTargetRecovery?: boolean; stoppedTargetAcceptanceReference?: string; onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal }): Promise<RehostRunnerResult> {
+  async rehostRunner(input: { seatRef: string; reason: string; operator?: string | null; actorGeneration?: string; maintenanceAuthority?: import("./codex-rehost.js").OperatorMaintenanceAuthority; codexStoppedRecovery?: import("./codex-rehost.js").CodexStoppedRecovery; legacyNativeWitness?: boolean; stoppedTargetRecovery?: boolean; stoppedTargetAcceptanceReference?: string; onPreEffectRefusal?: (refusal: SeatRefusal) => SeatRefusal }): Promise<RehostRunnerResult> {
     const required = this.requireReason(input.reason);
     if (required) return required;
     // EXPLICIT, DEFAULT-OFF. This boolean is the ONLY thing the option adds. No
@@ -1712,10 +1712,11 @@ export class SeatLifecycleService {
         return { ok: false, code: "rehost_process_identity_unproven", message: "Seat has no canonical session name to rehost." };
       if (input.codexStoppedRecovery) {
         if (!this.codexRehost.recoverStopped) return {ok:false,code:"rehost_unavailable",message:"Stopped Codex recovery unavailable"};
-        return this.codexRehost.recoverStopped({nodeId:resolved.nodeId,sessionName,reason:input.reason,operator:input.operator,actorGeneration:input.actorGeneration??"",...input.codexStoppedRecovery});
+        return this.codexRehost.recoverStopped({nodeId:resolved.nodeId,sessionName,reason:input.reason,operator:input.operator,actorGeneration:input.actorGeneration??"",maintenanceAuthority:input.maintenanceAuthority,...input.codexStoppedRecovery});
       }
-      return this.codexRehost.rehost({ nodeId: resolved.nodeId, sessionName, reason: input.reason, operator: input.operator });
+      return this.codexRehost.rehost({ nodeId: resolved.nodeId, sessionName, reason: input.reason, operator: input.operator, maintenanceAuthority: input.maintenanceAuthority });
     }
+    if (input.maintenanceAuthority) return {ok:false,code:"rehost_recovery_modes_exclusive",message:"Operator terminal maintenance requires actual Codex runtime"};
     if (input.codexStoppedRecovery) return {ok:false,code:"rehost_recovery_modes_exclusive",message:"Codex stopped recovery requires actual Codex runtime"};
     if (resolved.entry.runtime !== "pi")
       return { ok: false, code: "rehost_requires_pi_runtime", message: `Same-generation process rehost is unavailable for runtime '${resolved.entry.runtime ?? "unknown"}'.` };

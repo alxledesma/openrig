@@ -29,7 +29,23 @@ export type CodexRehostResult = {
   nativeFingerprintBefore:string;nativeFingerprintAfter:string;supervisorLaunchId:string;
   custodyPreserved:true;guardLeftEnabled:true;authorityRepaired:false;
 } | {ok:false;code:string;message:string;blindRetryAllowed:false;effectAttempted:boolean;receiptPath?:string};
-export interface CodexRehostInput {nodeId:string;sessionName:string;reason:string;operator?:string|null}
+declare const maintenanceBrand:unique symbol;
+export interface OperatorMaintenanceAuthority {
+  readonly [maintenanceBrand]:true;
+  readonly principal:'local-terminal-maintenance';readonly nodeId:string;readonly sessionName:'operator-agent@kernel';readonly generation:string;
+  readonly mode:'rehost'|'stopped-recovery';readonly attemptId?:string;readonly beganSha256?:string;
+}
+const maintenanceAuthorities=new WeakSet<object>();
+/** Trusted route-only issuer, called after terminal bearer and connection checks.
+ * JSON/body lookalikes are never capabilities, even if every field matches. */
+export function createOperatorMaintenanceAuthority(input:{nodeId:string;generation:string;recovery?:CodexStoppedRecovery}):OperatorMaintenanceAuthority {
+  if(!input.nodeId||!input.generation)throw new Error('Exact server Operator binding required');
+  if(input.recovery)parseCodexStoppedRecovery(input.recovery);
+  const authority=Object.freeze({principal:'local-terminal-maintenance',nodeId:input.nodeId,sessionName:'operator-agent@kernel',generation:input.generation,
+    mode:input.recovery?'stopped-recovery':'rehost',...(input.recovery??{})}) as OperatorMaintenanceAuthority;
+  maintenanceAuthorities.add(authority);return authority;
+}
+export interface CodexRehostInput {nodeId:string;sessionName:string;reason:string;operator?:string|null;maintenanceAuthority?:OperatorMaintenanceAuthority}
 export interface CodexStoppedRecovery {attemptId:string;beganSha256:string}
 export interface CodexStoppedRecoveryInput extends CodexRehostInput, CodexStoppedRecovery {actorGeneration:string}
 export function parseCodexStoppedRecovery(value:unknown):CodexStoppedRecovery {
@@ -86,6 +102,7 @@ export class CodexSameGenerationRehost {
       if(!this.deps.preflightSupervisedLaunch||!this.deps.observeSupervisedReplacement||!this.deps.nativeState||!this.deps.activityWitness||!this.deps.resume)
         reject("codex_rehost_unavailable","Every supervised resume, native and activity proof seam is required");
       return await this.deps.guard.runnerRehost(input.nodeId,async()=>{
+        if(input.maintenanceAuthority)this.maintenanceActor(input,'rehost');
         const binding=this.binding(input),pane=this.pane(input.nodeId),before=this.custody(binding);
         this.gates(binding);this.assertNoUnresolved(binding);
         const native=await this.native(binding),preflight=await this.deps.preflightSupervisedLaunch(binding,native);this.preflightMatches(binding,native,preflight);
@@ -103,7 +120,8 @@ export class CodexSameGenerationRehost {
         const final=await this.prove(binding,pane,false);await this.idle(binding,pane);this.unchanged(input,binding,before);this.gates(binding);
         if(final.fingerprint!==second.fingerprint||!this.history(native.transcriptPath,binding.nativeId).equals(initial))reject("codex_rehost_unstable","Native/history changed immediately before the durable stop boundary");
         receiptPath=path.join(directory,"began.json");
-        writeDurable(receiptPath,JSON.stringify({protocol:"codex-same-generation-rehost-v1",attemptId,at:this.now(),reason:input.reason,actor:input.operator??null,
+        writeDurable(receiptPath,JSON.stringify({protocol:"codex-same-generation-rehost-v1",attemptId,at:this.now(),reason:input.reason,actor:input.maintenanceAuthority?'local-terminal-maintenance':input.operator??null,
+          ...(input.maintenanceAuthority?{maintenanceProvenance:this.maintenanceProvenance(input.maintenanceAuthority)}:{}),
           bindingDigest:digest(binding),nativeIdHash:hash(binding.nativeId),nativeFingerprint:final.fingerprint,backup,custody:before,preflightDigest:preflight.evidenceDigest,
           nativeEvidence:{pane,panePid:final.panePid,processes:final.processes.map(({pid,ppid,startedAt})=>({pid,ppid,startedAt}))}})+"\n");
         effectAttempted=true; // Durable write-ahead intent: any following uncertainty blocks replay.
@@ -146,7 +164,9 @@ export class CodexSameGenerationRehost {
         const raw=readFileSync(receiptPath);if(hash(raw)!==input.beganSha256)reject("codex_rehost_recovery_receipt","Original write-ahead receipt digest differs");
         const began=JSON.parse(raw.toString('utf8'));
         privatePath(path.join(directory,'unknown.json'),false);const unknown=JSON.parse(readFileSync(path.join(directory,'unknown.json'),'utf8'));
-        if(began.protocol!=="codex-same-generation-rehost-v1"||began.attemptId!==input.attemptId||began.actor!=="operator-agent@kernel"
+        const originalMaintenance=input.maintenanceAuthority&&began.actor==='local-terminal-maintenance'
+          &&digest(began.maintenanceProvenance)===digest({...this.maintenanceProvenance(input.maintenanceAuthority),mode:'rehost'});
+        if(began.protocol!=="codex-same-generation-rehost-v1"||began.attemptId!==input.attemptId||(!originalMaintenance&&began.actor!=="operator-agent@kernel")
           ||unknown.attemptId!==input.attemptId||unknown.code!=="codex_rehost_stop_unknown"||unknown.effectAttempted!==true||unknown.blindRetryAllowed!==false
           ||began.bindingDigest!==digest(b)||began.nativeIdHash!==hash(b.nativeId)||!originalStopCustodyMatches(began.custody,before)
           ||!/^[a-f0-9]{64}$/.test(began.nativeFingerprint)||!/^[a-f0-9]{64}$/.test(began.preflightDigest))reject("codex_rehost_recovery_receipt","Original stop-only UNKNOWN, binding and custody must match exactly");
@@ -172,7 +192,8 @@ export class CodexSameGenerationRehost {
         if(digest(await this.stoppedProof(b,pane,began.nativeEvidence))!==digest(second))reject("codex_rehost_recovery_unstable","Bare pane changed before recovery intent");
         this.recoveryActor(input);this.unchanged(input,b,before);this.gates(b);
         if(!stopped.equals(this.history(native.transcriptPath,b.nativeId))||hash(readFileSync(receiptPath!))!==input.beganSha256)reject('codex_rehost_recovery_unstable','Retained history or original receipt changed before recovery intent');
-        writeDurable(path.join(directory,'recovery-began.json'),JSON.stringify({protocol:'codex-stopped-recovery-v1',attemptId:input.attemptId,beganSha256:input.beganSha256,at:this.now(),actor:input.operator,actorGeneration:input.actorGeneration,reason:input.reason,bindingDigest:digest(b),originalCustody:began.custody,recoveryBaselineCustody:before,preflightDigest:preflight.evidenceDigest,stoppedHistorySha256:hash(stopped),absence:second})+'\n');
+        writeDurable(path.join(directory,'recovery-began.json'),JSON.stringify({protocol:'codex-stopped-recovery-v1',attemptId:input.attemptId,beganSha256:input.beganSha256,at:this.now(),actor:input.maintenanceAuthority?'local-terminal-maintenance':input.operator,
+          ...(input.maintenanceAuthority?{maintenanceProvenance:this.maintenanceProvenance(input.maintenanceAuthority)}:{actorGeneration:input.actorGeneration}),reason:input.reason,bindingDigest:digest(b),originalCustody:began.custody,recoveryBaselineCustody:before,preflightDigest:preflight.evidenceDigest,stoppedHistorySha256:hash(stopped),absence:second})+'\n');
         effectAttempted=true;
         try {
           const resumed=await this.deps.resume.resume(b.sessionName,'codex_id',b.nativeId,b.cwd,b.codexConfigProfile,preflight.posture,b.model,b.effort,b.generation);
@@ -186,8 +207,20 @@ export class CodexSameGenerationRehost {
     }catch(error){return {ok:false,code:error instanceof Refusal?error.code:effectAttempted?'codex_rehost_recovery_unknown':'codex_rehost_recovery_unproven',message:error instanceof Refusal?error.message:'Stopped recovery proof unavailable; original evidence retained. No blind retry.',effectAttempted,blindRetryAllowed:false,...(receiptPath?{receiptPath}:{})};}
   }
   private recoveryActor(input:CodexStoppedRecoveryInput){
+    if(input.maintenanceAuthority){this.maintenanceActor(input,'stopped-recovery');return;}
     const t=this.deps.guard.target('operator-agent@kernel'),s=this.deps.db.prepare('SELECT status,startup_status FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1').get(t.nodeId) as {status:string;startup_status:string}|undefined;
     if(input.operator!=='operator-agent@kernel'||!input.actorGeneration||t.session!==input.operator||t.occupant!==input.actorGeneration||s?.status!=='running'||s.startup_status!=='ready')reject('codex_rehost_recovery_actor','Current running ready Operator transport identity and generation required');
+  }
+  private maintenanceProvenance(a:OperatorMaintenanceAuthority){return {principal:a.principal,nodeId:a.nodeId,sessionName:a.sessionName,generation:a.generation,mode:a.mode};}
+  private maintenanceActor(input:CodexRehostInput,mode:OperatorMaintenanceAuthority['mode']){
+    const a=input.maintenanceAuthority,t=this.deps.guard.target('operator-agent@kernel');
+    if(!a||!maintenanceAuthorities.has(a)||a.mode!==mode||a.principal!=='local-terminal-maintenance'||a.sessionName!=='operator-agent@kernel'
+      ||input.sessionName!==a.sessionName||input.nodeId!==a.nodeId||t.nodeId!==a.nodeId||t.session!==a.sessionName||t.occupant!==a.generation)
+      reject('codex_rehost_maintenance_identity','Server-derived maintenance authority for the exact current Operator binding is required');
+    if(mode==='stopped-recovery'){
+      const recovery=input as CodexStoppedRecoveryInput;
+      if(a.attemptId!==recovery.attemptId||a.beganSha256!==recovery.beganSha256)reject('codex_rehost_maintenance_attempt','Maintenance authority names a different original attempt');
+    }
   }
   private async stoppedProof(b:CodexRehostBinding,pane:string,original?:{pane:string;panePid:number;processes:Array<{pid:number;startedAt:string}>}){
     const panePid=await this.deps.tmux.getPanePid(pane),rows=await this.census(),root=rows.find(r=>r.pid===panePid);
@@ -256,7 +289,7 @@ export class CodexSameGenerationRehost {
     outbox:db.prepare('SELECT * FROM outbox_entries WHERE sender_session IN (?,?) OR destination_session IN (?,?) ORDER BY outbox_id').all(...a,...a)};
     return Object.fromEntries(Object.entries(rows).map(([k,v])=>[k,{count:v.length,sha256:digest(v)}]));
   }
-  private unchanged(input:CodexRehostInput,b:CodexRehostBinding,before:unknown){if(digest(this.binding(input))!==digest(b)||digest(this.custody(b))!==digest(before))reject("codex_rehost_custody_changed","Exact node/session/generation, authority, claims, resources or retained effects changed; nothing is silently repaired");}
+  private unchanged(input:CodexRehostInput,b:CodexRehostBinding,before:unknown){if(input.maintenanceAuthority)this.maintenanceActor(input,input.maintenanceAuthority.mode);if(digest(this.binding(input))!==digest(b)||digest(this.custody(b))!==digest(before))reject("codex_rehost_custody_changed","Exact node/session/generation, authority, claims, resources or retained effects changed; nothing is silently repaired");}
   private nodeDirectory(b:CodexRehostBinding){if(!path.isAbsolute(this.deps.snapshotRoot))reject("codex_rehost_private_store","Absolute private snapshot root required");mkdirSync(this.deps.snapshotRoot,{recursive:true,mode:0o700});privatePath(this.deps.snapshotRoot,true);const directory=path.join(realpathSync(this.deps.snapshotRoot),digest([b.nodeId,b.generation]));mkdirSync(directory,{recursive:true,mode:0o700});privatePath(directory,true);return directory;}
   /** Only the durable write-ahead marker signifies an effect may have begun.
    * A retained backup without it is a pre-effect refusal, never retry debt. */

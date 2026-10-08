@@ -1,4 +1,4 @@
-import { parseCodexStoppedRecovery, type CodexStoppedRecovery } from "../domain/codex-rehost.js";
+import { createOperatorMaintenanceAuthority, parseCodexStoppedRecovery, type CodexStoppedRecovery } from "../domain/codex-rehost.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import { SeatDispatchReservationService } from "../domain/seat-dispatch-reservation.js";
 import { getConnInfo } from "@hono/node-server/conninfo";
@@ -323,6 +323,7 @@ export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifec
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
   return new SeatLifecycleService({
     db: rigRepo.db,
+    codexRehost: c.get("codexRehost" as never) as import("../domain/codex-rehost.js").CodexSameGenerationRehost | undefined,
     rigRepo,
     sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
     eventBus: c.get("eventBus" as never) as EventBus,
@@ -380,6 +381,37 @@ export function parseStoppedTargetRecoveryRequest(body: Record<string, unknown>)
 // unchanged; startup does not expose them on the request context. Paths derive
 // from the same OPENRIG_HOME the launch path uses, so the session file identity
 // is the RECORDED one and never a reconstructed guess.
+// Independent local maintenance can repair the Operator without impersonating
+// a running agent. This route has no caller-selected target or actor.
+seatRoutes.post("/operator-maintenance/rehost-runner",async c=>{
+  const token=c.get("terminalBearerToken" as never) as string|null;
+  if(!token)return c.json({ok:false,code:"operator_maintenance_authenticated_control_required"},503);
+  const auth=await authBearerTokenMiddleware({expectedToken:token})(c,async()=>{});if(auth)return auth;
+  let address:string|undefined;try{address=getConnInfo(c).remote.address;}catch{}
+  if(c.req.raw.headers.has("Origin")||!isRotationLoopback(address))return c.json({ok:false,code:"operator_maintenance_local_only"},403);
+  if(["X-OpenRig-Session","X-OpenRig-Occupant-Generation","X-OpenRig-Origin-Unknown"].some(k=>c.req.raw.headers.has(k)))
+    return c.json({ok:false,code:"operator_maintenance_agent_identity_not_accepted"},400);
+  const body=await c.req.json<Record<string,unknown>>().catch(()=>null);
+  if(!body||typeof body!=="object"||Array.isArray(body)||Object.keys(body).some(k=>!["reason","expected","codexStoppedRecovery"].includes(k))
+    ||typeof body.reason!=="string"||!body.reason.trim()||!body.expected||typeof body.expected!=="object"||Array.isArray(body.expected)
+    ||Object.keys(body.expected).sort().join(',')!=="generation,nodeId")return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
+  const expected=body.expected as {nodeId:unknown;generation:unknown};
+  if(typeof expected.nodeId!=="string"||!expected.nodeId||typeof expected.generation!=="string"||!expected.generation)return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);
+  let recovery:CodexStoppedRecovery|undefined;
+  try{if(body.codexStoppedRecovery!==undefined)recovery=parseCodexStoppedRecovery(body.codexStoppedRecovery);}catch{return c.json({ok:false,code:"operator_maintenance_request_invalid"},400);}
+  const guard=(c.get("tmuxAdapter" as never) as TmuxAdapter)?.deliveryGuard;
+  if(!guard)return c.json({ok:false,code:"operator_maintenance_unavailable"},503);
+  try{
+    const target=guard.target("operator-agent@kernel");
+    if(target.session!=="operator-agent@kernel"||target.nodeId!==expected.nodeId||target.occupant!==expected.generation)
+      return c.json({ok:false,code:"operator_maintenance_binding_changed"},409);
+    const maintenanceAuthority=createOperatorMaintenanceAuthority({nodeId:target.nodeId,generation:target.occupant,recovery});
+    const result=await seatLifecycleService(c).rehostRunner({seatRef:"operator-agent@kernel",reason:body.reason,maintenanceAuthority,
+      ...(recovery?{codexStoppedRecovery:recovery}:{})});
+    return c.json(result,result.ok?200:seatLifecycleStatus(result.code));
+  }catch{return c.json({ok:false,code:"operator_maintenance_binding_unproven"},409);}
+});
+
 seatRoutes.post("/rehost-runner/:seatRef", async c => {
   const body = await c.req.json<Record<string, unknown>>();
   if (typeof body.reason !== "string" || !body.reason.trim()) return c.json({ error: "reason required" }, 400);

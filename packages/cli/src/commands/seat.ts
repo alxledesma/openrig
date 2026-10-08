@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import { Command } from "commander";
-import { DaemonClient, DaemonTimeoutError, terminalAuthHeaders } from "../client.js";
+import { DaemonClient, DaemonTimeoutError, OperatorMaintenancePreflightError, terminalAuthHeaders } from "../client.js";
 import { getDaemonStatus, getDaemonUrl , daemonStatusGuard} from "../daemon-lifecycle.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
@@ -479,6 +479,47 @@ or stopping and relaunching the seat, does not prove continuity.
   //
   // Per-request timeout for rehost-runner ONLY. Named so it is greppable and testable.
   const REHOST_TIMEOUT_MS = 60_000;
+  cmd.command("operator-maintenance")
+    .description("Independently maintain the server-resolved kernel Operator; no caller seat identity")
+    .requiredOption("--reason <text>", "Audit reason")
+    .requiredOption("--expected-node <id>", "Exact existing Operator node ID")
+    .requiredOption("--expected-generation <uuid>", "Exact existing Operator generation")
+    .option("--attempt-id <uuid>", "Exact retained stopped-recovery attempt")
+    .option("--began-sha256 <hash>", "SHA256 of its immutable began receipt")
+    .option("--json", "Return server result as JSON")
+    .action(async (opts: { reason: string; expectedNode: string; expectedGeneration: string; attemptId?: string; beganSha256?: string; json?: boolean }) => {
+      const emit = (data: Record<string, unknown>) => {
+        if (opts.json) console.log(JSON.stringify(data, null, 2));
+        else console.log(JSON.stringify(data));
+      };
+      const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (!opts.reason.trim() || !opts.expectedNode.trim() || !opts.expectedGeneration.trim() ||
+          ((opts.attemptId !== undefined) !== (opts.beganSha256 !== undefined)) ||
+          (opts.attemptId !== undefined && (!uuid.test(opts.attemptId) || !/^[0-9a-f]{64}$/.test(opts.beganSha256!)))) {
+        emit({ ok: false, code: "operator_maintenance_contract_required", message: "Nonempty reason/node/generation required; recovery flags must be paired UUID attempt and 64 lowercase hex began hash." });
+        process.exitCode = 1; return;
+      }
+      const body = { reason: opts.reason, expected: { nodeId: opts.expectedNode, generation: opts.expectedGeneration },
+        ...(opts.attemptId ? { codexStoppedRecovery: { attemptId: opts.attemptId, beganSha256: opts.beganSha256 } } : {}) };
+      try {
+        // Resolve the local configured endpoint without any health probe, identity read, or retry.
+        const client = getDeps().clientFactory(new DaemonClient().baseUrl);
+        const res = await client.postOperatorMaintenance<Record<string, unknown>>(body);
+        emit(res.data);
+        if (res.status >= 400 || res.data?.ok !== true) process.exitCode = res.status >= 500 ? 2 : 1;
+      } catch (error) {
+        if (error instanceof OperatorMaintenancePreflightError) {
+          emit({ ok: false, code: "operator_maintenance_preflight_refused", message: error.message });
+        } else {
+          emit({ ok: false, status: "unknown", code: "operator_maintenance_outcome_unknown",
+            message: "The maintenance response was not verified. Do not retry or issue another stop.",
+            expected: body.expected, ...(body.codexStoppedRecovery ? { codexStoppedRecovery: body.codexStoppedRecovery } : {}),
+            guidance: "Reconcile the exact server receipt/attempt before any further operation." });
+        }
+        process.exitCode = 1;
+      }
+    });
+
   const runLifecycleVerb = async (
     path: "set-cwd" | "set-model" | "set-codex-profile" | "set-permissions" | "launch" | "stop" | "clean" | "rehost-runner",
     seat: string,

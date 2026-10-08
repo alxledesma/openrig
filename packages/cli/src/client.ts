@@ -150,6 +150,8 @@ function localDaemonUrl(): string | undefined {
   }
 }
 
+export class OperatorMaintenancePreflightError extends Error {}
+
 export class DaemonClient {
   readonly baseUrl: string;
   private fetchImpl: typeof fetch = fetch;
@@ -214,6 +216,22 @@ export class DaemonClient {
     this.timeoutMs = options?.timeoutMs ?? 5_000;
   }
 
+  /** Independent terminal maintenance: fixed local route, no borrowed seat identity. */
+  async postOperatorMaintenance<T = unknown>(body: unknown): Promise<DaemonResponse<T>> {
+    let url: URL;
+    try { url = new URL(this.baseUrl); } catch { throw new OperatorMaintenancePreflightError("Operator maintenance requires a literal loopback daemon URL."); }
+    if (this.remoteTarget || url.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(url.hostname) ||
+        url.username || url.password || (url.pathname !== "/" && url.pathname !== "") || url.search || url.hash) {
+      throw new OperatorMaintenancePreflightError("Operator maintenance requires a literal loopback daemon URL without credentials or URL suffixes.");
+    }
+    const headers = terminalAuthHeaders();
+    if (!headers.Authorization) throw new OperatorMaintenancePreflightError("Configured terminal bearer is required for Operator maintenance.");
+    return this.requestJson<T>("/api/seat/operator-maintenance/rehost-runner", {
+      method: "POST", headers: { "Content-Type": "application/json", ...headers },
+      body: JSON.stringify(body), redirect: "error",
+    }, { timeoutMs: 60_000 }, true);
+  }
+
   async get<T = unknown>(path: string, options?: DaemonRequestOptions): Promise<DaemonResponse<T>> {
     return this.requestJson<T>(path, { method: "GET" }, options);
   }
@@ -263,7 +281,7 @@ export class DaemonClient {
     }, options);
   }
 
-  private async fetch(path: string, init: RequestInit, options?: DaemonRequestOptions, consumeResponse?: (response: Response) => Promise<void>): Promise<Response> {
+  private async fetch(path: string, init: RequestInit, options?: DaemonRequestOptions, consumeResponse?: (response: Response) => Promise<void>, terminalMaintenance = false): Promise<Response> {
     const timeoutMs = options?.timeoutMs ?? this.timeoutMs;
     if (options?.headers) {
       init = { ...init, headers: { ...(init.headers as Record<string, string> ?? {}), ...options.headers } };
@@ -271,13 +289,19 @@ export class DaemonClient {
     // P18 sender-provenance: stamp the seat-derived identity header LAST, so the transport — never a
     // caller-supplied header or a request body — decides the caller identity the channel of record records.
     // Known remote or unproved direct endpoints carry origin; proven local requests remain bare.
-    this.identity ??= this.identityHeaders();
-    init = { ...init, headers: { ...(init.headers as Record<string, string> ?? {}), ...await this.identity } };
+    if (terminalMaintenance) {
+      const headers = new Headers(init.headers);
+      for (const name of ["X-OpenRig-Session", "X-OpenRig-Occupant-Generation", "X-OpenRig-Origin-Unknown", "Origin"]) headers.delete(name);
+      init = { ...init, headers };
+    } else {
+      this.identity ??= this.identityHeaders();
+      init = { ...init, headers: { ...(init.headers as Record<string, string> ?? {}), ...await this.identity } };
+    }
     let responseStatus: number | undefined;
     try {
       const response = await fetchWithTimeout(
         this.fetchImpl,
-        `${this.baseUrl}${path}`,
+        terminalMaintenance ? new URL(path, this.baseUrl).href : `${this.baseUrl}${path}`,
         init,
         {
           timeoutMs,
@@ -288,7 +312,7 @@ export class DaemonClient {
           timeoutMessage: `Request to ${this.baseUrl}${path} timed out after ${timeoutMs}ms`,
         },
       );
-      if (response.ok && this.originUnknown) {
+      if (!terminalMaintenance && response.ok && this.originUnknown) {
         console.error("Origin instance unknown: local durable identity is unavailable; delivery continues with origin-unknown provenance.");
         this.originUnknown = false;
       }
@@ -312,9 +336,9 @@ export class DaemonClient {
     }
   }
 
-  private async requestJson<T>(path: string, init: RequestInit, options?: DaemonRequestOptions): Promise<DaemonResponse<T>> {
+  private async requestJson<T>(path: string, init: RequestInit, options?: DaemonRequestOptions, terminalMaintenance = false): Promise<DaemonResponse<T>> {
     let text = "";
-    const res = await this.fetch(path, init, options, async (response) => { text = await response.text(); });
+    const res = await this.fetch(path, init, options, async (response) => { text = await response.text(); }, terminalMaintenance);
     // Read the raw body once, THEN parse — so a truncated / unparseable response
     // (a real symptom under daemon saturation) surfaces as a typed
     // DaemonResponseError carrying the status + a bounded snippet, instead of a
