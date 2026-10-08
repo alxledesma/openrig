@@ -215,7 +215,14 @@ describe("actual context refresh composition",()=>{
   expect(db.prepare("SELECT delivery_state,body FROM outbox_entries WHERE outbox_id='unknown'").get()).toEqual({delivery_state:"indeterminate",body:"private retained"});
  });
  it("accepts only exact adopted UNKNOWN containment when checking effects debt",async()=>{
-  const original=await adoptContainedUnknownEffect();await boundGrant();
+  const original=await adoptContainedUnknownEffect();
+  db.prepare("INSERT INTO nodes(id,rig_id,logical_id) VALUES ('retained-builder','other','builder')").run();
+  db.prepare("INSERT INTO sessions(id,node_id,session_name) VALUES ('zz-retained-builder','retained-builder',?)").run(seat);
+  db.prepare("INSERT INTO occupant_tenures(id,node_id,generation_ordinal,generation_uuid,kind) VALUES ('retained-builder-tenure','retained-builder',99,'retained-builder-g1','fresh')").run();
+  db.prepare("INSERT INTO bindings(id,node_id,tmux_session,tmux_pane) VALUES ('retained-builder-binding','retained-builder',?,'%99')").run(seat);
+  db.prepare("UPDATE rigs SET archived_at=? WHERE id='other'").run(new Date(now).toISOString());
+  expect(resolveGuardTarget(db,seat)).toMatchObject({nodeId:seat,session:seat,occupant:"builder-g1"});
+  await boundGrant();
   expect((await integration.observe(operator,selection())).holds).not.toContain("effects-unresolved");
   expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id=?").get(original.outbox_id)).toEqual(original);
   outbox.record({outboxId:"wake-intent-refresh-mismatch",senderSession:"lead@xv",destinationSession:seat,body:"separate UNKNOWN input",auditPointer:"refresh-work"});outbox.markIndeterminate("wake-intent-refresh-mismatch");

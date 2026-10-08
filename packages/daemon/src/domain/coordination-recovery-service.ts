@@ -2090,7 +2090,8 @@ private dutyProtection(rigId:string,r:any):boolean {
  }
  private workerEffectDebt(session:string,excludeEffect?:string|string[]):boolean {
   const addresses=rotationLocalAddresses(this.db,session);
-  const rig=this.db.prepare('SELECT n.rig_id FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE s.session_name=? ORDER BY s.id DESC LIMIT 1').get(session) as {rig_id:string}|undefined;
+  const target=resolveGuardTarget(this.db,session);
+  const rig=target?.session===session?this.db.prepare('SELECT rig_id FROM nodes WHERE id=?').get(target.nodeId) as {rig_id:string}|undefined:undefined;
   const effects=this.db.prepare("SELECT * FROM outbox_entries WHERE delivery_state NOT IN ('delivered','failed','retired') AND (sender_session IN (?,?) OR destination_session IN (?,?))").all(...addresses,...addresses) as Record<string,unknown>[];
   return effects.some(row=>{
    if(Array.isArray(excludeEffect)?excludeEffect.includes(String(row.outbox_id)):row.outbox_id===excludeEffect)return false;

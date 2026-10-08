@@ -1,5 +1,5 @@
 import { historicalQuarantineExists, isHistoricalQuarantined } from "./historical-effect-disposition.js";
-import type { SeatDeliveryGuard } from "./seat-delivery-guard.js";
+import { resolveGuardTarget, type SeatDeliveryGuard } from "./seat-delivery-guard.js";
 import { QueueTransitionLog } from "./queue-transition-log.js";
 import { EventBus } from "./event-bus.js";
 import { createHash } from "node:crypto";
@@ -324,23 +324,26 @@ export class OutboxHandler {
     }).immediate();
   }
 
+  private currentRecipientGeneration(actor: string): string | null {
+    const target = resolveGuardTarget(this.db, actor);
+    return target?.session === actor ? target.occupant : null;
+  }
+
   /** Read-only current recipient evidence; displaying bytes is not testimony or execution. */
   recipientAcknowledgmentContract(actor:string,generation:string,outboxId:string):{body:string;contract:{outboxId:string;bodySha256:string;effectSnapshotSha256:string;expectedState:"pending"|"indeterminate";acknowledged:true;reason:string}} {
     const entry=this.getById(outboxId),hash=(v:string)=>createHash('sha256').update(v).digest('hex');
     // Reject executable and contained history before any origin-history lookup.
     if(!entry||!generation||entry.destinationSession!==actor||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||entry.guardBinding||this.isHistoricalQuarantined(outboxId)||!['pending','indeterminate'].includes(entry.deliveryState))throw new OutboxHandlerError('outbox_ack_evidence_required','Current exact recipient and unresolved real non-executable unquarantined direct attempt required');
-    const node=this.db.prepare('SELECT node_id FROM sessions WHERE session_name=? ORDER BY id DESC LIMIT 1').get(actor) as {node_id:string}|undefined;
-    const current=node?this.db.prepare('SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1').get(node.node_id) as {generation_uuid:string}|undefined:undefined;
+    const current = this.currentRecipientGeneration(actor);
     const attempt=this.db.prepare("SELECT payload FROM events WHERE type='outbox.direct_attempt' AND json_extract(payload,'$.outboxId')=? ORDER BY seq LIMIT 1").get(outboxId) as {payload:string}|undefined;let origin:any;try{origin=attempt?JSON.parse(attempt.payload):null;}catch{}
-    if(!entry||!generation||current?.generation_uuid!==generation||entry.destinationSession!==actor||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||entry.guardBinding||this.isHistoricalQuarantined(outboxId)||!['pending','indeterminate'].includes(entry.deliveryState)||origin?.schemaVersion!==1||origin.sender!==entry.senderSession||origin.destination!==entry.destinationSession||origin.bodySha256!==hash(entry.body)||origin.dispatchedAt!==entry.tsDispatched||origin.outcome!=='indeterminate')throw new OutboxHandlerError('outbox_ack_evidence_required','Current exact recipient and unresolved real non-executable unquarantined direct attempt required');
+    if(!entry||!generation||current!==generation||entry.destinationSession!==actor||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||entry.guardBinding||this.isHistoricalQuarantined(outboxId)||!['pending','indeterminate'].includes(entry.deliveryState)||origin?.schemaVersion!==1||origin.sender!==entry.senderSession||origin.destination!==entry.destinationSession||origin.bodySha256!==hash(entry.body)||origin.dispatchedAt!==entry.tsDispatched||origin.outcome!=='indeterminate')throw new OutboxHandlerError('outbox_ack_evidence_required','Current exact recipient and unresolved real non-executable unquarantined direct attempt required');
     return {body:entry.body,contract:{outboxId,bodySha256:hash(entry.body),effectSnapshotSha256:hash(JSON.stringify(entry)),expectedState:entry.deliveryState as 'pending'|'indeterminate',acknowledged:true,reason:'I actually read this exact direct message; acknowledgment grants no work or acceptance authority'}};
   }
   /** Read-only internal receipt proof; never creates an acknowledgment or replays transport. */
   recipientAcknowledgmentProof(actor:string,generation:string,outboxId:string,receiptId:string):boolean {
     const hash=(v:string)=>createHash('sha256').update(v).digest('hex'),entry=this.getById(outboxId);
-    const node=this.db.prepare('SELECT node_id FROM sessions WHERE session_name=? ORDER BY id DESC LIMIT 1').get(actor) as {node_id:string}|undefined;
-    const current=node?this.db.prepare('SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1').get(node.node_id) as {generation_uuid:string}|undefined:undefined;
-    if(!entry||!generation||current?.generation_uuid!==generation||entry.destinationSession!==actor||entry.deliveryState!=='delivered'||entry.guardBinding||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||this.isHistoricalQuarantined(outboxId)||receiptId!=='qitem-outbox-recipient-ack-'+hash(JSON.stringify([outboxId,actor,generation])))return false;
+    const current = this.currentRecipientGeneration(actor);
+    if(!entry||!generation||current!==generation||entry.destinationSession!==actor||entry.deliveryState!=='delivered'||entry.guardBinding||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||this.isHistoricalQuarantined(outboxId)||receiptId!=='qitem-outbox-recipient-ack-'+hash(JSON.stringify([outboxId,actor,generation])))return false;
     const saved=this.db.prepare("SELECT payload FROM events WHERE type='outbox.recipient_acknowledged' AND json_extract(payload,'$.receiptId')=? ORDER BY seq LIMIT 1").get(receiptId) as {payload:string}|undefined;
     const receipt=this.db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(receiptId) as any;
     const creation=this.db.prepare("SELECT actor_session,identity_provenance FROM queue_transitions WHERE qitem_id=? AND transition_note='created' ORDER BY transition_id LIMIT 1").get(receiptId) as any;
@@ -355,10 +358,9 @@ export class OutboxHandler {
     return this.db.transaction(()=>{
       const hash=(v:string)=>createHash("sha256").update(v).digest("hex"),refuse=(code:string,message:string):never=>{throw new OutboxHandlerError(code,message);};
       if(!input||Object.keys(input).sort().join(',')!=='acknowledged,bodySha256,effectSnapshotSha256,expectedState,outboxId,reason'||input.acknowledged!==true||!["pending","indeterminate"].includes(input.expectedState)||[input.outboxId,input.reason].some(v=>typeof v!=='string'||!v.trim())||[input.bodySha256,input.effectSnapshotSha256].some(v=>typeof v!=='string'||! /^[a-f0-9]{64}$/.test(v)))refuse('outbox_ack_contract_required','Exact frozen effect and explicit actual-reading acknowledgment required');
-      const node=this.db.prepare('SELECT node_id FROM sessions WHERE session_name=? ORDER BY id DESC LIMIT 1').get(actor) as {node_id:string}|undefined;
-      const tenure=node?this.db.prepare('SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1').get(node.node_id) as {generation_uuid:string}|undefined:undefined;
+      const tenure = this.currentRecipientGeneration(actor);
       const entry=this.getById(input.outboxId);
-      if(!entry||!actor||!generation||tenure?.generation_uuid!==generation||entry.destinationSession!==actor||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||entry.guardBinding||this.isHistoricalQuarantined(entry.outboxId))refuse('outbox_ack_recipient_required','Current actual native recipient and non-executable unquarantined direct effect required');
+      if(!entry||!actor||!generation||tenure!==generation||entry.destinationSession!==actor||entry.outboxId.startsWith(WAKE_INTENT_PREFIX)||entry.guardBinding||this.isHistoricalQuarantined(entry.outboxId))refuse('outbox_ack_recipient_required','Current actual native recipient and non-executable unquarantined direct effect required');
       const receiptId='qitem-outbox-recipient-ack-'+hash(JSON.stringify([input.outboxId,actor,generation]));
       const requestDigest=hash(JSON.stringify({actor,generation,input:{outboxId:input.outboxId,bodySha256:input.bodySha256,effectSnapshotSha256:input.effectSnapshotSha256,expectedState:input.expectedState,acknowledged:input.acknowledged,reason:input.reason}}));
       const saved=this.db.prepare("SELECT payload FROM events WHERE type='outbox.recipient_acknowledged' AND json_extract(payload,'$.receiptId')=? ORDER BY seq LIMIT 1").get(receiptId) as {payload:string}|undefined;
@@ -388,8 +390,7 @@ export class OutboxHandler {
         || entry.destinationSession !== input.actor || entry.guardBinding) {
         throw new OutboxHandlerError("outbox_reconciliation_refused", "Attributed recipient, reason and non-executable direct effect required.");
       }
-      const node = this.db.prepare("SELECT node_id FROM sessions WHERE session_name=? ORDER BY id DESC LIMIT 1").get(input.actor) as {node_id:string}|undefined;
-      const current = node ? this.db.prepare("SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1").get(node.node_id) as {generation_uuid:string}|undefined : undefined;
+      const current = this.currentRecipientGeneration(input.actor);
       const attempt = this.db.prepare("SELECT payload FROM events WHERE type='outbox.direct_attempt' AND json_extract(payload,'$.outboxId')=? ORDER BY seq LIMIT 1").get(entry.outboxId) as {payload:string}|undefined;
       let origin: {schemaVersion?:number;sender?:string;destination?:string;bodySha256?:string;outcome?:string;dispatchedAt?:string}|undefined;
       try { origin = attempt ? JSON.parse(attempt.payload) : undefined; } catch {}
@@ -405,7 +406,7 @@ export class OutboxHandler {
       if (creation?.actor_session !== input.actor || creation.identity_provenance !== "transport:v1") {
         throw new OutboxHandlerError("outbox_recipient_receipt_required", "Receipt creation must be attributed to the recipient's managed transport.");
       }
-      if (current?.generation_uuid !== input.generation || !receipt || receipt.source_session !== input.actor
+      if (current !== input.generation || !receipt || receipt.source_session !== input.actor
         || receipt.destination_session !== entry.senderSession || receipt.minting_generation_uuid !== input.generation
         || !Number.isFinite(Date.parse(entry.tsDispatched)) || !Number.isFinite(Date.parse(receipt.ts_created)) || Date.parse(receipt.ts_created) < Date.parse(entry.tsDispatched)
         || proof?.kind !== "outbox-delivery-ack" || proof.outboxId !== entry.outboxId || proof.bodySha256 !== hash) {
