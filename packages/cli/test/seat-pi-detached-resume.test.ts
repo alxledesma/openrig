@@ -11,6 +11,7 @@ const operator = "operator-agent@kernel";
 const generation = "operator-generation-exact";
 const attemptId = "c47de976-e4eb-4028-9b05-ae1efbd3caaa";
 const beganSha256 = "a".repeat(64);
+const originalRunnerEntryPath = "/private/var/tmp/openrig/runner-entry.js";
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); process.exitCode = originalExit; });
 
@@ -37,13 +38,13 @@ function makeCli() {
   return { program, requests, logs, client };
 }
 
-it("sends strict Pi detached mode with typed paired recovery and bearer authentication", async () => {
+it("sends strict Pi detached mode with typed original-runner recovery and bearer authentication", async () => {
   const f = makeCli();
-  await f.program.parseAsync(["node", "rig", "seat", "rehost-runner", "intake-lead@app-handy-conveyor", "--reason", "resume exact Pi history", "--pi-detached-resume", "--pi-recovery-attempt", attemptId, "--pi-began-sha256", beganSha256, "--json"]);
+  await f.program.parseAsync(["node", "rig", "seat", "rehost-runner", "intake-lead@app-handy-conveyor", "--reason", "resume exact Pi history", "--pi-detached-resume", "--pi-recovery-attempt", attemptId, "--pi-began-sha256", beganSha256, "--pi-original-runner", originalRunnerEntryPath, "--json"]);
   expect(f.requests).toHaveLength(1);
   expect(f.requests[0]).toMatchObject({
     path: "/api/seat/rehost-runner/intake-lead%40app-handy-conveyor",
-    body: { reason: "resume exact Pi history", legacyNativeWitness: false, piDetachedResume: true, piDetachedRecovery: { attemptId, beganSha256 } },
+    body: { reason: "resume exact Pi history", legacyNativeWitness: false, piDetachedResume: true, piDetachedRecovery: { attemptId, beganSha256, originalRunnerEntryPath } },
     options: { timeoutMs: 60000 },
   });
   expect((f.requests[0]!.body as Record<string, unknown>).operator).toBeUndefined();
@@ -67,6 +68,11 @@ it.each([
   ["attempt without mode", ["--pi-recovery-attempt", attemptId, "--pi-began-sha256", beganSha256]],
   ["invalid UUID", ["--pi-detached-resume", "--pi-recovery-attempt", "bad", "--pi-began-sha256", beganSha256]],
   ["invalid hash", ["--pi-detached-resume", "--pi-recovery-attempt", attemptId, "--pi-began-sha256", "A".repeat(64)]],
+  ["original runner without recovery pair", ["--pi-detached-resume", "--pi-original-runner", originalRunnerEntryPath]],
+  ["original runner without Pi mode", ["--pi-recovery-attempt", attemptId, "--pi-began-sha256", beganSha256, "--pi-original-runner", originalRunnerEntryPath]],
+  ["relative original runner", ["--pi-detached-resume", "--pi-recovery-attempt", attemptId, "--pi-began-sha256", beganSha256, "--pi-original-runner", "runner.js"]],
+  ["unnormalized original runner", ["--pi-detached-resume", "--pi-recovery-attempt", attemptId, "--pi-began-sha256", beganSha256, "--pi-original-runner", "/tmp/../runner.js"]],
+  ["newline original runner", ["--pi-detached-resume", "--pi-recovery-attempt", attemptId, "--pi-began-sha256", beganSha256, "--pi-original-runner", "/tmp/runner\n.js"]],
   ["caller-selected actor", ["--pi-detached-resume", "--operator", operator]],
   ["Codex mixed mode", ["--pi-detached-resume", "--codex-detached-resume"]],
   ["legacy mixed mode", ["--pi-detached-resume", "--legacy-native-witness"]],

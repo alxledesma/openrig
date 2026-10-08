@@ -2,6 +2,7 @@ import { createOperatorMaintenanceAuthority, parseCodexStoppedRecovery, type Cod
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import { SeatDispatchReservationService } from "../domain/seat-dispatch-reservation.js";
 import { getConnInfo } from "@hono/node-server/conninfo";
+import path from "node:path";
 import { isRotationLoopback } from "../domain/rotation-precondition.js";
 import { rotationFactsResolver } from "../domain/rotation-facts-resolver.js";
 import { OutboxHandler } from "../domain/outbox-handler.js";
@@ -348,6 +349,7 @@ export const LEGACY_WITNESS_FORBIDDEN_REQUEST_KEYS = [
   "runnerPid", "childPid", "ppid", "sessionFile", "launchId", "generation",
   "path", "sessionPath", "snapshotPath", "recoverySnapshot", "stoppedTargetLeaf", "leafSource",
   "startedAt", "runnerStartedAt", "childStartedAt", "timestamp", "timing", "timeout", "waitMs",
+  "originalRunnerEntryPath",
 ] as const;
 
 /** Parse the EXPLICIT legacy native-witness option. Absent means the ordinary rehost;
@@ -362,7 +364,7 @@ export function parseLegacyNativeWitnessRequest(body: Record<string, unknown>): 
   return { ok: true, legacyNativeWitness: raw };
 }
 
-export function parseStoppedTargetRecoveryRequest(body: Record<string, unknown>): { ok: true; legacyNativeWitness: boolean; stoppedTargetRecovery: boolean; codexDetachedResume?: true; piDetachedResume?: true; piDetachedRecovery?: { attemptId: string; beganSha256: string }; stoppedTargetAcceptanceReference?: string } | { ok: false; error: string } {
+export function parseStoppedTargetRecoveryRequest(body: Record<string, unknown>): { ok: true; legacyNativeWitness: boolean; stoppedTargetRecovery: boolean; codexDetachedResume?: true; piDetachedResume?: true; piDetachedRecovery?: { attemptId: string; beganSha256: string; originalRunnerEntryPath?: string }; stoppedTargetAcceptanceReference?: string } | { ok: false; error: string } {
   const legacy = parseLegacyNativeWitnessRequest(body);
   if (!legacy.ok) return legacy;
   const rawMode = body["stoppedTargetRecovery"];
@@ -375,14 +377,18 @@ export function parseStoppedTargetRecoveryRequest(body: Record<string, unknown>)
   if (rawPiDetached !== undefined && typeof rawPiDetached !== "boolean") return { ok: false, error: "piDetachedResume must be a boolean when present" };
   const piDetachedResume = rawPiDetached === true;
   const rawPiRecovery = body["piDetachedRecovery"];
-  let piDetachedRecovery: { attemptId: string; beganSha256: string } | undefined;
+  let piDetachedRecovery: { attemptId: string; beganSha256: string; originalRunnerEntryPath?: string } | undefined;
   if (rawPiRecovery !== undefined) {
     if (!rawPiRecovery || typeof rawPiRecovery !== "object" || Array.isArray(rawPiRecovery)) return { ok: false, error: "piDetachedRecovery must contain an attemptId UUID and beganSha256 when present" };
     const recovery = rawPiRecovery as Record<string, unknown>;
     const uuid = typeof recovery.attemptId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(recovery.attemptId);
     const hash = typeof recovery.beganSha256 === "string" && /^[0-9a-f]{64}$/.test(recovery.beganSha256);
-    if (!uuid || !hash || Object.keys(recovery).some(key => key !== "attemptId" && key !== "beganSha256")) return { ok: false, error: "piDetachedRecovery must contain only a valid attemptId UUID and lowercase beganSha256" };
-    piDetachedRecovery = { attemptId: recovery.attemptId as string, beganSha256: recovery.beganSha256 as string };
+    const originalRunnerEntryPath = recovery.originalRunnerEntryPath;
+    const originalRunnerValid = originalRunnerEntryPath === undefined || (typeof originalRunnerEntryPath === "string"
+      && originalRunnerEntryPath.length > 0 && !/[\0\r\n]/.test(originalRunnerEntryPath)
+      && path.isAbsolute(originalRunnerEntryPath) && path.normalize(originalRunnerEntryPath) === originalRunnerEntryPath);
+    if (!uuid || !hash || !originalRunnerValid || Object.keys(recovery).some(key => key !== "attemptId" && key !== "beganSha256" && key !== "originalRunnerEntryPath")) return { ok: false, error: "piDetachedRecovery must contain a valid attemptId UUID and lowercase beganSha256, with only an optional absolute normalized originalRunnerEntryPath" };
+    piDetachedRecovery = { attemptId: recovery.attemptId as string, beganSha256: recovery.beganSha256 as string, ...(typeof originalRunnerEntryPath === "string" ? { originalRunnerEntryPath } : {}) };
   }
   const rawAcceptance = body["stoppedTargetAcceptanceReference"];
   if (rawAcceptance !== undefined && typeof rawAcceptance !== "string") return { ok: false, error: "stoppedTargetAcceptanceReference must be a string when present" };

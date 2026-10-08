@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3";
@@ -21,13 +21,20 @@ const history = Buffer.from([
   JSON.stringify({ type: "message", id: "entry-2", parentId: "entry-1", message: { role: "assistant", content: [] }, timestamp: "2026-10-08T10:00:02.000Z" }),
   "",
 ].join("\n"));
+type TestPiOptions = PiDetachedResumeOptions & {
+  runnerEntryPath?: string;
+  preflightAtOriginalRunner?: (binding: PiDetachedBinding, detached: boolean, originalRunnerEntryPath: string) => Promise<{ digest: string; posture: "floor" | "full_bypass" }>;
+};
 
 describe("guarded detached Pi continuation engine", () => {
   let db: Database.Database;
   let root: string;
   let historyPath: string;
   let guard: SeatDeliveryGuard;
-  let options: PiDetachedResumeOptions;
+  let options: TestPiOptions;
+  let originalRunnerEntryPath: string;
+  let currentRunnerEntryPath: string;
+  let currentPreflightDigest: string;
   let panePid: number | null;
   let processes: NativeProcessRow[];
   let createTerminal: ReturnType<typeof vi.fn>;
@@ -52,7 +59,7 @@ describe("guarded detached Pi continuation engine", () => {
     const parsed = JSON.parse(bytes.toString()) as { attemptId: string };
     return { attemptId: parsed.attemptId, beganSha256: createHash("sha256").update(bytes).digest("hex"), directory: path.dirname(receiptPath), bytes };
   };
-  const service = (overrides: Partial<PiDetachedResumeOptions> = {}) => new PiDetachedResume({ ...options, ...overrides });
+  const service = (overrides: Partial<TestPiOptions> = {}) => new PiDetachedResume({ ...options, ...overrides });
   const run = (instance = service(), input: Record<string, unknown> = {}) => instance.run({ nodeId, sessionName: nodeId, reason: "Continue the retained detached Pi session", operator: "operator-agent@kernel", actorGeneration: "operator-agent-g1", ...input });
   const pane = (pid: number | null) => { panePid = pid; };
 
@@ -61,6 +68,14 @@ describe("guarded detached Pi continuation engine", () => {
     historyPath = path.join(root, "retained.jsonl");
     writeFileSync(historyPath, history, { mode: 0o600 });
     historyPath = realpathSync(historyPath);
+    const originalRunnerDir = path.join(root, "release-original");
+    const currentRunnerDir = path.join(root, "release-current");
+    mkdirSync(originalRunnerDir, { recursive: true, mode: 0o700 });
+    mkdirSync(currentRunnerDir, { recursive: true, mode: 0o700 });
+    originalRunnerEntryPath = path.join(originalRunnerDir, "pi-runner.js");
+    currentRunnerEntryPath = path.join(currentRunnerDir, "pi-runner.js");
+    writeFileSync(originalRunnerEntryPath, "identical-pi-runner-bytes\n", { mode: 0o600 });
+    copyFileSync(originalRunnerEntryPath, currentRunnerEntryPath);
     db = createDb();
     seed(db);
     const fixtureAt = new Date(Date.UTC(2026, 9, 8, 12)).toISOString();
@@ -92,7 +107,8 @@ describe("guarded detached Pi continuation engine", () => {
       if (!bytes.equals(history)) throw new Error("history bytes did not match retained fixture");
       return { nativeIdentity: nativeHeaderId, lastEntryId: "entry-2" };
     });
-    preflight = vi.fn(async () => ({ digest: "a".repeat(64), posture: "floor" as const }));
+    currentPreflightDigest = "a".repeat(64);
+    preflight = vi.fn(async () => ({ digest: currentPreflightDigest, posture: "floor" as const }));
     observeReplacement = vi.fn(async () => ({
       supervisorLaunchId: "managed-launch-1",
       nativeFingerprint: "native-process-fingerprint-1",
@@ -104,6 +120,10 @@ describe("guarded detached Pi continuation engine", () => {
       db,
       guard,
       snapshotRoot: path.join(root, "private-attempts"),
+      runnerEntryPath: originalRunnerEntryPath,
+      preflightAtOriginalRunner: async (_binding, _detached, candidate) => ({
+        digest: candidate === originalRunnerEntryPath ? "a".repeat(64) : "c".repeat(64), posture: "floor",
+      }),
       tmux: { getPanePid: async () => panePid },
       validateHistory,
       preflight,
@@ -141,6 +161,7 @@ describe("guarded detached Pi continuation engine", () => {
     expect(db.prepare("SELECT delivery_state FROM outbox_entries WHERE outbox_id=?").get(unknownId)).toEqual({ delivery_state: "indeterminate" });
     expect(readFileSync(historyPath)).toEqual(originalBytes);
     expect(readFileSync(result.backup.path)).toEqual(originalBytes);
+    expect(JSON.parse(readFileSync(path.join(path.dirname(result.receiptPath), "began.json"), "utf8")).runnerEntryPath).toBe(originalRunnerEntryPath);
     expect(createTerminal).toHaveBeenCalledTimes(1);
     expect(resume).toHaveBeenCalledTimes(1);
     expect(preflight).toHaveBeenCalled();
@@ -199,6 +220,66 @@ describe("guarded detached Pi continuation engine", () => {
     expect(files().some(file => file.endsWith("resume-began.json"))).toBe(true);
     expect(files().some(file => file.endsWith("completed.json"))).toBe(true);
     expect(guard.preference(nodeId)).toMatchObject({ desired: true, effective: true });
+  });
+
+  it("reproduces the original preflight for a legacy receipt at its explicit runner path, then uses current preflight", async () => {
+    createTerminal.mockRejectedValueOnce(new Error("Pi terminal creation refused before command dispatch"));
+    // Create a genuine legacy receipt: the original release did not persist
+    // runner provenance. Do not edit a durable receipt to manufacture it.
+    const first = await run(service({ runnerEntryPath: undefined }));
+    expect(first).toMatchObject({ ok: false, effectAttempted: true });
+    const original = beganEvidence();
+    const beganPath = path.join(original.directory, "began.json");
+    const legacyBytes = readFileSync(beganPath);
+    expect(JSON.parse(legacyBytes.toString()).runnerEntryPath).toBeUndefined();
+    const unknownPath = path.join(original.directory, "unknown.json");
+    const unknownBytes = readFileSync(unknownPath);
+    const legacyHash = createHash("sha256").update(legacyBytes).digest("hex");
+    options.runnerEntryPath = currentRunnerEntryPath;
+    currentPreflightDigest = "b".repeat(64);
+    const recovered = await run(service(), { recovery: { attemptId: original.attemptId, beganSha256: legacyHash, originalRunnerEntryPath } });
+    expect(recovered, JSON.stringify(recovered)).toMatchObject({ ok: true, generation, custodyPreserved: true });
+    expect(options.preflightAtOriginalRunner).toBeDefined();
+    expect(preflight).toHaveBeenCalled();
+    expect(resume).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ digest: currentPreflightDigest, posture: "floor" }));
+    expect(readFileSync(beganPath)).toEqual(legacyBytes);
+    expect(readFileSync(unknownPath)).toEqual(unknownBytes);
+    expect(createTerminal).toHaveBeenCalledTimes(2);
+    const repeat = await run(service(), { recovery: { attemptId: original.attemptId, beganSha256: legacyHash, originalRunnerEntryPath } });
+    expect(repeat).toMatchObject({ ok: false, effectAttempted: false, blindRetryAllowed: false });
+    expect(createTerminal).toHaveBeenCalledTimes(2);
+    expect(resume).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["changed-original-hash", "changed-configuration", "contradictory-path", "missing-provider"] as const)("holds relocated runner recovery for %s without changing the original receipt", async kind => {
+    createTerminal.mockRejectedValueOnce(new Error("Pi terminal creation refused before command dispatch"));
+    const first = await run();
+    expect(first).toMatchObject({ ok: false, effectAttempted: true });
+    const original = beganEvidence();
+    const beganPath = path.join(original.directory, "began.json");
+    const beganBytes = readFileSync(beganPath);
+    const unknownPath = path.join(original.directory, "unknown.json");
+    const unknownBytes = readFileSync(unknownPath);
+    options.runnerEntryPath = currentRunnerEntryPath;
+    currentPreflightDigest = "b".repeat(64);
+    if (kind === "changed-original-hash") {
+      options.preflightAtOriginalRunner = async () => ({ digest: "d".repeat(64), posture: "floor" });
+    }
+    if (kind === "changed-configuration") {
+      options.preflightAtOriginalRunner = async () => ({ digest: "a".repeat(64), posture: "full_bypass" });
+    }
+    if (kind === "missing-provider") options.preflightAtOriginalRunner = undefined;
+    const recovery = {
+      attemptId: original.attemptId,
+      beganSha256: original.beganSha256,
+      ...(kind === "contradictory-path" ? { originalRunnerEntryPath: currentRunnerEntryPath } : {}),
+    };
+    const result = await run(service(), { recovery });
+    expect(result).toMatchObject({ ok: false, effectAttempted: false, blindRetryAllowed: false });
+    expect(createTerminal).toHaveBeenCalledTimes(1);
+    expect(resume).not.toHaveBeenCalled();
+    expect(readFileSync(beganPath)).toEqual(beganBytes);
+    expect(readFileSync(unknownPath)).toEqual(unknownBytes);
   });
 
   it("continues an original pre-terminal UNKNOWN after exact absence proof, preserving the original receipts and custody", async () => {

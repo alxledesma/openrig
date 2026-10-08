@@ -13,6 +13,7 @@ const peer = "lead@xv";
 const peerGeneration = "lead-g1";
 const token = "pi-detached-route-test-token";
 const recovery = { attemptId: "c47de976-e4eb-4028-9b05-ae1efbd3caaa", beganSha256: "a".repeat(64) };
+const originalRunnerEntryPath = "/private/var/tmp/openrig/runner-entry.js";
 
 describe("guarded detached Pi resume route", () => {
   let db: ReturnType<typeof createDb>;
@@ -48,11 +49,11 @@ describe("guarded detached Pi resume route", () => {
   afterEach(() => db?.close());
 
   it("authenticates current peer Operator transport and forwards only the exact typed recovery input", async () => {
-    const response = await postPeer({ reason: "continue exact detached Pi", operator: "caller-forgery", piDetachedResume: true, piDetachedRecovery: recovery });
+    const response = await postPeer({ reason: "continue exact detached Pi", operator: "caller-forgery", piDetachedResume: true, piDetachedRecovery: { ...recovery, originalRunnerEntryPath } });
     const payload = await response.json();
     expect(response.status, JSON.stringify(payload)).toBe(200);
     expect(run).toHaveBeenCalledOnce();
-    expect(run.mock.calls[0]![0]).toEqual({ nodeId: peer, sessionName: peer, reason: "continue exact detached Pi", operator, actorGeneration: operatorGeneration, recovery });
+    expect(run.mock.calls[0]![0]).toEqual({ nodeId: peer, sessionName: peer, reason: "continue exact detached Pi", operator, actorGeneration: operatorGeneration, recovery: { ...recovery, originalRunnerEntryPath } });
 
     run.mockClear();
     expect((await postPeer(undefined, { ...peerHeaders(), "X-OpenRig-Occupant-Generation": "stale" })).status).toBe(403);
@@ -88,6 +89,10 @@ describe("guarded detached Pi resume route", () => {
       { reason: "bad uuid", piDetachedResume: true, piDetachedRecovery: { attemptId: "x", beganSha256: recovery.beganSha256 } },
       { reason: "bad hash", piDetachedResume: true, piDetachedRecovery: { attemptId: recovery.attemptId, beganSha256: "A".repeat(64) } },
       { reason: "extra proof", piDetachedResume: true, piDetachedRecovery: { ...recovery, pid: 5 } },
+      { reason: "relative original runner", piDetachedResume: true, piDetachedRecovery: { ...recovery, originalRunnerEntryPath: "runner.js" } },
+      { reason: "unnormalized original runner", piDetachedResume: true, piDetachedRecovery: { ...recovery, originalRunnerEntryPath: "/tmp/../runner.js" } },
+      { reason: "newline original runner", piDetachedResume: true, piDetachedRecovery: { ...recovery, originalRunnerEntryPath: "/tmp/runner\n.js" } },
+      { reason: "top-level original runner", piDetachedResume: true, piDetachedRecovery: recovery, originalRunnerEntryPath },
       { reason: "without mode", piDetachedRecovery: recovery },
       { reason: "nonboolean", piDetachedResume: "true" },
     ]) expect((await postPeer(body)).status).toBe(400);

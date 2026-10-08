@@ -9,7 +9,7 @@ describe('Pi detached retained-history parser',()=>{
  it.each(['truncated','wrong-cwd','duplicate','missing-parent','invalid-json'] as const)('holds malformed %s retained history',kind=>{let data=bytes([header,{type:'message',id:'a',parentId:null}]);if(kind==='truncated')data=data.subarray(0,-1);if(kind==='wrong-cwd')data=bytes([{...header,cwd:'/other'},{id:'a',parentId:null}]);if(kind==='duplicate')data=bytes([header,{id:'a',parentId:null},{id:'a',parentId:'a'}]);if(kind==='missing-parent')data=bytes([header,{id:'a',parentId:'not-present'}]);if(kind==='invalid-json')data=Buffer.from('not-json\n');expect(()=>validatePiDetachedHistory(binding,data)).toThrow();});
 });
 
-import {readFileSync,mkdtempSync,mkdirSync,rmSync} from 'node:fs';
+import {readFileSync,writeFileSync,mkdtempSync,mkdirSync,realpathSync,rmSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
@@ -33,6 +33,28 @@ it('production preflight freezes explicit restore policy and declared model with
  const deps={db:{},guard:{ownsRunnerRehost:()=>true,target:()=>({session:binding.sessionName,occupant:binding.generation,pane:'%1'})},tmux:{},resume:{},store:{assertReady:()=>{}},launchEnvironment:{usesNativeDuty:async()=>true},launchPath:process.env.PATH!,stateRoot:'/tmp/pi-test-state',runnerEntryPath:runner,piProve:async()=>null,piRunnerState:()=>null,configurationDigest:()=> 'frozen-config',resolvePosture:()=>posture,snapshotRoot:'/tmp/pi-test-snapshot'};
  const engine=createPiDetachedResumeIntegration(deps as unknown as Parameters<typeof createPiDetachedResumeIntegration>[0]);const options=(engine as unknown as {deps:{preflight:(b:PiDetachedBinding,d:boolean)=>Promise<{digest:string;posture:string}>}}).deps;
  const floor=await options.preflight(binding,true);expect(floor.posture).toBe('floor');expect(await options.preflight(binding,false)).toEqual(floor);posture='full_bypass';expect((await options.preflight(binding,true)).digest).not.toBe(floor.digest);expect(binding.model).toBe('openrouter/declared');
+});
+
+it('reproduces the exact original digest across canonical release paths only when runner bytes and launch configuration match',async()=>{
+ const root=realpathSync(mkdtempSync(path.join(tmpdir(),'pi-release-provenance-'))),originalDir=path.join(root,'release-original'),currentDir=path.join(root,'release-current');
+ mkdirSync(originalDir,{mode:0o700});mkdirSync(currentDir,{mode:0o700});
+ const sourceRunner=path.resolve('packages/daemon/src/adapters/pi-runner.ts'),runnerBytes=readFileSync(sourceRunner);
+ const originalRunner=path.join(originalDir,'pi-runner.ts'),currentRunner=path.join(currentDir,'pi-runner.ts');
+ writeFileSync(originalRunner,runnerBytes,{mode:0o600});writeFileSync(currentRunner,runnerBytes,{mode:0o600});
+ let configuration='frozen-config';const common={db:{},guard:{ownsRunnerRehost:()=>true,target:()=>({session:binding.sessionName,occupant:binding.generation,pane:'%1'})},tmux:{},resume:{},store:{assertReady:()=>{}},launchEnvironment:{usesNativeDuty:async()=>true},launchPath:process.env.PATH!,stateRoot:path.join(root,'state'),piProve:async()=>null,piRunnerState:()=>null,configurationDigest:()=>configuration,resolvePosture:()=>'floor' as const,snapshotRoot:path.join(root,'snapshots')};
+ const current=createPiDetachedResumeIntegration({...common,runnerEntryPath:currentRunner} as unknown as Parameters<typeof createPiDetachedResumeIntegration>[0]);
+ const original=createPiDetachedResumeIntegration({...common,runnerEntryPath:originalRunner} as unknown as Parameters<typeof createPiDetachedResumeIntegration>[0]);
+ const internals=(engine:unknown)=> (engine as {deps:{preflight:(b:PiDetachedBinding,d:boolean)=>Promise<{digest:string;posture:string}>;preflightAtOriginalRunner:(b:PiDetachedBinding,d:boolean,p:string)=>Promise<{digest:string;posture:string}>}}).deps;
+ try {
+  const originalContract=await internals(original).preflight(binding,true);
+  expect(await internals(current).preflightAtOriginalRunner(binding,true,originalRunner)).toEqual(originalContract);
+  expect(await internals(current).preflight(binding,true)).not.toEqual(originalContract);
+  writeFileSync(originalRunner,Buffer.concat([runnerBytes,Buffer.from('\nchanged')]),{mode:0o600});
+  await expect(internals(current).preflightAtOriginalRunner(binding,true,originalRunner)).rejects.toThrow(/contents changed/);
+  writeFileSync(originalRunner,runnerBytes,{mode:0o600});
+  configuration='changed-config';
+  expect(await internals(current).preflightAtOriginalRunner(binding,true,originalRunner)).not.toEqual(originalContract);
+ } finally {rmSync(root,{recursive:true,force:true});}
 });
 
 import {piSupervisorCandidates} from '../src/domain/pi-detached-resume-integration.js';

@@ -7,13 +7,15 @@ import type Database from "better-sqlite3";
 import { DeliveryGuardError, type SeatDeliveryGuard } from "./seat-delivery-guard.js";
 import type { NativeProcessRow } from "./native-process-lineage.js";
 export interface PiDetachedBinding { nodeId:string;sessionId:string;sessionName:string;generation:string;runtime:"pi";nativeId:string;cwd:string;model:string;effort:string|null;profile:string|null;launchPosture:string|null }
-export interface PiDetachedInput {nodeId:string;sessionName:string;reason:string;operator:string|null|undefined;actorGeneration:string;recovery?:{attemptId:string;beganSha256:string}}
+export interface PiDetachedInput {nodeId:string;sessionName:string;reason:string;operator:string|null|undefined;actorGeneration:string;recovery?:{attemptId:string;beganSha256:string;originalRunnerEntryPath?:string}}
 export interface PiDetachedPreflight {digest:string;posture:"floor"|"full_bypass"}
 export type PiDetachedResumeResult = {ok:true;runtime:"pi";nodeId:string;sessionName:string;generation:string;generationUnchanged:true;sessionId:string;nativeIdHash:string;attemptId:string;receiptPath:string;backup:{path:string;sha256:string;size:number};supervisorLaunchId:string;nativeFingerprint:string;custodyPreserved:true;guardLeftEnabled:true;authorityRepaired:false} | {ok:false;code:string;message:string;effectAttempted:boolean;blindRetryAllowed:false;receiptPath?:string};
 export interface PiDetachedResumeOptions {db:Database.Database;guard:SeatDeliveryGuard;snapshotRoot:string;
  tmux:{getPanePid(pane:string):Promise<number|null>};
  validateHistory(binding:PiDetachedBinding,bytes:Buffer):{nativeIdentity:string;lastEntryId:string};
  preflight(binding:PiDetachedBinding,detached:boolean):Promise<PiDetachedPreflight>;
+ runnerEntryPath?:string;
+ preflightAtOriginalRunner?(binding:PiDetachedBinding,detached:boolean,originalRunnerEntryPath:string):Promise<PiDetachedPreflight>;
  terminalAbsent(binding:PiDetachedBinding):Promise<boolean>;
  proveNativeAbsent(binding:PiDetachedBinding,panePid:number):Promise<boolean>;
  createTerminal(binding:PiDetachedBinding):Promise<{pane:string}>;
@@ -25,6 +27,7 @@ const hash=(value:string|Buffer)=>createHash("sha256").update(value).digest("hex
 const digest=(value:unknown)=>hash(JSON.stringify(value));
 class Hold extends Error {constructor(readonly code:string,message:string){super(message);}}
 function hold(code:string,message:string):never {throw new Hold(code,message);}
+function validRunnerPath(value:unknown):value is string {return typeof value==="string"&&path.isAbsolute(value)&&path.normalize(value)===value&&!/[\0\r\n]/.test(value);}
 function privatePath(file:string,directory=false){const st=lstatSync(file);if(st.isSymbolicLink()||(directory?!st.isDirectory():!st.isFile())||st.uid!==process.getuid?.()||(st.mode&0o077))hold("pi_detached_private_store","Private owner-only evidence path required");}
 function durable(file:string,value:unknown,raw=false){const fd=openSync(file,constants.O_CREAT|constants.O_EXCL|constants.O_WRONLY,0o600);try{writeFileSync(fd,raw?value as Buffer:JSON.stringify(value)+"\n");fsyncSync(fd);}finally{closeSync(fd);}const dir=openSync(path.dirname(file),constants.O_RDONLY);try{fsyncSync(dir);}finally{closeSync(dir);}}
 function readReceipt(file:string){privatePath(file);return JSON.parse(readFileSync(file,"utf8"));}
@@ -41,7 +44,8 @@ export class PiDetachedResume {
   let effectAttempted=false,receiptPath:string|undefined,directory:string|undefined;
   try{
    if(!input.reason?.trim())hold("pi_detached_reason_required","Accountable recovery reason required");
-   if(input.recovery&&(Object.keys(input.recovery).sort().join(',')!=="attemptId,beganSha256"||!/^[a-f0-9-]{36}$/.test(input.recovery.attemptId)||!/^[a-f0-9]{64}$/.test(input.recovery.beganSha256)))hold("pi_detached_receipt_invalid","Exact original attemptId and beganSha256 required");
+   if(input.recovery&&(!["attemptId,beganSha256","attemptId,beganSha256,originalRunnerEntryPath"].includes(Object.keys(input.recovery).sort().join(','))||!/^[a-f0-9-]{36}$/.test(input.recovery.attemptId)||!/^[a-f0-9]{64}$/.test(input.recovery.beganSha256)))hold("pi_detached_receipt_invalid","Exact original attemptId and beganSha256 required");
+   if(input.recovery?.originalRunnerEntryPath!==undefined&&!validRunnerPath(input.recovery.originalRunnerEntryPath))hold("pi_detached_receipt_invalid","Absolute original runner path required");
    this.actor(input);
    return await this.deps.guard.runnerRehost(input.nodeId,async()=>{
     this.actor(input);const b=this.binding(input),before=this.custody(b),oldPane=this.pane(b.nodeId);this.gates(b);
@@ -51,7 +55,7 @@ export class PiDetachedResume {
     const state=(this.deps.db.prepare('SELECT status FROM sessions WHERE id=?').get(b.sessionId) as {status:string}).status;
     if(!input.recovery&&state!=="detached")hold("pi_detached_binding","Expected exact detached occupant or its original partial continuation");
     const root=this.root(b);let attemptId:string,backup:{path:string;sha256:string;size:number},began:any,terminal:any;
-    let history=this.history(b),preflight:PiDetachedPreflight;
+    let history=this.history(b),preflight:PiDetachedPreflight,originalRunnerEntryPath:string|undefined;
     if(input.recovery){
      attemptId=input.recovery.attemptId;directory=path.join(root,attemptId);privatePath(directory,true);receiptPath=path.join(directory,"began.json");privatePath(receiptPath);
      if(hash(readFileSync(receiptPath))!==input.recovery.beganSha256)hold("pi_detached_receipt_invalid","Original receipt digest differs");
@@ -72,7 +76,18 @@ export class PiDetachedResume {
      if(hash(bytes)!==backup.sha256||bytes.length!==backup.size)hold("pi_detached_history","Original backup verification failed");this.prefix(history.bytes,bytes);
      if(history.facts.nativeIdentity!==began.nativeIdentity)hold("pi_detached_history","Retained native header identity changed");
      if(!terminal&&!history.bytes.equals(bytes))hold("pi_detached_history_changed","Pre-terminal continuation requires the unchanged original full history");
-     preflight=await this.deps.preflight(b,!terminal);if(digest(preflight)!==began.preflightDigest)hold("pi_detached_configuration_changed","Launch contract changed since original intent");
+     if(began.runnerEntryPath!==undefined&&!validRunnerPath(began.runnerEntryPath))hold("pi_detached_receipt_invalid","Invalid recorded runner provenance");
+     if(began.runnerEntryPath!==undefined&&input.recovery.originalRunnerEntryPath!==undefined&&began.runnerEntryPath!==input.recovery.originalRunnerEntryPath)hold("pi_detached_receipt_invalid","Explicit runner provenance contradicts original receipt");
+     originalRunnerEntryPath=began.runnerEntryPath??input.recovery.originalRunnerEntryPath;
+     preflight=await this.deps.preflight(b,!terminal);
+     if(digest(preflight)!==began.preflightDigest){
+      // Release directories may move while the actual launch contract stays
+      // identical. Reconstruct the original commitment, never waive it.
+      if(!originalRunnerEntryPath||!this.deps.preflightAtOriginalRunner)hold("pi_detached_configuration_changed","Launch contract changed since original intent");
+      let original:PiDetachedPreflight;
+      try{original=await this.deps.preflightAtOriginalRunner(b,!terminal,originalRunnerEntryPath);}catch{hold("pi_detached_configuration_changed","Original runner contract cannot be reproduced");}
+      if(digest(original)!==began.preflightDigest)hold("pi_detached_configuration_changed","Original launch contract differs beyond runner location");
+     }
     }else{
      this.noUnresolved(root,b);preflight=await this.deps.preflight(b,true);
      await this.absent(b);await this.sleep(100);await this.absent(b);unchanged();
@@ -81,7 +96,7 @@ export class PiDetachedResume {
      await this.absent(b);unchanged();
      attemptId=randomUUID();directory=path.join(root,attemptId);mkdirSync(directory,{mode:0o700});backup={path:path.join(directory,"transcript.jsonl"),sha256:hash(history.bytes),size:history.bytes.length};
      durable(backup.path,history.bytes,true);if(!readFileSync(backup.path).equals(history.bytes))hold("pi_detached_history","Private full history backup failed");
-     receiptPath=path.join(directory,"began.json");began={protocol:"pi-detached-resume-v1",attemptId,at:this.now(),actor:input.operator,actorGeneration:input.actorGeneration,reason:input.reason,bindingDigest:digest(b),nativeIdentity:history.facts.nativeIdentity,nativeIdHash:hash(b.nativeId),backup,custody:before,unknownEffects:this.unknownRows(b),preflightDigest:digest(preflight),oldPane};
+     receiptPath=path.join(directory,"began.json");began={protocol:"pi-detached-resume-v1",attemptId,at:this.now(),actor:input.operator,actorGeneration:input.actorGeneration,reason:input.reason,bindingDigest:digest(b),nativeIdentity:history.facts.nativeIdentity,nativeIdHash:hash(b.nativeId),backup,custody:before,unknownEffects:this.unknownRows(b),preflightDigest:digest(preflight),oldPane,...(this.deps.runnerEntryPath?{runnerEntryPath:this.deps.runnerEntryPath}:{})};
      durable(receiptPath,began);effectAttempted=true;
     }
     if(!terminal){
@@ -92,7 +107,7 @@ export class PiDetachedResume {
       await this.absent(b);unchanged();
       if(hash(readFileSync(receiptPath!))!==input.recovery.beganSha256)hold("pi_detached_receipt_invalid","Original receipt changed before terminal continuation");
       this.noUnresolved(root,b,directory);
-      durable(path.join(directory!,"terminal-recovery-began.json"),{attemptId,at:this.now(),actor:input.operator,actorGeneration:input.actorGeneration,beganSha256:input.recovery.beganSha256,bindingDigest:digest(b),preflightDigest:digest(preflight)});effectAttempted=true;
+      durable(path.join(directory!,"terminal-recovery-began.json"),{attemptId,at:this.now(),actor:input.operator,actorGeneration:input.actorGeneration,beganSha256:input.recovery.beganSha256,bindingDigest:digest(b),preflightDigest:digest(preflight),...(originalRunnerEntryPath?{originalRunnerEntryPath}:{})});effectAttempted=true;
      }
      const created=await this.deps.createTerminal(b);if(!/^%[0-9]+$/.test(created.pane))hold("pi_detached_terminal_unknown","Created pane is not exact");
      const pid=await this.deps.tmux.getPanePid(created.pane),row=(await this.census()).find(x=>x.pid===pid);
@@ -116,7 +131,7 @@ export class PiDetachedResume {
     const stable=this.history(b);if(!stable.bytes.equals(history.bytes))hold("pi_detached_history_changed","Retained history changed before resume");
     if(input.recovery&&hash(readFileSync(receiptPath!))!==input.recovery.beganSha256)hold("pi_detached_receipt_invalid","Original receipt changed before resume");
     if(digest(readReceipt(path.join(directory!,"terminal-bound.json")))!==digest(terminal))hold("pi_detached_receipt_invalid","Bound terminal receipt changed");
-    durable(path.join(directory!,"resume-began.json"),{attemptId,at:this.now(),actor:input.operator,actorGeneration:input.actorGeneration,reason:input.reason,bindingDigest:digest(b),beganSha256:hash(readFileSync(receiptPath!)),preflightDigest:digest(preflight),historySha256:hash(history.bytes),recovery:!!input.recovery});effectAttempted=true;
+    durable(path.join(directory!,"resume-began.json"),{attemptId,at:this.now(),actor:input.operator,actorGeneration:input.actorGeneration,reason:input.reason,bindingDigest:digest(b),beganSha256:hash(readFileSync(receiptPath!)),preflightDigest:digest(preflight),historySha256:hash(history.bytes),recovery:!!input.recovery,...(originalRunnerEntryPath?{originalRunnerEntryPath}:{})});effectAttempted=true;
     if(!(await this.deps.resume(b,preflight)).ok)hold("pi_detached_resume_unknown","Native resume was not confirmed; no replay or fresh fallback");
     const proof=await this.replacement(b,history.facts.nativeIdentity);const after=this.history(b);this.prefix(after.bytes,history.bytes);unchanged();
     if(after.facts.nativeIdentity!==history.facts.nativeIdentity)hold("pi_detached_history_changed","Resumed native identity changed");
