@@ -1946,6 +1946,17 @@ private dutyProtection(rigId:string,r:any):boolean {
     const dispatchHold=this.dispatchScopeHold(plan!,t);
     const assigned=this.db.prepare("SELECT a.queue_id,a.disposition_id,q.state,q.claimed_by_generation_uuid,q.destination_session FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=?").get(rigId,t.packageKey) as {queue_id:string;disposition_id:string|null;state:string;claimed_by_generation_uuid:string|null;destination_session:string}|undefined;
     if(assigned){
+     // Retained unfinished work needs the same accountable evidence refresh as
+     // undispatched work. This duty changes neither product custody nor admission.
+     const currentOwnerGeneration=this.authority.generation(t.owner);
+     const unresolvedOwned=!!currentOwnerGeneration&&assigned.destination_session===t.owner&&!assigned.disposition_id
+      &&(assigned.state==='pending'&&!assigned.claimed_by_generation_uuid
+       ||assigned.state==='in-progress'&&assigned.claimed_by_generation_uuid===currentOwnerGeneration);
+     if(unresolvedOwned&&!t.boundary&&this.admissionStaleReason(t)&&!this.workerEffectDebt(t.owner)){
+      const refresh=this.stageAdmissionRefreshDuty(rigId,t);
+      if(refresh?.state==='held')
+       result.push({key:refresh.key,state:'held',reason:refresh.reason,deadline:refresh.deadline??t.deadline,...(refresh.queueId?{queueId:refresh.queueId}:{}),...(refresh.activityEvidence?{activityEvidence:refresh.activityEvidence}:{})});
+     }
      const runtimeHold=assigned.state==='pending'&&!assigned.claimed_by_generation_uuid&&!assigned.disposition_id?this.runtimeReadiness?.(t):null;
      if(runtimeHold){result.push({key:t.key,state:'held',queueId:assigned.queue_id,reason:runtimeHold.reason,deadline:t.deadline,activityEvidence:{...runtimeHold}});continue;}
      if((!scope||t.deadline>this.now())&&this.dispatchObservationMatches(scope,t,plan!)&&!dispatchHold&&!t.boundary&&this.predecessorsReady(rigId,t)&&assigned.state==='pending'&&!assigned.claimed_by_generation_uuid&&!assigned.disposition_id&&this.admittedNow(t)&&!this.workerEffectDebt(t.owner)&&coordinationIdle(this.activity(t.owner),this.authority.generation(t.owner)??'',this.now()))this.repo.stageCoordinatorAssignmentWake({rigId,epoch:a!.epoch,generation,actor,queueId:assigned.queue_id,recipient:t.owner,recipientGeneration:t.admission.generation,now:this.now()});

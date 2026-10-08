@@ -1621,6 +1621,56 @@ describe('admission-refresh lifecycle duty',()=>{
  const r_cfg=(t:CoordinationTask)=>svc.configurationDigest(t.owner)!;
  const dutyBody=()=>{const r=refreshReceipt('expired');return r?JSON.parse((db.prepare('SELECT body FROM queue_items WHERE qitem_id=?').get(r.queueId) as any).body):null;};
 
+ const assignBeforeStale=(picked=false)=>{
+  configure([task('assigned-refresh','reviewer@xv',{deadline:clock+300000}),task('assigned-refresh-repair','architect@xv',{deadline:clock+300000,recoveryFor:'assigned-refresh'})]);
+  const queueId=svc.reconcile('lead@xv','lead-g1','xv').find(r=>r.key==='assigned-refresh')!.queueId!;
+  // Initial known assignment delivery is settled fixture evidence, not UNKNOWN.
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  if(picked)repo.claim({qitemId:queueId,destinationSession:'reviewer@xv',identityProvenance:'transport:v1'});
+  return queueId;
+ };
+ it.each(['pending-expired','picked-expired','picked-config'] as const)('assigned admission refresh %s preserves product and deduplicates',kind=>{
+  const queueId=assignBeforeStale(kind!=='pending-expired');
+  const productBefore=db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(queueId);
+  const assignmentBefore=db.prepare('SELECT * FROM coordinator_assignments WHERE queue_id=?').get(queueId);
+  const planBefore=JSON.stringify(svc.plan('xv')!.tasks);
+  repo.coordinatorAuthority.renew('lead@xv',token,600000,'assigned-renew');
+  if(kind==='picked-config')db.prepare("UPDATE nodes SET model='changed-model' WHERE logical_id='reviewer'").run();
+  else {clock+=60002;vi.setSystemTime(clock);refresh();}
+  const pkgBefore=db.prepare("SELECT contract FROM coordinator_packages WHERE package_key='assigned-refresh'").get();
+  svc.reconcile('lead@xv','lead-g1','xv');svc.reconcile('lead@xv','lead-g1','xv');
+  const rows=refreshAll().filter(r=>r.packageKey==='assigned-refresh');expect(rows).toHaveLength(1);
+  expect(rows[0].staleReason).toBe(kind==='picked-config'?'configuration_changed':'expired');
+  expect(db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(queueId)).toEqual(productBefore);
+  expect(db.prepare('SELECT * FROM coordinator_assignments WHERE queue_id=?').get(queueId)).toEqual(assignmentBefore);
+  expect(db.prepare("SELECT contract FROM coordinator_packages WHERE package_key='assigned-refresh'").get()).toEqual(pkgBefore);
+  expect(JSON.stringify(svc.plan('xv')!.tasks)).toBe(planBefore);
+ });
+ it.each(['unknown','foreign-claim','foreign-destination','done','failed','blocked','disposition'] as const)('assigned admission refresh excludes %s',kind=>{
+  const queueId=assignBeforeStale(kind!=='foreign-claim');
+  if(kind==='unknown')db.prepare("INSERT INTO outbox_entries(outbox_id,sender_session,destination_session,body,ts_dispatched,delivery_state) VALUES('assigned-unknown','watchdog@system','reviewer@xv','live',?,'indeterminate')").run(new Date(clock).toISOString());
+  if(kind==='foreign-claim')db.prepare("UPDATE queue_items SET state='in-progress',claimed_by_generation_uuid='foreign-generation' WHERE qitem_id=?").run(queueId);
+  if(kind==='foreign-destination')db.prepare("UPDATE queue_items SET destination_session='architect@xv' WHERE qitem_id=?").run(queueId);
+  if(['done','failed','blocked'].includes(kind))db.prepare('UPDATE queue_items SET state=? WHERE qitem_id=?').run(kind,queueId);
+  if(kind==='disposition')db.prepare("UPDATE coordinator_assignments SET disposition_id='retained-return' WHERE queue_id=?").run(queueId);
+  const before=db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(queueId);
+  const unknown=db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='assigned-unknown'").get();
+  repo.coordinatorAuthority.renew('lead@xv',token,600000,'excluded-renew');clock+=60002;vi.setSystemTime(clock);refresh();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  expect(refreshAll().filter(r=>r.packageKey==='assigned-refresh')).toHaveLength(0);
+  expect(db.prepare('SELECT * FROM queue_items WHERE qitem_id=?').get(queueId)).toEqual(before);
+  expect(db.prepare("SELECT * FROM outbox_entries WHERE outbox_id='assigned-unknown'").get()).toEqual(unknown);
+ });
+ it('assigned admission refresh excludes boundary',async()=>{
+  configure([task('assigned-refresh','reviewer@xv',{deadline:clock+300000,boundary:'owner-access'}),task('assigned-refresh-repair','architect@xv',{deadline:clock+300000,recoveryFor:'assigned-refresh'})]);
+  await repo.create({qitemId:'boundary-existing',sourceSession:'lead@xv',destinationSession:'reviewer@xv',body:'assigned-refresh',dispatch:{token,packageKey:'assigned-refresh'},nudge:false});
+  db.prepare("UPDATE outbox_entries SET delivery_state='delivered'").run();
+  const before=repo.getById('boundary-existing');
+  repo.coordinatorAuthority.renew('lead@xv',token,600000,'boundary-renew');clock+=60002;vi.setSystemTime(clock);refresh();
+  svc.reconcile('lead@xv','lead-g1','xv');
+  expect(refreshAll().filter(r=>r.packageKey==='assigned-refresh')).toHaveLength(0);
+  expect(repo.getById('boundary-existing')).toEqual(before);
+ });
  it('AR1 a stale task is held and stages one accountable Operator duty bound to live facts',()=>{
   const admittedAt=STALE_PLAN();
   const results=svc.reconcile('lead@xv','lead-g1','xv');
