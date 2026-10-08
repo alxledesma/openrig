@@ -1,3 +1,4 @@
+import { parseCodexStoppedRecovery, type CodexStoppedRecovery } from "../domain/codex-rehost.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import { SeatDispatchReservationService } from "../domain/seat-dispatch-reservation.js";
 import { getConnInfo } from "@hono/node-server/conninfo";
@@ -385,6 +386,18 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   if (body.operator !== undefined && typeof body.operator !== "string") return c.json({ error: "operator must be a string when present" }, 400);
   const rehostRequest = parseStoppedTargetRecoveryRequest(body);
   if (!rehostRequest.ok) return c.json({ error: rehostRequest.error }, 400);
+  let codexStoppedRecovery: CodexStoppedRecovery | undefined;
+  if (body.codexStoppedRecovery !== undefined) {
+    const token = c.get("terminalBearerToken" as never) as string | null;
+    if (!token) return c.json({ok:false,code:"codex_rehost_recovery_authenticated_control_required"},503);
+    const authResponse = await authBearerTokenMiddleware({expectedToken:token})(c,async()=>{});
+    if (authResponse) return authResponse;
+    let address:string|undefined;try { address=getConnInfo(c).remote.address; } catch {}
+    if(c.req.header("Origin")||!isRotationLoopback(address))return c.json({ok:false,code:"codex_rehost_recovery_local_only"},403);
+    try { codexStoppedRecovery = parseCodexStoppedRecovery(body.codexStoppedRecovery); } catch (error) { return c.json({error:(error as Error).message},400); }
+    if (rehostRequest.legacyNativeWitness || rehostRequest.stoppedTargetRecovery || rehostRequest.stoppedTargetAcceptanceReference) return c.json({error:"Codex and Pi recovery modes are exclusive"},400);
+    if (transportSenderSession(c) !== "operator-agent@kernel" || !c.req.header("X-OpenRig-Occupant-Generation") || c.req.header("X-OpenRig-Origin-Unknown") === "true") return c.json({error:"Current Operator transport identity and generation required"},403);
+  }
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
   const tmuxAdapter = c.get("tmuxAdapter" as never) as TmuxAdapter;
   const stateRoot = join(OPENRIG_HOME, "state", "pi");
@@ -522,7 +535,8 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   const result = await lifecycle.rehostRunner({
     seatRef: decodeURIComponent(c.req.param("seatRef")),
     reason: body.reason,
-    operator: (body.operator as string | undefined) ?? null,
+    operator: codexStoppedRecovery ? transportSenderSession(c) : (body.operator as string | undefined) ?? null,
+    ...(codexStoppedRecovery ? {codexStoppedRecovery,actorGeneration:c.req.header("X-OpenRig-Occupant-Generation")} : {}),
     legacyNativeWitness: rehostRequest.legacyNativeWitness,
     stoppedTargetRecovery: rehostRequest.stoppedTargetRecovery,
     ...(rehostRequest.stoppedTargetAcceptanceReference ? { stoppedTargetAcceptanceReference: rehostRequest.stoppedTargetAcceptanceReference } : {}),

@@ -1,6 +1,7 @@
 import type { RuntimeAvailability } from "./coordinator-runtime-availability.js";
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { EventBus } from "./event-bus.js";
 import { QueueTransitionLog, type NativeQueueCustodyReceipt, type QueueTransition } from "./queue-transition-log.js";
 
@@ -60,6 +61,39 @@ export class CoordinatorAuthorityService {
  private runtimeObserver?: (session:string)=>Promise<RuntimeAvailability|null>;
  private runtimeEvidence=new Map<string,RuntimeAvailability>();
  private availabilityRuns=new Map<string,number>();
+ private operationAvailability=new AsyncLocalStorage<{
+  rigId:string;members:string;generations:Map<string,string|null>;observations:Map<string,RuntimeAvailability>;
+  observer:((session:string)=>Promise<RuntimeAvailability|null>)|undefined;active:boolean;
+ }>();
+ /** Server-owned probe-through-decision context. Concurrent operations never share
+  * witnesses; an empty/expired context cannot borrow the observation cache. */
+ async withFreshRuntimeAvailability<T>(rigId:string,decide:()=>T|Promise<T>):Promise<T> {
+  const authority=this.get(rigId),observer=this.runtimeObserver;
+  const members=authority?JSON.parse(authority.coordinators) as string[]:[];
+  const generations=new Map(members.map(session=>[session,this.generation(session)]));
+  const results=observer?await Promise.allSettled(members.map(session=>observer(session))):[];
+  const observations=new Map<string,RuntimeAvailability>();
+  for(let i=0;i<results.length;i++){
+   const result=results[i]!;
+   if(result.status==='fulfilled'&&result.value&&result.value.session===members[i]){
+    const evidence=result.value;
+    observations.set(evidence.session,Object.freeze({...evidence,
+     ...(evidence.quiescence?{quiescence:Object.freeze({...evidence.quiescence})}:{})}));
+   }
+  }
+  const batch={rigId,members:authority?.coordinators??'',generations,observations,observer,active:true};
+  return this.operationAvailability.run(batch,async()=>{
+   try{return await decide();}finally{batch.active=false;}
+  });
+ }
+ private runtimeObservation(session:string):RuntimeAvailability|undefined {
+  const batch=this.operationAvailability.getStore();
+  if(!batch)return this.runtimeEvidence.get(session); // legacy observation-only/direct callers
+  if(!batch.active||batch.observer!==this.runtimeObserver||this.get(batch.rigId)?.coordinators!==batch.members
+    ||!batch.generations.has(session)||[...batch.generations].some(([member,generation])=>this.generation(member)!==generation))return undefined;
+  return batch.observations.get(session);
+ }
+
  setRuntimeObserver(observer:(session:string)=>Promise<RuntimeAvailability|null>):void {this.runtimeObserver=observer;this.runtimeEvidence.clear();}
  async refreshRuntimeAvailability(rigId:string):Promise<void> {
   const authority=this.get(rigId);if(!authority||!this.runtimeObserver)return;
@@ -82,7 +116,7 @@ export class CoordinatorAuthorityService {
    return node!.id;
   }
  private excluded(session:string,generation?:string):boolean {
-  const e=this.runtimeEvidence.get(session);return !!e&&e.state==='absent'&&e.session===session&&!!e.fingerprint&&e.observedAt<=this.now()&&this.now()-e.observedAt<=1000&&e.generation===(generation??this.generation(session))&&e.generation===this.generation(session);
+  const e=this.runtimeObservation(session);return !!e&&e.state==='absent'&&e.session===session&&!!e.fingerprint&&e.observedAt<=this.now()&&this.now()-e.observedAt<=1000&&e.generation===(generation??this.generation(session))&&e.generation===this.generation(session);
  }
  available(): boolean { return !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE name='coordinator_authority'").get(); }
  get(rigId: string): Authority | undefined { return this.db.prepare("SELECT * FROM coordinator_authority WHERE rig_id=?").get(rigId) as Authority | undefined; }
@@ -662,7 +696,7 @@ export class CoordinatorAuthorityService {
    const r=this.get(input.token.rigId);
    if(!r||r.state!=="active"||r.epoch!==input.token.epoch||r.owner_generation!==input.token.generation||this.generation(r.owner_session)!==r.owner_generation||r.lease_until!==input.expectedLeaseUntil)reject("coordinator_active_recovery_mismatch","Exact expired active holder, generation, epoch and lease required");
    if(r!.lease_until>this.now())reject("coordinator_lease_live","Recovery cannot replace a live lease");
-   const e=this.runtimeEvidence.get(r!.owner_session);
+   const e=this.runtimeObservation(r!.owner_session);
    if(!e||e.state!=="present"||e.session!==r!.owner_session||!e.fingerprint||e.generation!==r!.owner_generation||e.observedAt>this.now()||this.now()-e.observedAt>1000)reject("coordinator_live_holder_unproven","Fresh generation-bound native presence required");
    if(!Number.isSafeInteger(input.windowMs)||input.windowMs<10000||input.windowMs>900000)reject("coordinator_invalid_ack_window","Recovery window must be10seconds to15minutes");
    if(input.obligationsDigest!==this.reconciliationDigest(r!.rig_id))reject("coordinator_reconciliation_changed","Exact current custody digest required");
@@ -806,7 +840,7 @@ export class CoordinatorAuthorityService {
    // fabricated, so it is structurally impossible to pass one in. The route refreshes availability
    // immediately before this mutation.
    const ownerNode=this.nodeOf(row.owner_session);
-   const evidence=this.runtimeEvidence.get(row.owner_session);
+   const evidence=this.runtimeObservation(row.owner_session);
    // Exact current native occupant, freshly observed: same session, current generation, really present.
    if(!evidence||evidence.session!==row.owner_session||evidence.generation!==row.owner_generation||evidence.state!=="present"||!evidence.fingerprint)reject("coordinator_owner_unobserved","A fresh current native observation of the owner is required");
    // Narrow once after the refusal; the observation is not replaced inside this transaction.

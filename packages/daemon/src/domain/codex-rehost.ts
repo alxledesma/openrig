@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { CodexResumeAdapter } from "../adapters/codex-resume.js";
 import type { SeatDeliveryGuard } from "./seat-delivery-guard.js";
@@ -30,6 +30,14 @@ export type CodexRehostResult = {
   custodyPreserved:true;guardLeftEnabled:true;authorityRepaired:false;
 } | {ok:false;code:string;message:string;blindRetryAllowed:false;effectAttempted:boolean;receiptPath?:string};
 export interface CodexRehostInput {nodeId:string;sessionName:string;reason:string;operator?:string|null}
+export interface CodexStoppedRecovery {attemptId:string;beganSha256:string}
+export interface CodexStoppedRecoveryInput extends CodexRehostInput, CodexStoppedRecovery {actorGeneration:string}
+export function parseCodexStoppedRecovery(value:unknown):CodexStoppedRecovery {
+  if(!value||typeof value!=="object"||Array.isArray(value)||Object.keys(value).sort().join(',')!=="attemptId,beganSha256")throw new Error("Exact attemptId and beganSha256 required; caller native facts are not accepted");
+  const v=value as CodexStoppedRecovery;
+  if(!/^[a-f0-9-]{36}$/.test(v.attemptId)||!/^[a-f0-9]{64}$/.test(v.beganSha256))throw new Error("Invalid immutable stopped-rehost receipt reference");
+  return v;
+}
 export interface CodexRehostOptions {
   db:Database.Database;guard:SeatDeliveryGuard;tmux:{getPanePid(pane:string):Promise<number|null>};
   resume:Pick<CodexResumeAdapter,"resume">;snapshotRoot:string;
@@ -40,6 +48,10 @@ export interface CodexRehostOptions {
   preflightSupervisedLaunch:(binding:CodexRehostBinding,native:CodexRehostNativeState)=>Promise<CodexRehostPreflight>;
   /** Must independently prove the new installed supervisor under this exact owned rehost lease. No enrollment/grant. */
   observeSupervisedReplacement:(binding:CodexRehostBinding)=>Promise<{launchId:string;fingerprint:string}|null>;
+  /** Recovery-only retained transcript resolution. Never used as living native proof. */
+  stoppedNativeState?:(binding:CodexRehostBinding)=>Promise<CodexRehostNativeState>;
+  /** Fail-closed global kernel census; bare pane alone cannot exclude a reparented old process. */
+  proveStoppedIdentityAbsent?:(binding:CodexRehostBinding,panePid:number)=>Promise<boolean>;
   listProcesses?:()=>Promise<NativeProcessRow[]>;
   verifyProcessIdentity?:typeof verifyNativeDutyProcessIdentity;
   signal?:(pid:number)=>void;now?:()=>number;sleep?:(ms:number)=>Promise<void>;waitMs?:number;pollMs?:number;
@@ -48,6 +60,15 @@ class Refusal extends Error {constructor(readonly code:string,message:string){su
 function reject(code:string,message:string):never {throw new Refusal(code,message);}
 const hash=(value:string|Buffer)=>createHash("sha256").update(value).digest("hex");
 const digest=(value:unknown)=>hash(JSON.stringify(value));
+// Delayed held deliveries and session telemetry are allowed before recovery.
+// Identity and authority custody must still equal the original stop receipt;
+// every table is then frozen against the fresh in-recovery baseline.
+const STOP_CUSTODY_KEYS=['node','bindings','tenures','permissions','authority','assignments','staged','resources'] as const;
+function originalStopCustodyMatches(original:unknown,current:Record<string,unknown>):boolean {
+  if(!original||typeof original!=='object'||Array.isArray(original))return false;
+  const recorded=original as Record<string,unknown>;
+  return STOP_CUSTODY_KEYS.every(key=>recorded[key]!==undefined&&digest(recorded[key])===digest(current[key]));
+}
 function privatePath(file:string,directory:boolean){const s=lstatSync(file);if(s.isSymbolicLink()||(directory?!s.isDirectory():!s.isFile())||s.uid!==process.getuid?.()||(s.mode&0o077))reject("codex_rehost_private_store","Private owner-only nonsymlink evidence path required");}
 function writeDurable(file:string,bytes:string|Buffer){const fd=openSync(file,constants.O_CREAT|constants.O_EXCL|constants.O_WRONLY,0o600);try{writeFileSync(fd,bytes);fsyncSync(fd);}finally{closeSync(fd);}const dir=openSync(path.dirname(file),constants.O_RDONLY);try{fsyncSync(dir);}finally{closeSync(dir);}}
 function descendants(rows:NativeProcessRow[],root:number){const ids=new Set([root]);for(let i=0;i<rows.length;i++){let change=false;for(const r of rows)if(ids.has(r.ppid)&&!ids.has(r.pid)){ids.add(r.pid);change=true;}if(!change)break;}return rows.filter(r=>ids.has(r.pid));}
@@ -83,7 +104,8 @@ export class CodexSameGenerationRehost {
         if(final.fingerprint!==second.fingerprint||!this.history(native.transcriptPath,binding.nativeId).equals(initial))reject("codex_rehost_unstable","Native/history changed immediately before the durable stop boundary");
         receiptPath=path.join(directory,"began.json");
         writeDurable(receiptPath,JSON.stringify({protocol:"codex-same-generation-rehost-v1",attemptId,at:this.now(),reason:input.reason,actor:input.operator??null,
-          bindingDigest:digest(binding),nativeIdHash:hash(binding.nativeId),nativeFingerprint:final.fingerprint,backup,custody:before,preflightDigest:preflight.evidenceDigest})+"\n");
+          bindingDigest:digest(binding),nativeIdHash:hash(binding.nativeId),nativeFingerprint:final.fingerprint,backup,custody:before,preflightDigest:preflight.evidenceDigest,
+          nativeEvidence:{pane,panePid:final.panePid,processes:final.processes.map(({pid,ppid,startedAt})=>({pid,ppid,startedAt}))}})+"\n");
         effectAttempted=true; // Durable write-ahead intent: any following uncertainty blocks replay.
         try {
           (this.deps.signal??(pid=>process.kill(pid,"SIGTERM")))(final.pid);
@@ -105,6 +127,75 @@ export class CodexSameGenerationRehost {
     }catch(error){return {ok:false,code:error instanceof Refusal?error.code:effectAttempted?"codex_rehost_effect_unknown":"codex_rehost_precondition_failed",
       message:error instanceof Refusal?error.message:effectAttempted?"Native effect outcome is unknown; retained receipt and history require explicit recovery. No retry or fallback.":"A required native, activity, custody or launch precondition could not be proven; no process signal was attempted.",blindRetryAllowed:false,effectAttempted,...(receiptPath?{receiptPath}:{})};}
   }
+  /** Continue only a recorded stop-timeout, whose original code path never resumed.
+   * The original UNKNOWN is immutable. A separate exclusive write-ahead marker
+   * makes every uncertain recovery resume non-replayable, including lost replies. */
+  async recoverStopped(input:CodexStoppedRecoveryInput):Promise<CodexRehostResult>{
+    let effectAttempted=false,receiptPath:string|undefined;
+    try {
+      parseCodexStoppedRecovery({attemptId:input.attemptId,beganSha256:input.beganSha256});
+      if(!input.reason?.trim()||!this.deps.stoppedNativeState||!this.deps.proveStoppedIdentityAbsent)reject("codex_rehost_recovery_unavailable","Accountable reason and stopped recovery proof dependencies required");
+      return await this.deps.guard.runnerRehost(input.nodeId,async()=>{
+        this.recoveryActor(input);
+        const b=this.binding(input),pane=this.pane(b.nodeId),before=this.custody(b),root=this.nodeDirectory(b);
+        this.gates(b);
+        const candidates=readdirSync(root).filter(id=>id.endsWith('-'+input.attemptId));
+        if(candidates.length!==1)reject("codex_rehost_recovery_receipt","Exactly one retained original attempt is required");
+        const directory=path.join(root,candidates[0]!);privatePath(directory,true);
+        receiptPath=path.join(directory,'began.json');privatePath(receiptPath,false);
+        const raw=readFileSync(receiptPath);if(hash(raw)!==input.beganSha256)reject("codex_rehost_recovery_receipt","Original write-ahead receipt digest differs");
+        const began=JSON.parse(raw.toString('utf8'));
+        privatePath(path.join(directory,'unknown.json'),false);const unknown=JSON.parse(readFileSync(path.join(directory,'unknown.json'),'utf8'));
+        if(began.protocol!=="codex-same-generation-rehost-v1"||began.attemptId!==input.attemptId||began.actor!=="operator-agent@kernel"
+          ||unknown.attemptId!==input.attemptId||unknown.code!=="codex_rehost_stop_unknown"||unknown.effectAttempted!==true||unknown.blindRetryAllowed!==false
+          ||began.bindingDigest!==digest(b)||began.nativeIdHash!==hash(b.nativeId)||!originalStopCustodyMatches(began.custody,before)
+          ||!/^[a-f0-9]{64}$/.test(began.nativeFingerprint)||!/^[a-f0-9]{64}$/.test(began.preflightDigest))reject("codex_rehost_recovery_receipt","Original stop-only UNKNOWN, binding and custody must match exactly");
+        for(const id of readdirSync(root)){
+          const other=path.join(root,id);privatePath(other,true);
+          if(other===directory){if(existsSync(path.join(other,'completed.json'))||existsSync(path.join(other,'recovery-began.json')))reject("codex_rehost_recovery_replay","This attempt has a completion or an uncertain recovery intent; no replay");}
+          else if(this.hasBegan(other)){privatePath(path.join(other,'completed.json'),false);const r=JSON.parse(readFileSync(path.join(other,'completed.json'),'utf8'));if(r.ok!==true||r.nodeId!==b.nodeId||r.generation!==b.generation)reject("codex_rehost_unresolved_attempt","Another unresolved attempt excludes recovery");}
+        }
+        const backupPath=path.join(directory,'transcript.jsonl');privatePath(backupPath,false);
+        const backup=this.history(backupPath,b.nativeId);
+        if(began.backup?.path!==backupPath||began.backup.sha256!==hash(backup)||began.backup.size!==backup.length)reject("codex_rehost_recovery_history","Original full backup failed immutable verification");
+        const native=await this.deps.stoppedNativeState!(b);this.nativeMatches(b,native);
+        const stopped=this.history(native.transcriptPath,b.nativeId);this.prefix(stopped,backup);
+        const preflight=await this.deps.preflightSupervisedLaunch(b,native);this.preflightMatches(b,native,preflight);
+        if(preflight.evidenceDigest!==began.preflightDigest)reject("codex_rehost_configuration_changed","Recovery launch/profile digest differs from original preflight");
+        const first=await this.stoppedProof(b,pane,began.nativeEvidence);await this.sleep(100);
+        const second=await this.stoppedProof(b,pane,began.nativeEvidence);
+        if(digest(first)!==digest(second)||!stopped.equals(this.history(native.transcriptPath,b.nativeId)))reject("codex_rehost_recovery_unstable","Bare pane or retained history changed during absence proof");
+        const finalPreflight=await this.deps.preflightSupervisedLaunch(b,native);this.preflightMatches(b,native,finalPreflight);
+        if(digest(finalPreflight)!==digest(preflight))reject("codex_rehost_configuration_changed","Recovery launch dependencies changed before resume");
+        this.recoveryActor(input);this.unchanged(input,b,before);this.gates(b);
+        // Recheck absence after launch preflight awaits, immediately before the write-ahead boundary.
+        if(digest(await this.stoppedProof(b,pane,began.nativeEvidence))!==digest(second))reject("codex_rehost_recovery_unstable","Bare pane changed before recovery intent");
+        this.recoveryActor(input);this.unchanged(input,b,before);this.gates(b);
+        if(!stopped.equals(this.history(native.transcriptPath,b.nativeId))||hash(readFileSync(receiptPath!))!==input.beganSha256)reject('codex_rehost_recovery_unstable','Retained history or original receipt changed before recovery intent');
+        writeDurable(path.join(directory,'recovery-began.json'),JSON.stringify({protocol:'codex-stopped-recovery-v1',attemptId:input.attemptId,beganSha256:input.beganSha256,at:this.now(),actor:input.operator,actorGeneration:input.actorGeneration,reason:input.reason,bindingDigest:digest(b),originalCustody:began.custody,recoveryBaselineCustody:before,preflightDigest:preflight.evidenceDigest,stoppedHistorySha256:hash(stopped),absence:second})+'\n');
+        effectAttempted=true;
+        try {
+          const resumed=await this.deps.resume.resume(b.sessionName,'codex_id',b.nativeId,b.cwd,b.codexConfigProfile,preflight.posture,b.model,b.effort,b.generation);
+          if(!resumed.ok)reject("codex_rehost_resume_unknown","Recovery resume outcome unknown; no replay or fresh fallback");
+          const replacement=await this.replacement(b,pane,-1);
+          this.prefix(this.history(native.transcriptPath,b.nativeId),stopped);this.unchanged(input,b,before);this.gates(b);
+          const result:Extract<CodexRehostResult,{ok:true}>={ok:true,runtime:'codex',nodeId:b.nodeId,sessionName:b.sessionName,generation:b.generation,generationUnchanged:true,nativeIdHash:hash(b.nativeId),attemptId:input.attemptId,receiptPath:receiptPath!,backup:began.backup,nativeFingerprintBefore:began.nativeFingerprint,nativeFingerprintAfter:replacement.native.fingerprint,supervisorLaunchId:replacement.supervision.launchId,custodyPreserved:true,guardLeftEnabled:true,authorityRepaired:false};
+          writeDurable(path.join(directory,'completed.json'),JSON.stringify({...result,at:this.now(),recoveryProtocol:'codex-stopped-recovery-v1',beganSha256:input.beganSha256,custodyAfter:this.custody(b)})+'\n');return result;
+        }catch(error){try{writeDurable(path.join(directory,'recovery-unknown.json'),JSON.stringify({attemptId:input.attemptId,at:this.now(),effectAttempted:true,code:error instanceof Refusal?error.code:'codex_rehost_recovery_unknown',blindRetryAllowed:false})+'\n');}catch{}throw error;}
+      });
+    }catch(error){return {ok:false,code:error instanceof Refusal?error.code:effectAttempted?'codex_rehost_recovery_unknown':'codex_rehost_recovery_unproven',message:error instanceof Refusal?error.message:'Stopped recovery proof unavailable; original evidence retained. No blind retry.',effectAttempted,blindRetryAllowed:false,...(receiptPath?{receiptPath}:{})};}
+  }
+  private recoveryActor(input:CodexStoppedRecoveryInput){
+    const t=this.deps.guard.target('operator-agent@kernel'),s=this.deps.db.prepare('SELECT status,startup_status FROM sessions WHERE node_id=? ORDER BY id DESC LIMIT 1').get(t.nodeId) as {status:string;startup_status:string}|undefined;
+    if(input.operator!=='operator-agent@kernel'||!input.actorGeneration||t.session!==input.operator||t.occupant!==input.actorGeneration||s?.status!=='running'||s.startup_status!=='ready')reject('codex_rehost_recovery_actor','Current running ready Operator transport identity and generation required');
+  }
+  private async stoppedProof(b:CodexRehostBinding,pane:string,original?:{pane:string;panePid:number;processes:Array<{pid:number;startedAt:string}>}){
+    const panePid=await this.deps.tmux.getPanePid(pane),rows=await this.census(),root=rows.find(r=>r.pid===panePid);
+    if(!panePid||!root?.startedAt||!['zsh','bash','sh','fish','dash'].includes(root.executableName??'')||descendants(rows,panePid).length!==1
+      ||(original&&(original.pane!==pane||original.panePid!==panePid||original.processes.some(old=>rows.some(r=>r.pid===old.pid&&r.startedAt===old.startedAt))))
+      ||!await this.deps.proveStoppedIdentityAbsent!(b,panePid)||await this.deps.tmux.getPanePid(pane)!==panePid)reject('codex_rehost_recovery_absence','Stable bare bound pane and global old native identity absence are required');
+    return {pane,panePid,startedAt:root.startedAt,ppid:root.ppid,executableName:root.executableName};
+  }
   private binding(input:Pick<CodexRehostInput,"nodeId"|"sessionName">):CodexRehostBinding {
     const row=this.deps.db.prepare("SELECT n.id nodeId,n.runtime,n.cwd,n.model,n.effort,n.codex_config_profile codexConfigProfile,s.id sessionId,s.session_name sessionName,s.resume_type resumeType,s.resume_token nativeId,s.status,s.startup_status startupStatus FROM nodes n JOIN sessions s ON s.node_id=n.id WHERE n.id=? ORDER BY s.id DESC LIMIT 1").get(input.nodeId) as Record<string,string|null>|undefined;
     const tenure=this.deps.db.prepare("SELECT generation_uuid FROM occupant_tenures WHERE node_id=? ORDER BY generation_ordinal DESC LIMIT 1").get(input.nodeId) as {generation_uuid:string}|undefined;
@@ -121,7 +212,8 @@ export class CodexSameGenerationRehost {
     if(this.deps.db.prepare("SELECT 1 FROM outbox_entries WHERE delivery_state='sending' AND (sender_session IN (?,?) OR destination_session IN (?,?)) LIMIT 1").get(...addresses,...addresses))reject("codex_rehost_sending","An in-flight sending effect excludes process rehost; UNKNOWN remains retained");
     if(this.deps.db.prepare("SELECT 1 FROM coordinator_authority WHERE owner_session IN (?,?) AND owner_generation!=? LIMIT 1").get(...addresses,binding.generation))reject("codex_rehost_generation_mismatch","Retained authority names a different occupant generation");
   }
-  private async native(binding:CodexRehostBinding){const n=await this.deps.nativeState(binding.sessionName);if(n.nodeId!==binding.nodeId||n.sessionName!==binding.sessionName||n.nativeId!==binding.nativeId||n.runtimeContract.runtime!=="codex"||n.runtimeContract.model!==binding.model||n.runtimeContract.profile!==binding.codexConfigProfile||(binding.effort!==null&&n.runtimeContract.effort!==binding.effort))reject("codex_rehost_native_configuration_mismatch","Actual native thread/model/profile/effort differs from the persistent continuation binding; resolve that mismatch before rehost");return n;}
+  private nativeMatches(binding:CodexRehostBinding,n:CodexRehostNativeState){if(n.nodeId!==binding.nodeId||n.sessionName!==binding.sessionName||n.nativeId!==binding.nativeId||n.runtimeContract.runtime!=="codex"||n.runtimeContract.model!==binding.model||n.runtimeContract.profile!==binding.codexConfigProfile||(binding.effort!==null&&n.runtimeContract.effort!==binding.effort))reject("codex_rehost_native_configuration_mismatch","Native thread/model/profile/effort differs from the persistent continuation binding");}
+  private async native(binding:CodexRehostBinding){const n=await this.deps.nativeState(binding.sessionName);this.nativeMatches(binding,n);return n;}
   private preflightMatches(binding:CodexRehostBinding,n:CodexRehostNativeState,p:CodexRehostPreflight){
     const sandbox=n.runtimeContract.permissions.sandbox,kind=typeof sandbox==="string"?sandbox:(sandbox as {type?:unknown}|null)?.type;
     if(!p||!['floor','full_bypass'].includes(p.posture)||!/^[a-f0-9]{64}$/.test(p.evidenceDigest)||p.effective.model!==binding.model||p.effective.provider!==n.runtimeContract.provider||p.effective.effort!==n.runtimeContract.effort||p.effective.approval!==n.runtimeContract.permissions.approval||p.effective.sandbox!==kind||(p.posture==='full_bypass'&&(kind!=='danger-full-access'||p.effective.approval!=='never')))

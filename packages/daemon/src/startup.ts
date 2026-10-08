@@ -2066,7 +2066,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       deliver: async ({ targetSession, message, continuityAction, coordinatorRecovery }, source) => {
         let continuityActionCompleted = false;
         try {
-          if(coordinatorRecovery){await queueRepoInstance.coordinatorAuthority.refreshRuntimeAvailability(coordinatorRecovery.rigId);queueRepoInstance.coordinatorAuthority.recordObservedOutage(coordinatorRecovery.rigId,coordinatorRecovery.expectedEpoch,source.jobId,coordinatorRecovery.evidenceId);}
+          if(coordinatorRecovery){await queueRepoInstance.coordinatorAuthority.withFreshRuntimeAvailability(coordinatorRecovery.rigId,()=>queueRepoInstance.coordinatorAuthority.recordObservedOutage(coordinatorRecovery.rigId,coordinatorRecovery.expectedEpoch,source.jobId,coordinatorRecovery.evidenceId));}
           if (continuityAction) {
             await createContinuityCutoverBaton(continuityAction, queueRepoInstance);
             continuityActionCompleted = true;

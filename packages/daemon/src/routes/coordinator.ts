@@ -83,7 +83,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
      if(operation==="held-history-custody-attest")return c.json(svc.attestHeldHistoryCustody(actor,generation,await c.req.json()));
      if(operation==="migrate-legacy")return c.json(svc.migrateLegacy(actor,generation,await c.req.json()),201);
      if(operation==="enable")return c.json(svc.enable(actor,generation,await c.req.json()),201);
-     if(operation==="transfer"){const b=await c.req.json();await svc.refreshRuntimeAvailability(b.expected?.rigId);return c.json(svc.transfer(actor,generation,b));}
+     if(operation==="transfer"){const b=await c.req.json();return c.json(await svc.withFreshRuntimeAvailability(b.expected?.rigId,()=>svc.transfer(actor,generation,b)));}
      if(operation==="acknowledge"){
        const b=await c.req.json();if(b.token?.generation!==generation)throw new CoordinatorFenceError("coordinator_generation_mismatch","Token and immutable caller generation differ");
        return c.json(svc.acknowledge(actor,b.token,b));
@@ -97,10 +97,10 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
       // Operator-attributed bounded recovery of ONE already expired reconciling window. Availability
       // is refreshed here so the service reads its OWN current native evidence, including positive
       // quiescence; the body carries no proof at all.
-      const b=await c.req.json();await svc.refreshRuntimeAvailability(b.rigId);
-      return c.json(svc.recoverExpiredReconciling(actor,generation,b));
+      const b=await c.req.json();
+      return c.json(await svc.withFreshRuntimeAvailability(b.rigId,()=>svc.recoverExpiredReconciling(actor,generation,b)));
     }
-    if(operation==="active-expiry-recover"){const b=await c.req.json();await svc.refreshRuntimeAvailability(b.token?.rigId);return c.json(svc.recoverExpiredActive(actor,generation,b));}
+    if(operation==="active-expiry-recover"){const b=await c.req.json();return c.json(await svc.withFreshRuntimeAvailability(b.token?.rigId,()=>svc.recoverExpiredActive(actor,generation,b)));}
      if(operation==="reconciliation-recover")return c.json(svc.recoverReconciliation(actor,generation,await c.req.json()));
      if(operation==="renew"){
        const b=await c.req.json();if(b.token?.generation!==generation)throw new CoordinatorFenceError("coordinator_generation_mismatch","Token and caller generation differ");return c.json(svc.renew(actor,b.token,b.leaseMs,b.operationId));
@@ -112,7 +112,7 @@ export function coordinatorRoutes(opts:{bearerToken:string|null}):Hono {
        const b=await c.req.json();svc.dispose(actor,generation,b.rigId,b.packageKey,b.dispositionId);await svc.runtimeOutcomeAssessment?.drain(b.rigId);return c.json({ok:true});
      }
      if(operation==="recover"){
-       const b=await c.req.json();await svc.refreshRuntimeAvailability(b.rigId);return c.json(svc.recordOutage(actor,generation,b.rigId,b.evidenceId));
+       const b=await c.req.json();return c.json(await svc.withFreshRuntimeAvailability(b.rigId,()=>svc.recordOutage(actor,generation,b.rigId,b.evidenceId)));
      }
      return c.json({error:"unknown_coordinator_operation"},404);
    } catch(err) {

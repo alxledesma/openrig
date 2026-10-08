@@ -204,7 +204,7 @@ export function makePiNativeProver(db: Database.Database, exec: (command: string
         const runnerEv = await genFor(runner.pid), piEv = await genFor(piProc.pid);
         if (runnerEv.value !== binding.generation_uuid) return unknown("generation_unverified_runner", { detail: runnerEv.value === null ? "empty" : "ok" });
         if (piEv.value !== binding.generation_uuid) return unknown("generation_unverified_child", { detail: piEv.value === null ? "empty" : "ok" });
-        return { state: "present", generation: binding.generation_uuid, launchId: launchFlag, lastEntryId: state.lastEntryId ?? null, fingerprint: JSON.stringify({ pane: match[1], runner: [runner.pid, runner.ppid], pi: [piProc.pid, piProc.ppid], launchId: launchFlag, sidecarUpdatedAt: state.updatedAt, genSources: [runnerEv.source, piEv.source] }), quiescence: readQuiescence(state, launchFlag, binding.resume_token, binding.generation_uuid) };
+        return { state: "present", generation: binding.generation_uuid, launchId: launchFlag, lastEntryId: state.lastEntryId ?? null, fingerprint: JSON.stringify({ pane: match[1], runner: [runner.pid, runner.ppid], pi: [piProc.pid, piProc.ppid], launchId: launchFlag, genSources: [runnerEv.source, piEv.source] }), quiescence: readQuiescence(state, launchFlag, binding.resume_token, binding.generation_uuid) };
       };
       const first = await sample(), second = await sample();
       if (!first || !second) return unknown("unstable_between_samples");
