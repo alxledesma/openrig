@@ -7,8 +7,8 @@ import type { PersistedEvent } from "./types.js";
 import type { NativeQueueCustodyReceipt, QueueTransition } from "./queue-transition-log.js";
 import { CoordinatorFenceError, digest, type CoordinatorToken } from "./coordinator-authority-service.js";
 import type { ActivityEvidence, ArbitratedSeatState } from "./activity-taxonomy.js";
-import type { NativeRecoveryObservation, NativeRecoveryContinuationRuntime } from "./native-recovery-continuation-contract.js";
-import { claimedRecoveryContinuationOutboxId, type ClaimedRecoveryContinuationProof } from "./queue-repository.js";
+import type { NativeRecoveryObservation, NativeRecoveryContinuationRuntime, NativeSettledObservation } from "./native-recovery-continuation-contract.js";
+import { claimedRecoveryContinuationOutboxId, type ClaimedRecoveryContinuationProof, ownedOutcomeContinuationOutboxId, type OwnedOutcomeContinuationProof } from "./queue-repository.js";
 import { ADMISSION_DUTY_KIND, CONFIRMATION_DUTY_KIND, FrontierPlanning, PLANNING_DUTY_KIND, type FrontierAdmissionReceipt, type FrontierConfirmationReceipt, type FrontierPlanReceipt, type FrontierReopenReceipt, type FrontierSnapshot, type LegacyClassificationInput, type LegacyClassificationReceipt, type LegacyRevocationInput, type LegacyRevocationReceipt, type ScopeSource } from "./frontier-planning.js";
 
 /** The frontier kinds are next-work planning obligations, not administrative refresh:
@@ -1753,7 +1753,7 @@ private dutyProtection(rigId:string,r:any):boolean {
   if(this.authority.generation('operator-agent@kernel')!==plan!.operatorGeneration)fail('coordination_operator_retired','Reauthorize plan after Operator generation change');
   if(actor!==a!.owner_session||generation!==a!.owner_generation||this.authority.generation(actor)!==generation||a!.state!=='active'||a!.lease_until<=this.now())fail('coordinator_retired','Only reconciled current holder may dispatch');
   const [,failures]=await Promise.all([this.refreshActivity(rigId),this.preparedDispatch(rigId,scope=>this.reconcileScoped(actor,generation,rigId,scope))]);
-  const continuationResults=await this.stageRecoveredClaimedContinuations(actor,generation,rigId);
+  const continuationResults=[...await this.stageRecoveredClaimedContinuations(actor,generation,rigId),...await this.stageOwnedOutcomeContinuations(actor,generation,rigId)];
   // Aggregate administration/status may stage its existing duties, but cannot dispatch
   // another owner from cached evidence or re-use a preparation after asynchronous waits.
   return [...this.reconcileScoped(actor,generation,rigId,new Map()),...failures,...continuationResults];
@@ -1778,7 +1778,7 @@ private dutyProtection(rigId:string,r:any):boolean {
   // assignments. Re-read the holder after native observation; the continuation
   // path independently fences current authority, admission, custody and effects.
   const current=this.authority.get(rigId);
-  const continuations=current?await this.stageRecoveredClaimedContinuations(current.owner_session,current.owner_generation,rigId):[];
+  const continuations=current?[...await this.stageRecoveredClaimedContinuations(current.owner_session,current.owner_generation,rigId),...await this.stageOwnedOutcomeContinuations(current.owner_session,current.owner_generation,rigId)]:[];
   const final=this.superviseScoped(rigId,jobId,new Map());
   return final?[...final,...failures,...continuations]:failures.length||continuations.length?[...failures,...continuations]:null;
  }
@@ -2013,6 +2013,71 @@ private dutyProtection(rigId:string,r:any):boolean {
   const plan=this.plan(proof.rigId),task=plan?.tasks.find(t=>t.packageKey===proof.packageKey),authority=this.authority.get(proof.rigId);
   return !!task&&!!authority?this.claimedContinuationReady({rigId:proof.rigId,task,queueId,holderSession,holderGeneration:proof.holderGeneration,epoch:proof.epoch,proof,outboxId}):'invalid';
  }
+ /** Post-claim durable activity is a trigger, not semantic completion. The native
+  * observer independently proves current quiescence before staging and sending. */
+ private ownedOutcomeFacts(queueId:string,owner:string,generation:string):{claimedAt:string;claimTransitionId:number;activitySeq:number;activityEventAt:string}|null {
+  const q=this.repo.getById(queueId),target=resolveGuardTarget(this.db,owner);
+  if(!q?.claimedAt||!target||target.occupant!==generation)return null;
+  const claim=this.db.prepare("SELECT transition_id,ts FROM queue_transitions WHERE qitem_id=? AND state='in-progress' AND actor_session=? AND identity_provenance='transport:v1' ORDER BY transition_id DESC LIMIT 1").get(queueId,owner) as {transition_id:number;ts:string}|undefined;
+  const event=this.db.prepare("SELECT seq,payload FROM events WHERE node_id=? AND type='agent.activity' ORDER BY seq DESC LIMIT 1").get(target.nodeId) as {seq:number;payload:string}|undefined;
+  if(!claim||!event)return null;
+  try {
+   const e=JSON.parse(event.payload),at=Date.parse(e.activity?.eventAt??''),claimedAt=Date.parse(q.claimedAt),transitionAt=Date.parse(claim.ts);
+   if(e.sessionName!==owner||e.nodeId!==target.nodeId||e.activity?.generation!==generation||e.activity?.state!=='idle'||!Number.isFinite(at)||!Number.isFinite(claimedAt)||!Number.isFinite(transitionAt)||at<=Math.max(claimedAt,transitionAt)||at>this.now())return null;
+   return {claimedAt:q.claimedAt,claimTransitionId:claim.transition_id,activitySeq:event.seq,activityEventAt:e.activity.eventAt};
+  }catch{return null;}
+ }
+ private settledObservationMatches(rigId:string,owner:string,generation:string,o:NativeSettledObservation,fresh=false):boolean {
+  if(!o||o.schema!=='native-settled-observation.v1'||o.rigId!==rigId||o.sessionName!==owner||o.generation!==generation||!o.sessionId||!o.nodeId||!o.nativeIdentityHash||!o.configurationDigest||!o.lastEntryId||!o.incarnation?.key||!Number.isSafeInteger(o.incarnation.native?.pid)||o.incarnation.native.pid<=0||!o.incarnation.native.startFingerprint||!Number.isFinite(o.observedAt)||o.observedAt>this.now()||!Number.isFinite(o.quiescenceObservedAt)||o.quiescenceObservedAt>o.observedAt||(fresh&&this.now()-o.observedAt>3000))return false;
+  const target=resolveGuardTarget(this.db,owner);
+  return !!target&&target.nodeId===o.nodeId&&target.occupant===generation&&this.configurationDigest(owner)===o.configurationDigest&&!!this.db.prepare('SELECT 1 FROM sessions s JOIN nodes n ON n.id=s.node_id WHERE s.id=? AND s.node_id=? AND s.session_name=? AND n.rig_id=?').get(o.sessionId,o.nodeId,owner,rigId);
+ }
+ /** Current authority/admission/effects reuse the retained-claim fence. The proof
+  * adds the exact claim transition and durable post-claim activity boundary. */
+ ownedOutcomeContinuationWakeReadiness(outboxId:string,queueId:string,holderSession:string,recipient:string,tags:string[],requireReceipt=true,currentObservation?:NativeSettledObservation):'ready'|'held'|'invalid' {
+  let p:OwnedOutcomeContinuationProof;
+  try{if(tags.length!==3||tags[0]!=='queue:owned-outcome-protocol')return 'invalid';p=JSON.parse(tags[1]!) as OwnedOutcomeContinuationProof;}catch{return 'invalid';}
+  if(!p||p.schema!=='owned-outcome-protocol.v1'||p.queueId!==queueId||p.holderSession!==holderSession||p.observation?.sessionName!==recipient||tags[2]!==`queue:recipient-generation:${p.claimantGeneration}`||outboxId!==ownedOutcomeContinuationOutboxId(p))return 'invalid';
+  const plan=this.plan(p.rigId),task=plan?.tasks.find(t=>t.packageKey===p.packageKey);
+  if(!task||task.owner!==recipient||task.admission.generation!==p.claimantGeneration)return 'invalid';
+  const common=this.claimedContinuationReady({rigId:p.rigId,task,queueId,holderSession,holderGeneration:p.holderGeneration,epoch:p.epoch,outboxId});
+  if(common!=='ready')return common;
+  const row=this.db.prepare('SELECT p.contract_hash,a.body_hash FROM coordinator_assignments a JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.package_key=? AND a.queue_id=?').get(p.rigId,p.packageKey,queueId) as {contract_hash:string;body_hash:string}|undefined;
+  const facts=this.ownedOutcomeFacts(queueId,recipient,p.claimantGeneration);
+  if(!row||row.contract_hash!==p.contractHash||row.body_hash!==p.bodyHash||p.predecessorsHash!==digest(JSON.stringify(task.predecessors))||!this.settledObservationMatches(p.rigId,recipient,p.claimantGeneration,p.observation))return 'invalid';
+  // Trigger sequence/cursor are immutable audit evidence, not a lease on a future
+  // turn. Keep the obligation pending across intervening work and reobserve it.
+  if(!facts)return 'held';
+  if(facts.claimedAt!==p.claimedAt||facts.claimTransitionId!==p.claimTransitionId)return 'invalid';
+  const current=requireReceipt?currentObservation:p.observation;
+  if(!current||!this.settledObservationMatches(p.rigId,recipient,p.claimantGeneration,current,true)||current.quiescenceObservedAt<Date.parse(facts.activityEventAt))return 'held';
+  if(current.incarnation.key!==p.observation.incarnation.key||current.nativeIdentityHash!==p.observation.nativeIdentityHash)return 'invalid';
+  if(requireReceipt){
+   const saved=this.db.prepare("SELECT receipt,request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=? AND kind='owned-outcome-protocol'").get(p.rigId,outboxId) as {receipt:string;request_hash:string}|undefined;
+   if(!saved||saved.receipt!==JSON.stringify(p)||saved.request_hash!==digest(saved.receipt))return 'invalid';
+  }
+  return 'ready';
+ }
+ private async stageOwnedOutcomeContinuations(actor:string,generation:string,rigId:string):Promise<CoordinationResult[]> {
+  const runtime=this.nativeRecoveryContinuation,plan=this.plan(rigId),authority=this.authority.get(rigId);
+  if(!runtime?.observeSettledClaimant||!runtime.withSettledClaimant||!plan||!authority||authority.owner_session!==actor||authority.owner_generation!==generation)return [];
+  const results:CoordinationResult[]=[];
+  for(const task of plan.tasks){
+   const assigned=this.db.prepare('SELECT a.queue_id,p.contract_hash,a.body_hash FROM coordinator_assignments a JOIN coordinator_packages p ON p.rig_id=a.rig_id AND p.package_key=a.package_key WHERE a.rig_id=? AND a.package_key=? AND a.disposition_id IS NULL').get(rigId,task.packageKey) as {queue_id:string;contract_hash:string;body_hash:string}|undefined;
+   if(!assigned||this.claimedContinuationReady({rigId,task,queueId:assigned.queue_id,holderSession:actor,holderGeneration:generation,epoch:authority.epoch})!=='ready')continue;
+   const facts=this.ownedOutcomeFacts(assigned.queue_id,task.owner,task.admission.generation);if(!facts)continue;
+   const obligationId=ownedOutcomeContinuationOutboxId({rigId,queueId:assigned.queue_id,claimantGeneration:task.admission.generation,...facts});
+   if(this.db.prepare('SELECT 1 FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(rigId,obligationId))continue;
+   let observation:NativeSettledObservation|null;try{observation=await runtime.observeSettledClaimant(task.owner);}catch{continue;}
+   if(!observation||!this.settledObservationMatches(rigId,task.owner,task.admission.generation,observation,true))continue;
+   const proof:OwnedOutcomeContinuationProof={schema:'owned-outcome-protocol.v1',rigId,queueId:assigned.queue_id,packageKey:task.packageKey,contractHash:assigned.contract_hash,bodyHash:assigned.body_hash,claimantGeneration:task.admission.generation,holderSession:actor,holderGeneration:generation,epoch:authority.epoch,planRevision:plan.revision,admissionHash:digest(JSON.stringify({deadline:task.deadline,admission:task.admission,dispatchRestriction:plan.dispatchRestrictions?.find(r=>r.session===task.owner)??null})),predecessorsHash:digest(JSON.stringify(task.predecessors)),...facts,observation};
+   try{
+    const outboxId=this.db.transaction(()=>this.repo.stageOwnedOutcomeContinuation({proof,recipient:task.owner,body:`Your native turn settled while you still own assignment ${assigned.queue_id}. This is a bounded outcome-protocol obligation, not a new assignment or permission to repeat product work. Read that exact item with rig queue show ${assigned.queue_id} --full --json and follow its return instructions (returnInstructions) using your genuine identity. Reconcile your retained evidence first. If complete, create a NEW worker-authored typed return with the required evidence references, truthfully close the original using the supported closure contract, then invoke coordinator dispose for the original package and new return. If unfinished or blocked, record that truthful state through supported native commands and report the concrete remaining work or blocker; do not invent completion. Preserve all UNKNOWN effects; never replay uncertain sends. This notice grants no acceptance, recovery or additional product scope.`})).immediate();
+    if(outboxId)results.push({key:task.key,state:'owned-outcome-protocol-staged',queueId:assigned.queue_id,deadline:task.deadline});
+   }catch{/* safe hold; no original claim or effect is rewritten */}
+  }
+  return results;
+ }
  private reconcileScoped(actor:string,generation:string,rigId:string,scope?:DispatchScope):CoordinationResult[] {
   return this.db.transaction(()=>{
    const a=this.authority.get(rigId),plan=this.plan(rigId);
@@ -2193,7 +2258,7 @@ private dutyProtection(rigId:string,r:any):boolean {
  private pendingClaimedContinuations(session:string,queueId:string):string[] {
   return (this.db.prepare(`SELECT outbox_id FROM outbox_entries
    WHERE delivery_state='pending' AND destination_session=? AND audit_pointer=?
-    AND CASE WHEN json_valid(tags) THEN json_extract(tags,'$[0]') END='queue:claimed-native-recovery-continuation'`)
+    AND CASE WHEN json_valid(tags) THEN json_extract(tags,'$[0]') END IN ('queue:claimed-native-recovery-continuation','queue:owned-outcome-protocol')`)
    .all(session,queueId) as {outbox_id:string}[]).map(row=>row.outbox_id);
  }
  private workerEffectDebt(session:string,excludeEffect?:string|string[]):boolean {

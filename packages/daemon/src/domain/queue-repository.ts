@@ -7,7 +7,7 @@ import { CoordinatorAuthorityService, CoordinatorFenceError, AssignmentReplay, t
 import { readWakeLadderBackstop } from "./queue-wake-ladder.js";
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
-import type { NativeRecoveryObservation, NativeRecoveryContinuationRuntime } from "./native-recovery-continuation-contract.js";
+import type { NativeRecoveryObservation, NativeRecoveryContinuationRuntime, NativeSettledObservation } from "./native-recovery-continuation-contract.js";
 
 export interface ClaimedRecoveryContinuationProof {
   schema: "claimed-native-recovery-continuation.v1";
@@ -24,6 +24,19 @@ export interface ClaimedRecoveryContinuationProof {
   admissionHash: string;
   predecessorsHash: string;
   observation: NativeRecoveryObservation;
+}
+
+export interface OwnedOutcomeContinuationProof extends Omit<ClaimedRecoveryContinuationProof, "schema" | "observation"> {
+  schema: "owned-outcome-protocol.v1";
+  claimedAt: string;
+  claimTransitionId: number;
+  activitySeq: number;
+  activityEventAt: string;
+  observation: NativeSettledObservation;
+}
+/** One obligation per actual claim, independent of quiet timestamps or cursor churn. */
+export function ownedOutcomeContinuationOutboxId(proof: Pick<OwnedOutcomeContinuationProof, "rigId" | "queueId" | "claimantGeneration" | "claimedAt" | "claimTransitionId">): string {
+  return `${WAKE_INTENT_PREFIX}owned-outcome-${createHash("sha256").update(JSON.stringify([proof.rigId,proof.queueId,proof.claimantGeneration,proof.claimedAt,proof.claimTransitionId])).digest("hex")}`;
 }
 
 export function claimedRecoveryContinuationOutboxId(proof: Pick<ClaimedRecoveryContinuationProof, "rigId" | "queueId" | "claimantGeneration" | "observation">): string {
@@ -1036,6 +1049,18 @@ export class QueueRepository {
     return outboxId;
   }
 
+  /** Immutable observation and notice commit together; no original custody changes. */
+  stageOwnedOutcomeContinuation(input:{proof:OwnedOutcomeContinuationProof;recipient:string;body:string}):string|null {
+    if(!this.db.inTransaction||!this.outbox)throw new QueueRepositoryError('wake_intent_store_unavailable','Outcome protocol requires an atomic durable wake store');
+    const p=input.proof,outboxId=ownedOutcomeContinuationOutboxId(p);
+    if(this.outbox.getById(outboxId)||this.db.prepare('SELECT 1 FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(p.rigId,outboxId))return null;
+    const tags=['queue:owned-outcome-protocol',JSON.stringify(p),`queue:recipient-generation:${p.claimantGeneration}`];
+    if(this.coordinatorAuthority.coordinationRecovery?.ownedOutcomeContinuationWakeReadiness(outboxId,p.queueId,p.holderSession,input.recipient,tags,false)!=='ready')return null;
+    this.db.prepare('INSERT INTO coordinator_operations (rig_id,operation_id,kind,receipt,request_hash) VALUES (?,?,?,?,?)').run(p.rigId,outboxId,'owned-outcome-protocol',JSON.stringify(p),createHash('sha256').update(JSON.stringify(p)).digest('hex'));
+    this.recordWakeIntent({outboxId,auditPointer:p.queueId,fromSession:p.holderSession,toSession:input.recipient,identityProvenance:'system:operator-authorized-coordination',bareBody:input.body,tags});
+    return outboxId;
+  }
+
   private recordWakeIntent(input: {
     outboxId: string;
     auditPointer: string;
@@ -1210,7 +1235,7 @@ export class QueueRepository {
       if (alreadyHeld.auditPointer) this.recordNudgeAttempt(alreadyHeld.auditPointer, "retained:typing_guard");
       return "retained";
     }
-    if(alreadyHeld?.tags?.includes('queue:claimed-native-recovery-continuation'))
+    if(alreadyHeld?.tags?.includes('queue:claimed-native-recovery-continuation')||alreadyHeld?.tags?.includes('queue:owned-outcome-protocol'))
       return this.deliverClaimedRecoveryContinuation(alreadyHeld);
     // MF3: CLAIM (pending→sending) BEFORE the external send so overlapping drains
     // cannot both send. A losing claim — the row is no longer `pending` (already
@@ -1360,14 +1385,16 @@ export class QueueRepository {
       return true;
     })();
 
-    let proof: ClaimedRecoveryContinuationProof;
+    const outcomeProtocol=intent.tags?.[0]==="queue:owned-outcome-protocol";
+    if(outcomeProtocol&&!runtime.withSettledClaimant)return "retained";
+    let proof: ClaimedRecoveryContinuationProof | OwnedOutcomeContinuationProof;
     try {
-      if (!intent.tags || intent.tags.length !== 3 || intent.tags[0] !== "queue:claimed-native-recovery-continuation") return invalidatePending() ? "failed" : "skipped";
-      proof = JSON.parse(intent.tags[1]!) as ClaimedRecoveryContinuationProof;
-      if (!proof || proof.schema !== "claimed-native-recovery-continuation.v1" ||
-          intent.outboxId !== claimedRecoveryContinuationOutboxId(proof) ||
-          intent.tags[2] !== `queue:recipient-generation:${proof.claimantGeneration}` ||
-          proof.queueId !== intent.auditPointer || proof.observation?.completion?.sessionName !== intent.destinationSession) return invalidatePending() ? "failed" : "skipped";
+      if (!intent.tags || intent.tags.length !== 3 || !["queue:claimed-native-recovery-continuation","queue:owned-outcome-protocol"].includes(intent.tags[0]!)) return invalidatePending() ? "failed" : "skipped";
+      proof = JSON.parse(intent.tags[1]!) as ClaimedRecoveryContinuationProof | OwnedOutcomeContinuationProof;
+      const valid=outcomeProtocol
+        ?proof.schema==="owned-outcome-protocol.v1"&&intent.outboxId===ownedOutcomeContinuationOutboxId(proof)&&proof.observation.sessionName===intent.destinationSession
+        :proof.schema==="claimed-native-recovery-continuation.v1"&&intent.outboxId===claimedRecoveryContinuationOutboxId(proof)&&proof.observation?.completion?.sessionName===intent.destinationSession;
+      if(!valid||intent.tags[2]!==`queue:recipient-generation:${proof.claimantGeneration}`||proof.queueId!==intent.auditPointer)return invalidatePending()?"failed":"skipped";
     } catch {
       return invalidatePending() ? "failed" : "skipped";
     }
@@ -1385,14 +1412,15 @@ export class QueueRepository {
     };
 
     try {
-      const guarded = await runtime.withRecoveredIncarnation(proof.observation, async () => {
+      const guardedSend = async (currentObservation?:NativeSettledObservation):Promise<CallbackResult> => {
         // No await is permitted between the final readiness read and the CAS.
         const decision = this.db.transaction(() => {
           const current = this.outbox!.getById(intent.outboxId);
           if (!current || current.deliveryState !== "pending") return "lost" as const;
-          const readiness = this.coordinatorAuthority.coordinationRecovery?.claimedRecoveryContinuationWakeReadiness(
-            intent.outboxId, proof.queueId, intent.senderSession, intent.destinationSession, current.tags ?? [],
-          ) ?? "invalid";
+          const service=this.coordinatorAuthority.coordinationRecovery;
+          const readiness = (outcomeProtocol
+            ?service?.ownedOutcomeContinuationWakeReadiness(intent.outboxId,proof.queueId,intent.senderSession,intent.destinationSession,current.tags??[],true,currentObservation)
+            :service?.claimedRecoveryContinuationWakeReadiness(intent.outboxId,proof.queueId,intent.senderSession,intent.destinationSession,current.tags??[]))??"invalid";
           if (readiness === "held") return "held" as const;
           if (readiness === "invalid") {
             const safeTags = current.tags ?? [];
@@ -1417,7 +1445,10 @@ export class QueueRepository {
         const result: CallbackResult = { kind: "sent", outcome };
         callbackResult = result;
         return result;
-      });
+      };
+      const guarded=proof.schema==="owned-outcome-protocol.v1"
+        ?await runtime.withSettledClaimant!(proof.observation,guardedSend)
+        :await runtime.withRecoveredIncarnation(proof.observation,guardedSend);
 
       if (transportInvoked && guarded.state !== "performed") {
         finalizeUnknown(`guard-${guarded.state}:${guarded.reason}`);

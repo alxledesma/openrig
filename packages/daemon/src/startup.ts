@@ -439,6 +439,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // attachTransport().
   let recoveredRuntime: ReturnType<typeof createNativeRecoveryContinuation> | undefined;
   const recoveredBridge: NativeRecoveryContinuationRuntime = {
+    observeSettledClaimant: session => recoveredRuntime?.observeSettledClaimant?.(session) ?? Promise.resolve(null),
+    withSettledClaimant: (observation,send) => recoveredRuntime?.withSettledClaimant?.(observation,send) ?? Promise.resolve({state:"held",reason:"native-settled-runtime-unavailable"}),
     observeRecoveredIncarnation: session => recoveredRuntime?.observeRecoveredIncarnation(session) ?? Promise.resolve(null),
     withRecoveredIncarnation: (observation,send) => recoveredRuntime?.withRecoveredIncarnation(observation,send) ?? Promise.resolve({state:"held",reason:"native-recovery-runtime-unavailable"}),
   };

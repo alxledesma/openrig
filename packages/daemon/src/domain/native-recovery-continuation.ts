@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { EventBus } from "./event-bus.js";
 import { NativeRecoveryCompletionStore, type NativeRecoveryCompletionPublisher } from "./native-recovery-completion.js";
-import type { NativeRecoveryCompletion, NativeRecoveryContinuationRuntime, NativeRecoveryGuardResult, NativeRecoveryObservation } from "./native-recovery-continuation-contract.js";
+import type { NativeRecoveryCompletion, NativeRecoveryContinuationRuntime, NativeRecoveryGuardResult, NativeRecoveryObservation, NativeSettledObservation } from "./native-recovery-continuation-contract.js";
 import { readPinnedLegacyPiRecovery, type PinnedLegacyRecovery, type LegacyPiRecovery } from "./native-recovery-legacy.js";
 import { nativeRecoverySourceValid } from "./native-recovery-source-proof.js";
 import { observeNativeDutyLaunch, verifyNativeDutyProcessIdentity, type NativeDutyLaunchStore } from "./native-duty-launch.js";
@@ -63,6 +63,38 @@ export function createNativeRecoveryContinuation(deps:{
     const incarnation={key:digest(JSON.stringify({nodeId:b.nodeId,generation:b.generation,nativeIdentityHash:b.nativeIdentityHash,...fields})),...fields};
     return {binding:b,incarnation,proof};
   };
+  // A settled turn does not require a recovery receipt. Pair native kernel
+  // identity with two cursor/quiescence samples; quiet refresh timestamps are
+  // freshness evidence only and never part of the turn/incarnation identity.
+  const settled = async (session:string):Promise<NativeSettledObservation|null> => {
+    const b=binding(session);if(!b||b.runtime!=="pi")return null;
+    const before=await deps.piProve(session);
+    const current=await observe(session);if(!current)return null;
+    const after=await deps.piProve(session),at=now();
+    const fresh=(p:PiNativeProof|null)=>{
+      const qAt=Date.parse(p?.quiescence?.observedAt??"");
+      // The prover fingerprint binds its native runner launch independently of
+      // the sidecar's launch field. Never accept contradictory proof metadata.
+      const nativeLaunch=p?.state==="present"?JSON.parse(p.fingerprint).launchId:null;
+      return p?.state==="present"&&p.generation===b.generation
+        &&p.launchId===nativeLaunch&&p.launchId===current.incarnation.runtimeLaunchId&&p.fingerprint===current.proof.nativeFingerprint
+        &&typeof p.lastEntryId==="string"&&p.lastEntryId.trim().length>0
+        &&p.quiescence?.settled===true&&Number.isFinite(qAt)&&qAt<=at&&at-qAt<=3000;
+    };
+    if(!fresh(before)||!fresh(after)||before!.lastEntryId!==after!.lastEntryId
+      ||!same(b,current.binding)||!same(b,binding(session)))return null;
+    const latest=deps.store?.latest(b.nodeId,b.generation);
+    if(!latest||latest.intent.launchId!==current.incarnation.supervisorLaunchId
+      ||latest.intent.configurationDigest!==b.configurationDigest)return null;
+    return {schema:"native-settled-observation.v1",rigId:b.rigId,nodeId:b.nodeId,sessionId:b.sessionId,
+      sessionName:b.sessionName,generation:b.generation,runtime:b.runtime,nativeIdentityHash:b.nativeIdentityHash,
+      configurationDigest:b.configurationDigest,incarnation:current.incarnation,lastEntryId:after!.lastEntryId!,
+      quiescenceObservedAt:Date.parse(after!.quiescence!.observedAt!),observedAt:at};
+  };
+  const settledBindingMatches=(o:NativeSettledObservation,b:ReturnType<typeof binding>)=>
+    !!b&&o?.schema==="native-settled-observation.v1"&&o.rigId===b.rigId&&o.nodeId===b.nodeId
+      &&o.sessionId===b.sessionId&&o.sessionName===b.sessionName&&o.generation===b.generation&&o.runtime===b.runtime
+      &&o.nativeIdentityHash===b.nativeIdentityHash&&o.configurationDigest===b.configurationDigest;
   const matches=(completion:NativeRecoveryCompletion,current:NonNullable<Awaited<ReturnType<typeof observe>>>)=>{
     const b=current.binding;
     return completion.nodeId===b.nodeId&&completion.sessionId===b.sessionId&&completion.sessionName===b.sessionName
@@ -106,6 +138,25 @@ export function createNativeRecoveryContinuation(deps:{
     });
   };
   return {
+    observeSettledClaimant:async session=>{try{return await settled(session);}catch{return null;}},
+    withSettledClaimant:async<T>(observation:NativeSettledObservation,send:(current:NativeSettledObservation)=>Promise<T>):Promise<NativeRecoveryGuardResult<T>>=>{
+      let sendStarted=false;
+      try{return await deps.guard.operation(observation.sessionName,async()=>{
+        if(!settledBindingMatches(observation,binding(observation.sessionName)))return {state:"invalid",reason:"settled-binding-changed"};
+        const current=await settled(observation.sessionName);
+        if(!current)return {state:"held",reason:"native-settled-observation-unavailable"};
+        if(!settledBindingMatches(observation,binding(observation.sessionName))
+          ||!same(observation.incarnation,current.incarnation))
+          return {state:"invalid",reason:"settled-incarnation-changed"};
+        // No await from the final synchronous binding check to the consumer's
+        // atomic queue/CAS callback. Errors after callback starts stay UNKNOWN.
+        sendStarted=true;
+        return {state:"performed",value:await send(current)};
+      });}catch(error){
+        if(!sendStarted&&error instanceof DeliveryGuardError)return {state:error.code==="guard_target_changed"?"invalid":"held",reason:error.code};
+        throw error;
+      }
+    },
     recordNativeRecoveryCompletion:async evidence=>{
       if(deps.enabled&&!deps.enabled(evidence.nodeId))return;
       const current=await observe(evidence.sessionName,true);
