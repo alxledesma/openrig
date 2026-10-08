@@ -502,6 +502,20 @@ export class ContextRefreshIntegration implements ContextRefreshFacade {
   }
   async reconcile(actor:ContextRefreshActor,input:ContextRefreshSelection):Promise<ContextRefreshStatus>{
     const status=await this.status(actor,input);
+    if(input.operationId){
+      // A missing receipt does not authorize replay. Fence this exact request
+      // before declaring no effect: any delayed step must observe the tombstone.
+      // Existing invoked work is never cancelled by absence of process-local state.
+      this.retained(input.grantId,actor);this.operator(actor);
+      if(!id(input.operationId))refuse("refresh_operation_invalid","Bounded explicit step invocation ID required");
+      this.deps.db.transaction(()=>{
+        if(this.invocationExists(actor,{...input,operationId:input.operationId!}))return;
+        const digest=contextRefreshDigest({actor,input});
+        this.event(input.grantId,input.nodeId,input.operationId!,"step-invocation",digest);
+        this.event(input.grantId,input.nodeId,input.operationId!,"step-cancelled-before-invocation",digest);
+        this.event(input.grantId,input.nodeId,input.operationId!,"step-completed",digest);
+      }).immediate();
+    }
     if(status.checkpointRequest)this.ledger.reconcileCheckpoint(actor,status.checkpointRequest.operationId);
     if(status.attempt&&!['prepared','refreshed','cancelled-before-effect'].includes(status.attempt.phase)){
       try{await this.refreshEvidence(status.attempt,actor);}catch{this.receiptProofs.delete(status.attempt.attemptId);}
@@ -515,6 +529,14 @@ export class ContextRefreshIntegration implements ContextRefreshFacade {
     await this.reservations.attest(actor.session,actor.generation,attempt.reservationId,{operationId:attempt.operationId,checkpointHash:attempt.checkpoint.checkpointHash,kind:input.kind,evidenceRef:input.evidenceRef});
     await this.refreshEvidence(attempt,grant.executor);return this.ledger.reconcile(grant.executor,attempt.attemptId);
   }
+  private invocationExists(actor:ContextRefreshActor,input:ContextRefreshSelection&{operationId:string}):boolean {
+    const rows=this.deps.db.prepare("SELECT grant_id,node_id,phase,evidence_digest FROM context_refresh_events WHERE operation_id=?").all(input.operationId) as Array<{grant_id:string;node_id:string;phase:string;evidence_digest:string}>;
+    if(!rows.length)return false;
+    const prior=rows.find(row=>row.phase==="step-invocation");
+    if(!prior||prior.grant_id!==input.grantId||prior.node_id!==input.nodeId||prior.evidence_digest!==contextRefreshDigest({actor,input}))
+      refuse("refresh_operation_conflict","Step invocation ID is immutable");
+    return true;
+  }
   async step(actor:ContextRefreshActor,input:ContextRefreshSelection&{operationId:string}):Promise<ContextRefreshStepResult>{
     const invocation={owned:false};
     try { return await this.grantScope.run(input.grantId,()=>this.executeStep(actor,input,invocation)); }
@@ -527,18 +549,20 @@ export class ContextRefreshIntegration implements ContextRefreshFacade {
   private async executeStep(actor:ContextRefreshActor,input:ContextRefreshSelection&{operationId:string},invocation:{owned:boolean}):Promise<ContextRefreshStepResult>{
     if(!id(input.operationId))refuse("refresh_operation_invalid","Bounded explicit step invocation ID required");
     const grant=this.retained(input.grantId,actor),initial=await this.status(actor,input),existing=initial.attempt;
+    this.operator(actor);
+    // Accept and durably bind the invocation before a guard can refuse it.
+    // No effect occurs until the existing lifecycle/native/ledger gates pass.
+    const repeated=this.deps.db.transaction(()=>{
+      if(this.invocationExists(actor,input))return true;
+      this.assertNoInvocationDebt(input.nodeId);
+      this.event(input.grantId,input.nodeId,input.operationId,"step-invocation",contextRefreshDigest({actor,input}));return false;
+    }).immediate();
+    const result=async(effect:ContextRefreshStepResult["effect"],decision:ContextRefreshDecision|null,hold:string|null):Promise<ContextRefreshStepResult>=>({...await this.status(actor,input),operationId:input.operationId,effect,decision,hold});
+    if(repeated)return result("none",null,"invocation-retained-reconcile-only");
+    invocation.owned=true;
     const preparedIds={attemptId:`refresh-${randomUUID()}`,operationId:`rotation-${randomUUID()}`,reservationId:`reservation-${randomUUID()}`};
     const reservation=existing?this.deps.db.prepare("SELECT state FROM seat_dispatch_reservations WHERE reservation_id=?").get(existing.reservationId) as {state:string}|undefined:undefined;
     return this.deps.guard.lifecycle([grant.executor.nodeId,input.nodeId],async()=>{
-      const repeated=this.deps.db.transaction(()=>{
-        const prior=this.deps.db.prepare("SELECT evidence_digest FROM context_refresh_events WHERE operation_id=? AND phase='step-invocation' LIMIT 1").get(input.operationId) as {evidence_digest:string}|undefined;
-        const digest=contextRefreshDigest({actor,input});if(prior){if(prior.evidence_digest!==digest)refuse("refresh_operation_conflict","Step invocation ID is immutable");return true;}
-        this.assertNoInvocationDebt(input.nodeId);
-        this.event(input.grantId,input.nodeId,input.operationId,"step-invocation",digest);return false;
-      }).immediate();
-      const result=async(effect:ContextRefreshStepResult["effect"],decision:ContextRefreshDecision|null,hold:string|null):Promise<ContextRefreshStepResult>=>({...await this.status(actor,input),operationId:input.operationId,effect,decision,hold});
-      if(repeated)return result("none",null,"invocation-retained-reconcile-only");
-      invocation.owned=true;
       let status=await this.reconcile(actor,input);
       if(status.attempt?.phase==="uncertainty-held"||status.attempt?.phase==="replacement-started"||status.checkpointRequest?.phase==="uncertainty-held")return result("none",null,"effect-uncertain-reconcile-only");
       await this.refreshExecutor(grant);

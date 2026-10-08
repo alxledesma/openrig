@@ -173,6 +173,7 @@ describe("actual context refresh composition",()=>{
   expect((await integration.status(operator,{...selection(),operationId:"lost-handover"})).invocation?.state).toBe("completed");
   expect((await integration.step(operator,{...selection(),operationId:"next-poll"})).effect).toBe("none");expect(handoverCount).toBe(1);
   expect(db.prepare("SELECT state FROM seat_dispatch_reservations").get()).toEqual({state:"started"});
+  expect(db.prepare("SELECT count(*) n FROM context_refresh_events WHERE operation_id='lost-handover' AND phase='step-cancelled-before-invocation'").get()).toEqual({n:0});
  });
  it("holds expired grant, model/config drift and typing guard before any permit",async()=>{
   await boundGrant();now=grant.validUntil;vi.setSystemTime(now);activityAt=now;expect((await integration.evaluate(operator,selection())).phase).toBe("scope-ended");
@@ -191,9 +192,65 @@ describe("actual context refresh composition",()=>{
   expect(await integration.status(operator,input)).toMatchObject({invocation:{operationId:input.operationId,state:"in-flight"}});
   expect((await integration.step(operator,input)).effect).toBe("none");
   expect((await integration.status(operator,input)).invocation?.state).toBe("in-flight");
+  await integration.reconcile(operator,input);
+  expect((await integration.status(operator,input)).invocation?.state).toBe("in-flight");
+  expect(db.prepare("SELECT count(*) n FROM context_refresh_events WHERE operation_id=? AND phase='step-cancelled-before-invocation'").get(input.operationId)).toEqual({n:0});
   await expect(integration.step(operator,{...selection(),operationId:"bypass-attempt"})).rejects.toThrow("unfinished invocation");
   await expect(integration.grant(operator,{...grant,grantId:"bypass-grant"})).rejects.toThrow("unfinished invocation");
   expect(db.prepare("SELECT count(*) n FROM context_refresh_checkpoint_requests").get()).toEqual({n:0});
+ });
+ it("records a guard refusal before lifecycle acquisition and does not create an effect",async()=>{
+  await boundGrant();await guard.set(seat,true,"fixture","pre-effect guard refusal");
+  const input={...selection(),operationId:"guard-refusal-invocation"};
+  await expect(integration.step(operator,input)).rejects.toThrow();
+  expect(await integration.status(operator,input)).toMatchObject({invocation:{operationId:input.operationId,state:"completed"}});
+  expect(db.prepare("SELECT phase FROM context_refresh_events WHERE operation_id=? ORDER BY id").all(input.operationId)).toEqual([
+   {phase:"step-invocation"},{phase:"step-completed"}
+  ]);
+  expect(db.prepare("SELECT count(*) n FROM context_refresh_attempts").get()).toEqual({n:0});
+  expect(db.prepare("SELECT count(*) n FROM context_refresh_checkpoint_requests").get()).toEqual({n:0});
+  expect(handoverCount).toBe(0);
+ });
+ it("turns an exact missing invocation into a no-effect tombstone that a late step cannot replay",async()=>{
+  await boundGrant();const input={...selection(),operationId:"missing-invocation-reconciled"};
+  expect((await integration.status(operator,input)).invocation).toBeNull();
+  expect(await integration.reconcile(operator,input)).toMatchObject({invocation:{operationId:input.operationId,state:"completed"}});
+  expect(db.prepare("SELECT phase FROM context_refresh_events WHERE operation_id=? ORDER BY id").all(input.operationId)).toEqual([
+   {phase:"step-invocation"},{phase:"step-cancelled-before-invocation"},{phase:"step-completed"}
+  ]);
+  expect((await integration.step(operator,input)).effect).toBe("none");
+  expect(db.prepare("SELECT count(*) n FROM context_refresh_attempts").get()).toEqual({n:0});
+  expect(db.prepare("SELECT count(*) n FROM context_refresh_checkpoint_requests").get()).toEqual({n:0});
+  expect(handoverCount).toBe(0);
+ });
+ it("lets exact reconciliation cancel a request waiting before claim and fences its late continuation",async()=>{
+  await boundGrant();const input={...selection(),operationId:"concurrent-missing-invocation"};
+  const original=integration.status.bind(integration);let blocked=false,entered!:()=>void,release!:()=>void;
+  const atStatus=new Promise<void>(resolve=>{entered=resolve;}),barrier=new Promise<void>(resolve=>{release=resolve;});
+  vi.spyOn(integration,"status").mockImplementation(async(actor,inputArg)=>{
+   if(inputArg.operationId===input.operationId&&!blocked){blocked=true;entered();await barrier;}
+   return original(actor,inputArg);
+  });
+  const lateStep=integration.step(operator,input);await atStatus;
+  const reconciled=await integration.reconcile(operator,input);
+  expect(reconciled.invocation).toMatchObject({operationId:input.operationId,state:"completed"});
+  release();expect((await lateStep).effect).toBe("none");
+  expect(db.prepare("SELECT phase FROM context_refresh_events WHERE operation_id=? ORDER BY id").all(input.operationId)).toEqual([
+   {phase:"step-invocation"},{phase:"step-cancelled-before-invocation"},{phase:"step-completed"}
+  ]);
+  expect(db.prepare("SELECT count(*) n FROM context_refresh_attempts").get()).toEqual({n:0});
+  expect(db.prepare("SELECT count(*) n FROM context_refresh_checkpoint_requests").get()).toEqual({n:0});
+  expect(handoverCount).toBe(0);
+ });
+ it("refuses another actor and a conflicting immutable operation instead of tombstoning",async()=>{
+  await boundGrant();const input={...selection(),operationId:"operation-conflict-no-tombstone"};
+  await expect(integration.reconcile({session:"other-operator",generation:"other-g1"},input)).rejects.toThrow();
+  expect(db.prepare("SELECT count(*) n FROM context_refresh_events WHERE operation_id=?").get(input.operationId)).toEqual({n:0});
+  const foreignActor={session:"other-operator",generation:"other-g1"};
+  db.prepare("INSERT INTO context_refresh_events(grant_id,node_id,operation_id,phase,evidence_digest,observed_at) VALUES(?,?,?,'step-invocation',?,?)")
+   .run(grant.grantId,seat,input.operationId,contextRefreshDigest({actor:foreignActor,input}),now);
+  await expect(integration.reconcile(operator,input)).rejects.toThrow("Step invocation ID is immutable");
+  expect(db.prepare("SELECT phase FROM context_refresh_events WHERE operation_id=? ORDER BY id").all(input.operationId)).toEqual([{phase:"step-invocation"}]);
  });
  it("reconciles a lost actual queue response without repeating creation or its wake",async()=>{
   await boundGrant();const create=repo.createContextRefreshCheckpoint.bind(repo);
