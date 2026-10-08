@@ -8,6 +8,7 @@ export interface OutcomePolicy {
  qualification:{ref:string;providerConfigDigest:string;validUntil:number};
 }
 export interface QualificationRefresh {rigId:string;dutyQueueId:string;operationId:string;policyRevision:string;policyDigest:string;qualifiedAt:number;qualification:OutcomePolicy['qualification']}
+export interface OutcomeReassessment {rigId:string;packageKey:string;dispositionId:string;operationId:string;priorOperationId:string;priorReceiptDigest:string;inputDigest:string;token:{rigId:string;epoch:number;generation:string};evidenceRef:string}
 export interface RecoveryBinding {rigId:string;operationId:string;originalPackageKey:string;originalDispositionId:string;originalContractHash:string;recoveryPackageKey:string;recoveryQueueId:string;recoveryContractHash:string;evidenceRef:string;deadline:number}
 type Job={rigId:string;packageKey:string;queueId:string;dispositionId:string;worker:string;generation:string;policyRevision:string;inputDigest:string;configurationDigest:string|null;state:string;createdAt:number;startedAt?:number};
 /** Fixed-size allowlist of normalized adapter evidence; never raw provider payloads. */
@@ -170,6 +171,33 @@ export class RuntimeOutcomeAssessment {
   const job:Job={rigId,packageKey,queueId:a!.queue_id,dispositionId,worker:actor,generation,policyRevision:p.revision,configurationDigest:this.authority.coordinationRecovery?.configurationDigest(actor)??null,inputDigest:digest(JSON.stringify({body:a!.body,returned:returned!.body,state:a!.state})),state:JSON.stringify({assignment:a!.body,return:JSON.parse(returned!.body),terminalState:a!.state}),createdAt:this.now()};
   this.db.prepare('INSERT OR IGNORE INTO coordinator_operations VALUES (?,?,?,?,?)').run(rigId,'runtime-outcome-job:'+dispositionId,'runtime-outcome-pending',JSON.stringify(job),digest(JSON.stringify(job)));
  }
+ /** A new, explicitly authorized assessment of the same evidence is not a replay
+  * of the prior UNKNOWN operation. Preserve that receipt and bind its exact bytes.
+  * At most one successor may be authorized from each prior receipt. */
+ reassess(actor:string,generation:string,input:OutcomeReassessment):{operationId:string} {
+  return this.db.transaction(()=>{
+   if(!input||Object.keys(input).sort().join(',')!=='dispositionId,evidenceRef,inputDigest,operationId,packageKey,priorOperationId,priorReceiptDigest,rigId,token'||!['rigId','packageKey','dispositionId','operationId','priorOperationId','priorReceiptDigest','inputDigest','evidenceRef'].every(k=>typeof (input as any)[k]==='string'&&(input as any)[k].trim())||!input.token||Object.keys(input.token).sort().join(',')!=='epoch,generation,rigId'||input.token.rigId!==input.rigId||input.token.generation!==generation||!Number.isSafeInteger(input.token.epoch))reject('runtime_outcome_reassessment_required','Exact current-holder reassessment contract required');
+   this.authority.assertCurrentOwner(actor,input.token);
+   const operationId='runtime-outcome-reassessment:'+input.operationId,authorizationId='runtime-outcome-reassessment-authorization:'+input.operationId,request=digest(JSON.stringify({actor,generation,input}));
+   const saved=this.db.prepare('SELECT request_hash FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(input.rigId,authorizationId) as {request_hash:string}|undefined;
+   if(saved){if(saved.request_hash!==request)reject('runtime_outcome_reassessment_conflict','Reassessment operation cannot change');return {operationId};}
+   const p=this.policy(input.rigId),priorRow=this.db.prepare('SELECT kind,receipt FROM coordinator_operations WHERE rig_id=? AND operation_id=?').get(input.rigId,input.priorOperationId) as {kind:string;receipt:string}|undefined;
+   if(!p||!this.current(p))reject('runtime_outcome_qualification_required','Fresh unchanged provider qualification required');
+   if(!priorRow||priorRow.kind!=='runtime-outcome-finished'||digest(priorRow.receipt)!==input.priorReceiptDigest)reject('runtime_outcome_prior_receipt_required','Exact finished prior assessment receipt required');
+   const prior=JSON.parse(priorRow!.receipt),a=this.bindingAssignment(input.rigId,input.packageKey),returned=this.repo.getById(input.dispositionId);
+   const configuration=a?(this.authority.coordinationRecovery?.configurationDigest(a.destination)??null):null;
+   if(!a||!returned||!['done','handed-off'].includes(a.state)||a.disposition_id!==input.dispositionId||prior.rigId!==input.rigId||prior.packageKey!==input.packageKey||prior.queueId!==a.queue_id||prior.dispositionId!==input.dispositionId||prior.inputDigest!==input.inputDigest||prior.policyRevision!==p!.revision||prior.classification!=='unknown'||prior.required!==false||prior.jobBinding?.operationId!==input.priorOperationId||prior.jobBinding?.worker!==a.destination||prior.jobBinding?.generation!==a.claimed_by_generation_uuid||this.authority.generation(a.destination)!==a.claimed_by_generation_uuid||prior.jobBinding?.configurationDigest!==configuration||prior.jobBinding?.providerConfigDigest!==p!.qualification.providerConfigDigest||digest(JSON.stringify({body:a.body,returned:returned.body,state:a.state}))!==input.inputDigest)reject('runtime_outcome_reassessment_binding','Unchanged original terminal return, worker, configuration and UNKNOWN receipt required');
+   const plan=this.authority.coordinationRecovery?.plan(input.rigId),task=plan?.tasks.find(t=>t.packageKey===input.packageKey);
+   if(!task||plan?.operatorGeneration!==p!.operatorGeneration||task.owner!==a.destination||task.body!==a.body||task.deadline<=this.now()||task.admission.generation!==a.claimed_by_generation_uuid||task.admission.configurationDigest!==configuration||task.admission.validUntil<=this.now())reject('runtime_outcome_admission_required','Fresh exact original task admission required');
+   if(this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND kind='coordination-accept' AND json_extract(receipt,'$.queueId')=? AND json_extract(receipt,'$.dispositionId')=?").get(input.rigId,a.queue_id,input.dispositionId))reject('runtime_outcome_already_accepted','Accepted evidence must not be reopened');
+   if(this.db.prepare("SELECT 1 FROM coordinator_operations WHERE rig_id=? AND ((kind IN ('runtime-outcome-pending','runtime-outcome-running') AND json_extract(receipt,'$.dispositionId')=?) OR (kind='runtime-outcome-reassessment-authorized' AND json_extract(receipt,'$.input.priorOperationId')=?))").get(input.rigId,input.dispositionId,input.priorOperationId))reject('runtime_outcome_reassessment_conflict','An assessment or authorized successor already owns this return');
+   const job:Job={rigId:input.rigId,packageKey:input.packageKey,queueId:a.queue_id,dispositionId:input.dispositionId,worker:a.destination,generation:a.claimed_by_generation_uuid,policyRevision:p!.revision,inputDigest:input.inputDigest,configurationDigest:configuration,state:JSON.stringify({assignment:a.body,return:JSON.parse(returned!.body),terminalState:a.state}),createdAt:this.now()};
+   const authorization={actor,generation,input,operationId,authorizedAt:this.now(),grantsAuthority:false,priorReceiptPreserved:true};
+   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,authorizationId,'runtime-outcome-reassessment-authorized',JSON.stringify(authorization),request);
+   this.db.prepare('INSERT INTO coordinator_operations VALUES (?,?,?,?,?)').run(input.rigId,operationId,'runtime-outcome-pending',JSON.stringify(job),digest(JSON.stringify(job)));
+   return {operationId};
+  }).immediate();
+ }
  requiresRecovery(rigId:string,packageKey:string):boolean {
   const p=this.policy(rigId);if(p?.mode!=='enforce')return false;
   return !!this.db.prepare("SELECT 1 FROM coordinator_operations o JOIN coordinator_assignments a ON a.rig_id=o.rig_id AND a.package_key=json_extract(o.receipt,'$.packageKey') WHERE o.rig_id=? AND o.kind='runtime-outcome-recovery' AND a.package_key=? AND a.disposition_id=json_extract(o.receipt,'$.dispositionId') AND json_extract(o.receipt,'$.policyRevision')=?").get(rigId,packageKey,p.revision);
@@ -187,6 +215,12 @@ export class RuntimeOutcomeAssessment {
   for(const row of rows){
    const job=JSON.parse(row.receipt) as Job,p=this.policy(rigId);if(!p)continue;
    if(row.kind==='runtime-outcome-running'&&this.now()-(job.startedAt??job.createdAt)<15000)continue;
+   // No provider effect has started for pending jobs. Expired qualification is
+   // a recoverable eligibility boundary, not a terminal classification result.
+   // Running jobs deliberately do not use this path: their effects may be UNKNOWN.
+   if(row.kind==='runtime-outcome-pending'&&p.revision===job.policyRevision&&p.operatorGeneration===this.authority.generation('operator-agent@kernel')&&p.qualification.providerConfigDigest===digest(JSON.stringify(p.adapterConfig))&&p.qualification.validUntil<=this.now()){
+    this.stagePolicyBoundary(rigId);continue;
+   }
    if(row.kind==='runtime-outcome-pending'){job.startedAt=this.now();if(!this.db.prepare("UPDATE coordinator_operations SET kind='runtime-outcome-running',receipt=? WHERE rig_id=? AND operation_id=? AND kind='runtime-outcome-pending'").run(JSON.stringify(job),rigId,row.operation_id).changes)continue;}
    let classification='unknown',reason='deterministic-fallback',status='unavailable',negativeAdvice=false;let provenance:Record<string,unknown>={};let assessmentEvidence:Record<string,unknown>|null=null;
    const a=this.db.prepare('SELECT a.disposition_id,q.body,q.state,q.claimed_by_generation_uuid FROM coordinator_assignments a JOIN queue_items q ON q.qitem_id=a.queue_id WHERE a.rig_id=? AND a.package_key=?').get(rigId,job.packageKey) as {disposition_id:string;body:string;state:string;claimed_by_generation_uuid:string}|undefined;

@@ -136,6 +136,19 @@ export class CoordinatorAuthorityService {
   const q=this.db.prepare('SELECT destination_session,state,claimed_at,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(queueId) as any;
   return !!q&&q.destination_session===a.owner_session&&q.state==='in-progress'&&!!q.claimed_at&&q.claimed_by_generation_uuid===a.owner_generation;
  }
+ /** Scheduler ownership only: the exact enrolled control baton stays with
+  * coordinator continuity even when its authority lease expires. This grants
+  * no authority and deliberately does not change isStandingAuthorityMarker.
+  * Removed enrollment or stale/mismatched native custody is not excluded. */
+ isEnrolledControlBaton(queueId:string):boolean {
+  const a=this.db.prepare('SELECT * FROM coordinator_authority WHERE baton_id=?').get(queueId) as Authority|undefined;
+  if(!a||!["active","reconciling","recovery"].includes(a.state)
+    ||this.local(a.owner_session)?.rig_id!==a.rig_id||this.generation(a.owner_session)!==a.owner_generation)return false;
+  const q=this.db.prepare('SELECT destination_session,state,claimed_at,claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(queueId) as any;
+  return !!q&&q.destination_session===a.owner_session
+    &&(q.state==='pending'&&!q.claimed_at&&!q.claimed_by_generation_uuid
+      ||['in-progress','blocked'].includes(q.state)&&!!q.claimed_at&&q.claimed_by_generation_uuid===a.owner_generation);
+ }
  generation(session: string): string | null {
    const node = this.local(session); if (!node) return null;
    const row = this.db.prepare(`SELECT t.generation_uuid FROM sessions s JOIN occupant_tenures t ON t.node_id=s.node_id

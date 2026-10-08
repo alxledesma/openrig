@@ -4597,7 +4597,7 @@ export class QueueRepository {
 
   /** Shared ordinary-work boundary; raw queue/custody faces remain visible. */
   ordinaryWorkActionable(qitemId: string): boolean {
-    return !this.isStandingAuthorityMarker(qitemId) && this.genericWatchActionable(qitemId);
+    return !this.coordinatorAuthority.isEnrolledControlBaton(qitemId) && this.genericWatchActionable(qitemId);
   }
 
   /** Stable semantic identity of an obligation. Deliberately excludes timestamps,

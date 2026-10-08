@@ -143,7 +143,7 @@ describe('runtime outcome enforcement',()=>{
    repo.coordinatorAuthority.admit('operator-agent@kernel','operator-agent-g1','xv','unplanned',{inputDigest:digest('unplanned'),destination:'builder@xv',bodyHash:digest('unplanned'),resources:[],returnContract:{destination:'lead@xv',evidenceRequired:['report']}});
    const duty=svc.reconcile('lead@xv','lead-g1','xv').find(x=>x.key==='materialization:unplanned')!;expect(duty).toMatchObject({state:'held',reason:'lifecycle-recipient-protected'});
    expect(duty.queueId??null).toBeNull();expect(svc.lifecycleControlReceipt('qitem-unissued')).toBeNull();
-   expect(db.prepare("SELECT 1 FROM queue_items WHERE qitem_id LIKE 'qitem-coordination-lifecycle-%'").get()).toBeUndefined();
+   expect(db.prepare("SELECT 1 FROM queue_items WHERE json_valid(body) AND json_extract(body,'$.action')='materialize-exact-admitted-frontier' AND json_extract(body,'$.packageKey')='unplanned'").get()).toBeUndefined();
    expect(db.prepare("SELECT 1 FROM queue_items WHERE json_valid(body) AND json_extract(body,'$.action')='refresh-exact-expired-outcome-qualification'").get()).toBeUndefined();
   });
   it('pending historical intake notice cannot block qualification after active sending ends',async()=>{
@@ -229,5 +229,56 @@ describe('runtime outcome enforcement',()=>{
  it('stale response preserves diagnostic evidence explicitly suppressed',async()=>{configure(normal());const f=vi.fn(async()=>{db.prepare("UPDATE occupant_tenures SET generation_uuid='builder-g2' WHERE node_id='builder@xv'").run();return reply()('http://fixture');}) as unknown as typeof fetch;const r=outcome(f);await returned();await r.drain('xv');const result=JSON.parse((db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='runtime-outcome-finished'").get() as {receipt:string}).receipt);expect(result).toMatchObject({reason:'state-changed',required:false,negativeAdvice:false,assessmentEvidence:{applied:false,suppressed:true,outcome:{choice:'yes'},grantsAuthority:false}});});
  it('unavailable audit retains job timing without fabricated model evidence',async()=>{configure(normal());const r=outcome(vi.fn(async()=>{throw new Error('PRIVATE_ERROR_TOKEN')}) as unknown as typeof fetch);await returned();await r.drain('xv');const raw=(db.prepare("SELECT receipt FROM coordinator_operations WHERE kind='runtime-outcome-finished'").get() as {receipt:string}).receipt;const result=JSON.parse(raw);expect(raw).not.toContain('PRIVATE_ERROR_TOKEN');expect(result.jobBinding).toMatchObject({worker:'builder@xv',createdAt:clock,startedAt:clock});expect(result.assessmentEvidence.outcome).toBeNull();expect(result.assessmentEvidence.usage).toEqual({});expect(result.assessmentEvidence.applied).toBe(false);});
  it('audit allowlist rejects malformed numbers and oversized strings with bounded output',()=>{const result=sanitizedAssessmentEvidence({providerId:'x'.repeat(100000),model:{secret:'TOKEN'},rubricDigest:'TOKEN',answers:{outcome:{type:'choice',choice:'yes',probabilities:{yes:Infinity,no:0,unknown:0},topProbability:1,margin:1,secret:'TOKEN'}},usage:{input_tokens:-1,output_tokens:Infinity,cost:Infinity,secret:'TOKEN'},latencyMs:-1,raw:'TOKEN'},'a'.repeat(64));expect(result).toMatchObject({providerId:null,model:null,rubricDigest:null,outcome:null,usage:{},latencyMs:null,grantsAuthority:false});expect(JSON.stringify(result)).not.toContain('TOKEN');expect(JSON.stringify(result).length).toBeLessThan(4096);});
+
+ it('keeps an unstarted pending outcome job through qualification expiry and drains that same job after renewal',async()=>{
+  configure(normal());const f=reply('no'),r=outcome(f);await returned();
+  const op='runtime-outcome-job:result',before=db.prepare('SELECT kind,receipt FROM coordinator_operations WHERE operation_id=?').get(op) as {kind:string;receipt:string};
+  const original=JSON.parse(before.receipt),p=storedPolicy();clock=p.qualification.validUntil+1;vi.setSystemTime(clock);db.prepare('UPDATE coordinator_authority SET lease_until=? WHERE rig_id=?').run(clock+120000,'xv');
+  await r.drain('xv');
+  const held=db.prepare('SELECT kind,receipt FROM coordinator_operations WHERE operation_id=?').get(op) as {kind:string;receipt:string};
+  expect(held.kind).toBe('runtime-outcome-pending');expect(JSON.parse(held.receipt)).toMatchObject({dispositionId:'result',generation:original.generation,inputDigest:original.inputDigest});expect(JSON.parse(held.receipt).startedAt).toBeUndefined();expect(f).not.toHaveBeenCalled();
+  const dutyId=r.stagePolicyBoundary('xv')!;repo.claim({qitemId:dutyId,destinationSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1'});
+  const refresh=qualificationRefresh(p,dutyId);r.refreshQualification('operator-agent@kernel','operator-agent-g1',refresh);repo.update({qitemId:dutyId,actorSession:'operator-agent@kernel',actorGeneration:'operator-agent-g1',identityProvenance:'transport:v1',state:'done',closureReason:'no-follow-on'});
+  await r.drain('xv');
+  const finished=db.prepare('SELECT kind,receipt FROM coordinator_operations WHERE operation_id=?').get(op) as {kind:string;receipt:string};
+  expect(finished.kind).toBe('runtime-outcome-finished');expect(JSON.parse(finished.receipt).inputDigest).toBe(original.inputDigest);expect(f).toHaveBeenCalledTimes(1);
+ });
+
+ it('reassesses an exact prior UNKNOWN under current holder authority once and preserves the old receipt',async()=>{
+  configure(normal());let choice='unknown';const f=vi.fn(async()=>new Response(JSON.stringify({model:'qualified-fixture',answers:{outcome:{type:'choice',choice,probabilities:{yes:choice==='yes'?.9:.05,no:choice==='no'?.9:.05,unknown:choice==='unknown'?.9:.05}}},usage:{input_tokens:150,output_tokens:0,truncated:false}}),{status:200})) as unknown as typeof fetch;
+  const r=outcome(f);await returned();await r.drain('xv');expect(f).toHaveBeenCalledTimes(1);
+  const priorOperationId='runtime-outcome-job:result',priorRow=db.prepare('SELECT receipt FROM coordinator_operations WHERE operation_id=?').get(priorOperationId) as {receipt:string},priorRaw=priorRow.receipt,prior=JSON.parse(priorRaw);expect(prior).toMatchObject({classification:'unknown',required:false});
+  const holder=repo.coordinatorAuthority.get('xv')!;
+  const input={rigId:'xv',packageKey:'product',dispositionId:'result',operationId:'reassess-1',priorOperationId,priorReceiptDigest:digest(priorRaw),inputDigest:prior.inputDigest,token:{rigId:'xv',epoch:holder.epoch,generation:holder.owner_generation},evidenceRef:'current-holder/issue21-return-review'};
+  expect(()=>r.reassess('builder@xv','builder-g1',input)).toThrow();
+  expect(()=>r.reassess('lead@xv','lead-g1',{...input,priorReceiptDigest:'0'.repeat(64)})).toThrow('finished prior assessment receipt');
+  const returnRow=repo.getById('result')!;db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(JSON.stringify({packageKey:'product',inputDigest:digest('mutated'),evidence:[]}), 'result');
+  expect(()=>r.reassess('lead@xv','lead-g1',input)).toThrow('Unchanged original terminal return');
+  db.prepare('UPDATE queue_items SET body=? WHERE qitem_id=?').run(returnRow.body,'result');
+
+  expect(r.reassess('lead@xv','lead-g1',input)).toEqual({operationId:'runtime-outcome-reassessment:reassess-1'});
+  const oldAgain=db.prepare('SELECT kind,receipt FROM coordinator_operations WHERE operation_id=?').get(priorOperationId) as {kind:string;receipt:string};expect(oldAgain).toEqual({kind:'runtime-outcome-finished',receipt:priorRaw});
+  expect(()=>r.reassess('lead@xv','lead-g1',{...input,evidenceRef:'changed-attribution'})).toThrow('cannot change');
+  expect(()=>r.reassess('lead@xv','lead-g1',{...input,operationId:'reassess-2'})).toThrow('already owns this return');
+  choice='no';await r.drain('xv');expect(f).toHaveBeenCalledTimes(2);
+  const reassessed=db.prepare('SELECT kind,receipt FROM coordinator_operations WHERE operation_id=?').get('runtime-outcome-reassessment:reassess-1') as {kind:string;receipt:string};expect(reassessed.kind).toBe('runtime-outcome-finished');expect(JSON.parse(reassessed.receipt)).toMatchObject({dispositionId:'result',inputDigest:prior.inputDigest,classification:'no-explicit-unfinished',required:false});
+  expect((db.prepare('SELECT receipt FROM coordinator_operations WHERE operation_id=?').get(priorOperationId) as {receipt:string}).receipt).toBe(priorRaw);
+  expect(r.reassess('lead@xv','lead-g1',input)).toEqual({operationId:'runtime-outcome-reassessment:reassess-1'});await r.drain('xv');expect(f).toHaveBeenCalledTimes(2);
+ });
+
+ it('refuses explicit reassessment while the unchanged qualification is expired',async()=>{
+  configure(normal());const r=outcome(reply('unknown'));await returned();await r.drain('xv');
+  const priorOperationId='runtime-outcome-job:result',priorRaw=(db.prepare('SELECT receipt FROM coordinator_operations WHERE operation_id=?').get(priorOperationId) as {receipt:string}).receipt,prior=JSON.parse(priorRaw),p=storedPolicy();
+  clock=p.qualification.validUntil+1;vi.setSystemTime(clock);db.prepare('UPDATE coordinator_authority SET lease_until=? WHERE rig_id=?').run(clock+120000,'xv');
+  const holder=repo.coordinatorAuthority.get('xv')!;const input={rigId:'xv',packageKey:'product',dispositionId:'result',operationId:'expired-qualification',priorOperationId,priorReceiptDigest:digest(priorRaw),inputDigest:prior.inputDigest,token:{rigId:'xv',epoch:holder.epoch,generation:holder.owner_generation},evidenceRef:'current-holder/return-review'};
+  expect(()=>r.reassess('lead@xv','lead-g1',input)).toThrow('Fresh unchanged provider qualification');expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='runtime-outcome-reassessment-authorized'").get()).toBeUndefined();
+ });
+
+ it('does not reopen an original return after independent acceptance',async()=>{
+  configure(normal());const r=outcome(reply('unknown'));await returned();await r.drain('xv');
+  const priorOperationId='runtime-outcome-job:result',priorRaw=(db.prepare('SELECT receipt FROM coordinator_operations WHERE operation_id=?').get(priorOperationId) as {receipt:string}).receipt,prior=JSON.parse(priorRaw);svc.accept('lead@xv','lead-g1','xv','product','result','accepted/issue21-review.md');
+  const holder=repo.coordinatorAuthority.get('xv')!;const input={rigId:'xv',packageKey:'product',dispositionId:'result',operationId:'after-acceptance',priorOperationId,priorReceiptDigest:digest(priorRaw),inputDigest:prior.inputDigest,token:{rigId:'xv',epoch:holder.epoch,generation:holder.owner_generation},evidenceRef:'current-holder/return-review'};
+  expect(()=>r.reassess('lead@xv','lead-g1',input)).toThrow('must not be reopened');expect(db.prepare("SELECT 1 FROM coordinator_operations WHERE kind='runtime-outcome-reassessment-authorized'").get()).toBeUndefined();
+ });
 
 });
