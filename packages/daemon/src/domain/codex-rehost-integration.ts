@@ -1,3 +1,4 @@
+import type { NativeRecoveryCompletionPublisher } from "./native-recovery-completion.js";
 import { PeerServiceDispositionStore, SERVICE_PROCESS_PY } from './peer-service-disposition.js';
 import { OPENRIG_HOME } from '../openrig-compat.js';
 import type Database from "better-sqlite3";
@@ -214,7 +215,7 @@ export function createCodexRehostIntegration(deps: {
   whoami: WhoamiService; activity: SeatActivityService;
   adapter: CodexRuntimeAdapter; resume: CodexResumeAdapter;
   launchEnvironment: SeatLaunchEnvironment; store?: NativeDutyLaunchStore;
-  launchPath: string; snapshotRoot: string; detectDaemonSupport: CodexDaemonSupportDetector;
+  launchPath: string; recordNativeRecoveryCompletion?:NativeRecoveryCompletionPublisher; snapshotRoot: string; detectDaemonSupport: CodexDaemonSupportDetector;
   sessionEnv?: Record<string, string | undefined>;
   runtimeSessionEnv?: Record<string, Record<string, string | undefined>>;
   configurationDigest(session: string): string | null | undefined;
@@ -239,7 +240,7 @@ export function createCodexRehostIntegration(deps: {
     const current = await currentBinding(nodeId);
     return current?.pane ? { ...current, pane: current.pane } : null;
   };
-  return new CodexSameGenerationRehost({
+  return new CodexSameGenerationRehost({recordNativeRecoveryCompletion:deps.recordNativeRecoveryCompletion,
     db: deps.db, guard: deps.guard, tmux: deps.tmux, resume: deps.resume, snapshotRoot: deps.snapshotRoot,
     legacyNativeState: (session,profile) => observeLegacyCodexMaintenance(deps,session,profile),
     nativeState: async session => {

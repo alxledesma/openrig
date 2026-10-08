@@ -1,3 +1,4 @@
+import { recoveryReceiptDigest, type NativeRecoveryCompletionPublisher } from "./native-recovery-completion.js";
 import type { CodexRehostInput, CodexRehostResult } from "./codex-rehost.js";
 import type { NativeProcessLister } from "./native-process-lineage.js";
 import type { NativeProcessRow } from "./native-process-lineage.js";
@@ -55,6 +56,7 @@ const SEAT_LOOKUP_GUIDANCE = "List seats with: rig ps --nodes";
 const TERMINAL_SESSION_STATUSES = new Set(["superseded", "detached", "exited"]);
 
 export interface SeatLifecycleDeps {
+  recordNativeRecoveryCompletion?:NativeRecoveryCompletionPublisher;
   db: Database.Database;
   rigRepo: RigRepository;
   sessionRegistry: SessionRegistry;
@@ -472,6 +474,7 @@ export class SeatLifecycleService {
   private readonly db: Database.Database;
   private readonly rigRepo: RigRepository;
   private readonly sessionRegistry: SessionRegistry;
+  private readonly recordNativeRecoveryCompletion?:NativeRecoveryCompletionPublisher;
   private readonly eventBus: EventBus;
   private readonly tmuxAdapter: TmuxAdapter;
   private readonly listProcesses?: NativeProcessLister;
@@ -513,6 +516,7 @@ export class SeatLifecycleService {
     if (deps.db !== deps.rigRepo.db) throw new Error("SeatLifecycleService: rigRepo must share the same db handle");
     if (deps.db !== deps.sessionRegistry.db) throw new Error("SeatLifecycleService: sessionRegistry must share the same db handle");
     if (deps.db !== deps.eventBus.db) throw new Error("SeatLifecycleService: eventBus must share the same db handle");
+    this.recordNativeRecoveryCompletion=deps.recordNativeRecoveryCompletion;
     this.db = deps.db;
     this.rigRepo = deps.rigRepo;
     this.sessionRegistry = deps.sessionRegistry;
@@ -1801,6 +1805,7 @@ export class SeatLifecycleService {
       // Pre-effect receipt. If it cannot be written, nothing has been signalled, so this
       // is a typed refusal that signals nothing rather than an UNKNOWN.
       try {
+      if(this.db.prepare("SELECT 1 FROM events e WHERE e.type='seat.native_recovery_publication_began' AND e.node_id=? AND json_extract(e.payload,'$.generation')=? AND NOT EXISTS(SELECT 1 FROM events c WHERE c.type='seat.native_recovery_publication_completed' AND json_extract(c.payload,'$.publicationId')=json_extract(e.payload,'$.publicationId'))").get(seat.nodeId,plan.generation))return {ok:false,code:"rehost_completion_unresolved",message:"Native recovery completion publication unresolved; no native retry.",effectAttempted:false,blindRetryAllowed:false};
       this.appendRehostEvent("seat.runner_rehost_began", seat, input, {
         generation: plan.generation,
         sessionFile: plan.sessionFile,
@@ -2185,7 +2190,9 @@ export class SeatLifecycleService {
 
       // S5: completed receipt. The guard deliberately stays ON. It sits inside the single
       // guarded post-effect region opened at S3, so a failed write here is an UNKNOWN too.
-      this.appendRehostEvent("seat.runner_rehost_completed", seat, input, {
+      const publicationId=`pi-runner-rehost:${seat.nodeId}:${plan.generation}:${launchIdAfter}`;
+      if(this.recordNativeRecoveryCompletion)this.appendRehostEvent("seat.native_recovery_publication_began",seat,input,{generation:plan.generation,publicationId,blindRetryAllowed:false});
+      const completionEvent=this.appendRehostEvent("seat.runner_rehost_completed", seat, input, {
         generation: plan.generation,
         generationUnchanged: true,
         sessionFile: plan.sessionFile,
@@ -2225,6 +2232,7 @@ export class SeatLifecycleService {
         continuityCredit: false,
         nextActorIsGenuineHolder: "acknowledge then renew; for an EXPIRED reconciling lease use the single per-epoch reconciliation-recover window, which this operation never touches",
       });
+      if(this.recordNativeRecoveryCompletion){try{if(!plan.sessionId)throw new Error("Exact recovered session row unavailable");await this.recordNativeRecoveryCompletion({producer:"pi-runner-rehost",recoveryId:publicationId,rigId:seat.rigId,nodeId:seat.nodeId,sessionId:plan.sessionId,sessionName,generation:plan.generation,runtime:"pi",nativeIdentityHash:recoveryReceiptDigest(plan.sessionFile),source:{ref:`event:${completionEvent.seq}`,digest:recoveryReceiptDigest((this.db.prepare("SELECT payload FROM events WHERE seq=?").get(completionEvent.seq) as {payload:string}).payload)},runtimeLaunchId:launchIdAfter!});this.appendRehostEvent("seat.native_recovery_publication_completed",seat,input,{generation:plan.generation,publicationId});}catch(error){this.appendRehostEvent("seat.native_recovery_publication_unknown",seat,input,{generation:plan.generation,completionEventSeq:completionEvent.seq,blindRetryAllowed:false});throw error;}}
       return {
         ok: true,
         seat,
@@ -2883,12 +2891,12 @@ export class SeatLifecycleService {
     tx();
   }
 
-  private appendRehostEvent(type: string, seat: SeatDescriptor, input: { reason: string; operator?: string | null }, payload: Record<string, unknown>): void {
+  private appendRehostEvent(type: string, seat: SeatDescriptor, input: { reason: string; operator?: string | null }, payload: Record<string, unknown>) {
     const at = new Date().toISOString();
     const tx = this.db.transaction(() => {
-      this.eventBus.persistWithinTransaction({ type, rigId: seat.rigId, nodeId: seat.nodeId, logicalId: seat.logicalId, reason: input.reason.trim(), operator: input.operator ?? null, at, ...payload } as never);
+      return this.eventBus.persistWithinTransaction({ type, rigId: seat.rigId, nodeId: seat.nodeId, logicalId: seat.logicalId, reason: input.reason.trim(), operator: input.operator ?? null, at, ...payload } as never);
     });
-    tx();
+    return tx();
   }
 }
 

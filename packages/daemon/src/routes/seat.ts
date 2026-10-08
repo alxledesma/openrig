@@ -324,6 +324,7 @@ export function buildLegacySignalIntentEvent(input: {
 export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifecycleService {
   const rigRepo = c.get("rigRepo" as never) as RigRepository;
   return new SeatLifecycleService({
+    recordNativeRecoveryCompletion: c.get("recordNativeRecoveryCompletion" as never) as import("../domain/native-recovery-completion.js").NativeRecoveryCompletionPublisher | undefined,
     db: rigRepo.db,
     codexRehost: c.get("codexRehost" as never) as import("../domain/codex-rehost.js").CodexSameGenerationRehost | undefined,
     piDetachedResume: c.get("piDetachedResume" as never) as import("../domain/pi-detached-resume.js").PiDetachedResume | undefined,
@@ -541,6 +542,7 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
     } catch { return null; }
   };
   const lifecycle = new SeatLifecycleService({
+    recordNativeRecoveryCompletion: c.get("recordNativeRecoveryCompletion" as never) as import("../domain/native-recovery-completion.js").NativeRecoveryCompletionPublisher | undefined,
     db: rigRepo.db,
     rigRepo,
     codexRehost: c.get("codexRehost" as never) as import("../domain/codex-rehost.js").CodexSameGenerationRehost | undefined,

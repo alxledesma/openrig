@@ -149,6 +149,7 @@ import { createRouteTimingMiddleware } from "./domain/route-timing-recorder.js";
 import { browserBoundary, type BrowserBoundaryOptions } from "./middleware/browser-boundary.js";
 
 export interface AppDeps {
+  recordNativeRecoveryCompletion?: import("./domain/native-recovery-completion.js").NativeRecoveryCompletionPublisher;
   nativeDuty?: import("./domain/native-duty-integration.js").NativeDutyIntegration;
   contextRefresh?: import("./domain/context-refresh-integration.js").ContextRefreshFacade;
   proofSourceWatch?: import("./domain/proof/source-watch.js").ProofSourceWatch;
@@ -522,6 +523,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("sessionEnv" as never, deps.sessionEnv);
     c.set("seatLaunchEnvironment" as never, deps.seatLaunchEnvironment);
     c.set("codexRehost" as never, deps.codexRehost);
+    c.set("recordNativeRecoveryCompletion" as never, deps.recordNativeRecoveryCompletion);
     c.set("piDetachedResume" as never, deps.piDetachedResume);
     c.set("runtimeSessionEnv" as never, deps.runtimeSessionEnv);
     c.set("cmuxAdapter" as never, deps.cmuxAdapter);

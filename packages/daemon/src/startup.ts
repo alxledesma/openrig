@@ -1,3 +1,6 @@
+import { parsePinnedLegacyRecoveries } from "./domain/native-recovery-legacy.js";
+import { createNativeRecoveryContinuation } from "./domain/native-recovery-continuation.js";
+import type { NativeRecoveryContinuationRuntime } from "./domain/native-recovery-continuation-contract.js";
 import { createPiDetachedResumeIntegration } from './domain/pi-detached-resume-integration.js';
 import { assessPiDispatchReadiness } from "./domain/dispatch-runtime-readiness.js";
 import { NativeDutyIntegration } from "./domain/native-duty-integration.js";
@@ -434,7 +437,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // both the queueRepo dep slot and inboxHandler can share one instance.
   // Transport is wired after SessionTransport instantiation below via
   // attachTransport().
+  let recoveredRuntime: ReturnType<typeof createNativeRecoveryContinuation> | undefined;
+  const recoveredBridge: NativeRecoveryContinuationRuntime = {
+    observeRecoveredIncarnation: session => recoveredRuntime?.observeRecoveredIncarnation(session) ?? Promise.resolve(null),
+    withRecoveredIncarnation: (observation,send) => recoveredRuntime?.withRecoveredIncarnation(observation,send) ?? Promise.resolve({state:"held",reason:"native-recovery-runtime-unavailable"}),
+  };
   const queueRepoInstance = new QueueRepository(db, eventBus, {
+    nativeRecoveryContinuation: recoveredBridge,
     validateRig: topologyValidateRig,
     destinationAdvisory: topologyDestinationAdvisory,
     // OPR.0.4.6.WF3 FR-6 — the frontier close-path guard's predicate,
@@ -534,7 +543,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     if(node?.runtime!=='pi'||!/^[-a-zA-Z0-9_.@]+$/.test(task.owner))return null;
     try{return assessPiDispatchReadiness(JSON.parse(fs.readFileSync(nodePath.join(OPENRIG_HOME,'state','pi',task.owner,'runner-state.json'),'utf8')),sessionRegistry.currentOccupantGenerationForSession(task.owner)??'',Date.now(),task.admission.runtimeRequirements);}
     catch{return null;}
-  });
+  },recoveredBridge);
   queueRepoInstance.coordinatorAuthority.runtimeOutcomeAssessment = new RuntimeOutcomeAssessment(queueRepoInstance);
   const resilienceRollout = new ResilienceRolloutService(queueRepoInstance,watchdogJobsRepoInstance);
   queueRepoInstance.coordinatorAuthority.resilienceRollout = resilienceRollout;
@@ -702,6 +711,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     const node = db.prepare("SELECT rig_id,runtime FROM nodes WHERE id=?").get(target.nodeId) as { rig_id: string; runtime: string } | undefined;
     return node ? { nodeId: target.nodeId, session, generation: target.occupant, runtime: node.runtime, rigId: node.rig_id } : null;
   };
+  recoveredRuntime=createNativeRecoveryContinuation({db,eventBus,guard:deliveryGuard,enabled:nodeId=>nativeDutyNodes.has(nodeId),store:nativeDutyStore,tmux:tmuxAdapter,piProve:piNativeProver,
+    configurationDigest:session=>queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(session),
+    legacyReceipts:parsePinnedLegacyRecoveries(process.env.OPENRIG_NATIVE_RECOVERY_LEGACY_RECEIPTS),
+    roots:{piDetached:nodePath.join(OPENRIG_HOME,"state","pi-detached-resume"),codex:nodePath.join(OPENRIG_HOME,"state","codex-rehost")}});
+  const recordNativeRecoveryCompletion=recoveredRuntime.recordNativeRecoveryCompletion;
   const nativeDuty = new NativeDutyIntegration({ db, authority: queueRepoInstance.coordinatorAuthority,
     binding: nativeDutyBinding, lifecycleActive: nodeId => deliveryGuard.lifecycleActive(nodeId),
     observe: async (scope, launchId, supervisorPid) => nativeDutyStore ? observeNativeDutyLaunch(nativeDutyStore, { scope, launchId, supervisorPid }, {
@@ -1229,6 +1243,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // (ContextUsageStore is constructed above, ahead of ClaimService, for FR-3.)
   const whoamiService = new WhoamiService({ db, rigRepo, sessionRegistry, transcriptStore, contextUsageStore });
   const codexRehost = createCodexRehostIntegration({
+    recordNativeRecoveryCompletion,
     db, guard: deliveryGuard, tmux: tmuxAdapter, whoami: whoamiService, activity: seatActivityService,
     adapter: codexAdapter, resume: codexResume, launchEnvironment: seatLaunchEnvironment, store: nativeDutyStore,
     launchPath: process.env.PATH ?? "", snapshotRoot: nodePath.join(OPENRIG_HOME, "state", "codex-rehost"),
@@ -1236,7 +1251,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     detectDaemonSupport: codexDaemonSupportProbe(process.env.PATH, undefined, configuredCodexHome),
     configurationDigest: session => queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(session),
   });
-  const piDetachedResume = createPiDetachedResumeIntegration({db,guard:deliveryGuard,tmux:tmuxAdapter,resume:piResume,store:nativeDutyStore,launchEnvironment:seatLaunchEnvironment,launchPath:process.env.PATH??'',stateRoot:piStateRoot,runnerEntryPath:piRunnerEntryPath,piProve:piNativeProver,piRunnerState:session=>{try{return parsePiRunnerState(fs.readFileSync(nodePath.join(piStateRoot,session,'runner-state.json'),'utf8'));}catch{return null;}},configurationDigest:session=>queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(session),resolvePosture:binding=>{const row=db.prepare('SELECT rig_id FROM nodes WHERE id=?').get(binding.nodeId) as {rig_id:string};return restoreOrchestrator.resolveRestorePosture(binding.nodeId,row.rig_id);},sessionEnv:launchSessionEnv,runtimeSessionEnv,snapshotRoot:nodePath.join(OPENRIG_HOME,'state','pi-detached-resume')});
+  const piDetachedResume = createPiDetachedResumeIntegration({recordNativeRecoveryCompletion,db,guard:deliveryGuard,tmux:tmuxAdapter,resume:piResume,store:nativeDutyStore,launchEnvironment:seatLaunchEnvironment,launchPath:process.env.PATH??'',stateRoot:piStateRoot,runnerEntryPath:piRunnerEntryPath,piProve:piNativeProver,piRunnerState:session=>{try{return parsePiRunnerState(fs.readFileSync(nodePath.join(piStateRoot,session,'runner-state.json'),'utf8'));}catch{return null;}},configurationDigest:session=>queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(session),resolvePosture:binding=>{const row=db.prepare('SELECT rig_id FROM nodes WHERE id=?').get(binding.nodeId) as {rig_id:string};return restoreOrchestrator.resolveRestorePosture(binding.nodeId,row.rig_id);},sessionEnv:launchSessionEnv,runtimeSessionEnv,snapshotRoot:nodePath.join(OPENRIG_HOME,'state','pi-detached-resume')});
   const nodeCmuxService = new NodeCmuxService(rigRepo, sessionRegistry, cmuxAdapter, tmuxAdapter);
   // W2a-1 — producer wiring: the live occupant generation resolves synchronously from the shipped
   // occupant-tenure ledger. generation_uuid CHANGES for a new occupant and persists only within one
@@ -1271,6 +1286,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const compatibleSpecLibraryRoot = getCompatibleOpenRigPath("specs");
 
   const deps: AppDeps = {
+    recordNativeRecoveryCompletion,
     nativeDuty,
     seatLaunchEnvironment,
     rigRepo,

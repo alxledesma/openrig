@@ -44,7 +44,11 @@ export interface NativeDutyProof {
   supervisorPid: number;
   configurationDigest: string;
   fingerprint: string;
+  /** Runtime-specific producer fingerprint, distinct from supervisor and start digests. */
+  nativeFingerprint?: string;
   observedAt: number;
+  /** Kernel identity from the same two stable census samples as fingerprint. */
+  processIdentity?: {native:{pid:number;startFingerprint:string};supervisor:{pid:number;startFingerprint:string};nativeStartedAt:string;supervisorStartedAt:string;runtimeLaunchId?:string};
   nativePresent: boolean;
   supervisorIsNativeAncestor: boolean;
   lifecycleReserved: boolean;

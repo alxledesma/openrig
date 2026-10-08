@@ -1,3 +1,4 @@
+import { recoveryReceiptDigest, type NativeRecoveryCompletionPublisher } from "./native-recovery-completion.js";
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
@@ -61,6 +62,7 @@ export function parseCodexStoppedRecovery(value:unknown):CodexStoppedRecovery {
   return v;
 }
 export interface CodexRehostOptions {
+  recordNativeRecoveryCompletion?:NativeRecoveryCompletionPublisher;
   db:Database.Database;guard:SeatDeliveryGuard;tmux:{getPanePid(pane:string):Promise<number|null>};
   resume:Pick<CodexResumeAdapter,"resume">;snapshotRoot:string;
   nativeState:(session:string)=>Promise<CodexRehostNativeState>;
@@ -174,7 +176,7 @@ export class CodexSameGenerationRehost {
           const result:Extract<CodexRehostResult,{ok:true}>={ok:true,runtime:"codex",nodeId:binding.nodeId,sessionName:binding.sessionName,generation:binding.generation,generationUnchanged:true,
             nativeIdHash:hash(binding.nativeId),attemptId,receiptPath,backup,nativeFingerprintBefore:final.fingerprint,nativeFingerprintAfter:replacement.native.fingerprint,
             supervisorLaunchId:replacement.supervision.launchId,custodyPreserved:true,guardLeftEnabled:true,authorityRepaired:false};
-          writeDurable(path.join(directory,"completed.json"),JSON.stringify({...result,at:this.now(),custodyAfter:this.custody(binding)})+"\n");return result;
+          this.beginCompletionPublication(directory,result.attemptId);writeDurable(path.join(directory,"completed.json"),JSON.stringify({...result,at:this.now(),custodyAfter:this.custody(binding)})+"\n");await this.publishCompletion("codex-rehost",binding,directory,result);return result;
         }catch(error){try{writeDurable(path.join(directory,"unknown.json"),JSON.stringify({attemptId,at:this.now(),effectAttempted:true,code:error instanceof Refusal?error.code:"codex_rehost_effect_unknown",blindRetryAllowed:false})+"\n");}catch{}throw error;}
       });
     }catch(error){return {ok:false,code:error instanceof Refusal?error.code:effectAttempted?"codex_rehost_effect_unknown":"codex_rehost_precondition_failed",
@@ -222,7 +224,7 @@ export class CodexSameGenerationRehost {
           ||!/^[a-f0-9]{64}$/.test(began.nativeFingerprint)||!/^[a-f0-9]{64}$/.test(began.preflightDigest))reject("codex_rehost_recovery_receipt","Original pre-native UNKNOWN, binding and custody must match exactly");
         for(const id of readdirSync(root)){
           const other=path.join(root,id);privatePath(other,true);
-          if(other===directory){if(existsSync(path.join(other,'completed.json'))||existsSync(path.join(other,'recovery-began.json')))reject("codex_rehost_recovery_replay","This attempt has a completion or an uncertain recovery intent; no replay");}
+          if(this.completionPublicationUnresolved(other))reject('codex_rehost_completion_unresolved','Native completion publication unresolved; no native retry');if(other===directory){if(existsSync(path.join(other,'completed.json'))||existsSync(path.join(other,'recovery-began.json')))reject("codex_rehost_recovery_replay","This attempt has a completion or an uncertain recovery intent; no replay");}
           else if(this.hasBegan(other)){privatePath(path.join(other,'completed.json'),false);const r=JSON.parse(readFileSync(path.join(other,'completed.json'),'utf8'));if(r.ok!==true||r.nodeId!==b.nodeId||r.generation!==b.generation)reject("codex_rehost_unresolved_attempt","Another unresolved attempt excludes recovery");}
         }
         const backupPath=path.join(directory,'transcript.jsonl');privatePath(backupPath,false);
@@ -251,7 +253,7 @@ export class CodexSameGenerationRehost {
           const replacement=await this.replacement(b,pane,-1);
           this.prefix(this.history(native.transcriptPath,b.nativeId),stopped);this.unchanged(input,b,before);this.gates(b);
           const result:Extract<CodexRehostResult,{ok:true}>={ok:true,runtime:'codex',nodeId:b.nodeId,sessionName:b.sessionName,generation:b.generation,generationUnchanged:true,nativeIdHash:hash(b.nativeId),attemptId:input.attemptId,receiptPath:receiptPath!,backup:began.backup,nativeFingerprintBefore:began.nativeFingerprint,nativeFingerprintAfter:replacement.native.fingerprint,supervisorLaunchId:replacement.supervision.launchId,custodyPreserved:true,guardLeftEnabled:true,authorityRepaired:false};
-          writeDurable(path.join(directory,'completed.json'),JSON.stringify({...result,at:this.now(),recoveryProtocol:'codex-stopped-recovery-v1',beganSha256:input.beganSha256,custodyAfter:this.custody(b)})+'\n');return result;
+          this.beginCompletionPublication(directory,result.attemptId);writeDurable(path.join(directory,'completed.json'),JSON.stringify({...result,at:this.now(),recoveryProtocol:'codex-stopped-recovery-v1',beganSha256:input.beganSha256,custodyAfter:this.custody(b)})+'\n');await this.publishCompletion("codex-stopped-recovery",b,directory,result);return result;
         }catch(error){try{writeDurable(path.join(directory,'recovery-unknown.json'),JSON.stringify({attemptId:input.attemptId,at:this.now(),effectAttempted:true,code:error instanceof Refusal?error.code:'codex_rehost_recovery_unknown',blindRetryAllowed:false})+'\n');}catch{}throw error;}
       });
     }catch(error){return {ok:false,code:error instanceof Refusal?error.code:effectAttempted?'codex_rehost_recovery_unknown':'codex_rehost_recovery_unproven',message:error instanceof Refusal?error.message:'Stopped recovery proof unavailable; original evidence retained. No blind retry.',effectAttempted,blindRetryAllowed:false,...(receiptPath?{receiptPath}:{})};}
@@ -331,7 +333,7 @@ export class CodexSameGenerationRehost {
             generation:binding.generation,generationUnchanged:true,nativeIdHash:hash(binding.nativeId),attemptId,receiptPath,backup,
             nativeFingerprintBefore:fingerprint,nativeFingerprintAfter:replacement.native.fingerprint,supervisorLaunchId:replacement.supervision.launchId,
             custodyPreserved:true,guardLeftEnabled:true,authorityRepaired:false};
-          writeDurable(path.join(directory,'completed.json'),JSON.stringify(result)+'\n');return result;
+          this.beginCompletionPublication(directory,result.attemptId);writeDurable(path.join(directory,'completed.json'),JSON.stringify(result)+'\n');await this.publishCompletion("codex-detached-resume",binding,directory,result);return result;
         }catch(error){
           try{writeDurable(path.join(directory,'unknown.json'),JSON.stringify({at:this.now(),effectAttempted:true,blindRetryAllowed:false,code:error instanceof Refusal?error.code:'codex_detached_resume_unknown'})+'\n');}catch{}
           throw error;
@@ -458,7 +460,17 @@ export class CodexSameGenerationRehost {
     try { privatePath(path.join(attempt,"began.json"),false);return true; }
     catch(error) { if((error as NodeJS.ErrnoException).code==="ENOENT")return false;throw error; }
   }
-  private assertNoUnresolved(b:CodexRehostBinding){const dir=this.nodeDirectory(b);for(const id of readdirSync(dir)){const attempt=path.join(dir,id);privatePath(attempt,true);if(!this.hasBegan(attempt))continue;try{privatePath(path.join(attempt,'completed.json'),false);const receipt=JSON.parse(readFileSync(path.join(attempt,'completed.json'),'utf8'));if(receipt.ok!==true||receipt.generation!==b.generation||receipt.nodeId!==b.nodeId)throw new Error();}catch{reject("codex_rehost_unresolved_attempt","An earlier rehost attempt lacks a confirmed completion; no retry is permitted");}}}
+  private beginCompletionPublication(directory:string,attemptId:string){
+    if(this.deps.recordNativeRecoveryCompletion)writeDurable(path.join(directory,"completion-publication-began.json"),JSON.stringify({attemptId,at:this.now(),blindRetryAllowed:false})+"\n");
+  }
+  private completionPublicationUnresolved(directory:string){return existsSync(path.join(directory,"completion-publication-unknown.json"))||(existsSync(path.join(directory,"completion-publication-began.json"))&&!existsSync(path.join(directory,"completion-publication-completed.json")));}
+  private async publishCompletion(producer:"codex-rehost"|"codex-stopped-recovery"|"codex-detached-resume",b:CodexRehostBinding,directory:string,result:Extract<CodexRehostResult,{ok:true}>){
+    if(!this.deps.recordNativeRecoveryCompletion)return;
+    const completedPath=path.join(directory,"completed.json");
+    try{await this.deps.recordNativeRecoveryCompletion({producer,recoveryId:result.attemptId,rigId:(this.deps.db.prepare("SELECT rig_id FROM nodes WHERE id=?").get(b.nodeId) as {rig_id:string}).rig_id,nodeId:b.nodeId,sessionId:b.sessionId,sessionName:b.sessionName,generation:b.generation,runtime:"codex",nativeIdentityHash:result.nativeIdHash,source:{ref:completedPath,digest:recoveryReceiptDigest(readFileSync(completedPath))},supervisorLaunchId:result.supervisorLaunchId,nativeFingerprint:result.nativeFingerprintAfter});writeDurable(path.join(directory,"completion-publication-completed.json"),JSON.stringify({attemptId:result.attemptId,at:this.now()})+"\n");}
+    catch(error){writeDurable(path.join(directory,"completion-publication-unknown.json"),JSON.stringify({attemptId:result.attemptId,at:this.now(),blindRetryAllowed:false})+"\n");throw error;}
+  }
+  private assertNoUnresolved(b:CodexRehostBinding){const dir=this.nodeDirectory(b);for(const id of readdirSync(dir)){const attempt=path.join(dir,id);privatePath(attempt,true);if(this.completionPublicationUnresolved(attempt))reject("codex_rehost_completion_unresolved","Native completion publication unresolved; no native retry");if(!this.hasBegan(attempt))continue;try{privatePath(path.join(attempt,'completed.json'),false);const receipt=JSON.parse(readFileSync(path.join(attempt,'completed.json'),'utf8'));if(receipt.ok!==true||receipt.generation!==b.generation||receipt.nodeId!==b.nodeId)throw new Error();}catch{reject("codex_rehost_unresolved_attempt","An earlier rehost attempt lacks a confirmed completion; no retry is permitted");}}}
   private attemptDirectory(b:CodexRehostBinding,fingerprint:string,attemptId:string){
     const root=this.nodeDirectory(b);
     // Recognize both legacy fingerprint-only and uniquely named attempt directories.

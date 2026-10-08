@@ -239,19 +239,22 @@ export async function observeNativeDutyLaunch(store:NativeDutyLaunchStore,input:
     const binding=await deps.currentBinding(scope.nodeId);
     if(!binding || binding.lifecycleReserved || !binding.pane || !["nodeId","sessionName","generation","runtime","configurationDigest"].every(k=>(binding as unknown as Record<string,unknown>)[k]===(scope as unknown as Record<string,unknown>)[k]))return null;
     const census=deps.listProcesses??listNativeProcesses,verify=deps.verifyProcessIdentity??verifyNativeDutyProcessIdentity;
-    const sample=async():Promise<string|null>=>{
+    const sample=async():Promise<{fingerprint:string;nativeFingerprint?:string;processIdentity?:NativeDutyProof["processIdentity"]}|null>=>{
       if(!equal(await deps.currentBinding(scope.nodeId),binding)||!equal(store.read(scope.scopeId,launchId),read))return null;
       const panePid=await deps.tmux.getPanePid(binding.pane);if(!panePid)return null;
       const rows=await census();const supervisor=rows.find(row=>row.pid===supervisorPid);
       if(!supervisor || supervisor.executableName!==path.basename(intent.installedNode.path) || !ancestry(rows,supervisorPid,panePid))return null;
       if(!await verify(supervisorPid,publicIdentity(intent),[intent.installedNode.path,intent.installedSupervisor.path,"--supervise",intent.configPath]))return null;
       let native:NativeProcessRow|undefined;
+      let runtimeLaunchId:string|undefined,nativeFingerprint:string|undefined;
       if(scope.runtime==="codex"){
         const observed=await observeCodexPaneProcess({target:binding.pane,tmux:{getPanePid:async()=>panePid},listProcesses:async()=>rows,expectedToken:binding.resumeToken});
         native=observed?.process;
+        if(observed)nativeFingerprint=hash(observed.fingerprint);
       }else{
         const pi=await deps.piProve?.(binding.sessionName);if(pi?.state!=="present"||pi.generation!==binding.generation)return null;
         const fingerprint=JSON.parse(pi.fingerprint) as {pi?:number[];runner?:number[]};
+        runtimeLaunchId=pi.launchId??undefined;nativeFingerprint=pi.fingerprint;
         native=rows.find(row=>row.pid===fingerprint.pi?.[0]);
         if(!native||!fingerprint.runner?.[0]||!ancestry(rows,native.pid,fingerprint.runner[0]))return null;
       }
@@ -261,12 +264,16 @@ export async function observeNativeDutyLaunch(store:NativeDutyLaunchStore,input:
       const harness=underSupervisor[underSupervisor.length-2]!;
       if(!await verify(harness.pid,publicIdentity(intent),[config.harness.executable,...config.harness.args]) || !await verify(native.pid,publicIdentity(intent)))return null;
       if(await deps.tmux.getPanePid(binding.pane)!==panePid || !equal(await deps.currentBinding(scope.nodeId),binding) || !equal(store.read(scope.scopeId,launchId),read))return null;
-      return hash(canonical({pane:binding.pane,panePid,configSha256:intent.configSha256,configurationDigest:scope.configurationDigest,
+      const fingerprint=hash(canonical({pane:binding.pane,panePid,configSha256:intent.configSha256,configurationDigest:scope.configurationDigest,
         chain:chain.map(row=>[row.pid,row.ppid,row.startedAt,row.pgid,row.tpgid,row.executableName]),supervisorPid,launchId}));
+      const kernel=(row:NativeProcessRow)=>({pid:row.pid,startFingerprint:hash(canonical({pid:row.pid,startedAt:row.startedAt,executableName:row.executableName}))});
+      const processIdentity=native.startedAt&&supervisor.startedAt&&native.executableName&&supervisor.executableName
+        ? {native:kernel(native),supervisor:kernel(supervisor),nativeStartedAt:native.startedAt,supervisorStartedAt:supervisor.startedAt,...(runtimeLaunchId?{runtimeLaunchId}:{})}:undefined;
+      return {fingerprint,nativeFingerprint,...(processIdentity?{processIdentity}:{})};
     };
-    const first=await sample();if(!first)return null;const second=await sample();if(!second||second!==first)return null;
+    const first=await sample();if(!first)return null;const second=await sample();if(!second||!equal(second,first))return null;
     const observedAt=(deps.now??Date.now)();if(!Number.isSafeInteger(observedAt)||observedAt<0)return null;
     return {nodeId:scope.nodeId,sessionName:scope.sessionName,generation:scope.generation,runtime:scope.runtime,launchId,supervisorPid,
-      configurationDigest:scope.configurationDigest,fingerprint:second,observedAt,nativePresent:true,supervisorIsNativeAncestor:true,lifecycleReserved:false};
+      configurationDigest:scope.configurationDigest,fingerprint:second.fingerprint,nativeFingerprint:second.nativeFingerprint,...(second.processIdentity?{processIdentity:second.processIdentity}:{}),observedAt,nativePresent:true,supervisorIsNativeAncestor:true,lifecycleReserved:false};
   }catch{return null;}
 }

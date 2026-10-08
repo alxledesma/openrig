@@ -7,12 +7,35 @@ import { CoordinatorAuthorityService, CoordinatorFenceError, AssignmentReplay, t
 import { readWakeLadderBackstop } from "./queue-wake-ladder.js";
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
+import type { NativeRecoveryObservation, NativeRecoveryContinuationRuntime } from "./native-recovery-continuation-contract.js";
+
+export interface ClaimedRecoveryContinuationProof {
+  schema: "claimed-native-recovery-continuation.v1";
+  rigId: string;
+  queueId: string;
+  packageKey: string;
+  contractHash: string;
+  bodyHash: string;
+  claimantGeneration: string;
+  holderSession: string;
+  holderGeneration: string;
+  epoch: number;
+  planRevision: string;
+  admissionHash: string;
+  predecessorsHash: string;
+  observation: NativeRecoveryObservation;
+}
+
+export function claimedRecoveryContinuationOutboxId(proof: Pick<ClaimedRecoveryContinuationProof, "rigId" | "queueId" | "claimantGeneration" | "observation">): string {
+  const incarnation = proof.observation.completion.incarnation.key;
+  return `${WAKE_INTENT_PREFIX}claimed-${createHash("sha256").update(JSON.stringify([proof.rigId, proof.queueId, proof.claimantGeneration, incarnation])).digest("hex")}`;
+}
 import type { EventBus } from "./event-bus.js";
 import { loadHumanRegistry, resolveRegisteredHumanAddress, type LoadResult } from "./gateway/human-registry.js";
 import { resolveExternal } from "./gateway/external-admission.js";
 import type { PersistedEvent } from "./types.js";
 import { QueueTransitionLog, type OwnerNotificationLevel, type QueueTransition, type RecentQueueTransitionScope } from "./queue-transition-log.js";
-import { WAKE_INTENT_PREFIX, type OutboxHandler } from "./outbox-handler.js";
+import { WAKE_INTENT_PREFIX, type OutboxEntry, type OutboxHandler } from "./outbox-handler.js";
 import { derivePickup, type PickupReceipt } from "./queue-pickup.js";
 import { lastMeaningfulTransition, readWaitingView, type WaitingView, type WaitingActivityReader } from "./queue-waiting.js";
 import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
@@ -712,6 +735,7 @@ export class QueueRepository {
    *     fallback real code rather than a promise in a comment). */
   private outbox: OutboxHandler | undefined;
   private resolveOccupantGeneration?: (sessionName: string) => string | null;
+  private nativeRecoveryContinuation?: NativeRecoveryContinuationRuntime;
   private readonly wakeRepo: QueueWakeRepository;
   private watchdogJobsRepo: WatchdogJobsRepository | undefined;
   /** PL-007 Workspace Primitive — true when migration 038 has applied the
@@ -772,6 +796,8 @@ export class QueueRepository {
        */
       resolveOccupantGeneration?: (sessionName: string) => string | null;
       loadHumanRegistry?: () => LoadResult;
+      /** Optional exact recovered-incarnation final send fence. Absent disables claimed continuation delivery. */
+      nativeRecoveryContinuation?: NativeRecoveryContinuationRuntime;
     }
   ) {
     this.db = db;
@@ -786,6 +812,7 @@ export class QueueRepository {
     this.transport = opts?.transport;
     this.workflowFrontierPredicate = opts?.workflowFrontierPredicate;
     this.resolveOccupantGeneration = opts?.resolveOccupantGeneration;
+    this.nativeRecoveryContinuation = opts?.nativeRecoveryContinuation;
     this.loadHumanRegistryFn = opts?.loadHumanRegistry ?? (() => loadHumanRegistry());
     this.hasTargetRepoColumn = detectQueueColumn(db, "target_repo");
     this.hasSummaryColumn = detectQueueColumn(db, "summary");
@@ -993,6 +1020,22 @@ export class QueueRepository {
     return outboxId;
   }
 
+  /** Stage one distinct continuation notice for the exact existing claimed qitem.
+   * The original assignment row and its claim are never rewritten. Stable identity
+   * is qitem + claimant generation + recovered native incarnation, with no time or
+   * authority/admission churn in the key. */
+  stageClaimedRecoveryContinuation(input:{proof:ClaimedRecoveryContinuationProof;recipient:string;body:string}):string|null {
+    if(!this.db.inTransaction||!this.outbox)throw new QueueRepositoryError('wake_intent_store_unavailable','Claimed continuation requires an atomic durable wake store');
+    const p=input?.proof,c=p?.observation?.completion;
+    if(!p||p.schema!=='claimed-native-recovery-continuation.v1'||!c||c.schema!=='native-recovery-completion.v1'||!p.queueId||!p.rigId||!p.packageKey||!p.contractHash||!p.bodyHash||!p.claimantGeneration||!p.holderSession||!p.holderGeneration||!Number.isSafeInteger(p.epoch)||!p.planRevision||!p.admissionHash||!p.predecessorsHash||!Number.isFinite(p.observation.observedAt)||!c.incarnation?.key||input.recipient!==c.sessionName||input.recipient!==this.getById(p.queueId)?.destinationSession||p.claimantGeneration!==c.generation) return null;
+    const row=this.db.prepare('SELECT q.body,q.state,q.claimed_by_generation_uuid,a.destination,a.body_hash,a.disposition_id FROM queue_items q JOIN coordinator_assignments a ON a.queue_id=q.qitem_id WHERE a.rig_id=? AND a.package_key=? AND a.queue_id=?').get(p.rigId,p.packageKey,p.queueId) as {body:string;state:string;claimed_by_generation_uuid:string|null;destination:string;body_hash:string;disposition_id:string|null}|undefined;
+    if(!row||row.state!=='in-progress'||row.claimed_by_generation_uuid!==p.claimantGeneration||row.destination!==input.recipient||row.disposition_id||createHash('sha256').update(row.body).digest('hex')!==row.body_hash||row.body_hash!==p.bodyHash)return null;
+    const outboxId=claimedRecoveryContinuationOutboxId(p);
+    if(this.outbox.getById(outboxId))return null;
+    this.recordWakeIntent({outboxId,auditPointer:p.queueId,fromSession:p.holderSession,toSession:input.recipient,identityProvenance:'system:operator-authorized-coordination',bareBody:input.body,tags:['queue:claimed-native-recovery-continuation',JSON.stringify(p),`queue:recipient-generation:${p.claimantGeneration}`]});
+    return outboxId;
+  }
+
   private recordWakeIntent(input: {
     outboxId: string;
     auditPointer: string;
@@ -1167,6 +1210,8 @@ export class QueueRepository {
       if (alreadyHeld.auditPointer) this.recordNudgeAttempt(alreadyHeld.auditPointer, "retained:typing_guard");
       return "retained";
     }
+    if(alreadyHeld?.tags?.includes('queue:claimed-native-recovery-continuation'))
+      return this.deliverClaimedRecoveryContinuation(alreadyHeld);
     // MF3: CLAIM (pending→sending) BEFORE the external send so overlapping drains
     // cannot both send. A losing claim — the row is no longer `pending` (already
     // resolved, in-flight under another drainer, or claimed) — simply skips: no
@@ -1178,9 +1223,9 @@ export class QueueRepository {
       // Exact historical quarantine applies to individual and coalesced drains.
       if (this.outbox!.isHistoricalQuarantined(entry.outboxId)) return false;
       const row = entry.auditPointer ? this.db.prepare("SELECT state FROM queue_items WHERE qitem_id = ?").get(entry.auditPointer) as { state: string } | undefined : undefined;
-      let current = row?.state === "pending";
       const tagsValid=entry.tags==null||(Array.isArray(entry.tags)&&entry.tags.every(tag=>typeof tag==='string'));
       const safeTags=tagsValid?(entry.tags??[]):[];
+      let current = row?.state === "pending";
       if(!tagsValid)current=false;
       const recipientGenerations=safeTags.filter(tag=>tag.startsWith('queue:recipient-generation:')).map(tag=>tag.slice('queue:recipient-generation:'.length));
       if(recipientGenerations.length && (recipientGenerations.length!==1||!recipientGenerations[0]||recipientGenerations[0]!==this.resolveOccupantGeneration?.(entry.destinationSession)))current=false;
@@ -1244,9 +1289,10 @@ export class QueueRepository {
     }
     const qitemId = intent.auditPointer ?? outboxId;
     // MF4: send the FROZEN envelope stored on the intent verbatim (no re-resolution).
-    const outcome = await this.performWakeSend(
+    const send=()=>this.performWakeSend(
       qitemId, intent.destinationSession, intent.senderSession, undefined, group.map(entry => entry.body).join("\n"), group.map(entry => entry.outboxId), (intent.tags?.includes('queue:native-return-continuation')||intent.tags?.includes('queue:outbox-abandon-continuation')) ? intent.tags![1] : undefined,
     );
+    const outcome=await send();
     const finalState = outcome.classified === "verified" ? "delivered" : outcome.classified;
     for (const member of group) {
       const intent = member;
@@ -1290,6 +1336,124 @@ export class QueueRepository {
       if (wakeEvent) this.eventBus.notifySubscribers(wakeEvent);
     }
     return finalState;
+  }
+
+  /**
+   * Claimed native continuation has a stricter ordering than ordinary wakes:
+   * native incarnation validation may be asynchronous, so the durable intent
+   * stays pending until the guard invokes its callback. That callback performs
+   * the final synchronous database checks and pending→sending CAS immediately
+   * before transport. A transient hold therefore remains drainable; once the
+   * CAS succeeds, every ambiguous outcome remains terminal UNKNOWN.
+   */
+  private async deliverClaimedRecoveryContinuation(
+    intent: OutboxEntry,
+  ): Promise<"delivered" | "indeterminate" | "failed" | "skipped" | "retained"> {
+    const runtime = this.nativeRecoveryContinuation;
+    if (!runtime || intent.deliveryState !== "pending" || !intent.auditPointer || !this.outbox) return "skipped";
+    const invalidatePending = (): boolean => this.db.transaction(() => {
+      const current = this.outbox!.getById(intent.outboxId);
+      if (!current || current.deliveryState !== "pending") return false;
+      const safeTags = current.tags ?? [];
+      this.db.prepare("UPDATE outbox_entries SET delivery_state='failed', tags=? WHERE outbox_id=? AND delivery_state='pending'")
+        .run(JSON.stringify([...safeTags, "queue:wake-superseded"]), intent.outboxId);
+      return true;
+    })();
+
+    let proof: ClaimedRecoveryContinuationProof;
+    try {
+      if (!intent.tags || intent.tags.length !== 3 || intent.tags[0] !== "queue:claimed-native-recovery-continuation") return invalidatePending() ? "failed" : "skipped";
+      proof = JSON.parse(intent.tags[1]!) as ClaimedRecoveryContinuationProof;
+      if (!proof || proof.schema !== "claimed-native-recovery-continuation.v1" ||
+          intent.outboxId !== claimedRecoveryContinuationOutboxId(proof) ||
+          intent.tags[2] !== `queue:recipient-generation:${proof.claimantGeneration}` ||
+          proof.queueId !== intent.auditPointer || proof.observation?.completion?.sessionName !== intent.destinationSession) return invalidatePending() ? "failed" : "skipped";
+    } catch {
+      return invalidatePending() ? "failed" : "skipped";
+    }
+
+    type CallbackResult =
+      | { kind: "sent"; outcome: Awaited<ReturnType<QueueRepository["performWakeSend"]>> }
+      | { kind: "held" | "invalid" | "lost" };
+    let transportInvoked = false;
+    let callbackResult: CallbackResult | undefined;
+    const finalizeUnknown = (detail: string): void => {
+      this.db.transaction(() => {
+        this.recordNudgeAttempt(intent.auditPointer!, `indeterminate:claimed-native-continuation:${detail}`);
+        this.outbox!.finalizeDelivery(intent.outboxId, "indeterminate");
+      })();
+    };
+
+    try {
+      const guarded = await runtime.withRecoveredIncarnation(proof.observation, async () => {
+        // No await is permitted between the final readiness read and the CAS.
+        const decision = this.db.transaction(() => {
+          const current = this.outbox!.getById(intent.outboxId);
+          if (!current || current.deliveryState !== "pending") return "lost" as const;
+          const readiness = this.coordinatorAuthority.coordinationRecovery?.claimedRecoveryContinuationWakeReadiness(
+            intent.outboxId, proof.queueId, intent.senderSession, intent.destinationSession, current.tags ?? [],
+          ) ?? "invalid";
+          if (readiness === "held") return "held" as const;
+          if (readiness === "invalid") {
+            const safeTags = current.tags ?? [];
+            this.db.prepare("UPDATE outbox_entries SET delivery_state='failed', tags=? WHERE outbox_id=? AND delivery_state='pending'")
+              .run(JSON.stringify([...safeTags, "queue:wake-superseded"]), intent.outboxId);
+            return "invalid" as const;
+          }
+          return this.outbox!.claimForDelivery(intent.outboxId) ? "claimed" as const : "lost" as const;
+        })();
+        if (decision !== "claimed") {
+          const result: CallbackResult = { kind: decision };
+          callbackResult = result;
+          return result;
+        }
+
+        // The CAS is the first durable sign of a transport attempt. Invoke
+        // transport synchronously next; any subsequent uncertainty is UNKNOWN.
+        transportInvoked = true;
+        const outcome = await this.performWakeSend(
+          proof.queueId, intent.destinationSession, intent.senderSession, undefined, intent.body, [intent.outboxId],
+        );
+        const result: CallbackResult = { kind: "sent", outcome };
+        callbackResult = result;
+        return result;
+      });
+
+      if (transportInvoked && guarded.state !== "performed") {
+        finalizeUnknown(`guard-${guarded.state}:${guarded.reason}`);
+        return "indeterminate";
+      }
+      if (guarded.state === "held") return "retained"; // pending, eligible for a later drain
+      if (guarded.state === "invalid") {
+        if (transportInvoked) {
+          finalizeUnknown(`guard-invalid:${guarded.reason}`);
+          return "indeterminate";
+        }
+        invalidatePending();
+        return "failed";
+      }
+      if (guarded.state !== "performed") return "retained";
+      const result = guarded.value;
+      if (result.kind === "held") return "retained"; // leave same intent pending
+      if (result.kind === "lost") return "skipped";
+      if (result.kind === "invalid") return "failed"; // callback already invalidated pending
+      if (result.kind !== "sent") return "skipped";
+      const finalState = result.outcome.classified === "verified" ? "delivered" : result.outcome.classified;
+      this.db.transaction(() => {
+        this.recordNudgeAttempt(proof.queueId, result.outcome.nudgeResult);
+        this.outbox!.finalizeDelivery(intent.outboxId, finalState);
+      })();
+      return finalState;
+    } catch (error) {
+      if (transportInvoked) {
+        finalizeUnknown(error instanceof Error ? error.name : "unknown-throw");
+        return "indeterminate";
+      }
+      // Guard observation failures before the CAS are transient and must not
+      // consume the immutable intent.
+      if (callbackResult?.kind === "invalid") return "failed";
+      return "retained";
+    }
   }
 
   /**
