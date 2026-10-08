@@ -76,6 +76,14 @@ def native_thread(argv):
   raise ValueError()
  if resumed: raise ValueError()
  return None
+def foreign_seat_home(identity,expected):
+ # Session names are local to an OpenRig home. A different durable node in a
+ # proven different home is unrelated; missing scope remains UNKNOWN.
+ node=identity.get('OPENRIG_NODE_ID'); home=identity.get('OPENRIG_HOME'); own=expected.get('OPENRIG_HOME')
+ if not node or node==expected['OPENRIG_NODE_ID'] or not home or not own: return False
+ if not os.path.isabs(home) or not os.path.isabs(own): return False
+ if not os.path.isdir(home) or not os.path.isdir(own): return False
+ return os.path.realpath(home)!=os.path.realpath(own)
 ok=False
 try:
  expected=json.loads(sys.argv[1]); pane=int(sys.argv[2]); native=sys.argv[3]
@@ -96,9 +104,10 @@ try:
    prefix=(k+'=').encode(); values=[x[len(prefix):] for x in env if x.startswith(prefix)]
    if len(values)>1: raise ValueError()
    identity[k]=values[0].decode('utf8') if values else None
-  # Broader same-seat exclusion also catches stale-generation wrappers. The
-  # independently proven bare pane root alone is exempt from inherited tmux env.
-  if identity['OPENRIG_NODE_ID']==expected['OPENRIG_NODE_ID'] or identity['OPENRIG_SESSION_NAME']==expected['OPENRIG_SESSION_NAME']: raise ValueError()
+  # Exact node identity is global, including stale-generation wrappers.
+  # Only a fully scoped foreign seat may reuse this home's display name.
+  if identity['OPENRIG_NODE_ID']==expected['OPENRIG_NODE_ID']: raise ValueError()
+  if identity['OPENRIG_SESSION_NAME']==expected['OPENRIG_SESSION_NAME'] and not foreign_seat_home(identity,expected): raise ValueError()
   if os.path.basename(executable)=='codex' and native_thread(argv)==native: raise ValueError()
  ok=True
 except: pass
@@ -117,7 +126,7 @@ export async function proveDetachedCodexIdentityAbsent(binding:CodexRehostBindin
 
 async function proveCodexIdentityAbsent(binding:CodexRehostBinding,panePid:number,detached:boolean):Promise<boolean>{
   if(!Number.isSafeInteger(panePid)||(detached?panePid!==0:panePid<=1))return false;
-  try {const result=await promisify(execFile)('python3',['-c',STOPPED_CENSUS_PY,JSON.stringify({OPENRIG_NODE_ID:binding.nodeId,OPENRIG_SESSION_NAME:binding.sessionName}),String(panePid),binding.nativeId],{timeout:5000,maxBuffer:128,encoding:'utf8'});return result.stdout.trim()==='1';}catch{return false;}
+  try {const result=await promisify(execFile)('python3',['-c',STOPPED_CENSUS_PY,JSON.stringify({OPENRIG_NODE_ID:binding.nodeId,OPENRIG_SESSION_NAME:binding.sessionName,OPENRIG_HOME:process.env.OPENRIG_HOME??null}),String(panePid),binding.nativeId],{timeout:5000,maxBuffer:128,encoding:'utf8'});return result.stdout.trim()==='1';}catch{return false;}
 }
 
 /** Retained native records are contract evidence, not a claim of live process

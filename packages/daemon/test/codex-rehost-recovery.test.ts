@@ -1,7 +1,7 @@
 import {afterEach,beforeEach,describe,expect,it,vi} from 'vitest';
 import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
-import {mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync,existsSync,mkdirSync} from 'node:fs';
+import {mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync,existsSync,mkdirSync,symlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import type Database from 'better-sqlite3';
@@ -178,4 +178,55 @@ for kernel,native in [('',None),('codex',None),('/absolute/with\ncontrol',None),
  raise AssertionError('unproven executable accepted')
 print('PASS')`;
  expect(execFileSync('python3',['-c',program+check],{encoding:'utf8'}).trim()).toBe('PASS');
+});
+
+it('global census exempts a matching session name only for a proven different node and realpath-distinct home',()=>{
+ const source=readFileSync(new URL('../src/domain/codex-rehost-integration.ts',import.meta.url),'utf8');
+ const program=source.match(/const STOPPED_CENSUS_PY = String.raw`([\s\S]*?)`;/)![1]!;
+ const root=mkdtempSync(path.join(tmpdir(),'census-home-namespace-'));
+ const currentHome=path.join(root,'current'),otherHome=path.join(root,'other'),aliasHome=path.join(root,'current-alias');
+ mkdirSync(currentHome);mkdirSync(otherHome);symlinkSync(currentHome,aliasHome,'dir');
+ const pythonFixture=String.raw`
+def argv_env(pid):
+ case=json.loads(os.environ['RECOVERY_KERNEL_FIXTURE'])
+ if case.get('unreadable'): raise ValueError()
+ return case['argv'],[x.encode() for x in case['env']],case['exe']
+subprocess.check_output=lambda *args,**kwargs: ('4321 '+str(os.getuid())+' S\n').encode()
+os.kill=lambda *args: None
+`;
+ const originalHome=process.env['OPENRIG_HOME'];
+ const fixture=(env:string[],argv:string[]=['/bin/zsh'],exe='/bin/zsh')=>({env,argv,exe});
+ const foreignSameSession=(home:string,extra:string[]=[]):string[]=>[
+  'OPENRIG_NODE_ID=peer@xv',`OPENRIG_SESSION_NAME=${seat}`,`OPENRIG_HOME=${home}`,'OPENRIG_OCCUPANT_GENERATION=peer-g1',...extra,
+ ];
+ const run=(value:unknown,current: string|null)=>{
+  const environment:NodeJS.ProcessEnv={...process.env,RECOVERY_KERNEL_FIXTURE:JSON.stringify(value)};
+  if(current===null)delete environment['OPENRIG_HOME'];else environment['OPENRIG_HOME']=current;
+  const expected={OPENRIG_NODE_ID:seat,OPENRIG_SESSION_NAME:seat,OPENRIG_HOME:current};
+  return execFileSync('python3',['-c',program.replace('ok=False',pythonFixture+'\nok=False'),JSON.stringify(expected),'10',nativeId],{env:environment,encoding:'utf8'}).trim();
+ };
+ try {
+  // Only a different node with two existing, absolute, realpath-distinct homes
+  // makes this same display name unrelated to the target.
+  expect(run(fixture(foreignSameSession(otherHome)),currentHome)).toBe('1');
+  expect(run(fixture(foreignSameSession(currentHome)),currentHome)).toBe('0');
+  expect(run(fixture(foreignSameSession(aliasHome)),currentHome)).toBe('0');
+  expect(run(fixture(foreignSameSession('relative-home')),currentHome)).toBe('0');
+  expect(run(fixture(foreignSameSession(path.join(root,'missing-home'))),currentHome)).toBe('0');
+  expect(run(fixture(foreignSameSession(otherHome).filter(v=>!v.startsWith('OPENRIG_NODE_ID=')),),currentHome)).toBe('0');
+  expect(run(fixture(foreignSameSession(otherHome,[`OPENRIG_NODE_ID=${seat}`])),currentHome)).toBe('0');
+  expect(run(fixture(foreignSameSession(otherHome,[`OPENRIG_NODE_ID=third@xv`])),currentHome)).toBe('0');
+  expect(run(fixture(foreignSameSession(otherHome).filter(v=>!v.startsWith('OPENRIG_HOME=')),),currentHome)).toBe('0');
+  expect(run(fixture(foreignSameSession(otherHome,[`OPENRIG_HOME=${otherHome}`])),currentHome)).toBe('0');
+  expect(run(fixture(foreignSameSession(otherHome,[`OPENRIG_OCCUPANT_GENERATION=stale-generation`])),currentHome)).toBe('1');
+  expect(run(fixture(['OPENRIG_NODE_ID='+seat,`OPENRIG_SESSION_NAME=${seat}`,`OPENRIG_HOME=${otherHome}`,'OPENRIG_OCCUPANT_GENERATION=stale-generation']),currentHome)).toBe('0');
+  expect(run(fixture(foreignSameSession(otherHome)),null)).toBe('0');
+  expect(run(fixture(foreignSameSession(otherHome)),'' )).toBe('0');
+  // The identity exemption never hides a process running the exact native Codex thread.
+  expect(run(fixture(['OPENRIG_NODE_ID=peer@xv','OPENRIG_SESSION_NAME=other@xv',`OPENRIG_HOME=${otherHome}`,'OPENRIG_OCCUPANT_GENERATION=peer-g1'],['/usr/bin/codex','--no-daemon','resume',nativeId],'/usr/bin/codex'),currentHome)).toBe('0');
+  expect(run(fixture(['OPENRIG_NODE_ID=peer@xv','OPENRIG_SESSION_NAME=other@xv',`OPENRIG_HOME=${otherHome}`,'OPENRIG_OCCUPANT_GENERATION=peer-g1'],['/usr/bin/codex','--no-daemon','resume','unrelated-thread'],'/usr/bin/codex'),currentHome)).toBe('1');
+ } finally {
+  if(originalHome===undefined)delete process.env['OPENRIG_HOME'];else process.env['OPENRIG_HOME']=originalHome;
+  rmSync(root,{recursive:true,force:true});
+ }
 });
