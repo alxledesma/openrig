@@ -465,10 +465,64 @@ it('only exact temporary heartbeat refusal is observational; other POST failures
  try{
   Object.assign(process.env,values);globalThis.fetch=(async()=>new Response(JSON.stringify({error}),{status})) as typeof fetch;
   const {transport}=inheritedNativeDutyTransport();
-  await expect(transport.heartbeat('exact-id')).rejects.toBeInstanceOf(NativeDutyTemporaryHoldError);
-  await expect(transport.register({scopeId:'scope',launchId:'launch',supervisorPid:321})).rejects.toThrow('native-duty-transport-unresolved');
-  await expect(transport.inFlight('exact-id','op')).rejects.toThrow('native-duty-transport-unresolved');
-  error='native_duty_proof_mismatch';await expect(transport.heartbeat('exact-id')).rejects.toThrow('native-duty-transport-unresolved');
-  error='native_duty_temporary_exclusion';status=500;await expect(transport.heartbeat('exact-id')).rejects.toThrow('native-duty-transport-unresolved');
+  for(error of ['native_duty_temporary_exclusion','native_duty_proof_unavailable']){
+   status=409;
+   await expect(transport.heartbeat('exact-id')).rejects.toBeInstanceOf(NativeDutyTemporaryHoldError);
+   await expect(transport.register({scopeId:'scope',launchId:'launch',supervisorPid:321})).rejects.toThrow('native-duty-transport-unresolved');
+   await expect(transport.inFlight('exact-id','op')).rejects.toThrow('native-duty-transport-unresolved');
+   status=500;await expect(transport.heartbeat('exact-id')).rejects.toThrow('native-duty-transport-unresolved');
+  }
+  status=409;error='native_duty_proof_mismatch';await expect(transport.heartbeat('exact-id')).rejects.toThrow('native-duty-transport-unresolved');
+  for(const body of ['{invalid','null','[]',JSON.stringify('native_duty_proof_unavailable')]){
+   globalThis.fetch=(async()=>new Response(body,{status:409})) as typeof fetch;
+   await expect(transport.heartbeat('exact-id')).rejects.toThrow('native-duty-transport-unresolved');
+  }
  }finally{globalThis.fetch=oldFetch;for(const[k,v]of previous){if(v===undefined)delete process.env[k];else process.env[k]=v;}}
+});
+
+// Actual inherited wire classification feeds the existing executor; all effects
+// below are injected. Neither an observational hold nor later proof replays debt.
+it.each([1,2])('unavailable heartbeat at observation %i holds; fresh same registration continues without unresolved replay',async(holdAt)=>{
+ const values={OPENRIG_SESSION_NAME:'lead@rig',OPENRIG_OCCUPANT_GENERATION:'genuine-generation',OPENRIG_URL:'http://127.0.0.1:12345',OPENRIG_TERMINAL_BEARER_TOKEN:'test-only-token'};
+ const previous=new Map(Object.keys(values).map(k=>[k,process.env[k]])),oldFetch=globalThis.fetch;
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'native-duty-observation-'));fs.chmodSync(dir,0o700);
+ const actor={session:values.OPENRIG_SESSION_NAME,generation:values.OPENRIG_OCCUPANT_GENERATION};
+ let status:NativeDutyStatus={registrationId:'registration',scopeDigest:'scope-digest',launchId:'launch',
+  scope:{scopeId:'scope',nodeId:'node',sessionName:actor.session,generation:actor.generation,runtime:'codex',rigId:'rig',configurationDigest:'config',validUntil:100000,maxLeaseMs:10000,kind:'holder-continuation'},
+  phase:'watching',lastHeartbeatAt:10000,observerDeadline:13000,reason:null,intent:null};
+ let heartbeats=0,resumes=0,prepares=0,reconciles=0;
+ const journal=new FileDutyJournal(dir);
+ try{
+  Object.assign(process.env,values);
+  globalThis.fetch=(async(_input,init)=>{
+   expect(JSON.parse(String(init?.body))).toEqual({registrationId:'registration'});
+   if(++heartbeats===holdAt)return new Response(JSON.stringify({error:'native_duty_proof_unavailable'}),{status:409});
+   return new Response(JSON.stringify(status),{status:200});
+  }) as typeof fetch;
+  const wire=inheritedNativeDutyTransport();
+  const transport:NativeDutyTransport={...wire.transport,
+   status:async(id)=>{expect(id).toBe('registration');return structuredClone(status);},
+   register:async()=>{throw Error('must not re-register');},
+   show:async()=>({authority:{rig_id:'rig',owner_session:actor.session,owner_generation:actor.generation,epoch:7,lease_until:14000,state:'active',baton_id:'baton'},obligationsDigest:'a'.repeat(64),obligations:[{openQueue:[{qitem_id:'baton',destination_session:actor.session,state:'in-progress',claimed_by_generation_uuid:actor.generation}]}]}),
+   prepare:async(id,request)=>{prepares++;expect(id).toBe('registration');expect(journal.read()?.request).toEqual(request);status.intent={operationId:request.operationId,request,bodyDigest:'exact-digest',preparedAt:10000,phase:'prepared'};return structuredClone(status.intent);},
+   inFlight:async(id,op)=>{expect(id).toBe('registration');expect(op).toBe('exact-op');expect(journal.read()?.phase).toBe('effect-in-flight');status.intent={...status.intent!,phase:'effect-in-flight'};return {intent:structuredClone(status.intent),maySendEffect:true};},
+   resume:async()=>{resumes++;},
+   reconcile:async(id,op)=>{reconciles++;expect(id).toBe('registration');expect(op).toBe('exact-op');return {...status.intent!,phase:resumes===1?'receipt-confirmed':'uncertainty-held'};},
+  };
+  const executor=new HolderContinuationExecutor(transport,journal,actor,{now:()=>10000,sleep:async()=>{}},()=>true,()=> 'exact-op');
+  expect(await executor.step('registration')).toBe('held');expect(resumes).toBe(0);
+  expect(status.phase).toBe('watching');expect(status.scope.validUntil).toBe(100000);
+  if(holdAt===1){
+   expect(journal.read()).toBeNull();expect(prepares).toBe(0);
+   expect(await executor.step('registration')).toBe('confirmed');expect(resumes).toBe(1);expect(prepares).toBe(1);expect(heartbeats).toBe(3);
+  }else{
+   const held=journal.read();expect(held?.phase).toBe('effect-in-flight');
+   expect(await executor.step('registration')).toBe('held');expect(journal.read()).toEqual(held);
+   expect(resumes).toBe(0);expect(prepares).toBe(1);expect(heartbeats).toBe(2);expect(reconciles).toBe(1);
+   // A fresh helper with no local journal must also reconcile registry debt.
+   const freshDir=path.join(dir,'fresh');fs.mkdirSync(freshDir,{mode:0o700});
+   const fresh=new HolderContinuationExecutor(transport,new FileDutyJournal(freshDir),actor,{now:()=>10000,sleep:async()=>{}},()=>true,()=> 'must-not-create');
+   expect(await fresh.step('registration')).toBe('held');expect(resumes).toBe(0);expect(prepares).toBe(1);expect(heartbeats).toBe(2);expect(reconciles).toBe(2);
+  }
+ }finally{globalThis.fetch=oldFetch;for(const[k,v]of previous){if(v===undefined)delete process.env[k];else process.env[k]=v;}fs.rmSync(dir,{recursive:true,force:true});}
 });

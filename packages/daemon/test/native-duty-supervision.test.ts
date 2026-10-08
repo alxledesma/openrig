@@ -25,7 +25,7 @@ describe("native duty supervision", () => {
     const scope: NativeDutyScope = { scopeId: "scope-xv-12", nodeId: "node-xv", sessionName: native.session,
       generation: native.generation, runtime: "codex", rigId: "xv", configurationDigest: "cfg-sha256-12",
       validUntil: 90_000, maxLeaseMs: 20_000, kind: "holder-continuation" };
-    let config = scope.configurationDigest;
+    let config = scope.configurationDigest, proofUnavailable = false;
     let receipt: NativeDutyOperationReceipt | null = null;
     const proof = (launchId: string, supervisorPid: number): NativeDutyProof => ({ nodeId: scope.nodeId,
       sessionName: native.session, generation: native.generation, runtime: "codex", launchId, supervisorPid,
@@ -34,7 +34,7 @@ describe("native duty supervision", () => {
     const service = new NativeDutySupervisionService({ db, now: () => now,
       approvedScope: (id) => id === scope.scopeId ? scope : null,
       assertCurrentOperator: (actor) => { if (actor.session !== operator.session || actor.generation !== operator.generation) throw new Error("operator generation is not current"); },
-      observeNative: (_scope, launchId, pid) => proof(launchId, pid),
+      observeNative: (_scope, launchId, pid) => proofUnavailable ? null : proof(launchId, pid),
       assertResumeAuthority: (_scope, actor, request) => { expect(actor).toEqual(native); expect(request.rigId).toBe(scope.rigId); },
       operationReceipt: () => receipt,
     });
@@ -45,6 +45,15 @@ describe("native duty supervision", () => {
     expect(() => service.register({ ...native, generation: "lead-old" }, { scopeId: scope.scopeId, launchId: "launch-a", supervisorPid: 710 })).toThrowError(NativeDutyError);
     const registered = service.register(native, { scopeId: scope.scopeId, launchId: "launch-a", supervisorPid: 710 });
     expect(service.register(native, { scopeId: scope.scopeId, launchId: "launch-a", supervisorPid: 710 }).registrationId).toBe(registered.registrationId);
+
+    const watchingBefore=db.prepare("SELECT * FROM native_duty_registrations WHERE registration_id=?").get(registered.registrationId);
+    proofUnavailable=true;
+    expect(()=>service.heartbeat(native,registered.registrationId)).toThrowError(NativeDutyError);
+    expect(service.status(registered.registrationId).phase).toBe("watching");
+    expect(db.prepare("SELECT * FROM native_duty_registrations WHERE registration_id=?").get(registered.registrationId)).toEqual(watchingBefore);
+    proofUnavailable=false;now++;
+    expect(service.heartbeat(native,registered.registrationId)).toMatchObject({registrationId:registered.registrationId,phase:"watching",lastHeartbeatAt:now});
+    expect(db.prepare("SELECT count(*) n FROM native_duty_registrations WHERE scope_id=?").get(scope.scopeId)).toEqual({n:1});
 
     const mismatched = service.register(native, { scopeId: scope.scopeId, launchId: "launch-c", supervisorPid: 712 });
     config = "different-config";

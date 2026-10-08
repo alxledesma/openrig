@@ -191,6 +191,24 @@ describe("native duty actual authority integration",()=>{
   expect((await call("/heartbeat",{registrationId})).body.error).toBe("native_duty_proof_mismatch");
   expect(integration.service.status(registrationId).phase).toBe("held");
  });
+ it("unavailable native observation refuses effects but preserves the same watching registration for a fresh proof",async()=>{
+  const registrationId=await grantAndRegister();
+  const registration=()=>db.prepare("SELECT * FROM native_duty_registrations WHERE registration_id=?").get(registrationId);
+  const before=registration();proofMissing=true;
+  const unavailable=await call("/heartbeat",{registrationId});
+  expect(unavailable.status).toBe(409);expect(unavailable.body.error).toBe("native_duty_proof_unavailable");
+  expect(integration.service.status(registrationId).phase).toBe("watching");expect(registration()).toEqual(before);
+  const resume=request("no-proof-must-not-prepare");
+  const refused=await call("/prepare",{registrationId,request:resume});
+  expect(refused.status).toBe(409);expect(refused.body.error).toBe("native_duty_proof_unavailable");
+  expect(db.prepare("SELECT * FROM native_duty_intents").all()).toEqual([]);expect(registration()).toEqual(before);
+
+  proofMissing=false;now+=1000;vi.setSystemTime(now);
+  const fresh=await call("/heartbeat",{registrationId});
+  expect(fresh.status).toBe(200);expect(fresh.body.registrationId).toBe(registrationId);expect(fresh.body.phase).toBe("watching");
+  expect(integration.service.status(registrationId).phase).toBe("watching");
+  expect((registration() as any).last_heartbeat_at).toBe(now);expect(db.prepare("SELECT count(*) n FROM native_duty_registrations").get()).toEqual({n:1});
+ });
  it("temporary exclusion preserves prepared bytes and never reopens an in-flight send grant",async()=>{
   const registrationId=await grantAndRegister(),r=request();
   expect((await call("/prepare",{registrationId,request:r})).status).toBe(201);
@@ -252,18 +270,22 @@ describe("native duty actual authority integration",()=>{
   expect((await call("/register",enrollment)).status).toBeGreaterThanOrEqual(400);
  });
 
- it("discovers held and expired registrations for receipt-only reconciliation without reviving them",async()=>{
+ it("preserves in-flight receipt debt through an unavailable proof and stops only when its scope expires",async()=>{
   const registrationId=await grantAndRegister(),resume=request();
   expect((await call("/prepare",{registrationId,request:resume})).body.phase).toBe("prepared");
   await call("/in-flight",{registrationId,operationId:resume.operationId});
   repo.coordinatorAuthority.resumeOwned(holder.session,holder.generation,resume); // real durable receipt, response lost
   proofMissing=true;expect((await call("/heartbeat",{registrationId})).status).toBe(409);
-  expect(integration.service.status(registrationId).phase).toBe("held");
+  expect(integration.service.status(registrationId).phase).toBe("watching");
+  const intentBefore=db.prepare("SELECT * FROM native_duty_intents WHERE registration_id=?").get(registrationId);
   expect((await call(enrollmentUrl())).body).toEqual({state:"ready",registrationId});
   now=scope.validUntil+1;vi.setSystemTime(now);
   expect((await call(enrollmentUrl())).body).toEqual({state:"ready",registrationId});
+  expect((await call("/heartbeat",{registrationId})).body.error).toBe("native_duty_scope_expired");
+  expect(integration.service.status(registrationId).phase).toBe("stopped");
   expect((await call("/reconcile",{registrationId,operationId:resume.operationId})).body.phase).toBe("receipt-confirmed");
-  expect(integration.service.status(registrationId).phase).toBe("held");
+  expect(integration.service.status(registrationId).phase).toBe("stopped");
+  expect(db.prepare("SELECT * FROM native_duty_intents WHERE registration_id=?").get(registrationId)).toEqual({...intentBefore,phase:"receipt-confirmed"});
   expect((await call("/prepare",{registrationId,request:request("new-effect")})).status).toBeGreaterThanOrEqual(400);
   expect(db.prepare("SELECT count(*) n FROM native_duty_registrations").get()).toEqual({n:1});
  });

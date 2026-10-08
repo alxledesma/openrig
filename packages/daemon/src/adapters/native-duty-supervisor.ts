@@ -393,7 +393,8 @@ export function inheritedNativeDutyTransport(): { actor: NativeDutyActor; transp
         let refusal: unknown;
         try { refusal = await res.json(); } catch { /* Unknown response stays a mutation failure. */ }
         if (refusal && typeof refusal === "object" && !Array.isArray(refusal)
-          && (refusal as Record<string, unknown>).error === "native_duty_temporary_exclusion") throw new NativeDutyTemporaryHoldError();
+          && ((refusal as Record<string, unknown>).error === "native_duty_temporary_exclusion"
+            || (refusal as Record<string, unknown>).error === "native_duty_proof_unavailable")) throw new NativeDutyTemporaryHoldError();
       }
       throw body === undefined ? new NativeDutyObservationError() : new Error("native-duty-transport-unresolved");
     }

@@ -162,7 +162,10 @@ export class NativeDutySupervisionService {
     try{return this.assertNativeProof(scope,row.launch_id,row.supervisor_pid);}
     catch(error){
       const code=error instanceof NativeDutyError?error.code:"native-duty-proof-unavailable";
-      if(code==="native_duty_temporary_exclusion")throw error; // No durable phase change for an observed custody hold.
+      // Missing observation is not evidence that this native identity changed.
+      // Preserve the observer so a later fresh proof can continue the SAME live
+      // grant. The refusal still prevents every effect; mismatches stay held.
+      if(code==="native_duty_temporary_exclusion"||code==="native_duty_proof_unavailable")throw error;
       this.db.prepare("UPDATE native_duty_registrations SET phase='held',reason=? WHERE registration_id=? AND phase='watching'").run(code,row.registration_id);
       throw error;
     }
