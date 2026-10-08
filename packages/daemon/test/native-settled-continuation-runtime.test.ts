@@ -92,11 +92,20 @@ describe('ordinary native settled claimant with real launch storage and serializ
   const send=vi.fn(async()=> 'sent');expect(await runtime.withSettledClaimant(o,send)).toEqual({state:'performed',value:'sent'});expect(send).toHaveBeenCalledTimes(1);
   expect(completionStore.latest(nodeId,generation)).toBeNull();
  });
+ it.each([4000,6000,15000])('producer quiescence age %i ms permits observation and freshly revalidated send',async age=>{
+  proof.quiescence!.observedAt=new Date(clockNow-age).toISOString();
+  const o=await observation();expect(o.quiescenceObservedAt).toBe(clockNow-age);expect(o.observedAt).toBe(clockNow);
+  const send=vi.fn(async()=> 'sent');expect(await runtime.withSettledClaimant(o,send)).toEqual({state:'performed',value:'sent'});expect(send).toHaveBeenCalledTimes(1);
+ });
+ it('producer evidence aging beyond 15000 ms before send holds without a callback',async()=>{
+  proof.quiescence!.observedAt=new Date(clockNow-15000).toISOString();const o=await observation();
+  clockNow+=1;const send=vi.fn();expect(await runtime.withSettledClaimant(o,send)).toMatchObject({state:'held'});expect(send).not.toHaveBeenCalled();
+ });
  it.each(['busy','unknown','stale','future','empty-cursor','wrong-generation','wrong-launch','wrong-fingerprint'] as const)('%s proof denies observation and send',async kind=>{
   const o=await observation();
   if(kind==='busy')proof.quiescence!.settled=false;
   if(kind==='unknown')proof.quiescence=undefined;
-  if(kind==='stale')proof.quiescence!.observedAt=new Date(clockNow-3001).toISOString();
+  if(kind==='stale')proof.quiescence!.observedAt=new Date(clockNow-15001).toISOString();
   if(kind==='future')proof.quiescence!.observedAt=new Date(clockNow+1).toISOString();
   if(kind==='empty-cursor')proof.lastEntryId='';
   if(kind==='wrong-generation')proof.generation='wrong';

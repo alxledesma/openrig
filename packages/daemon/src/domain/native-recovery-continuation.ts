@@ -10,6 +10,11 @@ import { listNativeProcesses } from "./native-process-lineage.js";
 import { DeliveryGuardError, type SeatDeliveryGuard } from "./seat-delivery-guard.js";
 import type { PiNativeProof } from "./coordinator-runtime-availability.js";
 
+// Pi refreshes native quiescence every 5 seconds (QUIESCENCE_REFRESH_MS).
+// Match the existing 15-second Pi readiness bound for producer evidence;
+// consumers still require the newly captured aggregate observation within 3s.
+const SETTLED_QUIESCENCE_FRESHNESS_MS = 15_000;
+
 const digest=(value:string)=>createHash("sha256").update(value).digest("hex");
 const same=(a:unknown,b:unknown):boolean=>JSON.stringify(a)===JSON.stringify(b);
 
@@ -79,7 +84,7 @@ export function createNativeRecoveryContinuation(deps:{
       return p?.state==="present"&&p.generation===b.generation
         &&p.launchId===nativeLaunch&&p.launchId===current.incarnation.runtimeLaunchId&&p.fingerprint===current.proof.nativeFingerprint
         &&typeof p.lastEntryId==="string"&&p.lastEntryId.trim().length>0
-        &&p.quiescence?.settled===true&&Number.isFinite(qAt)&&qAt<=at&&at-qAt<=3000;
+        &&p.quiescence?.settled===true&&Number.isFinite(qAt)&&qAt<=at&&at-qAt<=SETTLED_QUIESCENCE_FRESHNESS_MS;
     };
     if(!fresh(before)||!fresh(after)||before!.lastEntryId!==after!.lastEntryId
       ||!same(b,current.binding)||!same(b,binding(session)))return null;
