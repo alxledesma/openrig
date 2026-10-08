@@ -108,10 +108,23 @@ try:
   # Only a fully scoped foreign seat may reuse this home's display name.
   if identity['OPENRIG_NODE_ID']==expected['OPENRIG_NODE_ID']: raise ValueError()
   if identity['OPENRIG_SESSION_NAME']==expected['OPENRIG_SESSION_NAME'] and not foreign_seat_home(identity,expected): raise ValueError()
-  if os.path.basename(executable)=='codex' and native_thread(argv)==native: raise ValueError()
+  if len(sys.argv)>4 and sys.argv[4]=='pi':
+   # The exact saved file is global, including stripped/reparented runners.
+   for arg in argv[1:]:
+    value=arg.split('=',1)[1] if arg.startswith('--session=') else arg
+    if os.path.isabs(value) and (os.path.realpath(value)==os.path.realpath(native)): raise ValueError()
+   if os.path.basename(executable)=='pi' or any(os.path.basename(a)=='pi-runner.js' or (os.path.basename(a)=='cli.js' and 'pi-coding-agent' in os.path.normpath(a).split(os.sep)) for a in argv):
+    sessions=[argv[i+1] for i,a in enumerate(argv[:-1]) if a=='--session']+[a.split('=',1)[1] for a in argv if a.startswith('--session=')]
+    if len(sessions)!=1 or not os.path.isabs(sessions[0]): raise ValueError()
+  elif os.path.basename(executable)=='codex' and native_thread(argv)==native: raise ValueError()
  ok=True
 except: pass
 print('1' if ok else '0')`;
+
+export async function provePiIdentityAbsent(binding:{nodeId:string;sessionName:string;nativeId:string},panePid:number):Promise<boolean>{
+  if(!Number.isSafeInteger(panePid)||panePid!==0&&panePid<=1)return false;
+  try{const r=await promisify(execFile)('python3',['-c',STOPPED_CENSUS_PY,JSON.stringify({OPENRIG_NODE_ID:binding.nodeId,OPENRIG_SESSION_NAME:binding.sessionName,OPENRIG_HOME:process.env.OPENRIG_HOME??null}),String(panePid),binding.nativeId,'pi'],{timeout:5000,maxBuffer:128,encoding:'utf8'});return r.stdout.trim()==='1';}catch{return false;}
+}
 
 export async function proveStoppedCodexIdentityAbsent(binding:CodexRehostBinding,panePid:number):Promise<boolean>{
   return proveCodexIdentityAbsent(binding,panePid,false);

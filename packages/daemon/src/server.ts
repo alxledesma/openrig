@@ -397,6 +397,7 @@ export interface AppDeps {
   sessionEnv?: Record<string, string | undefined>;
   seatLaunchEnvironment?: import("./domain/seat-launch-environment.js").SeatLaunchEnvironment;
   codexRehost?: import("./domain/codex-rehost.js").CodexSameGenerationRehost;
+  piDetachedResume?: import("./domain/pi-detached-resume.js").PiDetachedResume;
   /** Per-runtime launch env merged over sessionEnv (OMP's provider keys). */
   runtimeSessionEnv?: Record<string, Record<string, string | undefined>>;
 }
@@ -521,6 +522,7 @@ export function createApp(deps: AppDeps): Hono {
     c.set("sessionEnv" as never, deps.sessionEnv);
     c.set("seatLaunchEnvironment" as never, deps.seatLaunchEnvironment);
     c.set("codexRehost" as never, deps.codexRehost);
+    c.set("piDetachedResume" as never, deps.piDetachedResume);
     c.set("runtimeSessionEnv" as never, deps.runtimeSessionEnv);
     c.set("cmuxAdapter" as never, deps.cmuxAdapter);
     // S10 — the in-daemon gateway subsystem handle (health surface + dispatch seam).

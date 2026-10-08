@@ -324,6 +324,7 @@ export function seatLifecycleService(c: { get(key: never): unknown }): SeatLifec
   return new SeatLifecycleService({
     db: rigRepo.db,
     codexRehost: c.get("codexRehost" as never) as import("../domain/codex-rehost.js").CodexSameGenerationRehost | undefined,
+    piDetachedResume: c.get("piDetachedResume" as never) as import("../domain/pi-detached-resume.js").PiDetachedResume | undefined,
     rigRepo,
     sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
     eventBus: c.get("eventBus" as never) as EventBus,
@@ -361,7 +362,7 @@ export function parseLegacyNativeWitnessRequest(body: Record<string, unknown>): 
   return { ok: true, legacyNativeWitness: raw };
 }
 
-export function parseStoppedTargetRecoveryRequest(body: Record<string, unknown>): { ok: true; legacyNativeWitness: boolean; stoppedTargetRecovery: boolean; codexDetachedResume?: true; stoppedTargetAcceptanceReference?: string } | { ok: false; error: string } {
+export function parseStoppedTargetRecoveryRequest(body: Record<string, unknown>): { ok: true; legacyNativeWitness: boolean; stoppedTargetRecovery: boolean; codexDetachedResume?: true; piDetachedResume?: true; piDetachedRecovery?: { attemptId: string; beganSha256: string }; stoppedTargetAcceptanceReference?: string } | { ok: false; error: string } {
   const legacy = parseLegacyNativeWitnessRequest(body);
   if (!legacy.ok) return legacy;
   const rawMode = body["stoppedTargetRecovery"];
@@ -370,14 +371,30 @@ export function parseStoppedTargetRecoveryRequest(body: Record<string, unknown>)
   const rawDetached = body["codexDetachedResume"];
   if (rawDetached !== undefined && typeof rawDetached !== "boolean") return { ok: false, error: "codexDetachedResume must be a boolean when present" };
   const codexDetachedResume = rawDetached === true;
+  const rawPiDetached = body["piDetachedResume"];
+  if (rawPiDetached !== undefined && typeof rawPiDetached !== "boolean") return { ok: false, error: "piDetachedResume must be a boolean when present" };
+  const piDetachedResume = rawPiDetached === true;
+  const rawPiRecovery = body["piDetachedRecovery"];
+  let piDetachedRecovery: { attemptId: string; beganSha256: string } | undefined;
+  if (rawPiRecovery !== undefined) {
+    if (!rawPiRecovery || typeof rawPiRecovery !== "object" || Array.isArray(rawPiRecovery)) return { ok: false, error: "piDetachedRecovery must contain an attemptId UUID and beganSha256 when present" };
+    const recovery = rawPiRecovery as Record<string, unknown>;
+    const uuid = typeof recovery.attemptId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(recovery.attemptId);
+    const hash = typeof recovery.beganSha256 === "string" && /^[0-9a-f]{64}$/.test(recovery.beganSha256);
+    if (!uuid || !hash || Object.keys(recovery).some(key => key !== "attemptId" && key !== "beganSha256")) return { ok: false, error: "piDetachedRecovery must contain only a valid attemptId UUID and lowercase beganSha256" };
+    piDetachedRecovery = { attemptId: recovery.attemptId as string, beganSha256: recovery.beganSha256 as string };
+  }
   const rawAcceptance = body["stoppedTargetAcceptanceReference"];
   if (rawAcceptance !== undefined && typeof rawAcceptance !== "string") return { ok: false, error: "stoppedTargetAcceptanceReference must be a string when present" };
   const acceptance = typeof rawAcceptance === "string" ? rawAcceptance.trim() : "";
   if (legacy.legacyNativeWitness && stoppedTargetRecovery) return { ok: false, error: "legacyNativeWitness and stoppedTargetRecovery are mutually exclusive" };
-  if (codexDetachedResume && (legacy.legacyNativeWitness || stoppedTargetRecovery || body["stoppedTargetAcceptanceReference"] !== undefined || body["codexStoppedRecovery"] !== undefined || body["legacyCodexProfile"] !== undefined)) return { ok: false, error: "codexDetachedResume is exclusive with Codex stopped recovery, legacy Codex profile/witness, and Pi recovery modes" };
+  if (codexDetachedResume && (legacy.legacyNativeWitness || stoppedTargetRecovery || piDetachedResume || piDetachedRecovery !== undefined || body["stoppedTargetAcceptanceReference"] !== undefined || body["codexStoppedRecovery"] !== undefined || body["legacyCodexProfile"] !== undefined)) return { ok: false, error: "codexDetachedResume is exclusive with Codex stopped recovery, Pi detached recovery, legacy Codex profile/witness, and Pi recovery modes" };
+  if (piDetachedResume && (legacy.legacyNativeWitness || stoppedTargetRecovery || codexDetachedResume || body["stoppedTargetAcceptanceReference"] !== undefined || body["codexStoppedRecovery"] !== undefined || body["legacyCodexProfile"] !== undefined)) return { ok: false, error: "piDetachedResume is exclusive with every Codex, legacy and stopped-target recovery mode" };
+  if (piDetachedRecovery !== undefined && !piDetachedResume) return { ok: false, error: "piDetachedRecovery requires piDetachedResume" };
+  if (piDetachedResume && rawPiRecovery !== undefined && !piDetachedRecovery) return { ok: false, error: "piDetachedRecovery is invalid" };
   if (stoppedTargetRecovery && !acceptance) return { ok: false, error: "stoppedTargetAcceptanceReference is required and must acknowledge possible loss of an unpersisted in-flight turn" };
   if (!stoppedTargetRecovery && rawAcceptance !== undefined) return { ok: false, error: "stoppedTargetAcceptanceReference requires stoppedTargetRecovery" };
-  return { ok: true, legacyNativeWitness: legacy.legacyNativeWitness, stoppedTargetRecovery, ...(codexDetachedResume ? { codexDetachedResume: true as const } : {}), ...(acceptance ? { stoppedTargetAcceptanceReference: acceptance } : {}) };
+  return { ok: true, legacyNativeWitness: legacy.legacyNativeWitness, stoppedTargetRecovery, ...(codexDetachedResume ? { codexDetachedResume: true as const } : {}), ...(piDetachedResume ? { piDetachedResume: true as const } : {}), ...(piDetachedRecovery ? { piDetachedRecovery } : {}), ...(acceptance ? { stoppedTargetAcceptanceReference: acceptance } : {}) };
 }
 
 // Same-generation Pi runner rehost. The shipped resume primitive, the shipped pi
@@ -431,7 +448,7 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   const rehostRequest = parseStoppedTargetRecoveryRequest(body);
   if (!rehostRequest.ok) return c.json({ error: rehostRequest.error }, 400);
   let codexStoppedRecovery: CodexStoppedRecovery | undefined;
-  if (body.codexStoppedRecovery !== undefined || rehostRequest.codexDetachedResume) {
+  if (body.codexStoppedRecovery !== undefined || rehostRequest.codexDetachedResume || rehostRequest.piDetachedResume) {
     const token = c.get("terminalBearerToken" as never) as string | null;
     if (!token) return c.json({ok:false,code:"codex_rehost_recovery_authenticated_control_required"},503);
     const authResponse = await authBearerTokenMiddleware({expectedToken:token})(c,async()=>{});
@@ -446,7 +463,7 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
     const guard=(c.get("tmuxAdapter" as never) as TmuxAdapter | undefined)?.deliveryGuard;
     let operatorTarget:import("../domain/seat-delivery-guard.js").GuardTarget|undefined;try{operatorTarget=guard?.target("operator-agent@kernel");}catch{}
     if (transportSenderSession(c) !== "operator-agent@kernel" || !actorGeneration || actorGeneration!==operatorTarget?.occupant || c.req.header("X-OpenRig-Origin-Unknown") === "true") return c.json({error:"Current Operator transport identity and generation required"},403);
-    if(rehostRequest.codexDetachedResume){
+    if(rehostRequest.codexDetachedResume || rehostRequest.piDetachedResume){
       let target:import("../domain/seat-delivery-guard.js").GuardTarget|undefined;try{target=guard?.target(decodeURIComponent(c.req.param("seatRef")));}catch{}
       if(!target||target.nodeId===operatorTarget?.nodeId)return c.json({error:"Detached resume requires a peer target; Operator self-target is forbidden"},403);
     }
@@ -491,6 +508,7 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
     db: rigRepo.db,
     rigRepo,
     codexRehost: c.get("codexRehost" as never) as import("../domain/codex-rehost.js").CodexSameGenerationRehost | undefined,
+    piDetachedResume: c.get("piDetachedResume" as never) as import("../domain/pi-detached-resume.js").PiDetachedResume | undefined,
     sessionRegistry: c.get("sessionRegistry" as never) as SessionRegistry,
     eventBus: c.get("eventBus" as never) as EventBus,
     tmuxAdapter,
@@ -588,9 +606,10 @@ seatRoutes.post("/rehost-runner/:seatRef", async c => {
   const result = await lifecycle.rehostRunner({
     seatRef: decodeURIComponent(c.req.param("seatRef")),
     reason: body.reason,
-    operator: codexStoppedRecovery || rehostRequest.codexDetachedResume ? transportSenderSession(c) : (body.operator as string | undefined) ?? null,
+    operator: codexStoppedRecovery || rehostRequest.codexDetachedResume || rehostRequest.piDetachedResume ? transportSenderSession(c) : (body.operator as string | undefined) ?? null,
     ...(codexStoppedRecovery ? {codexStoppedRecovery,actorGeneration:c.req.header("X-OpenRig-Occupant-Generation")} : {}),
     ...(rehostRequest.codexDetachedResume ? {codexDetachedResume:true,actorGeneration:c.req.header("X-OpenRig-Occupant-Generation")} : {}),
+    ...(rehostRequest.piDetachedResume ? {piDetachedResume:true,piDetachedRecovery:rehostRequest.piDetachedRecovery,actorGeneration:c.req.header("X-OpenRig-Occupant-Generation")} : {}),
     legacyNativeWitness: rehostRequest.legacyNativeWitness,
     stoppedTargetRecovery: rehostRequest.stoppedTargetRecovery,
     ...(rehostRequest.stoppedTargetAcceptanceReference ? { stoppedTargetAcceptanceReference: rehostRequest.stoppedTargetAcceptanceReference } : {}),

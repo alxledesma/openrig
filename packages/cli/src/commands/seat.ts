@@ -722,6 +722,9 @@ Examples:
     .option("--legacy-native-witness", "EXPLICIT opt-in: prove the pre-stop idle witness from the daemon's own native evidence for a legacy Pi runner")
     .option("--stopped-target-recovery", "EXPLICIT opt-in: accept inability to prove live idle and recover only after the exact old runner and child have stopped")
     .option("--codex-detached-resume", "EXPLICIT opt-in: resume an exact detached Codex thread with the same generation after terminal/process absence is proven")
+    .option("--pi-detached-resume", "EXPLICIT opt-in: resume an exact detached Pi session file at its same generation while its typing guard stays ON")
+    .option("--pi-recovery-attempt <uuid>", "Exact retained Pi detached-resume attempt to continue")
+    .option("--pi-began-sha256 <hash>", "SHA256 of that immutable Pi attempt began receipt")
     .option("--accept-unpersisted-turn-loss <reference>", "Required accountable reference accepting possible loss of an unpersisted in-flight turn")
     .option("--json", "JSON output for agents")
     .description("Rehost a live pi seat's runner onto the SAME session file at the SAME generation")
@@ -758,13 +761,25 @@ seat. It requires exact current Operator transport identity and generation when
 targeting a peer; the Operator cannot target itself. It preserves the existing
 session and generation, proves terminal and native identity absence, and refuses
 without a same-generation path. It is exclusive with all other recovery modes.
+--pi-detached-resume is a separate Pi-only peer mode with the same exact current
+Operator transport identity and self-target fence. It leaves the typing guard ON,
+preserves the exact detached Pi session file and generation, and refuses without
+native absence and managed replacement proof. Optional recovery continuation
+requires both --pi-recovery-attempt and --pi-began-sha256; it never replays an
+attempt after resume-began. Pi detached resume is exclusive with every other mode.
 Examples:
   rig seat rehost-runner intake-lead@app-handy-conveyor --reason "runner qualification upgrade" --json
   rig seat rehost-runner dev.impl --reason "upgrade runner" --operator orch-lead@my-rig
   rig seat rehost-runner legacy@rig --reason "legacy runner bridge" --legacy-native-witness`)
-    .action(async (seat: string, opts: { reason: string; operator?: string; legacyNativeWitness?: boolean; stoppedTargetRecovery?: boolean; codexDetachedResume?: boolean; acceptUnpersistedTurnLoss?: string; json?: boolean }) => {
-      if ((opts.stoppedTargetRecovery && opts.legacyNativeWitness) || (opts.codexDetachedResume && (opts.stoppedTargetRecovery || opts.legacyNativeWitness || opts.acceptUnpersistedTurnLoss !== undefined))) {
-        console.error("Rehost modes are mutually exclusive.");
+    .action(async (seat: string, opts: { reason: string; operator?: string; legacyNativeWitness?: boolean; stoppedTargetRecovery?: boolean; codexDetachedResume?: boolean; piDetachedResume?: boolean; piRecoveryAttempt?: string; piBeganSha256?: string; acceptUnpersistedTurnLoss?: string; json?: boolean }) => {
+      const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const recoveryPaired = (opts.piRecoveryAttempt !== undefined) === (opts.piBeganSha256 !== undefined);
+      const recoveryValid = opts.piRecoveryAttempt === undefined || (uuid.test(opts.piRecoveryAttempt) && /^[0-9a-f]{64}$/.test(opts.piBeganSha256 ?? ""));
+      if ((opts.stoppedTargetRecovery && opts.legacyNativeWitness)
+        || (opts.codexDetachedResume && (opts.stoppedTargetRecovery || opts.legacyNativeWitness || opts.acceptUnpersistedTurnLoss !== undefined || opts.piDetachedResume || opts.piRecoveryAttempt !== undefined || opts.piBeganSha256 !== undefined))
+        || (opts.piDetachedResume && (opts.stoppedTargetRecovery || opts.legacyNativeWitness || opts.codexDetachedResume || opts.acceptUnpersistedTurnLoss !== undefined || opts.operator !== undefined || !recoveryPaired || !recoveryValid))
+        || (!opts.piDetachedResume && (opts.piRecoveryAttempt !== undefined || opts.piBeganSha256 !== undefined))) {
+        console.error("Rehost modes are mutually exclusive; Pi detached recovery requires --pi-detached-resume and a paired valid UUID attempt plus lowercase SHA256, without --operator.");
         process.exitCode = 1;
         return;
       }
@@ -786,6 +801,8 @@ Examples:
         legacyNativeWitness: opts.legacyNativeWitness === true,
         ...(opts.stoppedTargetRecovery ? { stoppedTargetRecovery: true, stoppedTargetAcceptanceReference: opts.acceptUnpersistedTurnLoss!.trim() } : {}),
         ...(opts.codexDetachedResume ? { codexDetachedResume: true } : {}),
+        ...(opts.piDetachedResume ? { piDetachedResume: true,
+          ...(opts.piRecoveryAttempt ? { piDetachedRecovery: { attemptId: opts.piRecoveryAttempt, beganSha256: opts.piBeganSha256! } } : {}) } : {}),
       }, opts, (data) => {
         if (!data["ok"]) {
           console.error(`Rehost refused: ${String(data["code"] ?? "unknown")} - ${String(data["message"] ?? "")}`);

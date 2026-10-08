@@ -1,3 +1,4 @@
+import { createPiDetachedResumeIntegration } from './domain/pi-detached-resume-integration.js';
 import { assessPiDispatchReadiness } from "./domain/dispatch-runtime-readiness.js";
 import { NativeDutyIntegration } from "./domain/native-duty-integration.js";
 import { NativeDutyLaunchStore, observeNativeDutyLaunch } from "./domain/native-duty-launch.js";
@@ -1235,6 +1236,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     detectDaemonSupport: codexDaemonSupportProbe(process.env.PATH, undefined, configuredCodexHome),
     configurationDigest: session => queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(session),
   });
+  const piDetachedResume = createPiDetachedResumeIntegration({db,guard:deliveryGuard,tmux:tmuxAdapter,resume:piResume,store:nativeDutyStore,launchEnvironment:seatLaunchEnvironment,launchPath:process.env.PATH??'',stateRoot:piStateRoot,runnerEntryPath:piRunnerEntryPath,piProve:piNativeProver,piRunnerState:session=>{try{return parsePiRunnerState(fs.readFileSync(nodePath.join(piStateRoot,session,'runner-state.json'),'utf8'));}catch{return null;}},configurationDigest:session=>queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(session),resolvePosture:binding=>{const row=db.prepare('SELECT rig_id FROM nodes WHERE id=?').get(binding.nodeId) as {rig_id:string};return restoreOrchestrator.resolveRestorePosture(binding.nodeId,row.rig_id);},sessionEnv:launchSessionEnv,runtimeSessionEnv,snapshotRoot:nodePath.join(OPENRIG_HOME,'state','pi-detached-resume')});
   const nodeCmuxService = new NodeCmuxService(rigRepo, sessionRegistry, cmuxAdapter, tmuxAdapter);
   // W2a-1 — producer wiring: the live occupant generation resolves synchronously from the shipped
   // occupant-tenure ledger. generation_uuid CHANGES for a new occupant and persists only within one
@@ -1315,6 +1317,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     claimService,
     liveProjectionRecovery,
     codexRehost,
+    piDetachedResume,
     selfAttachService,
     rigLifecycleService,
     rigExpansionService,
