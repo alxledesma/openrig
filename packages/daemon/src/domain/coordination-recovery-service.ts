@@ -1774,8 +1774,13 @@ private dutyProtection(rigId:string,r:any):boolean {
   const dutyObservations=this.refreshActivity(rigId);
   const dispatch=a.state==='active'&&a.lease_until>this.now()?this.preparedDispatch(rigId,scope=>this.superviseScoped(rigId,jobId,scope)):Promise.resolve([] as CoordinationResult[]);
   const [,failures]=await Promise.all([dutyObservations,dispatch]);
+  // The registered observer must continue retained claims as well as stage new
+  // assignments. Re-read the holder after native observation; the continuation
+  // path independently fences current authority, admission, custody and effects.
+  const current=this.authority.get(rigId);
+  const continuations=current?await this.stageRecoveredClaimedContinuations(current.owner_session,current.owner_generation,rigId):[];
   const final=this.superviseScoped(rigId,jobId,new Map());
-  return final?[...final,...failures]:failures.length?failures:null;
+  return final?[...final,...failures,...continuations]:failures.length||continuations.length?[...failures,...continuations]:null;
  }
  private get authority(){return this.repo.coordinatorAuthority;}
  private get db(){return this.authority.db;}

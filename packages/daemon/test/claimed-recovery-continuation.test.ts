@@ -9,6 +9,7 @@ import { QueueRepository } from '../src/domain/queue-repository.js';
 import { OutboxHandler } from '../src/domain/outbox-handler.js';
 import { CoordinationRecoveryService,type CoordinationActivity,type CoordinationPlan,type CoordinationTask } from '../src/domain/coordination-recovery-service.js';
 import { digest } from '../src/domain/coordinator-authority-service.js';
+import { makeCoordinatorContinuityPolicy } from '../src/domain/policies/coordinator-continuity.js';
 import type { NativeRecoveryCompletion,NativeRecoveryObservation,NativeRecoveryContinuationRuntime } from '../src/domain/native-recovery-continuation-contract.js';
 import { seed,token } from './helpers/coordinator-fixture.js';
 
@@ -53,6 +54,25 @@ describe('retained claimed native-recovery continuation',()=>{
   expect(intents()).toHaveLength(1);expect(repo.getById(queueId)?.state).toBe('in-progress');expect(db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(queueId)).toEqual({claimed_by_generation_uuid:'builder-g1'});
   await repo.drainPendingWakeIntents();expect(sent).toHaveLength(1);expect(sent[0]).toContain('already-claimed assignment '+queueId);expect(runtime.withRecoveredIncarnation).toHaveBeenCalledTimes(1);expect(repo.getById(queueId)?.state).toBe('in-progress');
   await svc.reconcilePrepared('lead@xv','lead-g1','xv');expect(intents()).toHaveLength(1);await repo.drainPendingWakeIntents();expect(sent).toHaveLength(1);
+ });
+
+ it('actual registered coordinator-continuity ticks stage and deliver one immutable notice',async()=>{
+  const {queueId}=await claimedAssignment(),sent:string[]=[];
+  repo.attachTransport({send:async(destination,text)=>{sent.push(destination+':'+text);return {ok:true,verified:true};}});
+  db.prepare("INSERT INTO watchdog_jobs(job_id,target_session,policy,interval_seconds,spec_yaml,state,registered_by_session,registered_at,registered_by_generation_uuid) VALUES ('continuity-observer','operator-agent@kernel','coordinator-continuity',1,'context: {}','active','operator-agent@kernel',?,'operator-agent-g1')").run(new Date(clock).toISOString());
+  const job={jobId:'continuity-observer',registeredBySession:'operator-agent@kernel',target:{session:'operator-agent@kernel'},context:{rigId:'xv'}} as any;
+  const before=db.prepare('SELECT qitem_id,body,state,claimed_by_generation_uuid,destination_session FROM queue_items WHERE qitem_id=?').get(queueId);
+  const policy=makeCoordinatorContinuityPolicy(repo.coordinatorAuthority);
+  await policy.evaluate(job);
+  const intents=()=>db.prepare("SELECT outbox_id,delivery_state,tags,body FROM outbox_entries WHERE audit_pointer=? AND tags LIKE '%queue:claimed-native-recovery-continuation%'").all(queueId) as Array<{outbox_id:string;delivery_state:string;tags:string;body:string}>;
+  expect(intents()).toHaveLength(1);expect(intents()[0]?.delivery_state).toBe('delivered');expect(sent).toHaveLength(1);
+  expect(repo.getById(queueId)?.state).toBe('in-progress');
+  expect(db.prepare('SELECT qitem_id,body,state,claimed_by_generation_uuid,destination_session FROM queue_items WHERE qitem_id=?').get(queueId)).toEqual(before);
+  expect(db.prepare('SELECT claimed_by_generation_uuid FROM queue_items WHERE qitem_id=?').get(queueId)).toEqual({claimed_by_generation_uuid:'builder-g1'});
+  await policy.evaluate(job);
+  expect(intents()).toHaveLength(1);expect(intents()[0]?.delivery_state).toBe('delivered');expect(sent).toHaveLength(1);
+  expect(db.prepare('SELECT qitem_id,body,state,claimed_by_generation_uuid,destination_session FROM queue_items WHERE qitem_id=?').get(queueId)).toEqual(before);
+  expect(runtime.observeRecoveredIncarnation).toHaveBeenCalledWith('builder@xv');
  });
 
  it('default absent completion observer disables claimed continuation',async()=>{
