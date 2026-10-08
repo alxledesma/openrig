@@ -180,7 +180,8 @@ export class CodexSameGenerationRehost {
     }catch(error){return {ok:false,code:error instanceof Refusal?error.code:effectAttempted?"codex_rehost_effect_unknown":"codex_rehost_precondition_failed",
       message:error instanceof Refusal?error.message:effectAttempted?"Native effect outcome is unknown; retained receipt and history require explicit recovery. No retry or fallback.":"A required native, activity, custody or launch precondition could not be proven; no process signal was attempted.",blindRetryAllowed:false,effectAttempted,...(receiptPath?{receiptPath}:{})};}
   }
-  /** Continue only a recorded stop-timeout, whose original code path never resumed.
+  /** Continue only a recorded stop-timeout or detached pre-native absence refusal.
+   * Both original code paths provably stopped before invoking native resume.
    * The original UNKNOWN is immutable. A separate exclusive write-ahead marker
    * makes every uncertain recovery resume non-replayable, including lost replies. */
   async recoverStopped(input:CodexStoppedRecoveryInput):Promise<CodexRehostResult>{
@@ -200,12 +201,25 @@ export class CodexSameGenerationRehost {
         const raw=readFileSync(receiptPath);if(hash(raw)!==input.beganSha256)reject("codex_rehost_recovery_receipt","Original write-ahead receipt digest differs");
         const began=JSON.parse(raw.toString('utf8'));
         privatePath(path.join(directory,'unknown.json'),false);const unknown=JSON.parse(readFileSync(path.join(directory,'unknown.json'),'utf8'));
+        // This precise detached failure is emitted by stoppedProof after the
+        // terminal binding CAS and before resume. Creation/resume uncertainty
+        // remains ineligible; a bare pane alone never makes it safe to replay.
+        const detached=began.protocol==='codex-detached-same-generation-resume-v1';
+        const eligibleFailure=detached
+          ? unknown.code==='codex_rehost_recovery_absence'&&(unknown.attemptId===undefined||unknown.attemptId===input.attemptId)
+          : began.protocol==='codex-same-generation-rehost-v1'&&unknown.code==='codex_rehost_stop_unknown'&&unknown.attemptId===input.attemptId;
         const originalMaintenance=input.maintenanceAuthority&&began.actor==='local-terminal-maintenance'
-          &&digest(began.maintenanceProvenance)===digest({...this.maintenanceProvenance(input.maintenanceAuthority),mode:'rehost'});
-        if(began.protocol!=="codex-same-generation-rehost-v1"||began.attemptId!==input.attemptId||(!originalMaintenance&&began.actor!=="operator-agent@kernel")
-          ||unknown.attemptId!==input.attemptId||unknown.code!=="codex_rehost_stop_unknown"||unknown.effectAttempted!==true||unknown.blindRetryAllowed!==false
-          ||began.bindingDigest!==digest(b)||began.nativeIdHash!==hash(b.nativeId)||!originalStopCustodyMatches(began.custody,before)
-          ||!/^[a-f0-9]{64}$/.test(began.nativeFingerprint)||!/^[a-f0-9]{64}$/.test(began.preflightDigest))reject("codex_rehost_recovery_receipt","Original stop-only UNKNOWN, binding and custody must match exactly");
+          &&digest(began.maintenanceProvenance)===digest({...this.maintenanceProvenance(input.maintenanceAuthority),mode:detached?'detached-resume':'rehost'});
+        // Detached intent records logical custody before physical rebinding.
+        // Held deliveries may arrive between attempts as in stopped recovery;
+        // identity, authority and logical session history cannot change. The
+        // fresh full baseline (including deliveries) stays frozen below.
+        const originalCustodyNow=detached?this.custody(b,true):before;
+        const sessionsMatch=!detached||(began.custody?.sessions!==undefined&&digest(began.custody.sessions)===digest(originalCustodyNow.sessions));
+        if(!eligibleFailure||began.attemptId!==input.attemptId||(!originalMaintenance&&began.actor!=="operator-agent@kernel")
+          ||unknown.effectAttempted!==true||unknown.blindRetryAllowed!==false
+          ||began.bindingDigest!==digest(b)||began.nativeIdHash!==hash(b.nativeId)||!originalStopCustodyMatches(began.custody,originalCustodyNow)||!sessionsMatch
+          ||!/^[a-f0-9]{64}$/.test(began.nativeFingerprint)||!/^[a-f0-9]{64}$/.test(began.preflightDigest))reject("codex_rehost_recovery_receipt","Original pre-native UNKNOWN, binding and custody must match exactly");
         for(const id of readdirSync(root)){
           const other=path.join(root,id);privatePath(other,true);
           if(other===directory){if(existsSync(path.join(other,'completed.json'))||existsSync(path.join(other,'recovery-began.json')))reject("codex_rehost_recovery_replay","This attempt has a completion or an uncertain recovery intent; no replay");}

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3";
@@ -153,6 +154,43 @@ describe("detached Codex runner resume",()=>{
   const locallyAuthorized=makeService({resume:{resume:operatorResume},stoppedNativeState:async(binding:any)=>({nodeId:binding.nodeId,sessionName:binding.sessionName,nativeId:"operator-native",transcriptPath:operatorTranscript,runtimeContract:{runtime:"codex",model:"gpt-6-luna",provider:"openai",profile:"exact",effort:"high",permissions:{sandbox:{type:"workspace-write"},approval:"never"}}}),
    verifyProcessIdentity:async(_pid,identity)=>identity.OPENRIG_NODE_ID===operator&&identity.OPENRIG_SESSION_NAME===operator&&identity.OPENRIG_OCCUPANT_GENERATION==="operator-agent-g1"&&identity.OPENRIG_RUNTIME==="codex"});
   expect(await resumeDetached(locallyAuthorized,{...request,maintenanceAuthority:localAuthority})).toMatchObject({ok:true,nodeId:operator,generation:"operator-agent-g1",authorityRepaired:false});
+  expect(operatorResume).toHaveBeenCalledTimes(1);expect(guard.preference(operator)).toMatchObject({desired:true,effective:true});
+ });
+ it.each(["continue","native-present","wrong-phase","custody-drift","session-drift","recovery-intent"] as const)("recovers only actual pre-native detached failure under current peer Operator: %s",async kind=>{
+  const absence=vi.fn(async()=>false),svc=makeService({proveStoppedIdentityAbsent:absence});
+  const first=await resumeDetached(svc);expect(first,JSON.stringify(first)).toMatchObject({ok:false,code:"codex_rehost_recovery_absence",effectAttempted:true,blindRetryAllowed:false});expect(resume).not.toHaveBeenCalled();expect(create).toHaveBeenCalledTimes(1);
+  const beganPath=evidenceFiles().find(p=>p.endsWith("began.json"))!,directory=path.dirname(path.join(base.snapshotRoot,beganPath)),beganBytes=readFileSync(path.join(directory,"began.json")),unknownBytes=readFileSync(path.join(directory,"unknown.json"));
+  const request={...input,actorGeneration:"operator-agent-g1",attemptId:JSON.parse(beganBytes.toString()).attemptId,beganSha256:createHash("sha256").update(beganBytes).digest("hex")};
+  absence.mockResolvedValue(true);if(kind==="native-present")processes=resumedTree(40);if(kind==="wrong-phase")writeFileSync(path.join(directory,"unknown.json"),JSON.stringify({code:"codex_rehost_resume_unknown",effectAttempted:true,blindRetryAllowed:false}));
+  if(kind==="custody-drift")db.prepare("UPDATE nodes SET role='changed-custody' WHERE id=?").run(lead);
+  if(kind==="session-drift")db.prepare("UPDATE sessions SET origin='changed-origin' WHERE node_id=?").run(lead);
+  if(kind==="recovery-intent")writeFileSync(path.join(directory,"recovery-began.json"),JSON.stringify({attemptId:request.attemptId}),{mode:0o600});
+  const protectedBefore=custody(),originalHistory=readFileSync(file),unknownBefore=readFileSync(path.join(directory,"unknown.json"));const recovered=await svc.recoverStopped(request);
+  if(kind==="continue"){expect(recovered,JSON.stringify(recovered)).toMatchObject({ok:true,generation,generationUnchanged:true,custodyPreserved:true,authorityRepaired:false});expect(resume).toHaveBeenCalledTimes(1);expect(await svc.recoverStopped(request)).toMatchObject({ok:false,effectAttempted:false});expect(readFileSync(path.join(directory,"unknown.json"))).toEqual(unknownBytes);}else{expect(recovered,JSON.stringify(recovered)).toMatchObject({ok:false,effectAttempted:false});expect(resume).not.toHaveBeenCalled();}
+  expect(create).toHaveBeenCalledTimes(1);expect(custody()).toBe(protectedBefore);expect(readFileSync(path.join(directory,"began.json"))).toEqual(beganBytes);expect(readFileSync(path.join(directory,"unknown.json"))).toEqual(unknownBefore);expect(readFileSync(file)).toEqual(originalHistory);expect(guard.preference(lead)).toMatchObject({desired:true,effective:true});
+ });
+ it("continues actual local maintenance pre-native failure without new terminal or generation",async()=>{
+  const operator="operator-agent@kernel";db.prepare("UPDATE nodes SET runtime='codex',cwd=?,model='gpt-6-luna',effort='high',codex_config_profile='exact' WHERE id=?").run(dir,operator);
+  db.prepare("UPDATE sessions SET status='detached',startup_status='ready',origin='claimed',resume_type='codex_id',resume_token='operator-native' WHERE node_id=?").run(operator);
+  const request={nodeId:operator,sessionName:operator,reason:input.reason,operator};
+  const result=await resumeDetached(makeService(),{...request,actorGeneration:"operator-agent-g1"});
+  expect(result).toMatchObject({ok:false,effectAttempted:false});expect(create).not.toHaveBeenCalled();expect(resume).not.toHaveBeenCalled();
+  const operatorTranscript=path.join(dir,"operator.jsonl");writeFileSync(operatorTranscript,JSON.stringify({type:"session_meta",payload:{id:"operator-native"}})+"\n",{mode:0o600});
+  const operatorResume=vi.fn(async()=>{
+   processes=[
+    {pid:30,ppid:1,command:"/bin/zsh",executableName:"zsh",startedAt:"operator-shell",pgid:30,tpgid:41},
+    {pid:40,ppid:30,command:"/usr/bin/node codex-wrapper.js",executableName:"node",startedAt:"operator-wrapper",pgid:41,tpgid:41},
+    {pid:41,ppid:40,command:"/usr/bin/codex --no-daemon -p exact -m gpt-6-luna resume operator-native",executableName:"codex",startedAt:"operator-native-process",pgid:41,tpgid:41},
+   ];return {ok:true as const};
+  });
+  const localAuthority=createOperatorMaintenanceAuthority({nodeId:operator,generation:"operator-agent-g1",detachedResume:true,enableGuard:true});
+  const absence=vi.fn(async()=>false);const locallyAuthorized=makeService({proveStoppedIdentityAbsent:absence,resume:{resume:operatorResume},stoppedNativeState:async(binding:any)=>({nodeId:binding.nodeId,sessionName:binding.sessionName,nativeId:"operator-native",transcriptPath:operatorTranscript,runtimeContract:{runtime:"codex",model:"gpt-6-luna",provider:"openai",profile:"exact",effort:"high",permissions:{sandbox:{type:"workspace-write"},approval:"never"}}}),
+   verifyProcessIdentity:async(_pid,identity)=>identity.OPENRIG_NODE_ID===operator&&identity.OPENRIG_SESSION_NAME===operator&&identity.OPENRIG_OCCUPANT_GENERATION==="operator-agent-g1"&&identity.OPENRIG_RUNTIME==="codex"});
+  const failed=await resumeDetached(locallyAuthorized,{...request,maintenanceAuthority:localAuthority});expect(failed,JSON.stringify(failed)).toMatchObject({ok:false,code:"codex_rehost_recovery_absence",effectAttempted:true});expect(operatorResume).not.toHaveBeenCalled();
+  const beganPath=evidenceFiles().find(p=>p.endsWith("began.json"))!,directory=path.dirname(path.join(base.snapshotRoot,beganPath)),beganBytes=readFileSync(path.join(directory,"began.json")),unknownBytes=readFileSync(path.join(directory,"unknown.json"));const recovery={attemptId:JSON.parse(beganBytes.toString()).attemptId,beganSha256:createHash("sha256").update(beganBytes).digest("hex")};
+  absence.mockResolvedValue(true);const recoveryAuthority=createOperatorMaintenanceAuthority({nodeId:operator,generation:"operator-agent-g1",recovery});const creates=create.mock.calls.length;
+  const recovered=await locallyAuthorized.recoverStopped({...request,...recovery,actorGeneration:"",maintenanceAuthority:recoveryAuthority});expect(recovered,JSON.stringify(recovered)).toMatchObject({ok:true,nodeId:operator,generation:"operator-agent-g1",authorityRepaired:false});expect(create).toHaveBeenCalledTimes(creates);expect(readFileSync(path.join(directory,"began.json"))).toEqual(beganBytes);expect(readFileSync(path.join(directory,"unknown.json"))).toEqual(unknownBytes);
+  expect(await locallyAuthorized.recoverStopped({...request,...recovery,actorGeneration:"",maintenanceAuthority:recoveryAuthority})).toMatchObject({ok:false,effectAttempted:false});
   expect(operatorResume).toHaveBeenCalledTimes(1);expect(guard.preference(operator)).toMatchObject({desired:true,effective:true});
  });
 });
