@@ -88,3 +88,33 @@ subprocess.check_output=lambda *a,**k: ('30717 '+str(os.getuid())+' S\n').encode
  for(const args of [['--session','relative.jsonl'],['--session'],['--session='],['--session','--help'],['--session','/other','--session','/third'],['--continue'],['--resume'],['--session-dir','/other'],['--mode','rpc']])expect(run(omp,args),JSON.stringify(args)).toBe('0');
  expect(run(pi,[],[],'/usr/bin/node')).toBe('0');expect(run(pi,['--session','relative'],[],'/usr/bin/node')).toBe('0');expect(run('node_modules/pi-coding-agent/dist/cli.js',[],[],'/usr/bin/node')).toBe('0');
 });
+
+it('Pi census classifies the proven Node entrypoint rather than runner and native CLI data operands',()=>{
+ const source=readFileSync(new URL('../src/domain/codex-rehost-integration.ts',import.meta.url),'utf8'),program=source.match(/const STOPPED_CENSUS_PY = String.raw`([\s\S]*?)`;/)![1]!;
+ const fixture=String.raw`
+def argv_env(pid):
+ c=json.loads(os.environ['PI_ENTRYPOINT_FIXTURE'])
+ return c['argv'],[x.encode() for x in c['env']],c['exe']
+subprocess.check_output=lambda *a,**k: ('4321 '+str(os.getuid())+' S\n').encode()
+`;
+ const node='/Users/alex/.nvm/versions/node/v22.19.0/bin/node',cli='/private/tmp/ASTRA-PI-RELEASE-CONTRACT-RELEASE-20261008/install/node_modules/@openrig/cli/dist/bin-wrapper.js';
+ const runner='/private/tmp/ASTRA-PI-CENSUS-RELEASE-20261008/install/node_modules/@openrig/cli/daemon/dist/adapters/pi-runner.js',nativeCli='/opt/node_modules/@earendil-works/pi-coding-agent/dist/cli.js',omp='/opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js';
+ const run=(argv:string[],env:string[]=[],exe=node)=>execFileSync('python3',['-c',program.replace('ok=False',fixture+'\nok=False'),JSON.stringify({OPENRIG_NODE_ID:'lead',OPENRIG_SESSION_NAME:'lead@rig',OPENRIG_HOME:null}),'0','/saved/session.jsonl','pi'],{encoding:'utf8',env:{...process.env,PI_ENTRYPOINT_FIXTURE:JSON.stringify({argv,env,exe})}}).trim();
+ const recovery=[node,cli,'seat','rehost-runner','lead@rig','--pi-detached-resume','--pi-recovery-attempt','16d831a0-fbb5-4751-906f-acf4c9c2c3af','--pi-began-sha256','4fc260caa4b0d78cd497523d0b38b2d64fcc9414a2d50b564dfc21f91021668f','--pi-original-runner',runner,'--json'];
+ expect(run(recovery)).toBe('1');
+ expect(run([node,cli,'--evidence',nativeCli])).toBe('1');
+ expect(run([node,cli,'--evidence',omp,'--mode','rpc'])).toBe('1');
+ expect(run(recovery,['OPENRIG_NODE_ID=lead'])).toBe('0');
+ expect(run([...recovery,'--evidence','/saved/session.jsonl'])).toBe('0');
+ expect(run([...recovery,'--session=/saved/session.jsonl'])).toBe('0');
+ for(const script of [runner,nativeCli]) {
+  expect(run([node,script])).toBe('0');
+  expect(run([node,script,'--session','relative.jsonl'])).toBe('0');
+ }
+ // An OMP-looking data operand cannot exempt an actual Pi entrypoint.
+ expect(run([node,nativeCli,'--evidence',omp])).toBe('0');
+ expect(run([node,runner,'--evidence',omp])).toBe('0');
+ for(const argv of [[node,'--trace-warnings',cli,'--evidence',runner],[node,'relative-cli.js','--evidence',runner],[node,'--eval','code','--evidence',runner]])expect(run(argv)).toBe('0');
+ expect(run(['/bin/bun',cli,'--evidence',runner],[],'/bin/bun')).toBe('0');
+ expect(run(['/bin/pi','--evidence',cli],[],'/bin/pi')).toBe('0');
+});

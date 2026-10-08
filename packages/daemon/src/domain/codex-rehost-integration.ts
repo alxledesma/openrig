@@ -115,10 +115,15 @@ try:
     if os.path.isabs(value) and (os.path.realpath(value)==os.path.realpath(native)): raise ValueError()
    # Oh My Pi is a separate runtime despite sharing the pi-coding-agent
    # directory name. Exact target node/file matches above remain global.
-   scripts=[os.path.realpath(a).split(os.sep) for a in argv if os.path.isabs(a) and os.path.basename(a)=='cli.js']
+   # Ordinary Node script invocation proves the entrypoint. Later argv values
+   # are data, not executable scripts (for example an original-runner proof).
+   # Flags before the script, relative entries and other interpreters remain
+   # ambiguous, so retain the conservative all-argv classification for them.
+   script_args=[argv[1]] if os.path.basename(executable)=='node' and len(argv)>1 and os.path.isabs(argv[1]) else argv
+   scripts=[os.path.realpath(a).split(os.sep) for a in script_args if os.path.isabs(a) and os.path.basename(a)=='cli.js']
    omp_native=any(any(parts[i:i+2]==['@oh-my-pi','pi-coding-agent'] for i in range(len(parts)-1)) for parts in scripts)
-   pi_native=os.path.basename(executable)=='pi' or any(os.path.basename(a)=='cli.js' and 'pi-coding-agent' in os.path.normpath(a).split(os.sep) for a in argv)
-   pi_runner=any(os.path.basename(a)=='pi-runner.js' for a in argv)
+   pi_native=os.path.basename(executable)=='pi' or any(os.path.basename(a)=='cli.js' and 'pi-coding-agent' in os.path.normpath(a).split(os.sep) for a in script_args)
+   pi_runner=any(os.path.basename(a)=='pi-runner.js' for a in script_args)
    if pi_native or pi_runner:
     sessions=[argv[i+1] for i,a in enumerate(argv[:-1]) if a=='--session']+[a.split('=',1)[1] for a in argv if a.startswith('--session=')]
     # A positively identified foreign runtime with no explicit resume is not
