@@ -12,7 +12,7 @@ export interface PiRotationFactsDeps {
   db: Database.Database; tmux: TmuxAdapter;
   piState(session: string): Promise<unknown>;
   piProof(session: string, generation: string): Promise<PiNativeProof | null>;
-  piRotation?: { agentDir(session: string): string; runnerEntryPath: string };
+  piRotation?: { agentDir(session: string): string; runnerEntryPath: string; resolvePosture(nodeId: string, rigId: string): "floor" | "full_bypass" };
 }
 export function canonicalPiSessionFile(value: unknown): value is string {
   if (typeof value !== "string" || !isAbsolute(value) || normalize(value) !== value || /[\x00-\x1f\x7f]/.test(value)) return false;
@@ -22,13 +22,18 @@ export function canonicalPiSessionFile(value: unknown): value is string {
 export function piRotationSidecar(value: unknown): PiRunnerState | null {
   return value && typeof value === "object" && !Array.isArray(value) ? value as PiRunnerState : null;
 }
-interface CurrentPiRow extends PiRotationNode { nodeId: string; sessionName: string; pane: string }
+interface CurrentPiRow extends PiRotationNode { nodeId: string; rigId: string; sessionName: string; pane: string }
 function current(deps: PiRotationFactsDeps, seat: string): CurrentPiRow | null {
-  return deps.db.prepare(`SELECT n.id nodeId,n.runtime,n.model,n.policy_launch_posture launchPosture,
+  const row = deps.db.prepare(`SELECT n.id nodeId,n.rig_id rigId,n.runtime,n.model,n.policy_launch_posture launchPosture,
     s.session_name sessionName,s.status sessionStatus,s.startup_status startupStatus,s.resume_type resumeType,s.resume_token resumeToken,
     t.generation_uuid generation,b.tmux_pane pane FROM nodes n JOIN sessions s ON s.node_id=n.id
     JOIN occupant_tenures t ON t.node_id=n.id JOIN bindings b ON b.node_id=n.id
-    WHERE s.session_name=? ORDER BY s.id DESC,t.generation_ordinal DESC LIMIT 1`).get(seat) as CurrentPiRow | undefined ?? null;
+    WHERE s.session_name=? ORDER BY s.id DESC,t.generation_ordinal DESC LIMIT 1`).get(seat) as CurrentPiRow | undefined;
+  if (!row) return null;
+  if (!row.rigId || typeof deps.piRotation?.resolvePosture !== "function") throw Error("Pi effective launch policy unavailable");
+  const posture = deps.piRotation.resolvePosture(row.nodeId, row.rigId);
+  if (posture !== "floor" && posture !== "full_bypass") throw Error("Pi effective launch policy unavailable");
+  return { ...row, launchPosture: posture };
 }
 /** Native presence is independent of idle. This is also used when the genuine
  * target submits a checkpoint draft while its own authenticated tool is busy. */
@@ -41,7 +46,7 @@ export async function observePiRotationIdentity(deps: PiRotationFactsDeps, seat:
   const agentDir = config.agentDir(seat), launch = await observePiRotationLaunch({nodeId:row.nodeId,sessionName:seat,generation:row.generation,
     sessionFile:row.resumeToken,agentDir,runnerEntryPath:config.runnerEntryPath,proof}, {
     tmux:deps.tmux, sidecar:async session=>piRotationSidecar(await deps.piState(session)),
-    currentBinding:async nodeId=>{const now=current(deps,seat);return now && now.nodeId===nodeId && now.generation ? {
+    currentBinding:async nodeId=>{const now=current(deps,seat);return now && JSON.stringify(now)===JSON.stringify(row) && now.nodeId===nodeId && now.generation ? {
       nodeId,sessionName:now.sessionName,generation:now.generation,runtime:now.runtime!,pane:now.pane,sessionFile:now.resumeToken} : null;},
   });
   const after = piRotationSidecar(await deps.piState(seat));

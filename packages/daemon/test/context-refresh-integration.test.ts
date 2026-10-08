@@ -1,3 +1,5 @@
+import { RigRepository } from "../src/domain/rig-repository.js";
+import { RestoreOrchestrator } from "../src/domain/restore-orchestrator.js";
 import {afterEach,beforeEach,describe,expect,it,vi} from "vitest";
 import {mkdtempSync,realpathSync,writeFileSync,appendFileSync,rmSync,readFileSync,mkdirSync,symlinkSync} from "node:fs";
 import {tmpdir} from "node:os";
@@ -45,7 +47,10 @@ describe("actual context refresh composition",()=>{
    {type:"thinking_level_change",id:"thinking",thinkingLevel:"high",timestamp:new Date(now).toISOString()}].map(r=>JSON.stringify(r)+"\n").join(""));
   writeHistory("pi-old-header");
   const generation=()=>repo.coordinatorAuthority.generation(seat)!;
-  deps.piRotation={agentDir:()=>agent,runnerEntryPath:join(dir,"pi-runner.js")};
+  // Exercise the actual shared policy resolver with this fixture's real DB;
+  // no launch/restore machinery is constructed or run.
+  const resolver = Object.assign(Object.create(RestoreOrchestrator.prototype), { rigRepo: new RigRepository(db) }) as RestoreOrchestrator;
+  deps.piRotation={agentDir:()=>agent,runnerEntryPath:join(dir,"pi-runner.js"),resolvePosture:(nodeId,rigId)=>resolver.resolveRestorePosture(nodeId,rigId)};
   deps.piProof=async()=>({state:"present",generation:generation(),launchId:launch,fingerprint:"real-pi-proof-fixture",lastEntryId:leaf,quiescence:{settled:activity==="idle-at-prompt",observedAt:new Date(activityAt).toISOString()}});
   deps.piState=async()=>({ready:true,launchId:launch,sessionFile:file,lastEntryId:leaf,model:{provider:"provider",id:"model",contextWindow:100},
    quiescence:{launchId:launch,generation:generation(),sessionFile:file,lastEntryId:leaf,settled:activity==="idle-at-prompt",observedAt:new Date(activityAt).toISOString()},
@@ -343,6 +348,28 @@ describe("actual context refresh composition",()=>{
   p.compact("second");expect(await integration.evaluate(operator,selection())).toMatchObject({action:"request-checkpoint",compactionsSinceBaseline:2});
   p.fail();expect((await integration.evaluate(operator,selection())).holds).toContain("runtime-not-ready");
   p.absent();expect((await integration.observe(operator,selection())).native.verified).toBe(false);
+ });
+ it("Pi effective posture inherits rig/default policy and respects explicit member precedence",async()=>{
+  piTarget();
+  db.prepare("UPDATE nodes SET policy_launch_posture=NULL,policy_origin=NULL WHERE id=?").run(seat);
+  expect((await piFacts.resolvePiRotationNativeState(deps,seat)).runtimeContract.trust).toBe("no-approve");
+  const rig=(db.prepare("SELECT rig_id rig FROM nodes WHERE id=?").get(seat) as {rig:string}).rig;
+  db.prepare("UPDATE rigs SET rig_policy_origin='builtin',rig_policy_launch_posture='full_bypass' WHERE id=?").run(rig);
+  await expect(piFacts.resolvePiRotationNativeState(deps,seat)).rejects.toThrow("binding-changed"); // Actual no-approve cannot prove bypass.
+  db.prepare("UPDATE nodes SET policy_origin='builtin',policy_launch_posture='floor' WHERE id=?").run(seat);
+  expect((await piFacts.resolvePiRotationNativeState(deps,seat)).runtimeContract.trust).toBe("no-approve");
+  db.prepare("UPDATE nodes SET policy_launch_posture=NULL,policy_origin=NULL WHERE id=?").run(seat);
+  db.prepare("UPDATE rigs SET rig_policy_launch_posture='floor' WHERE id=?").run(rig);
+  expect((await piFacts.resolvePiRotationNativeState(deps,seat)).runtimeContract.trust).toBe("no-approve");
+ });
+ it("Pi effective posture changes during identity observation refuse and missing/invalid resolver cannot upgrade",async()=>{
+  piTarget();const resolve=deps.piRotation!.resolvePosture;let calls=0;
+  deps.piRotation!.resolvePosture=(nodeId,rigId)=>++calls===1?resolve(nodeId,rigId):"full_bypass";
+  await expect(piFacts.resolvePiRotationNativeState(deps,seat)).rejects.toThrow("binding changed");
+  deps.piRotation!.resolvePosture=undefined as any;
+  await expect(piFacts.resolvePiRotationNativeState(deps,seat)).rejects.toThrow("effective launch policy unavailable");
+  deps.piRotation!.resolvePosture=()=>"invalid" as any;
+  await expect(piFacts.resolvePiRotationNativeState(deps,seat)).rejects.toThrow("effective launch policy unavailable");
  });
  it("Pi canonical file stays mandatory while defaults do not override native selection",async()=>{
   const p=piTarget();await boundGrant();

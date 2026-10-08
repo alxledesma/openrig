@@ -2537,7 +2537,8 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     db, queue: queueRepoInstance, guard: deliveryGuard, tmux: tmuxAdapter,
     whoami: whoamiService, activity: seatActivityService, store: nativeDutyStore,
     rotationRoot: nodePath.join(OPENRIG_HOME, "state", "context-refresh"),
-    piRotation: { agentDir: session => piSeatPaths(piStateRoot, session).agentDir, runnerEntryPath: piRunnerEntryPath },
+    piRotation: { agentDir: session => piSeatPaths(piStateRoot, session).agentDir, runnerEntryPath: piRunnerEntryPath,
+      resolvePosture: (nodeId, rigId) => restoreOrchestrator.resolveRestorePosture(nodeId, rigId) },
     configurationDigest: session => queueRepoInstance.coordinatorAuthority.coordinationRecovery?.configurationDigest(session),
     piState: async session => {
       try { return parsePiRunnerState(fs.readFileSync(piSeatPaths(piStateRoot, session).runnerStatePath, "utf8")); }

@@ -15,7 +15,7 @@ export interface ContextRefreshIntegrationDeps {
   db: Database.Database; queue: QueueRepository; guard: SeatDeliveryGuard; tmux: TmuxAdapter;
   whoami: WhoamiService; activity: SeatActivityService; store: NativeDutyLaunchStore;
   rotationRoot: string;
-  piRotation?: { agentDir(session: string): string; runnerEntryPath: string };
+  piRotation?: { agentDir(session: string): string; runnerEntryPath: string; resolvePosture(nodeId: string, rigId: string): "floor" | "full_bypass" };
   configurationDigest(session: string): string | null | undefined;
   piState(session: string): Promise<unknown>;
   piProof(session: string, generation: string): Promise<PiNativeProof | null>;
