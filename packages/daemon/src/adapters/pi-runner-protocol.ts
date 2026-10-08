@@ -1,3 +1,4 @@
+import type { PiManagedSpawnProof } from "./pi-managed-launch-proof.js";
 import { parseNativeModelWindow, parseNativeModelCatalog, type NativeModelWindow } from "../domain/model-window.js";
 // OPR.0.4.6.PI1 — the shared, PURE contract between the Pi runtime adapter,
 // the Pi resume adapter, and the pane-hosted pi-runner process.
@@ -68,6 +69,8 @@ export interface PiRunnerState {
    * after this runner receives a successful get_state response from its current
    * Pi child; the daemon independently binds childPid to kernel process identity.
    * Older sidecars omit this field and cannot prove the response-to-child link. */
+  /** Actual spawn intent, independently corroborated by the daemon kernel reader. */
+  managedSpawnProof?: PiManagedSpawnProof;
   rpcSessionFileProof?: {
     launchId: string;
     generation: string;

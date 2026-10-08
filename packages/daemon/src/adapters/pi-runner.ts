@@ -18,6 +18,7 @@
 // Only node builtins + pi-runner-protocol are imported so the compiled entry
 // stays runnable as `node <dist>/adapters/pi-runner.js` with no daemon deps.
 
+import { capturePiManagedSpawnProof, piLaunchArtifact, type PiManagedSpawnProof, type PiLaunchArtifact } from "./pi-managed-launch-proof.js";
 import fs from "node:fs";
 import nodePath from "node:path";
 import readline from "node:readline";
@@ -1343,7 +1344,22 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     command = resolved.path;
   }
 
-  const child = spawn(command, childArgs, {
+  let pinnedPi: { entry: PiLaunchArtifact; interpreter: PiLaunchArtifact } | undefined;
+  let spawnArgs = childArgs;
+  if (runtime === "pi") {
+    // Unsupported launchers remain compatible, but cannot mint launch proof.
+    try {
+      const pi = resolveRuntimeExecutable("pi", process.env), node = resolveRuntimeExecutable("node", process.env);
+      if (pi.ok && node.ok && /^#!\/usr\/bin\/env node\r?\n/.test(fs.readFileSync(pi.path, "utf8"))) {
+        pinnedPi = { entry: piLaunchArtifact(pi.path), interpreter: piLaunchArtifact(node.path) };
+        command = pinnedPi.interpreter.path;
+        spawnArgs = [pinnedPi.entry.path, ...childArgs];
+      }
+    } catch { /* Compatible launch; missing proof holds rotation. */ }
+  }
+  let managedSpawnProof: PiManagedSpawnProof | undefined;
+  let spawnProofAttempted = false;
+  const child = spawn(command, spawnArgs, {
     cwd: args.cwd,
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
@@ -1377,8 +1393,17 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         .finally(() => clearTimeout(timeout));
     },
     writeSidecar: (state) => {
+      if (state.exited || !state.ready || state.rpcSessionFileProof?.childPid !== child.pid) managedSpawnProof = undefined;
+      if (runtime === "pi" && pinnedPi && !spawnProofAttempted && state.ready && !state.exited && state.rpcSessionFileProof?.childPid === child.pid) {
+        spawnProofAttempted = true; // Only after successful current-child pipe RPC, not spawn/pre-exec.
+        if (child.exitCode === null && child.signalCode === null && process.env.OPENRIG_NODE_ID && process.env.OPENRIG_OCCUPANT_GENERATION && child.pid) {
+          managedSpawnProof = capturePiManagedSpawnProof({ nodeId: process.env.OPENRIG_NODE_ID,
+            generation: process.env.OPENRIG_OCCUPANT_GENERATION, intent: { ...args, runnerEntryPath: fileURLToPath(import.meta.url) },
+            childPid: child.pid, piEntry: pinnedPi.entry, interpreter: pinnedPi.interpreter, childArgs }) ?? undefined;
+        }
+      }
       try {
-        fs.writeFileSync(paths.runnerStatePath, JSON.stringify(state));
+        fs.writeFileSync(paths.runnerStatePath, JSON.stringify({ ...state, ...(managedSpawnProof ? { managedSpawnProof } : {}) }));
       } catch { /* best-effort; adapter falls back to pane markers */ }
     },
     currentChildPid: () => child.pid,

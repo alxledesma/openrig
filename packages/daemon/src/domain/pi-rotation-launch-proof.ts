@@ -1,3 +1,4 @@
+import { readPiLaunchProcess, validatePiManagedSpawnProof, type PiManagedSpawnProof } from "../adapters/pi-managed-launch-proof.js";
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -51,6 +52,8 @@ export interface PiRotationLaunchDeps {
   processes?: () => Promise<NativeProcessRow[]>;
   /** Kernel-backed reader. Its result is a bounded allowlist, never raw argv/env. */
   kernelProcess?: (pid: number, role: "runner" | "child", expected: PiRotationLaunchExpected) => Promise<PiKernelLaunchObservation | null>;
+  /** Independent live kernel/artifact corroboration, not a sidecar boolean. */
+  managedLaunch?: (proof: PiManagedSpawnProof, expected: PiRotationLaunchExpected, runnerPid: number, childPid: number) => Promise<boolean>;
   now?: () => number;
 }
 
@@ -138,6 +141,7 @@ function stateMatches(input: {
 function sessionProofStateKey(state: PiRunnerState | null): string | null {
   if (!state) return null;
   return JSON.stringify({
+    managedSpawnProof: state.managedSpawnProof,
     ready: state.ready, launchId: state.launchId, sessionFile: state.sessionFile, lastEntryId: state.lastEntryId,
     rpcSessionFileProof: state.rpcSessionFileProof,
     runtimeReadiness: state.runtimeReadiness ? {
@@ -263,11 +267,16 @@ export async function observePiRotationLaunch(
       const [runnerKernel, childKernel] = await Promise.all([
         readKernel(runner.pid, "runner", expected), readKernel(child.pid, "child", expected),
       ]);
-      if (!runnerKernel || !childKernel || !runnerKernel.publicIdentityMatches || !childKernel.publicIdentityMatches
-        || !runnerKernel.runnerEntryMatches || !runnerKernel.runnerFlagsMatch || !childKernel.rpcChildMatches
-        || !childKernel.sessionDirectoryMatches || !childKernel.agentDirectoryMatches
-        || !runnerKernel.trustFlag || runnerKernel.trustFlag !== childKernel.trustFlag) return null;
-      return { panePid, pane, runner, child, trustFlag: childKernel.trustFlag };
+      const spawnProof = sidecarBefore?.managedSpawnProof;
+      if (!spawnProof || !runnerKernel || !childKernel || !runnerKernel.publicIdentityMatches || !childKernel.publicIdentityMatches
+        || !runnerKernel.runnerEntryMatches || !runnerKernel.runnerFlagsMatch || !childKernel.agentDirectoryMatches
+        || !runnerKernel.trustFlag || runnerKernel.trustFlag !== spawnProof.intent?.trust) return null;
+      const corroborate = deps.managedLaunch ?? (async (record, wanted, runnerPid, childPid) => {
+        const observedRunner = readPiLaunchProcess(runnerPid), observedChild = readPiLaunchProcess(childPid);
+        return validatePiManagedSpawnProof(record, wanted, observedRunner, observedChild);
+      });
+      if (!await corroborate(spawnProof, expected, runner.pid, child.pid)) return null;
+      return { panePid, pane, runner, child, trustFlag: runnerKernel.trustFlag };
     };
     const first = await sample();
     const second = await sample();

@@ -21,6 +21,7 @@ const rows: NativeProcessRow[] = [
   { pid: 102, ppid: 101, startedAt: "Wed Oct 7 22:00:00 2026", command: "pi", executableName: "pi" },
 ];
 const state: PiRunnerState = {
+  managedSpawnProof: { version: 1, intent: { trust: "no-approve" } } as PiRunnerState["managedSpawnProof"],
   ready: true, launchId: "launch-1", sessionFile: input.sessionFile, sessionId: "native-session-1",
   lastEntryId: "entry-9", updatedAt: "2026-10-07T23:00:00.000Z",
   rpcSessionFileProof: {
@@ -59,11 +60,21 @@ function deps(over: {
     sidecar: over.sidecar ?? (async () => state),
     processes: over.processes ?? (async () => rows),
     kernelProcess: over.kernelProcess ?? (async (_pid, role) => kernel(role)),
+    managedLaunch: async () => true,
     now: () => NOW,
   };
 }
 
 describe("Pi rotation OS launch proof", () => {
+  it("holds when legacy launch has no actual spawn proof", async () => {
+    await expect(observePiRotationLaunch({ ...input, proof }, deps({ sidecar: async () => ({ ...state, managedSpawnProof: undefined }) }))).resolves.toBeNull();
+  });
+  it("accepts erased child flags only with independent managed corroboration", async () => {
+    const d = deps({ kernelProcess: async (_pid, role) => role === "runner" ? kernel(role) : { ...kernel(role), rpcChildMatches: false, sessionDirectoryMatches: false, trustFlag: null } });
+    await expect(observePiRotationLaunch({ ...input, proof }, d)).resolves.not.toBeNull();
+    d.managedLaunch = async () => false;
+    await expect(observePiRotationLaunch({ ...input, proof }, d)).resolves.toBeNull();
+  });
   it("returns a verified launch only after stable process and child-bound RPC proof", async () => {
     await expect(observePiRotationLaunch({ ...input, proof }, deps())).resolves.toEqual({
       generation: "generation-1", launchId: "launch-1", sessionFile: input.sessionFile,

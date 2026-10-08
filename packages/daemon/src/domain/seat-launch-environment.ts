@@ -139,7 +139,12 @@ export class SeatLaunchEnvironment {
     const env = publicSeatEnvironment({ OPENRIG_TRANSCRIPTS_LINES: "", OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS: "", ...this.sessionEnv, ...identity });
     if (target.runtime === "codex" && this.codexHome) env.CODEX_HOME = this.codexHome;
     const assignments = Object.entries(env).map(([key, value]) => shellQuote(`${key}=${value}`));
-    return `/usr/bin/env ${assignments.join(" ")} PATH=${shellQuote(binDir)}:"$PATH" ${[wrapped.executable, ...wrapped.args].map(shellQuote).join(" ")}`;
+    // The managed Pi runner resolves its child toolchain after the pane's rc
+    // has run. Keep that selection on the same PATH used to resolve the runner;
+    // otherwise an rc-selected wrapper/interpreter defeats the launch contract.
+    // Retain the pane's extra tools after the daemon-selected toolchain.
+    const managedPath = target.runtime === "pi" ? `${binDir}${path.delimiter}${this.sessionEnv.PATH}` : binDir;
+    return `/usr/bin/env ${assignments.join(" ")} PATH=${shellQuote(managedPath)}:"$PATH" ${[wrapped.executable, ...wrapped.args].map(shellQuote).join(" ")}`;
   }
 
   private rigBin(): string {
