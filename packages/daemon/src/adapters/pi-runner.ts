@@ -334,9 +334,10 @@ export class RunnerCore {
   /** A bounded quiescence refresh is in flight; at most one at a time. */
   private refreshSequence = 0;
   private pendingRefresh?: {
-    id: string; epoch: number; issuedAt: number; sessionFile: string;
+    id: string; epoch: number; issuedAt: number; sessionFile: string; afterAbort: boolean;
     sessionId: string | undefined; launchId: string | undefined; generation: string | undefined;
   };
+  private pendingAbort?: { id: string; epoch: number };
   private quiescenceObservedAt = "";
   private quiescenceRefreshIntervalId: ReturnType<typeof setInterval> | undefined;
   /** The epoch at which the current turn started. Bumped by every native turn
@@ -412,14 +413,18 @@ export class RunnerCore {
    *    response. A failed or missing response therefore cannot refresh anything.
    *
    *  Returns whether a request was actually issued. */
-  refreshQuiescence(): boolean {
+  refreshQuiescence(): boolean { return this.requestQuiescence(false); }
+
+  /** An acknowledged abort may leave local processing stuck busy without an
+   * agent_settled event. Only a fresh, epoch-bound native read can clear it. */
+  private requestQuiescence(afterAbort: boolean): boolean {
     if (this.runtime !== "pi") return false;
     const now = Date.parse(this.io.now());
     if (!Number.isFinite(now)) return false;
     if (this.pendingRefresh && (now < this.pendingRefresh.issuedAt || now - this.pendingRefresh.issuedAt >= QUIESCENCE_REFRESH_TIMEOUT_MS)) this.pendingRefresh = undefined;
-    if (!this.ready || this.processing || this.controlPending || !this.sessionFile || this.pendingRefresh) return false;
+    if (!this.ready || (!afterAbort && this.processing) || this.controlPending || !this.sessionFile || this.pendingRefresh) return false;
     const id = `${QUIESCENCE_REFRESH_ID}-${++this.refreshSequence}`;
-    this.pendingRefresh = { id, epoch: this.activityEpoch, issuedAt: now, sessionFile: this.sessionFile,
+    this.pendingRefresh = { id, epoch: this.activityEpoch, issuedAt: now, sessionFile: this.sessionFile, afterAbort,
       sessionId: this.sessionId, launchId: this.identity.launchId, generation: this.identity.generation };
     try { this.io.sendRpc({ type: "get_state", id }); }
     catch (error) { this.pendingRefresh = undefined; throw error; }
@@ -493,8 +498,18 @@ export class RunnerCore {
       return;
     }
     if (block === "/abort") {
-      if (isPi) this.markBusy();
-      this.io.sendRpc({ type: "abort" });
+      if (isPi) {
+        // Abort does not change the model or consume context. Invalidate idle
+        // evidence without discarding retained usage; acknowledgment alone is
+        // not settlement, even though native abort waits for idle.
+        this.invalidateRefresh();
+        this.processing = true;
+        this.settledProven = false;
+        this.writeQuiescence();
+        const id = `pi-runner-abort-${++this.refreshSequence}`;
+        this.pendingAbort = { id, epoch: this.activityEpoch };
+        this.io.sendRpc({ type: "abort", id });
+      } else this.io.sendRpc({ type: "abort" });
       this.io.mirrorLine("[pi-runner] abort sent");
       return;
     }
@@ -547,6 +562,13 @@ export class RunnerCore {
   }
 
   private handleResponse(record: Record<string, unknown>): void {
+    if (this.runtime === "pi" && typeof record.id === "string" && record.id.startsWith("pi-runner-abort-")) {
+      const request = this.pendingAbort;
+      if (!request || record.id !== request.id || request.epoch !== this.activityEpoch) return;
+      this.pendingAbort = undefined;
+      if (record.command === "abort" && record.success === true && record.error == null) this.requestQuiescence(true);
+      return;
+    }
     // A response can only prove this launch's current child. Drop the prior
     // witness before handling any new startup get_state result so a failure,
     // malformed response, or late response from a replaced child cannot retain
@@ -558,7 +580,7 @@ export class RunnerCore {
       if (!request || record.id !== request.id) return;
       this.pendingRefresh = undefined;
       const now = Date.parse(this.io.now());
-      if (!this.ready || this.processing || this.controlPending || request.epoch !== this.activityEpoch ||
+      if (!this.ready || (!request.afterAbort && this.processing) || this.controlPending || request.epoch !== this.activityEpoch ||
         !Number.isFinite(now) || now < request.issuedAt || now - request.issuedAt >= QUIESCENCE_REFRESH_TIMEOUT_MS ||
         request.sessionFile !== this.sessionFile || request.sessionId !== this.sessionId ||
         request.launchId !== this.identity.launchId || request.generation !== this.identity.generation ||
@@ -1035,6 +1057,7 @@ export class RunnerCore {
   private invalidateRefresh(): void {
     this.activityEpoch++;
     this.pendingRefresh = undefined;
+    this.pendingAbort = undefined;
   }
 
   /** Mark the seat busy ahead of a native turn or control effect and persist

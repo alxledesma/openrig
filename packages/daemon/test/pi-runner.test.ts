@@ -118,7 +118,7 @@ describe("runner input", () => {
       expect(rpc.filter(x => ["prompt", "steer", "follow_up", "abort"].includes(String(x.type)))).toEqual([
         { type: "prompt", message: "first", streamingBehavior: "followUp" },
         { type: "steer", message: "second" },
-        { type: "follow_up", message: "later" }, { type: "abort" },
+        { type: "follow_up", message: "later" }, { type: "abort", id: expect.stringMatching(/^pi-runner-abort-/) },
       ]);
     } finally { t.editor.close(); }
   });
@@ -291,7 +291,7 @@ describe("RunnerCore.handleUserBlock", () => {
   it("/abort → RPC abort; /followup → RPC follow_up", () => {
     const { core, rpc } = readyCore();
     core.handleUserBlock("/abort");
-    expect(rpc.at(-1)).toEqual({ type: "abort" });
+    expect(rpc.at(-1)).toMatchObject({ type: "abort" });
     core.handleUserBlock("/followup after this turn");
     expect(rpc.at(-1)).toEqual({ type: "follow_up", message: "after this turn" });
   });
@@ -1042,4 +1042,60 @@ it("sidecar reads reproject untrusted native model fields", () => {
  const m={provider:"p",id:"m",contextWindow:32000};
  const parsed=parsePiRunnerState(JSON.stringify({ready:true,updatedAt:"now",model:{...m,secret:"excluded"},models:[{...m,secret:"excluded"},{...m,contextWindow:0}]}));
  expect(parsed!.model).toEqual(m);expect(parsed!.models).toEqual([m]);
+});
+
+describe("RunnerCore abort state reconciliation",()=>{
+ const quiet={sessionFile:SESSION_FILE,sessionId:"0197a2f0",isStreaming:false,isCompacting:false,pendingMessageCount:0};
+ const respond=(f:ReturnType<typeof readyCore>,id:unknown,data:unknown=quiet,success=true)=>f.core.handlePiLine(JSON.stringify({type:"response",id,command:"get_state",success,data}));
+ const abortAcknowledged=(f:ReturnType<typeof readyCore>)=>{
+  f.core.handleUserBlock("/abort");const id=f.rpc.at(-1)!.id;
+  f.core.handlePiLine(JSON.stringify({type:"response",id,command:"abort",success:true}));
+  expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(false);
+  expect(f.rpc.at(-1)!.type).toBe("get_state");return f.rpc.at(-1)!.id;
+ };
+ it("idle abort settles only after fresh native state without needing agent_end",()=>{
+  const f=readyCore();const id=abortAcknowledged(f);respond(f,id);
+  expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(true);
+  expect(f.core.refreshQuiescence()).toBe(true);
+ });
+ it.each([{...quiet,isStreaming:true},{...quiet,isCompacting:true},{...quiet,pendingMessageCount:1},{},{...quiet,sessionFile:"/foreign"}])("abort state cannot settle busy or unknown native state %j",data=>{
+  const f=readyCore();const id=abortAcknowledged(f);respond(f,id,data);expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(false);
+ });
+ it("failed abort acknowledgement or failed state never proves idle",()=>{
+  const f=readyCore();f.core.handleUserBlock("/abort");const id=f.rpc.at(-1)!.id;
+  f.core.handlePiLine(JSON.stringify({type:"response",id,command:"abort",success:false,error:"refused"}));
+  expect(f.rpc.at(-1)!.type).toBe("abort");expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(false);
+  const stateId=abortAcknowledged(f);respond(f,stateId,quiet,false);expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(false);
+ });
+ it.each(["new prompt","/abort","/followup next"])("rejects an abort state reply after newer input %s",input=>{
+  const f=readyCore();const id=abortAcknowledged(f);f.core.handleUserBlock(input);respond(f,id);expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(false);
+ });
+ it("rejects delayed abort acknowledgement after newer native activity",()=>{
+  const f=readyCore();f.core.handleUserBlock("/abort");const id=f.rpc.at(-1)!.id;f.core.handlePiLine(JSON.stringify({type:"agent_start"}));const count=f.rpc.length;
+  f.core.handlePiLine(JSON.stringify({type:"response",id,command:"abort",success:true}));expect(f.rpc).toHaveLength(count);expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(false);
+ });
+ it("abort reconciliation preserves exact current context and unresolved runtime failures",()=>{
+  const f=readyCore(),model={provider:"p",id:"m",contextWindow:10000};
+  respond(f,"pi-runner-get-state",{...quiet,model});
+  f.core.handlePiLine(JSON.stringify({type:"message_end",message:{role:"assistant",provider:"p",model:"m",stopReason:"stop",timestamp:1,usage:{totalTokens:100}}}));
+  const context=f.sidecars.at(-1)!.runtimeReadiness!.context;
+  const id=abortAcknowledged(f);respond(f,id,{...quiet,model});
+  expect(f.sidecars.at(-1)!.runtimeReadiness!.context).toEqual(context);
+  f.core.handlePiLine(JSON.stringify({type:"auto_retry_end",success:false}));
+  const failures=f.sidecars.at(-1)!.runtimeReadiness!.failures;
+  const next=abortAcknowledged(f);respond(f,next,{...quiet,model});
+  expect(f.sidecars.at(-1)!.runtimeReadiness!.failures).toEqual(failures);
+  expect(failures).toEqual(expect.arrayContaining([expect.objectContaining({code:"model_error"})]));
+ });
+ it("abort state after native activity or timeout cannot settle",()=>{
+  const f=readyCore();let id=abortAcknowledged(f);
+  f.core.handlePiLine(JSON.stringify({type:"compaction_start"}));respond(f,id);expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(false);
+  id=abortAcknowledged(f);f.io.now=()=>"2026-07-06T10:00:03Z";respond(f,id);expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(false);
+ });
+ it("OMP abort retains its existing untagged RPC behavior",()=>{
+  const f=fakeIo(),core=new RunnerCore(f.io,{sessionName:SESSION},{runtime:"omp"});core.handleUserBlock("/abort");expect(f.rpc).toEqual([{type:"abort"}]);expect(f.sidecars).toEqual([]);
+ });
+ it("active abort stays usable and settles from subsequent native state",()=>{
+  const f=readyCore();f.core.handlePiLine(JSON.stringify({type:"agent_start"}));const id=abortAcknowledged(f);respond(f,id);expect(f.sidecars.at(-1)!.quiescence!.settled).toBe(true);
+ });
 });
