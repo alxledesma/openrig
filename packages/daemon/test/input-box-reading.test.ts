@@ -494,8 +494,9 @@ describe("readSeatBeforePaste: verified needs a seat proven idle before the past
       const frame = claude(name);
       expect(frame.split("\n")[slotOf(frame)]).toBe(row);
       expect(readSeatBeforePaste(frame, "claude-code", seat)).toBe("idle");
-      // The same frame with the slot blank (the fullscreen form) is idle too.
-      expect(readSeatBeforePaste(slot(frame, ""), "claude-code", seat)).toBe("idle");
+      // Review round 1, change 3: the same frame with the slot blank has the seat's last message right above it,
+      // which is how a classic frame can look while Claude Code hides its spinner for streamed text: unknown.
+      expect(readSeatBeforePaste(slot(frame, ""), "claude-code", seat)).toBe("unknown");
     });
 
     it.each(seats)("%s: unknown without the seat's name or for another seat", (name, seat) => {
@@ -625,5 +626,195 @@ describe("readSeatBeforePaste: verified needs a seat proven idle before the past
     ])("malformed, %s: unknown", (_name, row) => {
       expect(readSeatBeforePaste(completion(row), "codex")).toBe("unknown");
     });
+  });
+});
+
+// Review round 1: the maintainer's changes 1 to 3, read on real frames and one- or two-line edits of them, named
+// where they are made. Change 4 (audited prompt answers) is in session-transport-input-box.test.ts (T41, T41c).
+describe("review round 1, change 1: the exact-text check keeps word boundaries (both runtime paths)", () => {
+  // Edits: the box row of a real staged frame replaced by `box`; for Codex, `more` adds continuation rows.
+  const claudeBox = (box: string) => editLine(claude("staged-short.raw"), claudeBoxRow, `❯\u00a0${box}`);
+  const codexBox = (box: string, more: string[] = []) => editLine(codex("staged-short.J"), codexBoxRow, [`› ${box}`, ...more.map((row) => `  ${row}`)]);
+  const both = [["claude-code", claudeBox], ["codex", codexBox]] as const;
+
+  it.each(both)("%s: `now here` is not `nowhere`, either way round", (runtime, box) => {
+    expect(readInputBox(box("nowhere"), runtime, "now here")).toBe("other");
+    expect(readInputBox(box("now here"), runtime, "nowhere")).toBe("other");
+    expect(readInputBox(box("now here"), runtime, "now here")).toBe("exact");
+    expect(readInputBox(box("nowhere"), runtime, "nowhere")).toBe("exact");
+  });
+
+  it.each(both)("%s: a run of spaces or a Unicode space compares as one space, and only as a space", (runtime, box) => {
+    expect(readInputBox(box("now   here"), runtime, "now here")).toBe("exact");
+    expect(readInputBox(box("now here"), runtime, "now\u00a0\u2003here")).toBe("exact");
+    expect(readInputBox(box("now here"), runtime, "  now here\n")).toBe("exact");
+    expect(readInputBox(box("now here"), runtime, "nowhere ")).toBe("other");
+  });
+
+  it.each([
+    ["claude-code", "staged-wrapped.raw"], ["claude-code", "staged-wrapped.J"], ["codex", "staged-wrapped.raw"], ["codex", "staged-wrapped.J"],
+  ] as const)("%s %s: the real wrapped frame breaks rows at spaces, so the text is exact; the text with a break inside a word is ambiguous", (runtime, name) => {
+    const frame = runtime === "codex" ? codex(name) : claude(name);
+    expect(readInputBox(frame, runtime, texts.wrapped)).toBe("exact");
+    // The first row break of the real frame falls between `next` and `scheduled`; without that space in the sent text
+    // the break would be inside a word, which the box draws the same way.
+    expect(readInputBox(frame, runtime, texts.wrapped.replace("next scheduled", "nextscheduled"))).toBe("ambiguous");
+    // A space missing inside a row is a different text.
+    expect(readInputBox(frame, runtime, texts.wrapped.replace("Background instructions", "Backgroundinstructions"))).toBe("other");
+  });
+
+  it("codex: the inline envelope's line breaks are row breaks between words, so it stays exact", () => {
+    expect(readInputBox(codex("staged-envelope.J"), "codex", texts.envelope)).toBe("exact");
+    expect(readInputBox(codex("product-path-staged-envelope.J"), "codex", texts.envelope)).toBe("exact");
+  });
+
+  it("codex: a row break counts as a space only where the two words joined would fit in the box's widest row", () => {
+    // Edits: the box drawn over two rows. `now` and `here` joined (7 cells) fit in the 19-cell first row, so a word
+    // wrapper would not have split `nowhere` there: the break is a space.
+    expect(readInputBox(codexBox("check the queue now", ["here"]), "codex", "check the queue now here")).toBe("exact");
+    // In a box no wider than 4 cells, `nowhere` would have to be split, so the break could be inside it: ambiguous.
+    expect(readInputBox(codexBox("now", ["here"]), "codex", "now here")).toBe("ambiguous");
+    // Wide characters count as two cells for the joined words: 3 + 4 wide characters may take 14 cells.
+    expect(readInputBox(codexBox("one two 文字文", ["字字字字 three"]), "codex", "one two 文字文 字字字字 three")).toBe("ambiguous");
+    // A sent text with no space where the box breaks its rows is ambiguous, never exact.
+    expect(readInputBox(codexBox("check the queue now", ["here"]), "codex", "check the queue nowhere")).toBe("ambiguous");
+    // A box that holds only part of the text, or more, is other text.
+    expect(readInputBox(codexBox("check the queue now", ["here"]), "codex", "check the queue now here please")).toBe("other");
+    expect(readInputBox(codexBox("check the queue now", ["here"]), "codex", "check the queue now")).toBe("other");
+  });
+
+  it("claude: the same rule on a two-row box (edit: the real wrapped frame's rows replaced)", () => {
+    const twoRows = (first: string, second: string) => {
+      const lines = claude("staged-wrapped.raw").split("\n");
+      const at = lines.findIndex(claudeBoxRow);
+      lines.splice(at, 3, `❯\u00a0${first}`, `  ${second}`);
+      return lines.join("\n");
+    };
+    expect(readInputBox(twoRows("check the queue now", "here"), "claude-code", "check the queue now here")).toBe("exact");
+    expect(readInputBox(twoRows("now", "here"), "claude-code", "now here")).toBe("ambiguous");
+    expect(readInputBox(twoRows("check the queue now", "here"), "claude-code", "check the queue nowhere")).toBe("ambiguous");
+    expect(readInputBox(twoRows("check the queue nowhere", "today"), "claude-code", "check the queue now here today")).toBe("other");
+  });
+});
+
+describe("review round 1, change 2: a frame that names another client version never reads as a recorded layout", () => {
+  const claudeVersion = (frame: string, version: string) => editLine(frame, (line) => line.includes("Claude Code v2.1.296"),
+    ` ▐▛███▛█   Claude Code v${version}`);
+  const codexHeader = (frame: string, version: string) => editLine(frame, (line) => line.includes(">_ OpenAI Codex"),
+    `  >_ OpenAI Codex (v${version})`);
+  const codexUpdate = (frame: string, from: string) => editLine(frame, (line) => line.includes("Update available!"),
+    `│ ✨ Update available! ${from} -> 0.162.1         │`);
+
+  it.each(["2.1.295", "2.1.297", "2.2.0", "3.0.0-beta"])("claude: a banner naming %s: the seat reads unknown and the box unrecognized", (version) => {
+    // after-enter-15s.J reads idle by its completion row, and idle-fresh-suggestion by its banner; neither with this banner.
+    expect(readSeatBeforePaste(claudeVersion(claude("after-enter-15s.J"), version), "claude-code")).toBe("unknown");
+    expect(readSeatBeforePaste(claudeVersion(claude("idle-fresh-suggestion"), version), "claude-code")).toBe("unknown");
+    expect(readInputBox(claudeVersion(claude("staged-short.raw"), version), "claude-code", texts.short)).toBe("unrecognized");
+    expect(readInputBox(claudeVersion(claude("after-enter-0.4s.J"), version), "claude-code", texts.submit)).toBe("unrecognized");
+  });
+
+  it.each(["0.159.0", "0.161.0", "0.160.1"])("codex: a session header naming %s: the seat reads unknown and the box unrecognized", (version) => {
+    expect(readSeatBeforePaste(codexHeader(codex("after-enter-15s.J"), version), "codex")).toBe("unknown");
+    expect(readInputBox(codexHeader(codex("staged-short.J"), version), "codex", texts.short)).toBe("unrecognized");
+    expect(readInputBox(codexHeader(codex("after-enter-0.4s.J"), version), "codex", texts.submit)).toBe("unrecognized");
+  });
+
+  it.each(["0.159.0", "0.161.0"])("codex: an update notice saying the running version is %s", (version) => {
+    expect(readSeatBeforePaste(codexUpdate(codex("after-enter-15s.J"), version), "codex")).toBe("unknown");
+    expect(readInputBox(codexUpdate(codex("staged-short.J"), version), "codex", texts.short)).toBe("unrecognized");
+  });
+
+  it("a later banner or header naming another version counts, though an earlier one names the recorded version", () => {
+    // Edits: a second banner or header row under the first, as after the client was restarted in the same pane.
+    const claudeTwice = editLine(claude("after-enter-15s.J"), (line) => line.includes("Claude Code v2.1.296"),
+      [" ▐▛███▛█   Claude Code v2.1.296", " ▐▛███▛█   Claude Code v2.1.297"]);
+    expect(readSeatBeforePaste(claudeTwice, "claude-code")).toBe("unknown");
+    const codexTwice = editLine(codex("after-enter-15s.J"), (line) => line.includes(">_ OpenAI Codex"),
+      ["  >_ OpenAI Codex (v0.160.0)", "  >_ OpenAI Codex (v0.161.0)"]);
+    expect(readSeatBeforePaste(codexTwice, "codex")).toBe("unknown");
+  });
+
+  it("the recorded versions, and an update offered to a newer one, read as before", () => {
+    expect(readSeatBeforePaste(claude("after-enter-15s.J"), "claude-code")).toBe("idle");
+    expect(readSeatBeforePaste(claude("idle-fresh-suggestion"), "claude-code")).toBe("idle");
+    // Every Codex frame here shows `Update available! 0.160.0 -> 0.162.1`: it runs 0.160.0.
+    expect(codex("after-enter-15s.J")).toContain("Update available! 0.160.0 -> 0.162.1");
+    expect(readSeatBeforePaste(codex("after-enter-15s.J"), "codex")).toBe("idle");
+    expect(readInputBox(codex("staged-short.J"), "codex", texts.short)).toBe("exact");
+  });
+
+  it("no version on screen: the layout alone decides, which is evidence about the layout, not the version", () => {
+    // Edit: the real OpenRig seat frame without its banner rows (they scroll away in a 30-row capture).
+    const frame = claude("openrig-seat-bypass-idle").split("\n").filter((line) => !/[▐▝]/.test(line)).join("\n");
+    expect(frame).not.toContain("Claude Code v");
+    expect(readSeatBeforePaste(frame, "claude-code", "orch-advisor@sample-rig")).toBe("idle");
+    // Edit: the Codex completion-row frame without its header.
+    const codexFrame = editLine(codex("after-enter-15s.J"), (line) => line.includes(">_ OpenAI Codex"), "");
+    expect(readSeatBeforePaste(editLine(codexFrame, (line) => line.includes("Update available!"), ""), "codex")).toBe("idle");
+  });
+
+  it("a version named in another client's form is not this client's version", () => {
+    // Edit: a Claude transcript row quoting a Codex header, and a Codex frame quoting a Claude banner.
+    expect(readSeatBeforePaste(editLine(claude("after-enter-15s.J"), (line) => line.startsWith("● OK"), "● OpenAI Codex (v0.161.0) is installed"), "claude-code")).toBe("idle");
+    expect(readSeatBeforePaste(editLine(codex("after-enter-15s.J"), (line) => line.startsWith("• OK"), "• Claude Code v2.1.297 is installed"), "codex")).toBe("idle");
+  });
+});
+
+describe("review round 1, change 3: a blank Claude status slot is idle only under a completion row or the fresh banner", () => {
+  const BYPASS = "orch-advisor@sample-rig";
+  const bypass = claude("openrig-seat-bypass-idle");
+  // Edit: the completion row of the real OpenRig frame (the status slot) replaced by `rows`; the last one becomes the slot.
+  const slotRows = (rows: string[]) => editLine(bypass, (line) => line.startsWith("✻ Crunched"), rows);
+
+  it("streaming in the classic renderer, the last streamed row blank (the shape the 2.1.296 bundle does not rule out): unknown", () => {
+    // Claude Code hides its spinner while streamed text is on screen and draws nothing in its place, so with
+    // OpenRig's statusLine nothing on this screen says a turn runs.
+    const frame = slotRows(["❯ Check the queue again.", "", "● I am checking the queue now; the first item is a", "  review request.", ""]);
+    expect(frame).not.toMatch(/esc to interrupt|✶|paste again/);
+    expect(readSeatBeforePaste(frame, "claude-code", BYPASS)).toBe("unknown");
+  });
+
+  it("the same with the message's `●` row scrolled out of the capture: unknown", () => {
+    const frame = slotRows(["  review request, and then I will claim it.", ""]);
+    expect(readSeatBeforePaste(frame, "claude-code", BYPASS)).toBe("unknown");
+  });
+
+  it("a blank slot with several blank rows under streamed text (as in the fullscreen layout): unknown", () => {
+    const frame = editLine(claude("after-enter-15s.J"), (line) => line.startsWith("✻ Cooked"), "● I am checking the queue now.");
+    expect(readSeatBeforePaste(frame, "claude-code")).toBe("unknown");
+  });
+
+  it("a fresh session whose first turn is streaming under the banner: unknown", () => {
+    const frame = editLine(claude("idle-fresh-suggestion"), (line) => line.includes("◐ medium"), ["❯ Check the queue.", "", "● Checking.", "", ""]);
+    expect(readSeatBeforePaste(frame, "claude-code")).toBe("unknown");
+  });
+
+  it("a blank slot with nothing above it: unknown", () => {
+    const lines = claude("after-enter-15s.J").split("\n");
+    const box = lines.map((line) => line.startsWith("❯")).lastIndexOf(true);
+    const frame = [...lines.slice(0, box - 1).map(() => ""), ...lines.slice(box - 1)].join("\n");
+    expect(readSeatBeforePaste(frame, "claude-code")).toBe("unknown");
+  });
+
+  it.each([
+    ["the completion row in the slot itself (the real classic OpenRig frame)", bypass, BYPASS],
+    ["blank rows between the completion row and the slot (after-enter-15s.J, fullscreen)", claude("after-enter-15s.J"), undefined],
+    ["one blank row between the completion row and the slot (edit)", slotRows(["✻ Crunched for 9s · done 10:50 PM", ""]), BYPASS],
+    ["blank under the welcome banner before any turn (idle-fresh-suggestion)", claude("idle-fresh-suggestion"), undefined],
+    ["blank under the welcome banner, tmux notice above the rule (cleared-without-enter.J)", claude("cleared-without-enter.J"), undefined],
+  ] as const)("idle: %s", (_name, frame, seat) => {
+    expect(readSeatBeforePaste(frame, "claude-code", seat)).toBe("idle");
+  });
+
+  it("the completion row's own grammar still decides what sits above a blank slot", () => {
+    expect(readSeatBeforePaste(slotRows(["✻ Crunched for 9s", ""]), "claude-code", BYPASS)).toBe("unknown");
+    expect(readSeatBeforePaste(slotRows(["  ✻ Crunched for 9s · done 10:50 PM", ""]), "claude-code", BYPASS)).toBe("unknown");
+  });
+
+  it("a banner that is not the recorded one does not count as a fresh session", () => {
+    const banner = (row: string) => editLine(claude("idle-fresh-suggestion"), (line) => line.includes("Claude Code v2.1.296"), row);
+    expect(readSeatBeforePaste(banner(" ▐▛███▛█   Claude Code"), "claude-code")).toBe("unknown");
+    expect(readSeatBeforePaste(banner("Claude Code v2.1.296"), "claude-code")).toBe("unknown");
+    expect(readSeatBeforePaste(editLine(claude("idle-fresh-suggestion"), (line) => line.startsWith("▝▜"), "  some other row"), "claude-code")).toBe("unknown");
   });
 });

@@ -115,6 +115,24 @@ const openRig = {
   stagedWhileRunning: (text: string) => posture(nameBox(claudeStagedWhileRunning(text)), ACCEPT_EDITS_TEXT),
 };
 
+// Review round 1 (the maintainer's four changes). Every frame below is an edit of a real frame, named here.
+// Change 1, word boundaries: the box row of a real staged frame replaced by `boxText`.
+const claudeStagedAs = (boxText: string) => editLine(claude("staged-short.raw"), claudeBoxRow, `❯\u00a0${boxText}`);
+const codexStagedAs = (boxText: string) => editLine(codex("staged-short.J"), (line) => line.startsWith("› Queue handoff"), `› ${boxText}`);
+// Change 1: the wrapped text with the space at its first row break taken out, so the break falls inside a word.
+const wrappedJoinedAtBreak = texts.wrapped.replace("next scheduled", "nextscheduled");
+// Change 2, versions: the version a client prints in its banner, header or update notice, edited.
+const claudeVersion = (frame: string, version: string) => editLine(frame, (line) => line.includes("Claude Code v2.1.296"),
+  ` ▐▛███▛█   Claude Code v${version}`);
+const codexHeaderVersion = (frame: string, version: string) => editLine(frame, (line) => line.includes(">_ OpenAI Codex"),
+  `  >_ OpenAI Codex (v${version})`);
+const codexUpdateFrom = (frame: string, version: string) => editLine(frame, (line) => line.includes("Update available!"),
+  `│ ✨ Update available! ${version} -> 0.162.1         │`);
+// Change 3, Claude's blank status row: OpenRig's idle frame with its completion row replaced by a streamed message
+// whose last row is blank, the shape the 2.1.296 bundle does not rule out while it hides its spinner for streamed text.
+const openRigStreamingBlankTail = editLine(openRig.idle, (line) => line.startsWith("✻ Cooked"),
+  ["● I am checking the queue now; the first item is a review request.", ""]);
+
 type Phase = "prePaste" | "afterPaste" | "afterEnter";
 type Read<T> = T | Error | "never";
 interface Script {
@@ -413,6 +431,52 @@ describe("SessionTransport with transport.verify_input_box", () => {
       null, { seat: "unknown", before: "exact", after: "empty", sameProcess: true }, false],
     ["U3 Claude: a draft in the box before the paste", "claude-code", texts.submit,
       { prePaste: claude("staged-short.raw"), afterPaste: claude("submit-staged.J"), afterEnter: claude("after-enter-0.4s.J") },
+      null, { seat: "unknown", before: "exact", after: "empty", sameProcess: true }, false],
+    // Review round 1, change 1: the exact-text check keeps word boundaries on both runtime paths. The maintainer's
+    // case: `now here` pasted against a box that holds `nowhere`, then an empty box, read exact and delivered.
+    ["R1-1 Claude: `now here` sent, the box holds `nowhere`", "claude-code", "now here",
+      { prePaste: idle, afterPaste: claudeStagedAs("nowhere"), afterEnter: claude("after-enter-0.4s.J") },
+      false, { seat: "idle", before: "other", after: "empty", sameProcess: true }, false],
+    ["R1-2 Codex: `now here` sent, the box holds `nowhere`", "codex", "now here",
+      { prePaste: codex("idle"), afterPaste: codexStagedAs("nowhere"), afterEnter: codex("after-enter-0.4s.J") },
+      false, { seat: "idle", before: "other", after: "empty", sameProcess: true }, false],
+    ["R1-3 Claude: `nowhere` sent, the box holds `now here`", "claude-code", "nowhere",
+      { prePaste: idle, afterPaste: claudeStagedAs("now here"), afterEnter: claude("after-enter-0.4s.J") },
+      false, { seat: "idle", before: "other", after: "empty", sameProcess: true }, false],
+    ["R1-4 Codex: `nowhere` sent, the box holds `now here`", "codex", "nowhere",
+      { prePaste: codex("idle"), afterPaste: codexStagedAs("now here"), afterEnter: codex("after-enter-0.4s.J") },
+      false, { seat: "idle", before: "other", after: "empty", sameProcess: true }, false],
+    ["R1-5 Claude: the box holds `now here` as sent: verified", "claude-code", "now here",
+      { prePaste: idle, afterPaste: claudeStagedAs("now here"), afterEnter: claude("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "exact", after: "empty", sameProcess: true }, true],
+    ["R1-6 Codex: the box holds `now here` as sent: verified", "codex", "now here",
+      { prePaste: codex("idle"), afterPaste: codexStagedAs("now here"), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "exact", after: "empty", sameProcess: true }, true],
+    ["R1-7 Claude wrapped: a row break where the sent text has no space is ambiguous", "claude-code", wrappedJoinedAtBreak,
+      { prePaste: idle, afterPaste: claude("staged-wrapped.raw"), afterEnter: claude("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true }, false],
+    ["R1-8 Codex wrapped: a row break where the sent text has no space is ambiguous", "codex", wrappedJoinedAtBreak,
+      { prePaste: codex("idle"), afterPaste: codex("staged-wrapped.raw"), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true }, false],
+    // Review round 1, change 2: a frame that visibly names another client version never confirms.
+    ["R1-9 Claude: a finished-turn seat whose banner names 2.1.295", "claude-code", texts.submit,
+      { prePaste: claudeVersion(claude("after-enter-15s.J"), "2.1.295"), afterPaste: claude("submit-staged.J"), afterEnter: claude("after-enter-0.4s.J") },
+      null, { seat: "unknown", before: "exact", after: "empty", sameProcess: true }, false],
+    ["R1-10 Claude: the staged box under a banner that names 2.1.297", "claude-code", texts.submit,
+      { prePaste: idle, afterPaste: claudeVersion(claude("submit-staged.J"), "2.1.297"), afterEnter: claude("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "unrecognized", after: "empty", sameProcess: true }, false],
+    ["R1-11 Codex: a finished-turn seat whose header names 0.161.0", "codex", texts.submit,
+      { prePaste: codexHeaderVersion(codex("after-enter-15s.J"), "0.161.0"), afterPaste: codex("submit-staged.J"), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "unknown", before: "exact", after: "empty", sameProcess: true }, false],
+    ["R1-12 Codex: a finished-turn seat whose update notice says it runs 0.159.0", "codex", texts.submit,
+      { prePaste: codexUpdateFrom(codex("after-enter-15s.J"), "0.159.0"), afterPaste: codex("submit-staged.J"), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "unknown", before: "exact", after: "empty", sameProcess: true }, false],
+    ["R1-13 Codex: the empty box after Enter under a header that names 0.159.0", "codex", texts.submit,
+      { prePaste: codex("idle"), afterPaste: codex("submit-staged.J"), afterEnter: codexHeaderVersion(codex("after-enter-0.4s.J"), "0.159.0") },
+      null, { seat: "idle", before: "exact", after: "unrecognized", sameProcess: true }, false],
+    // Review round 1, change 3: a blank status slot under streamed text is not proof of an idle Claude seat.
+    ["R1-14 OpenRig-launched Claude seat streaming, its last streamed row blank: unconfirmed", "claude-code", texts.short,
+      { prePaste: openRigStreamingBlankTail, afterPaste: openRig.staged(texts.short), afterEnter: openRig.idle },
       null, { seat: "unknown", before: "exact", after: "empty", sameProcess: true }, false],
   ];
 
@@ -765,10 +829,15 @@ describe("SessionTransport with transport.verify_input_box", () => {
       expect(on.log).not.toContain("sendText");
     });
 
-    it.each(["claude-code", "codex"] as const)("T41 an audited prompt answer to %s: no box read, no inputBox, unconfirmed", async (runtime) => {
-      const answerFrame = (input: string) => runtime === "codex" ? `› ${input}\n\n  test-model · ~/example`
-        : `────────────────────\n❯ ${input}\n────────────────────\n\n  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents`;
-      const frames = { prePaste: answerFrame(""), afterPaste: answerFrame("green please"), afterEnter: answerFrame("") };
+    // Review round 1, change 4: an audited prompt answer reads no box, so with the setting on it says so plainly
+    // (every inputBox field `unchecked`) and reads unconfirmed; it never falls back to today's count. In the echoed
+    // case the frame after Enter shows the answer above an empty box, so today's count confirms it with the setting off.
+    it.each([
+      ["claude-code", false], ["codex", false], ["claude-code", true], ["codex", true],
+    ] as const)("T41 an audited prompt answer to %s (answer echoed after Enter: %s): no box read, inputBox unchecked, unconfirmed", async (runtime, echoed) => {
+      const answerFrame = (input: string, echo = "") => runtime === "codex" ? `${echo ? `› ${echo}\n\n` : ""}› ${input}\n\n  test-model · ~/example`
+        : `${echo ? `❯ ${echo}\n\n` : ""}────────────────────\n❯ ${input}\n────────────────────\n\n  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents`;
+      const frames = { prePaste: answerFrame(""), afterPaste: answerFrame("green please"), afterEnter: answerFrame("", echoed ? "green please" : "") };
       const answer = async (setting?: boolean) => {
         seedCanonicalRig(runtime);
         const eventBus = new EventBus(db);
@@ -788,9 +857,70 @@ describe("SessionTransport with transport.verify_input_box", () => {
       const on = await answer(true);
       expect(on.log).toEqual(off.log);
       expect(on.log.some((call) => call.startsWith("pid:"))).toBe(false);
+      expect(off.result.promptInteraction).toBe("enter-sent");
+      expect(off.result.inputBox).toBeUndefined();
+      expect(off.result.verified).toBe(echoed);
       expect(on.result.promptInteraction).toBe("enter-sent");
       expect(on.result).toMatchObject({ ok: true, verified: false, outcome: "rendered-unconfirmed" });
-      expect(on.result.inputBox).toBeUndefined();
+      expect(on.result.inputBox).toEqual({ seat: "unchecked", before: "unchecked", after: "unchecked", sameProcess: false });
+    });
+
+    it.each(["claude-code", "codex"] as const)("T41c an audited prompt answer to %s that is not visibly staged (no Enter): inputBox unchecked", async (runtime) => {
+      const answerFrame = (input: string) => runtime === "codex" ? `› ${input}\n\n  test-model · ~/example`
+        : `────────────────────\n❯\u00a0${input}\n────────────────────\n\n  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents`;
+      // The answer never shows in the prompt, so the existing path sends no Enter.
+      const frames = { prePaste: answerFrame(""), afterPaste: answerFrame(""), afterEnter: answerFrame("") };
+      const answer = async (setting?: boolean) => {
+        seedCanonicalRig(runtime);
+        const eventBus = new EventBus(db);
+        const activity = new AgentActivityStore({ db, eventBus });
+        activity.recordHookEvent({ runtime, sessionName: SESSION, hookEvent: "PermissionRequest", subtype: "Bash" });
+        const { tmux, log } = phasedTmux({ frames });
+        const result = await new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux, eventBus, agentActivityStore: activity,
+          sleep: async () => {}, ...(setting === undefined ? {} : { verifyInputBox: () => setting }) })
+          .send(SESSION, "green please", { verify: true, dangerouslyInteract: true, reason: "answer the text field" });
+        return { result, log };
+      };
+      const off = await answer();
+      db.close();
+      db = createFullTestDb();
+      rigRepo = new RigRepository(db);
+      sessionRegistry = new SessionRegistry(db);
+      const on = await answer(true);
+      expect(on.log).toEqual(off.log);
+      expect(on.log.some((call) => call.startsWith("sendKeys"))).toBe(false);
+      expect(off.result).toMatchObject({ verified: false, outcome: "rendered-unconfirmed", promptInteraction: "unverified" });
+      expect(off.result.inputBox).toBeUndefined();
+      expect(on.result).toMatchObject({ verified: false, outcome: "rendered-unconfirmed", promptInteraction: "unverified" });
+      expect(on.result.inputBox).toEqual({ seat: "unchecked", before: "unchecked", after: "unchecked", sameProcess: false });
+    });
+
+    it.each(["claude-code", "codex"] as const)("T41d an audited prompt answer to %s whose capture after Enter fails: inputBox unchecked", async (runtime) => {
+      const answerFrame = (input: string) => runtime === "codex" ? `› ${input}\n\n  test-model · ~/example`
+        : `────────────────────\n❯\u00a0${input}\n────────────────────\n\n  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents`;
+      const frames = { prePaste: answerFrame(""), afterPaste: answerFrame("green please"), afterEnter: new Error("capture failed") };
+      const answer = async (setting?: boolean) => {
+        seedCanonicalRig(runtime);
+        const eventBus = new EventBus(db);
+        const activity = new AgentActivityStore({ db, eventBus });
+        activity.recordHookEvent({ runtime, sessionName: SESSION, hookEvent: "PermissionRequest", subtype: "Bash" });
+        const { tmux, log } = phasedTmux({ frames });
+        const result = await new SessionTransport({ db, rigRepo, sessionRegistry, tmuxAdapter: tmux, eventBus, agentActivityStore: activity,
+          sleep: async () => {}, ...(setting === undefined ? {} : { verifyInputBox: () => setting }) })
+          .send(SESSION, "green please", { verify: true, dangerouslyInteract: true, reason: "answer the text field" });
+        return { result, log };
+      };
+      const off = await answer();
+      db.close();
+      db = createFullTestDb();
+      rigRepo = new RigRepository(db);
+      sessionRegistry = new SessionRegistry(db);
+      const on = await answer(true);
+      expect(on.log).toEqual(off.log);
+      expect(off.result).toMatchObject({ verified: false, outcome: "rendered-unconfirmed", promptInteraction: "enter-sent" });
+      expect(off.result.inputBox).toBeUndefined();
+      expect(on.result).toMatchObject({ verified: false, outcome: "rendered-unconfirmed", promptInteraction: "enter-sent" });
+      expect(on.result.inputBox).toEqual({ seat: "unchecked", before: "unchecked", after: "unchecked", sameProcess: false });
     });
 
     it("T42 the setting is read fresh per send", async () => {

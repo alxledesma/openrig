@@ -175,6 +175,15 @@ describe("Send CLI", () => {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: true, sessionName: "input-box-other-process", verified: false, outcome: "rendered-unconfirmed",
               inputBox: { seat: "unknown", before: "hidden", after: "empty", sameProcess: false } }));
+          } else if (parsed.session === "input-box-ambiguous") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, sessionName: "input-box-ambiguous", verified: false, outcome: "rendered-unconfirmed",
+              inputBox: { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true } }));
+          } else if (parsed.session === "input-box-unchecked") {
+            // An audited prompt answer with the setting on: its path reads no box.
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, sessionName: "input-box-unchecked", verified: false, outcome: "rendered-unconfirmed",
+              inputBox: { seat: "unchecked", before: "unchecked", after: "unchecked", sameProcess: false } }));
           } else if (parsed.session === "dead-session") {
             res.writeHead(502, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ ok: false, sessionName: "dead-session", reason: "submit_failed", outcome: "failed", error: "Text is visible in 'dead-session' but was not submitted (Enter failed)." }));
@@ -435,7 +444,7 @@ describe("Send CLI", () => {
     });
     const output = logs.join("\n");
     expect(output).toContain("Verified: no");
-    expect(output).toContain("Delivery: rendered-unconfirmed (seat before the paste: not idle (a running turn, a queue, a pending input or a paste hint showed); input box before Enter: the exact text; after Enter: queued or possibly queued (a queued label, or a turn was running); not a failure - confirm with: rig capture input-box-queued)");
+    expect(output).toContain("Delivery: rendered-unconfirmed (seat before the paste: not idle (a running turn, a queue, a pending input or a paste hint showed); input box before Enter: the exact text; after Enter: queued or possibly queued (a queued label, or a turn was running); not a failure; to look, optionally: rig capture input-box-queued)");
     expect(output).not.toContain("pane re-render not confirmed");
     expect(exitCode).toBeUndefined();
   });
@@ -444,7 +453,27 @@ describe("Send CLI", () => {
     const { logs } = await captureLogs(async () => {
       await makeCmd().parseAsync(["node", "rig", "send", "input-box-other-process", "hello", "--verify"]);
     });
-    expect(logs.join("\n")).toContain("Delivery: rendered-unconfirmed (seat before the paste: not a known idle layout; input box before Enter: a collapsed paste (text hidden); after Enter: empty; pane process changed or unknown; not a failure - confirm with: rig capture input-box-other-process)");
+    expect(logs.join("\n")).toContain("Delivery: rendered-unconfirmed (seat before the paste: not a known idle layout; input box before Enter: a collapsed paste (text hidden); after Enter: empty; pane process changed or unknown; not a failure; to look, optionally: rig capture input-box-other-process)");
+  });
+
+  it("verify with input-box evidence: an ambiguous box says the word boundaries were uncertain", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "input-box-ambiguous", "hello", "--verify"]);
+    });
+    const output = logs.join("\n");
+    expect(output).toContain("Verified: no");
+    expect(output).toContain("Delivery: rendered-unconfirmed (seat before the paste: idle; input box before Enter: the text, but a line break in the box may split a word (word boundaries uncertain); after Enter: empty; not a failure; to look, optionally: rig capture input-box-ambiguous)");
+  });
+
+  it("verify with input-box evidence: an unchecked path says plainly it was not checked and is unconfirmed, never verified", async () => {
+    const { logs } = await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "send", "input-box-unchecked", "hello", "--verify"]);
+    });
+    const output = logs.join("\n");
+    expect(output).toContain("Verified: no");
+    expect(output).toContain("Delivery: rendered-unconfirmed (input box not checked: an audited prompt answer is typed as keys and its box is not read; not a failure; to look, optionally: rig capture input-box-unchecked)");
+    expect(output).not.toContain("pane re-render not confirmed");
+    expect(output).not.toMatch(/resend|send it again|re-send/i);
   });
 
   it("verify genuine transport failure stays an error path, distinct from the middle (discriminator)", async () => {

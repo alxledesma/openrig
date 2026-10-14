@@ -5,6 +5,15 @@ Real frames of Claude Code 2.1.296 (`claude-code-2.1.296/`) and Codex 0.160.0 (`
 (`claude-code-2.1.296/openrig-seat-*`, see below). `texts/` holds the texts that were sent.
 `input-box-reading.test.ts` and `session-transport-input-box.test.ts` read them.
 
+## Versions and their limits
+
+Every frame here is of one client version, named by its folder; the idle allow-list and the box readers were built
+from them. A frame that names another version in a row the client prints it in (Claude Code's welcome banner, Codex's
+session header or update notice) reads `unknown` before the paste and `unrecognized` in the box; the
+tests make such frames by editing the version in a real banner or header. Most frames show no version, and there a
+matching layout is evidence about the layout only, not proof of the client version: another version that draws the
+same rows reads the same.
+
 ## How they were captured
 
 - Text was pasted the way OpenRig pastes it: `tmux load-buffer`, then `paste-buffer -d -r -p`.
@@ -95,10 +104,14 @@ captured frame), and the tests also make them by editing one line of a plain-`cl
   row for an empty statusLine in the classic renderer OpenRig launches with, so the entry is "no row between the
   closing rule and the footer", as the `openrig-seat-*` frames show. A configured statusLine also makes Claude Code drop the footer's hints
   (`esc to interrupt`, `? for shortcuts`), so a running turn draws the idle footer row; the status row above the box
-  is then the only running signal, and the allow-list requires it blank or a completion row. While streamed text is
-  shown Claude Code hides that row, and the guard is that assistant text never starts at column 0. The tests'
-  OpenRig-shaped running frames are `after-enter-0.4s.J` with the named box and the accept-edits footer row in place
-  of its own, and the `openrig-seat-*` frames with a live status row in the slot.
+  is then the only running signal, and the allow-list requires a completion row there, or a blank slot whose first
+  non-blank row above is that completion row or the last row of the welcome banner. While streamed text is shown
+  Claude Code hides that row and draws nothing in its place (2.1.296 bundle), so the last streamed row moves into the
+  slot; it never matches the completion row, and since the bundle does not show it is never blank, a blank slot under
+  transcript text reads unknown. No frame here shows a streaming Claude seat; the tests' streaming frames are edits
+  of the `openrig-seat-*` frames, named where they are made. The tests' OpenRig-shaped running frames are
+  `after-enter-0.4s.J` with the named box and the accept-edits footer row in place of its own, and the
+  `openrig-seat-*` frames with a live status row in the slot.
 
 The Codex completion row is matched by the grammar Codex 0.160.0 prints it with (`tui/src/history_cell/separators.rs`
 and `tui/src/clock_format.rs` at `rust-v0.160.0`): 12- and 24-hour clocks, a date before the time on another day,

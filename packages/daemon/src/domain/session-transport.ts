@@ -44,8 +44,10 @@ import { hashSentText, type CaptureObserverSink, type CaptureSlot, type Observat
 // authorize a send from a reading tens of seconds old. (EXA: agtx#14, daintree#3938.)
 const SEND_READINESS_FRESHNESS_MS = 15_000;
 
-// transport.verify_input_box: each extra input-box read gives up after this long and reads `unavailable`.
-// It reports only, so a late read never holds Enter longer than this.
+// transport.verify_input_box: each extra input-box read gives up after this long and reads `unavailable`. A deadline
+// budget, not a guarantee: the pre-Enter read comes after the existing 200 ms wait and can add about this much before
+// Enter, and the post-Enter process read about this much before the reply. A read that misses it leaves the send
+// unconfirmed, and Enter is still sent once.
 const INPUT_BOX_READ_DEADLINE_MS = 500;
 
 // Mid-work detection patterns (cheap heuristics)
@@ -907,9 +909,10 @@ const CODEX_HINT_ROW = /(?:^|\s)\? for shortcuts(?:\s|$)|⚠ \d+ warnings? · f2
 // Codex shows a long paste as this label until it is submitted. Matched on the normalized body.
 const CODEX_COLLAPSED_PASTE = /^\[PastedContent\d+chars\]$/;
 
-/** The current Codex input box: its normalized text ("" when empty) and where its prompt row is, or null when
- *  the layout is not the recognized one (another footer, a selector, no blank separator, an older TUI). */
-function codexInputBox(pane: string): { text: string; lines: string[]; inputAt: number } | null {
+/** The current Codex input box: its normalized text ("" when empty), its rows as drawn (the prompt glyph removed)
+ *  and where its prompt row is, or null when the layout is not the recognized one (another footer, a selector, no
+ *  blank separator, an older TUI). */
+function codexInputBox(pane: string): { text: string; rows: string[]; lines: string[]; inputAt: number } | null {
   const lines = pane.split("\n");
   let last = lines.length - 1;
   while (last >= 0 && !lines[last]!.trim()) last--;
@@ -928,9 +931,48 @@ function codexInputBox(pane: string): { text: string; lines: string[]; inputAt: 
   // Only indented continuation rows belong to the input; anything else is not an input box.
   if (rows.slice(1).some((row) => row.trim() && !/^\s/.test(row))) return null;
   if (CODEX_EMPTY_COMPOSER_PATTERN.test(rows[0]!.trimStart()) && rows.slice(1).every((row) => !row.trim())) {
-    return { text: "", lines, inputAt };
+    return { text: "", rows: [], lines, inputAt };
   }
-  return { text: rows.join("\n").trimStart().slice(1).replace(/\s+/g, ""), lines, inputAt };
+  return { text: rows.join("\n").trimStart().slice(1).replace(/\s+/g, ""), rows: stripBoxGlyph(rows), lines, inputAt };
+}
+
+/** A box's rows with the prompt glyph taken off the first row (`❯`, `›`), as composerRegion does for its body. */
+function stripBoxGlyph(rows: string[]): string[] {
+  return rows.map((row, i) => (i === 0 ? row.trimStart().slice(1) : row));
+}
+
+// Upper bound of a string's terminal width: a non-ASCII character may take two cells.
+const widthAtMost = (text: string) => [...text].reduce((cells, ch) => cells + (ch.charCodeAt(0) < 0x80 ? 1 : 2), 0);
+
+/** Whether a Claude Code or Codex box, given as its rows, holds exactly `text` with its word boundaries kept.
+ *  Whitespace inside a row is compared as one space (runs and Unicode spaces count the same, so `now here` is not
+ *  `nowhere`). A row break counts as the text's space only where the two words it separates, joined, would fit in
+ *  the box's widest row: both TUIs wrap at word boundaries and split a word only when it is wider than a row (the
+ *  real wrapped frames, staged-wrapped.*, break at spaces and leave the rest of the row empty), so a break there
+ *  cannot be inside a word. A break that falls inside a word of the text, or a break whose two words joined would
+ *  not fit, could also be how the box draws different spacing, so the reading is `ambiguous`, never `exact`. */
+function boxHoldsText(rows: string[], text: string): "exact" | "ambiguous" | "other" {
+  const shown = rows.map((row) => row.trim().replace(/\s+/g, " ")).filter(Boolean);
+  const sent = text.trim().replace(/\s+/g, " ");
+  // Each shown row is at most as wide as the box, so the widest row's length is a lower bound of its width.
+  const widest = Math.max(0, ...shown.map((row) => [...row].length));
+  let at = 0;
+  let ambiguous = false;
+  for (let i = 0; i < shown.length; i++) {
+    const row = shown[i]!;
+    if (!sent.startsWith(row, at)) return "other";
+    at += row.length;
+    if (i === shown.length - 1) break;
+    if (sent[at] === " ") {
+      at += 1;
+      const joined = row.slice(row.lastIndexOf(" ") + 1) + shown[i + 1]!.split(" ")[0];
+      if (widthAtMost(joined) > widest) ambiguous = true;
+    } else {
+      ambiguous = true;
+    }
+  }
+  if (at !== sent.length) return "other";
+  return ambiguous ? "ambiguous" : "exact";
 }
 
 /** The row of Codex's running-turn status (`• Working (… esc to interrupt)`) above its input box, or -1. */
@@ -945,7 +987,9 @@ function codexTurnStatusAt(box: { lines: string[]; inputAt: number }): number {
  *  `findClaudeComposer` reads it above a one-row box. Claude Code queues a message submitted during a turn, and it
  *  labels the queue only while a per-user hint counter is low, so an unlabelled queued message leaves the same
  *  empty box as a submit. With a statusLine configured (OpenRig installs one on every seat) and while the box holds
- *  text, the footer never draws `esc to interrupt`, so the status row is the running signal. */
+ *  text, the footer never draws `esc to interrupt`, so the status row is the running signal, but only while it is
+ *  drawn: Claude Code hides it while streamed text is shown (SEAT_IDLE_SHAPES.claude.statusSlot). So this reading
+ *  can only say a turn ran; a turn it misses is ruled out, if at all, by the seat reading before the paste. */
 function claudeTurnRunning(pane: string): boolean {
   const { markerLine, closingRuleLine } = composerRegion(pane, "claude-code");
   if (closingRuleLine === null || markerLine === null) return false;
@@ -970,8 +1014,9 @@ const BRAILLE_SPINNER = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
 
 /** What the seat showed in the capture taken before the paste, with transport.verify_input_box on: `idle` only
  *  when the frame has one of the idle shapes below; `not-idle` when any row of it is a running, streaming,
- *  queued, pending-input or paste-hint row; `unknown` for anything else, including no capture. Only `idle` lets a
- *  send read verified, so a seat whose running turn hides its signals reads unconfirmed. */
+ *  queued, pending-input or paste-hint row; `unknown` for anything else, including no capture and a frame that
+ *  names another client version. Only `idle` lets a send read verified, so a seat whose running turn hides its
+ *  signals reads unconfirmed. */
 export type SeatReading = "idle" | "not-idle" | "unknown";
 
 // Rows that rule out an idle seat wherever they are in the capture (compared trimmed). A transcript row that
@@ -1047,7 +1092,7 @@ const SEAT_IDLE_SHAPES: {
     statusLineRows: string[];
     boxes: RegExp[];
     notices: string[];
-    statusSlot: RegExp[];
+    statusSlot: Record<"finishedTurn" | "freshSession", RowShape>;
   };
   codex: { hints: RegExp[]; above: Record<"finishedTurn" | "freshSession", RowShape> };
 } = {
@@ -1091,16 +1136,31 @@ const SEAT_IDLE_SHAPES: {
     notices: ["", "◐ medium · /effort",
       "tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on' to ~/.tmux.conf for wheel scroll",
       "tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking"],
-    // The status slot, the row above that. Blank (after-enter-15s.J: fullscreen, the box pinned to the bottom of the
-    // screen), or the completion row at column 0 (CLAUDE_COMPLETION_ROW): in the classic renderer OpenRig launches
-    // Claude with, the box follows the transcript, so an idle seat that has finished a turn shows that turn's
-    // completion row there (openrig-seat-*: real OpenRig-launched seats). With OpenRig's statusLine the footer shows
-    // no running signal. A running turn draws its live status row in this slot, but not always: while streamed text
-    // is shown, Claude Code 2.1.296 hides that row and draws nothing in its place, so the slot holds the last streamed
-    // row. The guard is that assistant text never starts at column 0: Claude Code draws it behind a two-cell `● `
-    // column (continuation rows two spaces in), the user's echo after `❯ `, tool output indented, so no transcript
-    // row matches CLAUDE_COMPLETION_ROW. Any other row reads unknown.
-    statusSlot: [/^$/, CLAUDE_COMPLETION_ROW],
+    // The status slot, the row above that, read together with the rows above it when it is blank: the first
+    // non-blank row at or above the slot must be one of these. With OpenRig's statusLine the footer shows no running
+    // signal, so this slot is what tells a running turn apart, and the 2.1.296 bundle says what a running turn leaves
+    // there. Its REPL draws the live status row (the spinner) only while
+    // `isLoading && (!hasDisplayedStreamingText || tailBlank || …)`: once streamed text with a complete line is on
+    // screen it hides the spinner, and draws nothing in its place (the slot component renders only a retry banner,
+    // or null), so the last streamed row moves down into the slot. That row is never the completion row: Claude Code
+    // draws a message behind a two-cell `●` column (continuation rows two spaces in), the user's echo after `❯ `,
+    // tool output indented. But the bundle does not show that the last streamed row is never blank (the streamed
+    // markdown is laid out in a column with a one-row gap, and its unfinished last line is hidden), so a blank slot
+    // under transcript text is not proof of an idle seat and reads unknown. A blank slot counts only where nothing
+    // of a newer turn can be under the row it sits below:
+    // - finishedTurn: the completion row at column 0 (CLAUDE_COMPLETION_ROW). In the classic renderer OpenRig
+    //   launches Claude with, the box follows the transcript, so an idle seat that has finished a turn shows that
+    //   turn's completion row in the slot itself (openrig-seat-*: real OpenRig-launched seats); in the fullscreen
+    //   renderer the box is pinned to the bottom and blank rows sit between them (after-enter-15s.J). A newer turn
+    //   draws its echo, its status row or its `●` rows under the completion row.
+    // - freshSession: the last row of the welcome banner of Claude Code v2.1.296, before any turn (idle-fresh-
+    //   suggestion, cleared-without-enter.J).
+    // Any other row reads unknown.
+    statusSlot: {
+      finishedTurn: (lines: string[], at: number) => CLAUDE_COMPLETION_ROW.test(lines[at] ?? ""),
+      freshSession: (lines: string[], at: number) => at >= 2 && /^ ▝▝ {3}▝▝ {3}[~/]/.test(lines[at]!)
+        && /^▝▜██████▀ {2}\S/.test(lines[at - 1]!) && /^ ▐▛███▛█ {3}Claude Code v2\.1\.296$/.test(lines[at - 2]!),
+    },
   },
   codex: {
     // The hint row under the status line of an empty box (product-path-idle.J, idle).
@@ -1135,7 +1195,15 @@ function claudeSeatIdle(lines: string[], sessionName?: string): boolean {
   return Object.values(idle.footers).includes(lines[footer]!.trim())
     && idle.statusLineRows.every((row, i) => lines[closing + 1 + i]!.trim() === row) && plainRule(lines[closing]!)
     && idle.boxes.some((box) => box.test(lines[closing - 1]!)) && openingRule(lines[closing - 2]!)
-    && idle.notices.includes(lines[closing - 3]!.trim()) && idle.statusSlot.some((row) => row.test(lines[closing - 4]!));
+    && idle.notices.includes(lines[closing - 3]!.trim()) && claudeStatusSlotIdle(lines, closing - 4);
+}
+
+/** The status slot (see SEAT_IDLE_SHAPES.claude.statusSlot): its own row, or, when it is blank, the first non-blank
+ *  row above it. */
+function claudeStatusSlotIdle(lines: string[], slot: number): boolean {
+  let at = slot;
+  while (at >= 0 && !lines[at]!.trim()) at--;
+  return at >= 0 && Object.values(SEAT_IDLE_SHAPES.claude.statusSlot).some((shape) => shape(lines, at));
 }
 
 function codexSeatIdle(pane: string): boolean {
@@ -1150,18 +1218,40 @@ function codexSeatIdle(pane: string): boolean {
   return Object.values(SEAT_IDLE_SHAPES.codex.above).some((shape) => shape(lines, above));
 }
 
+// The client versions the idle layouts and box readers were recorded from, and the rows in which each client names
+// the version it runs: Claude Code's welcome banner (`Claude Code v2.1.296`), Codex's session header
+// (`>_ OpenAI Codex (v0.160.0)`) and its update notice, whose first version is the running one
+// (`Update available! 0.160.0 -> 0.162.1`). These are only what the frames show; nothing here discovers a version. A frame where one of them names another version is not read as these
+// layouts. Most frames name no version (the banner and header scroll away), and then a matching layout is evidence
+// about the layout only, not proof of the client version: another version that draws the same rows reads the same.
+const RECORDED_CLIENT_VERSION: Record<"claude-code" | "codex", string> = { "claude-code": "2.1.296", codex: "0.160.0" };
+const VISIBLE_CLIENT_VERSION: Record<"claude-code" | "codex", RegExp[]> = {
+  "claude-code": [/Claude Code v(\d[\w.+-]*)/g],
+  codex: [/OpenAI Codex \(v(\d[\w.+-]*)\)/g, /Update available! (\d[\w.+-]*) -> /g],
+};
+
+/** Whether a frame visibly names a client version other than the recorded one (see RECORDED_CLIENT_VERSION). */
+function namesAnotherClientVersion(pane: string, runtime: "claude-code" | "codex"): boolean {
+  return VISIBLE_CLIENT_VERSION[runtime].some((pattern) =>
+    [...pane.matchAll(pattern)].some((match) => match[1] !== RECORDED_CLIENT_VERSION[runtime]));
+}
+
 /** The seat before the paste (see SeatReading), read from the capture the transport already takes before it.
- *  `sessionName` is the seat's own session name, which a Claude Code seat launched by OpenRig draws on its box. */
+ *  `sessionName` is the seat's own session name, which a Claude Code seat launched by OpenRig draws on its box.
+ *  A frame that names another client version is `unknown`. */
 export function readSeatBeforePaste(pane: string | null, runtime: "claude-code" | "codex", sessionName?: string): SeatReading {
   if (!pane?.trim()) return "unknown";
   const lines = pane.split("\n").map((row) => row.trimEnd());
   if (lines.some((row) => SEAT_NOT_IDLE_ROWS[runtime].some((pattern) => pattern.test(row.trim())))) return "not-idle";
+  if (namesAnotherClientVersion(pane, runtime)) return "unknown";
   return (runtime === "codex" ? codexSeatIdle(pane) : claudeSeatIdle(lines, sessionName)) ? "idle" : "unknown";
 }
 
-/** What a Claude Code or Codex input box shows, read from the input box only (never the transcript), with
- *  whitespace ignored. Labels and placeholders (Claude's queued label and Try suggestion, collapsed pastes,
- *  Codex's empty-box placeholder) are checked before the sent text, so none of them can read as `exact`.
+/** What a Claude Code or Codex input box shows, read from the input box only (never the transcript). Labels and
+ *  placeholders (Claude's queued label and Try suggestion, collapsed pastes, Codex's empty-box placeholder) are
+ *  checked before the sent text, so none of them can read as `exact`. The sent text is `exact` only with its word
+ *  boundaries kept, and `ambiguous` where the box's row breaks leave them uncertain (boxHoldsText). A frame that
+ *  names another client version reads `unrecognized` (RECORDED_CLIENT_VERSION).
  *
  *  An empty box also reads `queued` where the frames say the message may wait behind a turn: Codex's
  *  pending-input rows above the box, rows between Codex's running-turn status row and the box, or
@@ -1173,6 +1263,7 @@ export function readSeatBeforePaste(pane: string | null, runtime: "claude-code" 
  *  Used only to report a send with transport.verify_input_box on. */
 export function readInputBox(pane: string | null, runtime: "claude-code" | "codex", text: string, beforeEnter?: string | null): InputBoxReading {
   if (!pane?.trim()) return "unavailable";
+  if (namesAnotherClientVersion(pane, runtime)) return "unrecognized";
   if (runtime === "codex") {
     const box = codexInputBox(pane);
     if (box === null) return "unrecognized";
@@ -1184,15 +1275,16 @@ export function readInputBox(pane: string | null, runtime: "claude-code" | "code
       return pendingInput || rowsBehindTurn || (before !== null && codexTurnStatusAt(before) >= 0) ? "queued" : "empty";
     }
     if (CODEX_COLLAPSED_PASTE.test(box.text)) return "hidden";
-    return box.text === text.replace(/\s+/g, "") ? "exact" : "other";
+    return boxHoldsText(box.rows, text);
   }
-  const body = composerRegion(pane, runtime).body;
+  const { body, markerLine, closingRuleLine } = composerRegion(pane, runtime);
   if (body === null) return "unrecognized";
   if (!body) return beforeEnter && claudeTurnRunning(beforeEnter) ? "queued" : "empty";
   if (body === QUEUED_PLACEHOLDER) return "queued";
   if (COLLAPSED_PASTE.test(body)) return "hidden";
   if (CLAUDE_TRY_SUGGESTION.test(body)) return "other";
-  return body === text.replace(/\s+/g, "") ? "exact" : "other";
+  // composerRegion's body has every space removed (the startup guard's matcher, unchanged); identity reads the rows.
+  return boxHoldsText(stripBoxGlyph(pane.split("\n").slice(markerLine! - 1, closingRuleLine! - 1)), text);
 }
 
 export interface SendOpts {
@@ -1299,22 +1391,31 @@ export interface SendResult {
   inputBox?: InputBoxEvidence;
 }
 
-/** One reading of a Claude Code or Codex input box: `exact` (the sent text), `empty`, `queued` (Claude's
- *  queued-messages label, or an empty box while a turn was running, so the message may wait behind it),
- *  `hidden` (a collapsed paste label), `other` (any other text), `unrecognized` (no recognized input box) or
- *  `unavailable` (no capture, or none in time). */
-export type InputBoxReading = "exact" | "empty" | "queued" | "hidden" | "other" | "unrecognized" | "unavailable";
+/** One reading of a Claude Code or Codex input box: `exact` (the sent text, word boundaries kept), `ambiguous`
+ *  (the sent text, but a row break in the box may fall inside a word, so its word boundaries cannot be told),
+ *  `empty`, `queued` (Claude's queued-messages label, or an empty box while a turn was running, so the message may
+ *  wait behind it), `hidden` (a collapsed paste label), `other` (any other text), `unrecognized` (no recognized
+ *  input box, or a frame that names another client version), `unavailable` (no capture, or none in time) or
+ *  `unchecked` (this path does not read the box: an audited prompt answer). */
+export type InputBoxReading = "exact" | "ambiguous" | "empty" | "queued" | "hidden" | "other" | "unrecognized" | "unavailable" | "unchecked";
 
 /** With transport.verify_input_box on: what the seat showed before the paste, and what a Claude Code or Codex
  *  input box showed before and after Enter. Reporting only. `verified` is true only for a seat proven idle
  *  before the paste, then exact, then empty, on the same pane process (`#{pane_pid}`, the pane's root process);
- *  that means the box was cleared after holding the text, normally by our Enter, never that the model read it. */
+ *  that means the box was cleared after holding the text, normally by our Enter, never that the model read it.
+ *  `sameProcess` compares the pane's root process (usually a shell) and the seat's binding: an agent restarted
+ *  under the same shell is not caught by it, and the same pane and binding are not proof of the same native
+ *  conversation. An audited prompt answer is not checked: every field reads `unchecked` (sameProcess false) and the
+ *  send reads unconfirmed. */
 export interface InputBoxEvidence {
-  seat: SeatReading;
+  seat: SeatReading | "unchecked";
   before: InputBoxReading;
   after: InputBoxReading;
   sameProcess: boolean;
 }
+
+/** The evidence of a verified send whose path does not read the input box (an audited prompt answer). */
+const INPUT_BOX_UNCHECKED: InputBoxEvidence = { seat: "unchecked", before: "unchecked", after: "unchecked", sameProcess: false };
 
 export interface CaptureResult {
   ok: boolean;
@@ -2379,7 +2480,7 @@ export class SessionTransport {
     await this.sleep(200);
 
     // With transport.verify_input_box on, one bounded read of the input box and its pane process before
-    // Enter. It only reports: nothing here decides whether Enter is sent.
+    // Enter (a 500 ms budget after the 200 ms wait). It only reports: nothing here decides whether Enter is sent.
     // The seat is read from the existing --verify capture taken before the paste (the whole screen); no new read.
     let boxBefore: { seat: SeatReading; reading: InputBoxReading; pid: number | null; pane: string | null } | null = null;
     if (inputBoxRuntime && !promptOverride) {
@@ -2399,6 +2500,7 @@ export class SessionTransport {
       if (runtime === "claude-code" && bindingChanged()) return observe(changedRecipient(true));
       if (!promptAnswerStaged(pane, text, runtime)) {
         return observe({ ok: true, sessionName, sent: true, verified: false, outcome: "rendered-unconfirmed", promptInteraction: "unverified",
+          ...(inputBoxRuntime ? { inputBox: INPUT_BOX_UNCHECKED } : {}),
           warning: "prompt-override: answer sent as unbracketed input; submission unverified. No trailing Enter: the complete answer is not visibly staged (it may have been consumed, the prompt changed, or observation is unavailable)." });
       }
       sendAdvisory = "prompt-override: answer sent as unbracketed input; Enter submitted the complete still-staged answer.";
@@ -2449,8 +2551,11 @@ export class SessionTransport {
         const count = envelope ? (pane: string, expected: string) => countEnvelopeOccurrences(pane, expected, promptClass) : countOccurrences;
         const preCount = count(transcript(preVerifyContent), snippet);
         const postCount = count(transcript(content), snippet);
+        // An audited prompt answer reads no box (no extra read is added for it), so it says so: unchecked, and
+        // unconfirmed; it never falls back to the count below.
         const inputBox = boxBefore && inputBoxRuntime
-          ? await this.inputBoxEvidence(sessionName, sessionMeta, boxBefore, readInputBox(content, inputBoxRuntime, text, boxBefore.pane)) : undefined;
+          ? await this.inputBoxEvidence(sessionName, sessionMeta, boxBefore, readInputBox(content, inputBoxRuntime, text, boxBefore.pane))
+          : inputBoxRuntime && promptOverride ? INPUT_BOX_UNCHECKED : undefined;
         // With the setting on, only a seat proven idle before the paste and input-box evidence verify: exact before
         // Enter, empty after, same process. A not-idle or unknown seat always reads unconfirmed.
         const verified = inputBoxRuntime
@@ -2462,7 +2567,8 @@ export class SessionTransport {
           observed.post = { state: "unavailable", cause: "capture_error", capturedAt: this.now().toISOString(), captureSeq };
         }
         const inputBox: InputBoxEvidence | undefined = boxBefore
-          ? { seat: boxBefore.seat, before: boxBefore.reading, after: "unavailable", sameProcess: false } : undefined;
+          ? { seat: boxBefore.seat, before: boxBefore.reading, after: "unavailable", sameProcess: false }
+          : inputBoxRuntime && promptOverride ? INPUT_BOX_UNCHECKED : undefined;
         return observe({ ok: true, sessionName, ...interaction, verified: false, outcome: "rendered-unconfirmed", ...(inputBox ? { inputBox } : {}), ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
       }
     }

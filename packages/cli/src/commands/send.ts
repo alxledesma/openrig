@@ -274,18 +274,24 @@ communicate. Use --wait-for-idle to send only after explicit idle evidence. Use
 --verify to confirm the message appeared in the pane only; it is not agent
 acknowledgement. With transport.verify_input_box on, a Claude Code or Codex send
 reads verified only when the seat was proven idle before the paste (its screen
-matched a known idle layout of Claude Code 2.1.296 or Codex 0.160.0) and its
-input box held the exact text before Enter and was empty after it: the box was
-cleared, normally by that Enter (a clear by anything else at that moment, or a
-text the agent runs as a command, looks the same). A Claude Code seat OpenRig
-launched counts as idle in any posture it launches, fresh or after its turns,
-when the row above its empty box is blank or the last turn's completion row
-("✻ Cooked for 9s · done 5:24 PM", time of day today); anything else there reads
+matched an idle layout recorded from Claude Code 2.1.296 or Codex 0.160.0; a
+screen that names another version reads unconfirmed, and a matching layout that
+shows no version is evidence about the layout, not the version) and its input
+box held the exact text, word boundaries kept, before Enter and was empty after
+it: the box was cleared, normally by that Enter (a clear by anything else at
+that moment, or a text the agent runs as a command, looks the same). A Claude
+Code seat OpenRig launched counts as idle in any posture it launches when the
+row two above its empty box is the last turn's completion row ("✻ Cooked for 9s
+· done 5:24 PM", time of day today) or, before its first turn, blank under the
+welcome banner; a blank row under transcript text, or anything else there, reads
 unconfirmed. On Claude Code only a text shown inline in the box can verify: a
 multi-line text, including every enveloped send and queue wake, collapses to a
 paste label and reads unconfirmed. A send to a busy seat, or to a seat whose
 screen is not a known idle layout, always reads unconfirmed; a turn that starts
-in the ~200 ms before Enter is caught only when the screen shows it.
+in the ~200 ms before Enter is caught only when the screen shows it. An audited
+prompt answer (--dangerously-interact) is not checked and reads unconfirmed.
+The extra reads add up to about 500 ms before Enter and 500 ms before the reply
+(budgets, not guarantees).
 
 A mid-task/busy target now sends-with-advisory by default (busy is not a block);
 --force is a back-compat no-op and never bypasses the interactive-prompt/permission
@@ -662,6 +668,7 @@ const SEAT_READING_WORDS: Record<string, string> = {
 
 const INPUT_BOX_READING_WORDS: Record<string, string> = {
   exact: "the exact text",
+  ambiguous: "the text, but a line break in the box may split a word (word boundaries uncertain)",
   empty: "empty",
   queued: "queued or possibly queued (a queued label, or a turn was running)",
   hidden: "a collapsed paste (text hidden)",
@@ -680,9 +687,14 @@ function inputBoxDeliveryLine(outcome: string | undefined, inputBox: unknown, se
     return "Delivery: delivered (seat idle before the paste; input box: the exact text before Enter, empty after it, same pane process; not agent acknowledgement)";
   }
   if (outcome !== "rendered-unconfirmed") return null;
+  // `rig capture` is an optional look, never a required follow-up, and nothing here suggests sending again.
+  const look = `not a failure; to look, optionally: rig capture ${session}`;
+  if (box.before === "unchecked") {
+    return `Delivery: rendered-unconfirmed (input box not checked: an audited prompt answer is typed as keys and its box is not read; ${look})`;
+  }
   const paneProcess = box.sameProcess === true ? "" : "; pane process changed or unknown";
   const seat = box.seat === undefined ? "" : `seat before the paste: ${SEAT_READING_WORDS[String(box.seat)] ?? String(box.seat)}; `;
-  return `Delivery: rendered-unconfirmed (${seat}input box before Enter: ${words(box.before)}; after Enter: ${words(box.after)}${paneProcess}; not a failure - confirm with: rig capture ${session})`;
+  return `Delivery: rendered-unconfirmed (${seat}input box before Enter: ${words(box.before)}; after Enter: ${words(box.after)}${paneProcess}; ${look})`;
 }
 
 /** Renders an EffectCheck on the human surface — shared wording across the
