@@ -966,7 +966,14 @@ const ASCII_UNBROKEN_WORD = /^[A-Za-z0-9'.,:;]+$/;
  *  words are split at ASCII spaces only, which neither TUI breaks inside a word. `ownIndent` is how many cells of
  *  `row` the box draws itself (1 after the prompt glyph, 2 on a continuation row). Either:
  *  - the next row's first word would have fit on this row after a space: both wrappers fill a row first
- *    (wrap-ansi and FirstFit are greedy), so the box breaks its rows there only at a line break of its text; or
+ *    (wrap-ansi and FirstFit are greedy), so where the rows follow the wrapper's own lines the box breaks its rows
+ *    there only at a line break of its text. Residual (review-safety-3 F1, from a model of the rust-v0.160.0 source,
+ *    not a live capture): on Codex, once a row holding only indentation has absorbed and split a word (below), the
+ *    re-pass can push a later row early at a hyphen, since its keep-whole check measures a hyphenated compound as one
+ *    word, so a short row can be followed by a fragment that would have fit with no whitespace between them, and this
+ *    rule counts that break as a space. Every such box in that model also holds the earlier absorbed split, which
+ *    only this rule reads and which it rejects (the row is full), so the box reads `ambiguous`, never `exact`. That
+ *    relies on the row-start check below, which the tests pin; or
  *  - no wrapper breaks between the two characters (ASCII_NO_BREAK_BEFORE above), the two words they end and begin,
  *    joined, fit in a row, the row's last word has no break opportunity inside it (ASCII_UNBROKEN_WORD), and the
  *    row's text starts at its first cell with a printable ASCII character. Codex 0.160.0 keeps a word that fits in a
@@ -1451,8 +1458,8 @@ export type InputBoxReading = "exact" | "ambiguous" | "empty" | "queued" | "hidd
  *  that means the box was cleared after holding the text, normally by our Enter, never that the model read it.
  *  `sameProcess` compares the pane's root process (usually a shell) and the seat's binding: an agent restarted
  *  under the same shell is not caught by it, and the same pane and binding are not proof of the same native
- *  conversation. An audited prompt answer is not checked: every field reads `unchecked` (sameProcess false) and the
- *  send reads unconfirmed. */
+ *  conversation. An audited prompt answer is not checked: `seat`, `before` and `after` read `unchecked`,
+ *  `sameProcess` is false (a boolean, as on every other path), and the send reads unconfirmed. */
 export interface InputBoxEvidence {
   seat: SeatReading | "unchecked";
   before: InputBoxReading;

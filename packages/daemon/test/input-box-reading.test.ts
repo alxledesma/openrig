@@ -1005,3 +1005,31 @@ describe("repair round 2 (review-safety-2): Codex splits a word that fits after 
     expect(readInputBox(build([ideographs, "abcdefgh ijklmnopqrs"]), runtime, `${ideographs} abcdefgh ijklmnopqrs`)).toBe("ambiguous");
   });
 });
+
+describe("review round 1 polish (review-safety-3 F2): the no-break pair list is pinned at its edge", () => {
+  // A break between a row's last word and the next row's first character counts as a space only for the pairs in
+  // ASCII_NO_BREAK_BEFORE (or two letters or digits). Rows `check foo` | `<c>bar now`: the box is 9 cells, so the
+  // first-fit rule fails (`<c>bar` would not have fit after `check foo`), and `foo<c>bar` (7 cells) fits in a row.
+  const PUNCTUATION = [..."!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"];
+  const LISTED = [..."-/.,:;!?)]}"];
+  it("the punctuation characters split into the 11 listed and 21 others", () => {
+    expect(PUNCTUATION).toHaveLength(32);
+    expect(PUNCTUATION.filter((c) => LISTED.includes(c))).toHaveLength(11);
+  });
+
+  for (const [runtime, build] of both) {
+    it.each(LISTED)(`${runtime}: a break before %s, a listed character, reads exact`, (c) => {
+      expect(readInputBox(build(["check foo", `${c}bar now`]), runtime, `check foo ${c}bar now`)).toBe("exact");
+    });
+
+    it.each(PUNCTUATION.filter((c) => !LISTED.includes(c)))(`${runtime}: a break before %s, not listed, reads ambiguous`, (c) => {
+      expect(readInputBox(build(["check foo", `${c}bar now`]), runtime, `check foo ${c}bar now`)).toBe("ambiguous");
+    });
+
+    it(`${runtime}: a break between \`;\` and \`(\` reads ambiguous: UAX #14 has a break opportunity there (LB30 forbids one before \`(\` only after AL, HL or NU; \`;\` is IS)`, () => {
+      expect(readInputBox(build(["check foo;", "(bar) now"]), runtime, "check foo; (bar) now")).toBe("ambiguous");
+      // The box's own text (no space at the break) reads ambiguous too.
+      expect(readInputBox(build(["check foo;", "(bar) now"]), runtime, "check foo;(bar) now")).toBe("ambiguous");
+    });
+  }
+});

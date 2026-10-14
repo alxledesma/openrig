@@ -152,8 +152,8 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
      (`✻ <verb> for <duration> · done <time>` at column 0, matched by the
      Claude Code 2.1.296 bundle's grammar: one of its eight past-tense verbs,
      its duration format, and the time of a turn finished today on a 12- or
-     24-hour en-US clock). A blank slot counts only directly under that
-     completion row (blank rows between them, as in the fullscreen renderer)
+     24-hour en-US clock). A blank slot counts only under that completion
+     row, with only blank rows between them (as in the fullscreen renderer),
      or, before the first turn, under the last row of the Claude Code v2.1.296
      welcome banner. OpenRig launches Claude in the classic renderer, where the
      box follows the transcript, so an idle seat that has finished a turn
@@ -237,7 +237,13 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
      the same way in a row that took the next textwrap line. So on Codex a
      split between two letters is not always the text's space; after an
      indented row, or after a last word with a break opportunity inside it,
-     only the first rule reads the break. The widest row is counted in
+     only the first rule reads the break. The first rule has one known
+     residual on Codex, found in a model of the rust-v0.160.0 source, not in
+     a live capture: once an indented row has absorbed and split a word, the
+     re-pass can end a later row early at a hyphen, so a break with no
+     whitespace can pass the first rule. Every such box in that model also
+     holds the earlier split after the indented row, which reads `ambiguous`,
+     so the box never reads `exact`. The widest row is counted in
      printable ASCII cells only, so combining marks, joiners and zero-width
      characters never widen it. Any other break, and a break inside a word of
      the text, reads `ambiguous` and the send stays unconfirmed. A collapsed paste label, Claude's
@@ -257,8 +263,9 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
    `empty`, so for a seat that was idle before the paste they are the only
    check that rejects a message queued behind a turn that started after the
    pre-paste capture. An audited prompt answer (step 4) reads no box: with
-   the setting on its `inputBox` reads `unchecked` in every field and the
-   send reads unconfirmed, whatever the default matcher would say.
+   the setting on its `inputBox` reads `unchecked` for `seat`, `before` and
+   `after`, `sameProcess` is `false` (it stays a boolean), and the send reads
+   unconfirmed, whatever the default matcher would say.
    It reports only: the seat is read from the capture `--verify` already
    takes, and none of the extra reads decides whether Enter is sent. Each has
    a 500 ms deadline, which is a budget, not a guarantee: the pre-Enter read
