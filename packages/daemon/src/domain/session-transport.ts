@@ -947,31 +947,46 @@ function stripBoxGlyph(rows: string[]): string[] {
 const widthAtMost = (text: string) => [...text].reduce((cells, ch) => cells + (ch.charCodeAt(0) < 0x80 ? 1 : 2), 0);
 const widthAtLeast = (text: string) => [...text].filter((ch) => ch >= " " && ch <= "~").length;
 
-// Pairs of characters that neither TUI separates across rows unless a word is wider than a row. Claude Code 2.1.296
-// wraps its input with wrap-ansi, which breaks only at spaces. Codex 0.160.0 wraps it with textwrap's FirstFit, its
-// UAX #14 word separator and its hyphen splitter (tui/src/bottom_pane/textarea/wrapping.rs at rust-v0.160.0), which
-// also break with no space drawn after a hyphen or a slash, between ideographs and at other UAX #14 break
-// opportunities. UAX #14 has none between two ASCII letters or digits (LB23, LB25, LB28), nor between a printable
-// ASCII character and a following hyphen, slash, closing bracket or `.,:;!?` (LB13, LB15d, LB21).
+// Pairs of characters that no wrapper separates across rows inside a word that fits in a row, under the conditions
+// rowBreakIsSpace adds. Claude Code 2.1.296 wraps its input with wrap-ansi, which breaks only at spaces. Codex 0.160.0
+// wraps it with textwrap's FirstFit, its UAX #14 word separator and its hyphen splitter, then re-passes the rows
+// (tui/src/bottom_pane/textarea/wrapping.rs at rust-v0.160.0), which also break with no space drawn after a hyphen
+// or a slash, between ideographs and at other UAX #14 break opportunities. UAX #14 has none between two ASCII
+// letters or digits (LB23, LB25, LB28), nor between a printable ASCII character and a following hyphen, slash,
+// closing bracket or `.,:;!?` (LB13, LB15d, LB21).
 const ASCII_LETTER_OR_DIGIT = /^[A-Za-z0-9]$/;
 const ASCII_VISIBLE = /^[!-~]$/;
 const ASCII_NO_BREAK_BEFORE = /^[-/.,:;!?)\]}]$/;
+// A word of ASCII letters, digits, `'` and `.,:;`, which has no UAX #14 break opportunity inside it (LB13, LB19, LB23,
+// LB25, LB28, LB29): Codex's re-pass keeps such a word whole when it starts on a row that already holds text.
+const ASCII_UNBROKEN_WORD = /^[A-Za-z0-9'.,:;]+$/;
 
 /** Whether the break between two drawn rows of a box must be whitespace of the box's text, given a lower bound of
  *  the box's width. Rows are measured as drawn, the box's own indentation included (an upper bound of their width);
- *  words are split at ASCII spaces only, which neither TUI breaks inside a word. Either:
+ *  words are split at ASCII spaces only, which neither TUI breaks inside a word. `ownIndent` is how many cells of
+ *  `row` the box draws itself (1 after the prompt glyph, 2 on a continuation row). Either:
  *  - the next row's first word would have fit on this row after a space: both wrappers fill a row first
  *    (wrap-ansi and FirstFit are greedy), so the box breaks its rows there only at a line break of its text; or
- *  - no wrapper breaks between the two characters (ASCII_NO_BREAK_BEFORE above) and the two words they end and
- *    begin, joined, fit in a row: both split such a word only when it is wider than a row. */
-function rowBreakIsSpace(row: string, next: string, width: number): boolean {
+ *  - no wrapper breaks between the two characters (ASCII_NO_BREAK_BEFORE above), the two words they end and begin,
+ *    joined, fit in a row, the row's last word has no break opportunity inside it (ASCII_UNBROKEN_WORD), and the
+ *    row's text starts at its first cell with a printable ASCII character. Codex 0.160.0 keeps a word that fits in a
+ *    row whole only where the word starts on a row that already holds text, after whitespace or at one of textwrap's
+ *    breaks: a row holding only indentation absorbs the next word and splits it where the row fills ("Partial
+ *    whitespace rows absorb the next word"), and a word after a hyphen or a slash in a row that took the next
+ *    textwrap line is split the same way. So on Codex a split between two letters is no space at all on a row that
+ *    starts with indentation, or after a break opportunity inside the row's last word; only the first rule above
+ *    reads such a break. */
+function rowBreakIsSpace(row: string, next: string, width: number, ownIndent: number): boolean {
   const firstWord = next.trim().split(" ")[0]!;
   if (widthAtMost(row.trimEnd()) + 1 + widthAtMost(firstWord) <= width) return true;
-  const before = row.trimEnd().at(-1) ?? "";
+  if (row.slice(0, ownIndent).trim() || !ASCII_VISIBLE.test(row.slice(ownIndent, ownIndent + 1))) return false;
+  const lastWord = row.trim().split(" ").at(-1)!;
+  if (!ASCII_UNBROKEN_WORD.test(lastWord)) return false;
+  const before = lastWord.at(-1)!;
   const after = next.trimStart()[0] ?? "";
   const noBreak = (ASCII_LETTER_OR_DIGIT.test(before) && ASCII_LETTER_OR_DIGIT.test(after))
     || (ASCII_VISIBLE.test(before) && ASCII_NO_BREAK_BEFORE.test(after));
-  return noBreak && widthAtMost(row.trim().split(" ").at(-1)! + firstWord) <= width;
+  return noBreak && widthAtMost(lastWord + firstWord) <= width;
 }
 
 /** Whether a Claude Code or Codex box, given as its rows, holds exactly `text` with its word boundaries kept.
@@ -982,11 +997,12 @@ function rowBreakIsSpace(row: string, next: string, width: number): boolean {
  *  break may fall inside a word of the box's text, or be how the box draws different spacing, so the reading is
  *  `ambiguous`, never `exact`, and so is a break that falls inside a word of the sent text. */
 function boxHoldsText(rows: string[], text: string): "exact" | "ambiguous" | "other" {
-  const drawn = rows.filter((row) => row.trim());
-  const shown = drawn.map((row) => row.trim().replace(/\s+/g, " "));
+  // The box draws its first row one cell after the prompt glyph, and its continuation rows two cells in.
+  const drawn = rows.flatMap((row, index) => (row.trim() ? [{ row, ownIndent: index === 0 ? 1 : 2 }] : []));
+  const shown = drawn.map(({ row }) => row.trim().replace(/\s+/g, " "));
   const sent = text.trim().replace(/\s+/g, " ");
   // Measured on the rows as drawn: whitespace compares as a space, but U+FEFF, which `\s` matches, takes no cell.
-  const width = Math.max(0, ...drawn.map((row) => widthAtLeast(row.trim())));
+  const width = Math.max(0, ...drawn.map(({ row }) => widthAtLeast(row.trim())));
   let at = 0;
   let ambiguous = false;
   for (let i = 0; i < shown.length; i++) {
@@ -996,7 +1012,7 @@ function boxHoldsText(rows: string[], text: string): "exact" | "ambiguous" | "ot
     if (i === shown.length - 1) break;
     if (sent[at] === " ") {
       at += 1;
-      if (!rowBreakIsSpace(drawn[i]!, drawn[i + 1]!, width)) ambiguous = true;
+      if (!rowBreakIsSpace(drawn[i]!.row, drawn[i + 1]!.row, width, drawn[i]!.ownIndent)) ambiguous = true;
     } else {
       ambiguous = true;
     }

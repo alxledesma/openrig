@@ -132,6 +132,15 @@ const codexStagedRows = (rows: string[]) => editLine(codex("staged-short.J"), (l
 // A 24-cell box whose first row is NFD text (44 code points), then one 28-letter word split at 24 cells.
 const nfdRows = [`${"e\u0301".repeat(10)} ${"e\u0301".repeat(10)} ok`, "abcdefghijklmnopqrstuvwx", "yz12"];
 const nfdSentWithSpace = `${nfdRows[0]} abcdefghijklmnopqrstuvwx yz12`;
+// Repair round 2 (review-safety-2): Codex 0.160.0's re-pass lets a row holding only indentation absorb the next word
+// and split it where the row fills, though the word fits in a row. Edit of the real wrapped Codex frame (its box is
+// 112 to 117 cells): `› ` + 8 spaces + a 110-letter token's first 108 letters, its last 2, then the frame's first
+// real row as a continuation row. The sent text has a space at the split.
+const TOKEN = "Zm9vYmFyYmF6cXV4".repeat(7).slice(0, 110);
+const codexWrappedFirstRow = codex("staged-wrapped.raw").split("\n").find((line) => line.startsWith("› Background"))!;
+const codexIndentedToken = editLine(codex("staged-wrapped.raw"), (line) => line === codexWrappedFirstRow,
+  [`› ${" ".repeat(8)}${TOKEN.slice(0, 108)}`, `  ${TOKEN.slice(108)}`, `  ${codexWrappedFirstRow.slice(2)}`]);
+const indentedTokenSentWithSpace = `${" ".repeat(8)}${TOKEN.slice(0, 108)} ${TOKEN.slice(108)}\n${texts.wrapped.trim()}`;
 // Change 1: the wrapped text with the space at its first row break taken out, so the break falls inside a word.
 const wrappedJoinedAtBreak = texts.wrapped.replace("next scheduled", "nextscheduled");
 // Change 2, versions: the version a client prints in its banner, header or update notice, edited.
@@ -512,6 +521,22 @@ describe("SessionTransport with transport.verify_input_box", () => {
       "the long first row of this message self-\nreview now",
       { prePaste: codex("idle"), afterPaste: codexStagedRows(["the long first row of this message", "self-", "review now"]), afterEnter: codex("after-enter-0.4s.J") },
       null, { seat: "idle", before: "exact", after: "empty", sameProcess: true }, true],
+    // Repair round 2 (review-safety-2): a split between two letters is no space on a row that starts with the text's
+    // own indentation, or after a break opportunity inside the row's last word. Before the repair RS2-1, RS2-2 and
+    // RS2-4 read exact, then empty, and verified.
+    ["RS2-1 Codex: an indented token split where its row fills; a space sent at the split", "codex", indentedTokenSentWithSpace,
+      { prePaste: codex("idle"), afterPaste: codexIndentedToken, afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true }, false],
+    ["RS2-2 Claude: the same rows in a Claude box (one rule for both runtimes)", "claude-code",
+      `    ${"0123456789abcdefghijklmnopqrstuvwxyz".slice(0, 34)} yz\nPlease run this exact command from the repository root.`,
+      { prePaste: idle, afterPaste: claudeStagedRows([`    ${"0123456789abcdefghijklmnopqrstuvwxyz".slice(0, 34)}`, "yz", "Please run this exact command from the", "repository root."]), afterEnter: claude("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true }, false],
+    ["RS2-3 Codex: an indented row whose next word would have fit after it: verified", "codex", "Please run this exact command from the\n    first step\nsecond step",
+      { prePaste: codex("idle"), afterPaste: codexStagedRows(["Please run this exact command from the", "    first step", "second step"]), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "exact", after: "empty", sameProcess: true }, true],
+    ["RS2-4 Codex: a space sent where a word after a hyphen in the row's last word is split", "codex", "aaaaaa c-ddddddddddd ddddd",
+      { prePaste: codex("idle"), afterPaste: codexStagedRows(["aaaaaa c-ddddddddddd", "ddddd"]), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true }, false],
   ];
 
   describe.each(rows)("%s", (_id, runtime, text, frames, off, box, on) => {

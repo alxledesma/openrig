@@ -228,11 +228,19 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
      first, so the text has a line break there), or where it falls between
      two ASCII letters or digits, or before a hyphen, a slash, a closing
      bracket or `.,:;!?`, and the two words it separates, joined, fit in the
-     box's widest row (both split such a word only when it is wider than a
-     row). The widest row is counted in printable ASCII cells only, so
-     combining marks, joiners and zero-width characters never widen it. Any
-     other break, and a break inside a word of the text, reads `ambiguous`
-     and the send stays unconfirmed. A collapsed paste label, Claude's
+     box's widest row, but only after a row whose text starts at its first
+     cell with a printable ASCII character and whose last word is ASCII
+     letters, digits, `'` and `.,:;` only. Codex keeps a word that fits in a
+     row whole only where the word starts on a row that already holds text:
+     a row holding only indentation absorbs the next word and splits it
+     where the row fills, and a word after a hyphen or a slash can be split
+     the same way in a row that took the next textwrap line. So on Codex a
+     split between two letters is not always the text's space; after an
+     indented row, or after a last word with a break opportunity inside it,
+     only the first rule reads the break. The widest row is counted in
+     printable ASCII cells only, so combining marks, joiners and zero-width
+     characters never widen it. Any other break, and a break inside a word of
+     the text, reads `ambiguous` and the send stays unconfirmed. A collapsed paste label, Claude's
      queued-messages label or `Try "…"` suggestion, or another draft is never
      the message. The default `--verify` matcher above is unchanged.
    - **The box is empty after Enter on the same pane process.** The capture

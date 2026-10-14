@@ -819,17 +819,18 @@ describe("review round 1, change 3: a blank Claude status slot is idle only unde
   });
 });
 
+// Edits: the box rows of a real staged frame replaced by `rows` (continuation rows drawn two cells in, as both TUIs
+// draw them). Claude: staged-wrapped.raw's three rows; Codex: staged-short.J's one row.
+const claudeRows = (rows: string[]) => {
+  const lines = claude("staged-wrapped.raw").split("\n");
+  const at = lines.findIndex(claudeBoxRow);
+  lines.splice(at, 3, `❯ ${rows[0]}`, ...rows.slice(1).map((row) => `  ${row}`));
+  return lines.join("\n");
+};
+const codexRows = (rows: string[]) => editLine(codex("staged-short.J"), codexBoxRow, [`› ${rows[0]}`, ...rows.slice(1).map((row) => `  ${row}`)]);
+const both = [["claude-code", claudeRows], ["codex", codexRows]] as const;
+
 describe("repair round 1 (review-safety-1): a row break counts as a space only where the box's text must have whitespace", () => {
-  // Edits: the box rows of a real staged frame replaced by `rows` (continuation rows drawn two cells in, as both TUIs
-  // draw them). Claude: staged-wrapped.raw's three rows; Codex: staged-short.J's one row.
-  const claudeRows = (rows: string[]) => {
-    const lines = claude("staged-wrapped.raw").split("\n");
-    const at = lines.findIndex(claudeBoxRow);
-    lines.splice(at, 3, `❯ ${rows[0]}`, ...rows.slice(1).map((row) => `  ${row}`));
-    return lines.join("\n");
-  };
-  const codexRows = (rows: string[]) => editLine(codex("staged-short.J"), codexBoxRow, [`› ${rows[0]}`, ...rows.slice(1).map((row) => `  ${row}`)]);
-  const both = [["claude-code", claudeRows], ["codex", codexRows]] as const;
 
   // S1. A 24-cell box: row 0 is 24 cells of NFD text (e + U+0301 is one cell and two code points, so 44 code
   // points), rows 1-2 one 28-letter word split at 24 cells. Counted in code points, row 0 made the box look 44 wide.
@@ -862,11 +863,13 @@ describe("repair round 1 (review-safety-1): a row break counts as a space only w
 
   it.each(both)("%s: a break no wrapper makes without a space reads exact when the two words joined fit in a row", (runtime, build) => {
     // Between two ASCII letters, and before a hyphen or a full stop: no UAX #14 break opportunity, and wrap-ansi
-    // breaks only at spaces. The joined words (`queuenow`, `queue.---`, `sample-rig---`) fit in the first row (27 to
-    // 30 cells), and the next row's first word would not have fit after it.
+    // breaks only at spaces. The joined words (`queuenow`, `queue.---`) fit in the first row (29 and 30 cells), and
+    // the next row's first word would not have fit after it.
     expect(readInputBox(build(["please check your rig's queue", "now and report"]), runtime, "please check your rig's queue now and report")).toBe("exact");
     expect(readInputBox(build(["please check your rig's queue.", "--- and report"]), runtime, "please check your rig's queue. --- and report")).toBe("exact");
-    expect(readInputBox(build(["please check the sample-rig", "--- and report"]), runtime, "please check the sample-rig --- and report")).toBe("exact");
+    // Repair round 2: `sample-rig` has a break opportunity after its hyphen, so Codex may have started a word at `rig`
+    // that its re-pass does not keep whole (see the repair round 2 block below): ambiguous since then.
+    expect(readInputBox(build(["please check the sample-rig", "--- and report"]), runtime, "please check the sample-rig --- and report")).toBe("ambiguous");
   });
 
   it.each(both)("%s: a hard line break the next word would have fit before reads exact, whatever the characters", (runtime, build) => {
@@ -923,5 +926,82 @@ describe("repair round 1 (review-safety-1): versions are compared whole, and the
   ])("claude: a fresh banner whose last row is edited (%s) is not the fresh session", (_name, row) => {
     const frame = editLine(claude("idle-fresh-suggestion"), (line) => line.startsWith(" ▝▝"), row);
     expect(readSeatBeforePaste(frame, "claude-code")).toBe("unknown");
+  });
+});
+
+describe("repair round 2 (review-safety-2): Codex splits a word that fits after indentation or after a break inside a word", () => {
+  // Codex 0.160.0's composer re-pass (tui/src/bottom_pane/textarea/wrapping.rs at rust-v0.160.0) keeps a word that
+  // fits in a row whole only where the word starts on a row that already holds text: after whitespace, or at one of
+  // textwrap's breaks. A row holding only indentation takes the next word with no check ("Partial whitespace rows
+  // absorb the next word"), and the overflow check then splits it where the row fills, though textwrap had put the
+  // word on a row of its own. Edit of the real wrapped frame (its box is 112 to 117 cells): `› ` + 8 spaces + a
+  // 110-letter token's first 108 letters, then its last 2, then the frame's first real row as a continuation row.
+  const TOKEN = "Zm9vYmFyYmF6cXV4".repeat(7).slice(0, 110);
+  const indentedTokenFrame = editLine(codex("staged-wrapped.raw"), (line) => line.startsWith("› Background"),
+    [`› ${" ".repeat(8)}${TOKEN.slice(0, 108)}`, `  ${TOKEN.slice(108)}`, `  ${codex("staged-wrapped.raw").split("\n").find((line) => line.startsWith("› Background"))!.slice(2)}`]);
+
+  it("codex: the real wrapped frame with an indented token split where its row fills: a space sent at the split is not exact", () => {
+    expect(TOKEN).toMatch(/^[A-Za-z0-9]{110}$/);
+    expect(readInputBox(indentedTokenFrame, "codex", `${" ".repeat(8)}${TOKEN}\n${texts.wrapped.trim()}`)).toBe("ambiguous");
+    expect(readInputBox(indentedTokenFrame, "codex", `${" ".repeat(8)}${TOKEN.slice(0, 108)} ${TOKEN.slice(108)}\n${texts.wrapped.trim()}`)).toBe("ambiguous");
+  });
+
+  it.each(both)("%s: an indented first or continuation row: only the first-fit rule reads its break", (runtime, build) => {
+    // A 38-cell box. Row 0: 4 spaces + 34 of a 36-letter token, then its last 2 letters; the joined token (36 cells)
+    // fits in the 38-cell row.
+    const tok = "0123456789abcdefghijklmnopqrstuvwxyz";
+    const tail = ["Please run this exact command from the", "repository root."];
+    expect(readInputBox(build([`    ${tok.slice(0, 34)}`, tok.slice(34), ...tail]), runtime,
+      `    ${tok.slice(0, 34)} ${tok.slice(34)}\n${tail.join(" ")}`)).toBe("ambiguous");
+    expect(readInputBox(build([`    ${tok.slice(0, 34)}`, tok.slice(34), ...tail]), runtime, `    ${tok}\n${tail.join(" ")}`)).toBe("ambiguous");
+    // The same on a continuation row, drawn two cells in by the box, then four of the text's own.
+    expect(readInputBox(build([tail[0]!, `    ${tok.slice(0, 34)}`, tok.slice(34)]), runtime,
+      `${tail[0]}\n    ${tok.slice(0, 34)} ${tok.slice(34)}`)).toBe("ambiguous");
+    // One cell of the text's own indentation is enough, on a continuation row and on the first row.
+    expect(readInputBox(build([tail[0]!, ` ${tok.slice(0, 34)}`, tok.slice(34)]), runtime,
+      `${tail[0]}\n ${tok.slice(0, 34)} ${tok.slice(34)}`)).toBe("ambiguous");
+    expect(readInputBox(build([` ${tok.slice(0, 34)}`, tok.slice(34), ...tail]), runtime,
+      ` ${tok.slice(0, 34)} ${tok.slice(34)}\n${tail.join(" ")}`)).toBe("ambiguous");
+    // Control: without the indentation the joined token is a word that fits, so the split is the text's space.
+    expect(readInputBox(build([tail[0]!, tok.slice(0, 34), tok.slice(34)]), runtime,
+      `${tail[0]}\n${tok.slice(0, 34)} ${tok.slice(34)}`)).toBe("exact");
+    // Control: an indented row whose next word would have fit after it still reads its line break.
+    expect(readInputBox(build([tail[0]!, "    first step", "second step"]), runtime, `${tail[0]}\n    first step\nsecond step`)).toBe("exact");
+  });
+
+  it.each(both)("%s: a break opportunity inside the row's last word: only the first-fit rule reads the break", (runtime, build) => {
+    // Codex's re-pass checks a word that starts after a hyphen or a slash only at the start of a textwrap line, so in
+    // a row that took the next textwrap line such a word is split where the row fills (`ddddd` below).
+    expect(readInputBox(build(["aaaaaa c-ddddddddddd", "ddddd"]), runtime, "aaaaaa c-ddddddddddd ddddd")).toBe("ambiguous");
+    expect(readInputBox(build(["open the x.com/pa", "th now"]), runtime, "open the x.com/pa th now")).toBe("ambiguous");
+    expect(readInputBox(build(["please run the self-reviewer", "s now"]), runtime, "please run the self-reviewer s now")).toBe("ambiguous");
+    // Controls: no break opportunity inside the last word (letters, digits, `'` and `.,:;`): the split is a space.
+    expect(readInputBox(build(["please run the selfreviewer", "s now"]), runtime, "please run the selfreviewer s now")).toBe("exact");
+    expect(readInputBox(build(["please check your rig's", "queue now"]), runtime, "please check your rig's queue now")).toBe("exact");
+    expect(readInputBox(build(["please read v1.2.3", "now ok"]), runtime, "please read v1.2.3 now ok")).toBe("exact");
+  });
+
+  it.each(both)("%s: the row before the break must start with printable ASCII text at its first cell", (runtime, build) => {
+    // Codex keeps the row's last word whole only on a row that already holds text. A non-ASCII first character may be
+    // whitespace to Codex and not to this reader (U+0085 is whitespace to Rust's char::is_whitespace, not to `\s`).
+    expect(readInputBox(build(["\u0085 please run the selfreviewer", "s now"]), runtime, "\u0085 please run the selfreviewer s now")).toBe("ambiguous");
+    expect(readInputBox(build(["日本 please run the selfreviewer", "s now"]), runtime, "日本 please run the selfreviewer s now")).toBe("ambiguous");
+    // The box's own cells are counted by the row's place in the box, a blank first row included: a text that starts
+    // with a line break draws its first text on a continuation row, two cells in.
+    expect(readInputBox(build(["", "please run the selfreviewer", "s now"]), runtime, "\nplease run the selfreviewer s now")).toBe("exact");
+  });
+
+  it("codex: a continuation row drawn one cell in (not the recorded layout) is not read by the joined-word rule", () => {
+    const frame = editLine(codex("staged-short.J"), codexBoxRow, ["› please run the long checklist", " xplease run the selfreviewer", "  s now"]);
+    expect(readInputBox(frame, "codex", "please run the long checklist xplease run the selfreviewer s now")).toBe("ambiguous");
+  });
+
+  it.each(both)("%s: wide characters on the row before a break count two cells in the first-fit rule (F2)", (runtime, build) => {
+    // Codex may break between an ideograph and `a` with no space drawn. The 10 ideographs take 20 cells, so `abcdefgh`
+    // would not have fit after them in the 20-cell box; counted one cell per character, the drawn row (the box's own
+    // cell included) would leave room for it (11 + 1 + 8 <= 20).
+    const ideographs = "日本語日本語日本語日";
+    expect([...ideographs]).toHaveLength(10);
+    expect(readInputBox(build([ideographs, "abcdefgh ijklmnopqrs"]), runtime, `${ideographs} abcdefgh ijklmnopqrs`)).toBe("ambiguous");
   });
 });
