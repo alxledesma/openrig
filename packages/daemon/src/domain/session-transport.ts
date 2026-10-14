@@ -941,21 +941,52 @@ function stripBoxGlyph(rows: string[]): string[] {
   return rows.map((row, i) => (i === 0 ? row.trimStart().slice(1) : row));
 }
 
-// Upper bound of a string's terminal width: a non-ASCII character may take two cells.
+// Bounds of a string's terminal width. Upper: a non-ASCII character may take two cells. Lower: a printable ASCII
+// character takes exactly one cell, and any other character is counted as none (a combining mark, a variation
+// selector or a joiner takes none, and an emoji sequence of several code points takes two cells in all).
 const widthAtMost = (text: string) => [...text].reduce((cells, ch) => cells + (ch.charCodeAt(0) < 0x80 ? 1 : 2), 0);
+const widthAtLeast = (text: string) => [...text].filter((ch) => ch >= " " && ch <= "~").length;
+
+// Pairs of characters that neither TUI separates across rows unless a word is wider than a row. Claude Code 2.1.296
+// wraps its input with wrap-ansi, which breaks only at spaces. Codex 0.160.0 wraps it with textwrap's FirstFit, its
+// UAX #14 word separator and its hyphen splitter (tui/src/bottom_pane/textarea/wrapping.rs at rust-v0.160.0), which
+// also break with no space drawn after a hyphen or a slash, between ideographs and at other UAX #14 break
+// opportunities. UAX #14 has none between two ASCII letters or digits (LB23, LB25, LB28), nor between a printable
+// ASCII character and a following hyphen, slash, closing bracket or `.,:;!?` (LB13, LB15d, LB21).
+const ASCII_LETTER_OR_DIGIT = /^[A-Za-z0-9]$/;
+const ASCII_VISIBLE = /^[!-~]$/;
+const ASCII_NO_BREAK_BEFORE = /^[-/.,:;!?)\]}]$/;
+
+/** Whether the break between two drawn rows of a box must be whitespace of the box's text, given a lower bound of
+ *  the box's width. Rows are measured as drawn, the box's own indentation included (an upper bound of their width);
+ *  words are split at ASCII spaces only, which neither TUI breaks inside a word. Either:
+ *  - the next row's first word would have fit on this row after a space: both wrappers fill a row first
+ *    (wrap-ansi and FirstFit are greedy), so the box breaks its rows there only at a line break of its text; or
+ *  - no wrapper breaks between the two characters (ASCII_NO_BREAK_BEFORE above) and the two words they end and
+ *    begin, joined, fit in a row: both split such a word only when it is wider than a row. */
+function rowBreakIsSpace(row: string, next: string, width: number): boolean {
+  const firstWord = next.trim().split(" ")[0]!;
+  if (widthAtMost(row.trimEnd()) + 1 + widthAtMost(firstWord) <= width) return true;
+  const before = row.trimEnd().at(-1) ?? "";
+  const after = next.trimStart()[0] ?? "";
+  const noBreak = (ASCII_LETTER_OR_DIGIT.test(before) && ASCII_LETTER_OR_DIGIT.test(after))
+    || (ASCII_VISIBLE.test(before) && ASCII_NO_BREAK_BEFORE.test(after));
+  return noBreak && widthAtMost(row.trim().split(" ").at(-1)! + firstWord) <= width;
+}
 
 /** Whether a Claude Code or Codex box, given as its rows, holds exactly `text` with its word boundaries kept.
  *  Whitespace inside a row is compared as one space (runs and Unicode spaces count the same, so `now here` is not
- *  `nowhere`). A row break counts as the text's space only where the two words it separates, joined, would fit in
- *  the box's widest row: both TUIs wrap at word boundaries and split a word only when it is wider than a row (the
- *  real wrapped frames, staged-wrapped.*, break at spaces and leave the rest of the row empty), so a break there
- *  cannot be inside a word. A break that falls inside a word of the text, or a break whose two words joined would
- *  not fit, could also be how the box draws different spacing, so the reading is `ambiguous`, never `exact`. */
+ *  `nowhere`), and letters are compared as they are (case included). A row break counts as the text's space only
+ *  where it must be whitespace of the box's text (rowBreakIsSpace), measured against the box's widest row in
+ *  printable ASCII cells (widthAtLeast), a lower bound of the box's width whatever else the rows hold. Any other
+ *  break may fall inside a word of the box's text, or be how the box draws different spacing, so the reading is
+ *  `ambiguous`, never `exact`, and so is a break that falls inside a word of the sent text. */
 function boxHoldsText(rows: string[], text: string): "exact" | "ambiguous" | "other" {
-  const shown = rows.map((row) => row.trim().replace(/\s+/g, " ")).filter(Boolean);
+  const drawn = rows.filter((row) => row.trim());
+  const shown = drawn.map((row) => row.trim().replace(/\s+/g, " "));
   const sent = text.trim().replace(/\s+/g, " ");
-  // Each shown row is at most as wide as the box, so the widest row's length is a lower bound of its width.
-  const widest = Math.max(0, ...shown.map((row) => [...row].length));
+  // Measured on the rows as drawn: whitespace compares as a space, but U+FEFF, which `\s` matches, takes no cell.
+  const width = Math.max(0, ...drawn.map((row) => widthAtLeast(row.trim())));
   let at = 0;
   let ambiguous = false;
   for (let i = 0; i < shown.length; i++) {
@@ -965,8 +996,7 @@ function boxHoldsText(rows: string[], text: string): "exact" | "ambiguous" | "ot
     if (i === shown.length - 1) break;
     if (sent[at] === " ") {
       at += 1;
-      const joined = row.slice(row.lastIndexOf(" ") + 1) + shown[i + 1]!.split(" ")[0];
-      if (widthAtMost(joined) > widest) ambiguous = true;
+      if (!rowBreakIsSpace(drawn[i]!, drawn[i + 1]!, width)) ambiguous = true;
     } else {
       ambiguous = true;
     }

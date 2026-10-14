@@ -219,13 +219,22 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
      box with its word boundaries kept (`readInputBox`, `boxHoldsText`): runs
      of whitespace, including Unicode spaces, compare as one space, so a box
      holding `nowhere` is not the text `now here`. A row break counts as a
-     space only where the two words it separates, joined, would fit in the
-     box's widest row (both TUIs wrap at word boundaries and split a word only
-     when it is wider than a row); a break inside a word of the text, or one
-     whose words joined would not fit, reads `ambiguous` and the send stays
-     unconfirmed. A collapsed paste label, Claude's queued-messages label or
-     `Try "…"` suggestion, or another draft is never the message. The default
-     `--verify` matcher above is unchanged.
+     space only where it must be whitespace of the box's text. Claude Code
+     2.1.296 wraps its input at spaces only (wrap-ansi). Codex 0.160.0 wraps
+     it with textwrap (FirstFit, UAX #14 break opportunities, the hyphen
+     splitter), which also breaks with no space drawn after a hyphen or a
+     slash and between ideographs. So a break counts where the next row's
+     first word would have fit on the row before it (both wrappers fill a row
+     first, so the text has a line break there), or where it falls between
+     two ASCII letters or digits, or before a hyphen, a slash, a closing
+     bracket or `.,:;!?`, and the two words it separates, joined, fit in the
+     box's widest row (both split such a word only when it is wider than a
+     row). The widest row is counted in printable ASCII cells only, so
+     combining marks, joiners and zero-width characters never widen it. Any
+     other break, and a break inside a word of the text, reads `ambiguous`
+     and the send stays unconfirmed. A collapsed paste label, Claude's
+     queued-messages label or `Try "…"` suggestion, or another draft is never
+     the message. The default `--verify` matcher above is unchanged.
    - **The box is empty after Enter on the same pane process.** The capture
      after Enter must show the box empty, with the pane process
      (`#{pane_pid}`) and the seat's binding unchanged.

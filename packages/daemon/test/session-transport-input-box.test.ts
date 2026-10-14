@@ -119,6 +119,19 @@ const openRig = {
 // Change 1, word boundaries: the box row of a real staged frame replaced by `boxText`.
 const claudeStagedAs = (boxText: string) => editLine(claude("staged-short.raw"), claudeBoxRow, `❯\u00a0${boxText}`);
 const codexStagedAs = (boxText: string) => editLine(codex("staged-short.J"), (line) => line.startsWith("› Queue handoff"), `› ${boxText}`);
+// Repair round 1 (review-safety-1): staged boxes drawn over several rows (continuation rows two cells in). Claude:
+// staged-wrapped.raw's three box rows replaced; Codex: staged-short.J's box row replaced.
+const claudeStagedRows = (rows: string[]) => {
+  const lines = wrappedRaw.split("\n");
+  const at = lines.findIndex(claudeBoxRow);
+  lines.splice(at, 3, `❯\u00a0${rows[0]}`, ...rows.slice(1).map((row) => `  ${row}`));
+  return lines.join("\n");
+};
+const codexStagedRows = (rows: string[]) => editLine(codex("staged-short.J"), (line) => line.startsWith("› Queue handoff"),
+  [`› ${rows[0]}`, ...rows.slice(1).map((row) => `  ${row}`)]);
+// A 24-cell box whose first row is NFD text (44 code points), then one 28-letter word split at 24 cells.
+const nfdRows = [`${"e\u0301".repeat(10)} ${"e\u0301".repeat(10)} ok`, "abcdefghijklmnopqrstuvwx", "yz12"];
+const nfdSentWithSpace = `${nfdRows[0]} abcdefghijklmnopqrstuvwx yz12`;
 // Change 1: the wrapped text with the space at its first row break taken out, so the break falls inside a word.
 const wrappedJoinedAtBreak = texts.wrapped.replace("next scheduled", "nextscheduled");
 // Change 2, versions: the version a client prints in its banner, header or update notice, edited.
@@ -478,6 +491,27 @@ describe("SessionTransport with transport.verify_input_box", () => {
     ["R1-14 OpenRig-launched Claude seat streaming, its last streamed row blank: unconfirmed", "claude-code", texts.short,
       { prePaste: openRigStreamingBlankTail, afterPaste: openRig.staged(texts.short), afterEnter: openRig.idle },
       null, { seat: "unknown", before: "exact", after: "empty", sameProcess: true }, false],
+    // Repair round 1 (review-safety-1): a row break that need not be whitespace of the box's text is not the sent
+    // text's space. Before the repair each of these read exact, then empty, and verified.
+    ["RS1-1 Claude: combining marks no longer widen the box; a space sent where a long word was split", "claude-code", nfdSentWithSpace,
+      { prePaste: idle, afterPaste: claudeStagedRows(nfdRows), afterEnter: claude("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true }, false],
+    ["RS1-2 Codex: combining marks no longer widen the box; a space sent where a long word was split", "codex", nfdSentWithSpace,
+      { prePaste: codex("idle"), afterPaste: codexStagedRows(nfdRows), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true }, false],
+    ["RS1-3 Codex: a space sent where the box breaks after a hyphen (`self-review`)", "codex", "please run the self- review checklist",
+      { prePaste: codex("idle"), afterPaste: codexStagedRows(["please run the self-", "review checklist"]), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true }, false],
+    ["RS1-4 Codex: a space sent where the box breaks after a slash (`docs/guide`)", "codex", "open the docs/ guide today ok",
+      { prePaste: codex("idle"), afterPaste: codexStagedRows(["open the docs/", "guide today ok"]), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true }, false],
+    ["RS1-5 Codex: a space sent where the box breaks between ideographs", "codex", "please review 日本語 テキスト now",
+      { prePaste: codex("idle"), afterPaste: codexStagedRows(["please review 日本語", "テキスト now"]), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "ambiguous", after: "empty", sameProcess: true }, false],
+    ["RS1-6 Codex: a hard line break after a hyphen, the next word would have fit before it: verified", "codex",
+      "the long first row of this message self-\nreview now",
+      { prePaste: codex("idle"), afterPaste: codexStagedRows(["the long first row of this message", "self-", "review now"]), afterEnter: codex("after-enter-0.4s.J") },
+      null, { seat: "idle", before: "exact", after: "empty", sameProcess: true }, true],
   ];
 
   describe.each(rows)("%s", (_id, runtime, text, frames, off, box, on) => {

@@ -818,3 +818,110 @@ describe("review round 1, change 3: a blank Claude status slot is idle only unde
     expect(readSeatBeforePaste(editLine(claude("idle-fresh-suggestion"), (line) => line.startsWith("▝▜"), "  some other row"), "claude-code")).toBe("unknown");
   });
 });
+
+describe("repair round 1 (review-safety-1): a row break counts as a space only where the box's text must have whitespace", () => {
+  // Edits: the box rows of a real staged frame replaced by `rows` (continuation rows drawn two cells in, as both TUIs
+  // draw them). Claude: staged-wrapped.raw's three rows; Codex: staged-short.J's one row.
+  const claudeRows = (rows: string[]) => {
+    const lines = claude("staged-wrapped.raw").split("\n");
+    const at = lines.findIndex(claudeBoxRow);
+    lines.splice(at, 3, `❯ ${rows[0]}`, ...rows.slice(1).map((row) => `  ${row}`));
+    return lines.join("\n");
+  };
+  const codexRows = (rows: string[]) => editLine(codex("staged-short.J"), codexBoxRow, [`› ${rows[0]}`, ...rows.slice(1).map((row) => `  ${row}`)]);
+  const both = [["claude-code", claudeRows], ["codex", codexRows]] as const;
+
+  // S1. A 24-cell box: row 0 is 24 cells of NFD text (e + U+0301 is one cell and two code points, so 44 code
+  // points), rows 1-2 one 28-letter word split at 24 cells. Counted in code points, row 0 made the box look 44 wide.
+  const nfd = "é".repeat(10);
+  it.each(both)("%s: combining marks do not widen the box, so a word split because it is wider than a row is not a space", (runtime, build) => {
+    const frame = build([`${nfd} ${nfd} ok`, "abcdefghijklmnopqrstuvwx", "yz12"]);
+    expect(readInputBox(frame, runtime, `${nfd} ${nfd} ok abcdefghijklmnopqrstuvwxyz12`)).toBe("ambiguous");
+    expect(readInputBox(frame, runtime, `${nfd} ${nfd} ok abcdefghijklmnopqrstuvwx yz12`)).toBe("ambiguous");
+    // Control: the same rows in plain ASCII.
+    const plain = build([`${"e".repeat(10)} ${"e".repeat(10)} ok`, "abcdefghijklmnopqrstuvwx", "yz12"]);
+    expect(readInputBox(plain, runtime, `${"e".repeat(10)} ${"e".repeat(10)} ok abcdefghijklmnopqrstuvwx yz12`)).toBe("ambiguous");
+  });
+
+  it.each(both)("%s: a ZWJ emoji sequence (7 code points, 2 cells) does not widen the box either", (runtime, build) => {
+    const family = "\u{1F468}‍\u{1F469}‍\u{1F467}‍\u{1F466}";
+    const frame = build([`${family} ${family} ${family} ok`, "abcdefghijk", "lm"]);
+    expect(readInputBox(frame, runtime, `${family} ${family} ${family} ok abcdefghijk lm`)).toBe("ambiguous");
+  });
+
+  // S2. Codex 0.160.0 also breaks rows with no space drawn: after a hyphen or a slash, between ideographs.
+  it.each([
+    ["after a hyphen", ["please run the self-", "review checklist"], "please run the self- review checklist"],
+    ["after a slash", ["open the docs/", "guide today ok"], "open the docs/ guide today ok"],
+    ["between ideographs", ["please review 日本語", "テキスト now"], "please review 日本語 テキスト now"],
+  ])("codex: a break %s may be no space at all, so a space there is ambiguous", (_name, rows, sent) => {
+    expect(readInputBox(codexRows(rows), "codex", sent)).toBe("ambiguous");
+    // The box's own text (no space at the break) is ambiguous too, as before.
+    expect(readInputBox(codexRows(rows), "codex", sent.replace(`${rows[0]} `, rows[0]!))).toBe("ambiguous");
+  });
+
+  it.each(both)("%s: a break no wrapper makes without a space reads exact when the two words joined fit in a row", (runtime, build) => {
+    // Between two ASCII letters, and before a hyphen or a full stop: no UAX #14 break opportunity, and wrap-ansi
+    // breaks only at spaces. The joined words (`queuenow`, `queue.---`, `sample-rig---`) fit in the first row (27 to
+    // 30 cells), and the next row's first word would not have fit after it.
+    expect(readInputBox(build(["please check your rig's queue", "now and report"]), runtime, "please check your rig's queue now and report")).toBe("exact");
+    expect(readInputBox(build(["please check your rig's queue.", "--- and report"]), runtime, "please check your rig's queue. --- and report")).toBe("exact");
+    expect(readInputBox(build(["please check the sample-rig", "--- and report"]), runtime, "please check the sample-rig --- and report")).toBe("exact");
+  });
+
+  it.each(both)("%s: a hard line break the next word would have fit before reads exact, whatever the characters", (runtime, build) => {
+    // `self-` then `review`: a break a wrapper may make, but `review` would have fit after `self-` in a 34-cell row,
+    // so both greedy wrappers would have kept it there: the box's text has a line break.
+    expect(readInputBox(build(["the long first row of this message", "self-", "review now"]), runtime,
+      "the long first row of this message self- review now")).toBe("exact");
+    // The drawn row is measured with its indentation: 12 spaces of the text's own indentation leave no room.
+    expect(readInputBox(build(["0123456789 abcdefgh", `${" ".repeat(12)}ab-`, "cd"]), runtime, "0123456789 abcdefgh ab- cd")).toBe("ambiguous");
+  });
+
+  it.each(both)("%s: the joined words must fit within the widest row's cells, the equality included", (runtime, build) => {
+    // The widest row is 8 cells. `cdefg` + `hij` is 8 cells: exact. `cdefg` + `hijk` is 9: ambiguous. The drawn rows'
+    // indentation (two cells on continuation rows) does not widen the box.
+    expect(readInputBox(build(["ab cdefg", "hij"]), runtime, "ab cdefg hij")).toBe("exact");
+    expect(readInputBox(build(["ab cdefg", "hijk"]), runtime, "ab cdefg hijk")).toBe("ambiguous");
+  });
+
+  it.each(both)("%s: a no-break space does not end a word, so it does not shorten the joined words", (runtime, build) => {
+    // `aaaa\u00a0bbbbbcc` is one word to both wrappers (12 cells), split because it is wider than a row; the box is at
+    // least 9 cells wide. Split at the no-break space, the joined words `bbbbbcc` would fit.
+    expect(readInputBox(build(["aaaa\u00a0bbbbb", "cc"]), runtime, "aaaa bbbbb cc")).toBe("ambiguous");
+  });
+
+  it.each(both)("%s: a zero-width no-break space (U+FEFF), which compares as a space, does not widen the box", (runtime, build) => {
+    // Row 0 draws 9 cells (`ab`, `cd`, `ef`, a space, `gh`); counted as compared (`ab cd ef gh`), it would be 11, and
+    // `gh` + `ijklmnop` (10 cells) would fit.
+    expect(readInputBox(build(["ab\ufeffcd\ufeffef gh", "ijklmnop"]), runtime, "ab cd ef gh ijklmnop")).toBe("ambiguous");
+  });
+
+  it.each(both)("%s: letters are compared as they are: a case difference is other text", (runtime, build) => {
+    expect(readInputBox(build(["Now here"]), runtime, "now here")).toBe("other");
+    expect(readInputBox(build(["now here"]), runtime, "now Here")).toBe("other");
+  });
+});
+
+describe("repair round 1 (review-safety-1): versions are compared whole, and the fresh banner's last row exactly", () => {
+  it.each(["2.1.296-rc1", "2.1.2960", "2.1.296.1"])("claude: a banner naming %s is another version", (version) => {
+    const banner = (frame: string) => editLine(frame, (line) => line.includes("Claude Code v2.1.296"), ` ▐▛███▛█   Claude Code v${version}`);
+    expect(readSeatBeforePaste(banner(claude("idle-fresh-suggestion")), "claude-code")).toBe("unknown");
+    expect(readInputBox(banner(claude("staged-short.raw")), "claude-code", texts.short)).toBe("unrecognized");
+  });
+
+  it.each(["0.160.0-alpha.2", "0.160.00", "0.160.0+dev"])("codex: a session header naming %s is another version", (version) => {
+    const header = (frame: string) => editLine(frame, (line) => line.includes(">_ OpenAI Codex"), `  >_ OpenAI Codex (v${version})`);
+    expect(readSeatBeforePaste(header(codex("after-enter-15s.J")), "codex")).toBe("unknown");
+    expect(readInputBox(header(codex("staged-short.J")), "codex", texts.short)).toBe("unrecognized");
+  });
+
+  it.each([
+    ["no path after the logo foot", " ▝▝   ▝▝   workspace1"],
+    ["the logo foot drawn narrower", " ▝▝ ▝▝ ~/workspace1/capture/composer-demo/work"],
+    ["only the first half of the logo foot", " ▝▝   ~/workspace1/capture/composer-demo/work"],
+  ])("claude: a fresh banner whose last row is edited (%s) is not the fresh session", (_name, row) => {
+    const frame = editLine(claude("idle-fresh-suggestion"), (line) => line.startsWith(" ▝▝"), row);
+    expect(readSeatBeforePaste(frame, "claude-code")).toBe("unknown");
+  });
+});
