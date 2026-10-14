@@ -272,7 +272,20 @@ determined (unknown / missing / stale telemetry) the send PROCEEDS with an
 advisory note — telemetry is advisory, not authority over whether agents can
 communicate. Use --wait-for-idle to send only after explicit idle evidence. Use
 --verify to confirm the message appeared in the pane only; it is not agent
-acknowledgement.
+acknowledgement. With transport.verify_input_box on, a Claude Code or Codex send
+reads verified only when the seat was proven idle before the paste (its screen
+matched a known idle layout of Claude Code 2.1.296 or Codex 0.160.0) and its
+input box held the exact text before Enter and was empty after it: the box was
+cleared, normally by that Enter (a clear by anything else at that moment, or a
+text the agent runs as a command, looks the same). A Claude Code seat OpenRig
+launched counts as idle in any posture it launches, fresh or after its turns,
+when the row above its empty box is blank or the last turn's completion row
+("✻ Cooked for 9s · done 5:24 PM", time of day today); anything else there reads
+unconfirmed. On Claude Code only a text shown inline in the box can verify: a
+multi-line text, including every enveloped send and queue wake, collapses to a
+paste label and reads unconfirmed. A send to a busy seat, or to a seat whose
+screen is not a known idle layout, always reads unconfirmed; a turn that starts
+in the ~200 ms before Enter is caught only when the screen shows it.
 
 A mid-task/busy target now sends-with-advisory by default (busy is not a block);
 --force is a back-compat no-op and never bypasses the interactive-prompt/permission
@@ -555,7 +568,10 @@ agent@rig@host is sugar for --host when the suffix is a REGISTERED host id
           const verified = res.data["verified"] as boolean | undefined;
           console.log(`Verified: ${verified ? "yes" : "no"}`);
           const outcome = res.data["outcome"] as string | undefined;
-          if (outcome === "delivered") {
+          const inputBoxLine = inputBoxDeliveryLine(outcome, res.data["inputBox"], session);
+          if (inputBoxLine) {
+            console.log(inputBoxLine);
+          } else if (outcome === "delivered") {
             console.log("Delivery: delivered (message landed; render confirmed)");
           } else if (outcome === "rendered-unconfirmed") {
             console.log(`Delivery: rendered-unconfirmed (landed; pane re-render not confirmed - confirm with: rig capture ${session})`);
@@ -636,6 +652,37 @@ async function classifyDeliveryEffect(
   return recheck.state === "staged"
     ? { checked: true, state: "staged", remedy: "submitted-still-staged" }
     : { checked: true, state: "staged", remedy: "submitted-cleared" };
+}
+
+const SEAT_READING_WORDS: Record<string, string> = {
+  idle: "idle",
+  "not-idle": "not idle (a running turn, a queue, a pending input or a paste hint showed)",
+  unknown: "not a known idle layout",
+};
+
+const INPUT_BOX_READING_WORDS: Record<string, string> = {
+  exact: "the exact text",
+  empty: "empty",
+  queued: "queued or possibly queued (a queued label, or a turn was running)",
+  hidden: "a collapsed paste (text hidden)",
+  other: "other text",
+  unrecognized: "layout not recognized",
+  unavailable: "no capture",
+};
+
+/** The Delivery line for a send verified by its input box (transport.verify_input_box), shared by the local
+ *  and cross-host printers. Null when the result carries no inputBox, so the legacy lines print verbatim. */
+function inputBoxDeliveryLine(outcome: string | undefined, inputBox: unknown, session: string): string | null {
+  if (!inputBox || typeof inputBox !== "object") return null;
+  const box = inputBox as { seat?: unknown; before?: unknown; after?: unknown; sameProcess?: unknown };
+  const words = (reading: unknown) => INPUT_BOX_READING_WORDS[String(reading)] ?? String(reading);
+  if (outcome === "delivered") {
+    return "Delivery: delivered (seat idle before the paste; input box: the exact text before Enter, empty after it, same pane process; not agent acknowledgement)";
+  }
+  if (outcome !== "rendered-unconfirmed") return null;
+  const paneProcess = box.sameProcess === true ? "" : "; pane process changed or unknown";
+  const seat = box.seat === undefined ? "" : `seat before the paste: ${SEAT_READING_WORDS[String(box.seat)] ?? String(box.seat)}; `;
+  return `Delivery: rendered-unconfirmed (${seat}input box before Enter: ${words(box.before)}; after Enter: ${words(box.after)}${paneProcess}; not a failure - confirm with: rig capture ${session})`;
 }
 
 /** Renders an EffectCheck on the human surface — shared wording across the
@@ -909,7 +956,10 @@ async function runHttpHostSend(
     const verified = data["verified"] as boolean | undefined;
     console.log(`Verified: ${verified ? "yes" : "no"}`);
     const outcome = data["outcome"] as string | undefined;
-    if (outcome === "delivered") {
+    const inputBoxLine = inputBoxDeliveryLine(outcome, data["inputBox"], session);
+    if (inputBoxLine) {
+      console.log(inputBoxLine);
+    } else if (outcome === "delivered") {
       console.log("Delivery: delivered (message landed; render confirmed)");
     } else if (outcome === "rendered-unconfirmed") {
       console.log(`Delivery: rendered-unconfirmed (landed; pane re-render not confirmed - confirm with: rig capture ${session})`);

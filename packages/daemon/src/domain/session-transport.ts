@@ -1,6 +1,6 @@
 import { CODEX_TURN_STATUS_PATTERN } from "./codex-pane-patterns.js";
 import { randomUUID } from "node:crypto";
-import { inspectStartupStagedText, startupSubmissionEvidence, type StartupSubmissionEvidence } from "./startup-submission-evidence.js";
+import { COLLAPSED_PASTE, composerRegion, inspectStartupStagedText, QUEUED_PLACEHOLDER, startupSubmissionEvidence, type StartupSubmissionEvidence } from "./startup-submission-evidence.js";
 import {
   composerNumberedChoicePattern,
   composerPromptClassForRuntime,
@@ -43,6 +43,10 @@ import { hashSentText, type CaptureObserverSink, type CaptureSlot, type Observat
 // window comfortably spans one inter-tool gap (so a mid-turn reading stays trusted) while refusing to
 // authorize a send from a reading tens of seconds old. (EXA: agtx#14, daintree#3938.)
 const SEND_READINESS_FRESHNESS_MS = 15_000;
+
+// transport.verify_input_box: each extra input-box read gives up after this long and reads `unavailable`.
+// It reports only, so a late read never holds Enter longer than this.
+const INPUT_BOX_READ_DEADLINE_MS = 500;
 
 // Mid-work detection patterns (cheap heuristics)
 const MID_WORK_PATTERNS = [
@@ -896,6 +900,301 @@ function promptAnswerStaged(pane: string | null, answer: string, runtime: string
   return end > inputIndex && lines.slice(inputIndex, end).join("\n").trimStart().slice(1).trim() === answer.trim();
 }
 
+// Codex 0.160 input box: the last prompt line plus indented continuation rows, one blank row, then a footer
+// of at most two rows: the `<model> · <~ or /path>` status line, optionally followed by one known hint row.
+const CODEX_STATUS_LINE = /^ {2}[^\s·][^·]* · [~/]/;
+const CODEX_HINT_ROW = /(?:^|\s)\? for shortcuts(?:\s|$)|⚠ \d+ warnings? · f2 to view\s*$/;
+// Codex shows a long paste as this label until it is submitted. Matched on the normalized body.
+const CODEX_COLLAPSED_PASTE = /^\[PastedContent\d+chars\]$/;
+
+/** The current Codex input box: its normalized text ("" when empty) and where its prompt row is, or null when
+ *  the layout is not the recognized one (another footer, a selector, no blank separator, an older TUI). */
+function codexInputBox(pane: string): { text: string; lines: string[]; inputAt: number } | null {
+  const lines = pane.split("\n");
+  let last = lines.length - 1;
+  while (last >= 0 && !lines[last]!.trim()) last--;
+  let footerStart = last;
+  while (footerStart > 0 && lines[footerStart - 1]!.trim()) footerStart--;
+  const footer = lines.slice(footerStart, last + 1);
+  if (last < 0 || footer.length > 2 || !CODEX_STATUS_LINE.test(footer[0]!)
+    || !footer.slice(1).every((row) => CODEX_HINT_ROW.test(row))) return null;
+  // promptAnswerStaged also ends a Codex input at a blank row.
+  const separator = footerStart - 1;
+  if (separator < 1 || lines[separator]!.trim()) return null;
+  const promptClass = composerPromptClassForRuntime("codex");
+  const inputAt = findComposerInputLineIndex(lines.slice(0, separator), promptClass);
+  if (inputAt < 0 || composerNumberedChoicePattern(promptClass).test(lines[inputAt]!.trimStart())) return null;
+  const rows = lines.slice(inputAt, separator);
+  // Only indented continuation rows belong to the input; anything else is not an input box.
+  if (rows.slice(1).some((row) => row.trim() && !/^\s/.test(row))) return null;
+  if (CODEX_EMPTY_COMPOSER_PATTERN.test(rows[0]!.trimStart()) && rows.slice(1).every((row) => !row.trim())) {
+    return { text: "", lines, inputAt };
+  }
+  return { text: rows.join("\n").trimStart().slice(1).replace(/\s+/g, ""), lines, inputAt };
+}
+
+/** The row of Codex's running-turn status (`• Working (… esc to interrupt)`) above its input box, or -1. */
+function codexTurnStatusAt(box: { lines: string[]; inputAt: number }): number {
+  for (let i = box.inputAt - 1; i >= 0; i--) if (CODEX_TURN_STATUS_PATTERN.test(box.lines[i]!)) return i;
+  return -1;
+}
+
+/** Whether a Claude Code frame shows a running turn: `esc to interrupt` in the footer under its input box, or a
+ *  live status row above the box (timer-less rows included): in the two rows above the box's opening rule, where
+ *  Claude Code 2.1.296 draws its status row over a one-row margin whatever the box's height, or as
+ *  `findClaudeComposer` reads it above a one-row box. Claude Code queues a message submitted during a turn, and it
+ *  labels the queue only while a per-user hint counter is low, so an unlabelled queued message leaves the same
+ *  empty box as a submit. With a statusLine configured (OpenRig installs one on every seat) and while the box holds
+ *  text, the footer never draws `esc to interrupt`, so the status row is the running signal. */
+function claudeTurnRunning(pane: string): boolean {
+  const { markerLine, closingRuleLine } = composerRegion(pane, "claude-code");
+  if (closingRuleLine === null || markerLine === null) return false;
+  const lines = pane.split("\n");
+  if (lines.slice(closingRuleLine).some((row) => /esc to interrupt/.test(row))) return true;
+  // markerLine is 1-based: the box's first row is lines[markerLine - 1] and its opening rule the row above it.
+  const statusSlot = lines.slice(Math.max(0, markerLine - 4), Math.max(0, markerLine - 2)).map((row) => row.trim());
+  if (statusSlot.some((row) => CLAUDE_LIVE_STATUS_PATTERN.test(row) || CLAUDE_TIMERLESS_STATUS_PATTERN.test(row))) return true;
+  return findClaudeComposer(pane, { timerlessStatusIsLive: true })?.liveStatus != null;
+}
+
+// Claude's faint `Try "…"` suggestion in an empty box. The capture is unstyled, so it is read as other text and
+// never as the sent text, even when the text is the suggestion itself.
+const CLAUDE_TRY_SUGGESTION = /^Try"[^"]*"$/;
+
+// Codex 0.160 lists messages waiting for a running turn above its input box under one of these headers, with
+// `↳ <text>` rows (tui/src/bottom_pane/pending_input_preview.rs). Like Claude's queued label, such a row is generic:
+// it says a message waits, not which one.
+const CODEX_PENDING_INPUT_HEADER = /^• (?:Messages to be submitted (?:after next tool call|at end of turn)|Queued follow-up inputs)\b/;
+const CODEX_PENDING_INPUT_ROW = new RegExp(`${CODEX_PENDING_INPUT_HEADER.source}|^↳ `);
+const BRAILLE_SPINNER = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/;
+
+/** What the seat showed in the capture taken before the paste, with transport.verify_input_box on: `idle` only
+ *  when the frame has one of the idle shapes below; `not-idle` when any row of it is a running, streaming,
+ *  queued, pending-input or paste-hint row; `unknown` for anything else, including no capture. Only `idle` lets a
+ *  send read verified, so a seat whose running turn hides its signals reads unconfirmed. */
+export type SeatReading = "idle" | "not-idle" | "unknown";
+
+// Rows that rule out an idle seat wherever they are in the capture (compared trimmed). A transcript row that
+// happens to match also reads not-idle, which only leaves the send unconfirmed.
+const SEAT_NOT_IDLE_ROWS: Record<"claude-code" | "codex", RegExp[]> = {
+  "claude-code": [CLAUDE_LIVE_STATUS_PATTERN, CLAUDE_TIMERLESS_STATUS_PATTERN, /esc to interrupt/, /paste again to expand/,
+    /Press up to edit queued messages/, BRAILLE_SPINNER],
+  codex: [CODEX_TURN_STATUS_PATTERN, /esc to interrupt/, CODEX_PENDING_INPUT_ROW, BRAILLE_SPINNER],
+};
+
+type RowShape = (lines: string[], at: number) => boolean;
+
+// Codex 0.160's completion row (tui/src/history_cell/separators.rs, FinalMessageSeparator::label at rust-v0.160.0):
+// `Worked for <elapsed>`, then ` • ` and the completion time (an optional date for another day, then the host's
+// 12- or 24-hour clock, tui/src/clock_format.rs), then optional runtime metrics, each after ` • `, in source order.
+// A live completion always has both the elapsed time and the time (chatwidget/completion.rs), so both are required.
+// `<1s`, `{s}s`, `{m}m {s}s` or `{h}h {m}m {s}s`, with minutes and seconds below 60 and no leading zeros.
+const CODEX_SIXTY = "(?:[0-9]|[1-5][0-9])";
+const CODEX_NONZERO_SIXTY = "(?:[1-9]|[1-5][0-9])";
+const CODEX_ELAPSED = `(?:<1s|${CODEX_NONZERO_SIXTY}s|${CODEX_NONZERO_SIXTY}m ${CODEX_SIXTY}s|[1-9][0-9]*h ${CODEX_SIXTY}m ${CODEX_SIXTY}s)`;
+// `%b %-d at ` (this year) or `%b %-d, %Y at ` (another year); nothing for today.
+const CODEX_DATE = "(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?:[1-9]|[12][0-9]|3[01])(?:, [0-9]{4})? at )?";
+// `%-I:%M %p` (TwelveHour) or `%H:%M` (TwentyFourHour).
+const CODEX_CLOCK = "(?:(?:[1-9]|1[0-2]):[0-5][0-9] [AP]M|(?:[01][0-9]|2[0-3]):[0-5][0-9])";
+// runtime_metrics_label: format_duration_ms gives `<n>.<d>s` from one second, `<n>ms` below it.
+const CODEX_MS = "(?:[0-9]+\\.[0-9]s|[0-9]+ms)";
+const CODEX_TTFT_TBT = `(?:${CODEX_MS} \\(iapi\\)(?: ${CODEX_MS} \\(service\\))?|${CODEX_MS} \\(service\\))`;
+// A metric is shown only for a count above zero; pluralize() gives the singular for exactly one.
+const CODEX_MANY = "(?:[2-9]|[1-9][0-9]+)";
+const CODEX_COUNT = "[1-9][0-9]*";
+const CODEX_METRICS = [
+  `Local tools: (?:1 call|${CODEX_MANY} calls) \\(${CODEX_MS}\\)`,
+  `Inference: (?:1 call|${CODEX_MANY} calls) \\(${CODEX_MS}\\)`,
+  `WebSocket: ${CODEX_COUNT} events send \\(${CODEX_MS}\\)`,
+  `(?:Stream: 1 event|Streams: ${CODEX_MANY} events) \\(${CODEX_MS}\\)`,
+  `${CODEX_COUNT} events received \\(${CODEX_MS}\\)`,
+  `Responses API overhead: ${CODEX_MS}`,
+  `Responses API inference: ${CODEX_MS}`,
+  `TTFT: ${CODEX_TTFT_TBT}`,
+  `TBT: ${CODEX_TTFT_TBT}`,
+].map((metric) => `(?: • ${metric})?`).join("");
+const CODEX_COMPLETION_ROW = new RegExp(`^ {2}Worked for ${CODEX_ELAPSED} • ${CODEX_DATE}${CODEX_CLOCK}${CODEX_METRICS}$`);
+
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Claude Code 2.1.296's completion row, which ends a finished turn in the transcript (the bundle's turn-duration
+// row): the `✻` glyph in a two-cell column at column 0, then `<verb> for <duration> · done <time>`. The verb is one
+// of the bundle's past-tense list, picked from the turn's id. The duration is the bundle's duration format:
+// `<s>s` below a minute (`0.0s` below 1 ms), `<m>m <s>s`, `<h>h <m>m <s>s`, `<d>d <h>h <m>m`, without leading
+// zeros. The time is the clock of a turn that finished today in the en-US forms of the bundle's time-format
+// presets: `auto` (en-US) and `12-hour` (`5:24 PM`), `24-hour` (`17:24`, `09:05`), `24-hour-utc` (`17:24Z`); real
+// frames of OpenRig-launched seats show the 12-hour form. Anything after the time
+// (a still-running note, hidden-message or budget notes), a row without `· done`, another locale, a custom
+// pattern or the weekday and date of an earlier day is not on this list.
+const CLAUDE_COMPLETION_VERBS = ["Baked", "Brewed", "Churned", "Cogitated", "Cooked", "Crunched", "Saut\u00e9ed", "Worked"];
+const CLAUDE_SIXTY = "(?:[0-9]|[1-5][0-9])";
+const CLAUDE_NONZERO_SIXTY = "(?:[1-9]|[1-5][0-9])";
+const CLAUDE_HOURS = "(?:[0-9]|1[0-9]|2[0-3])";
+const CLAUDE_NONZERO_HOURS = "(?:[1-9]|1[0-9]|2[0-3])";
+const CLAUDE_DURATION = `(?:0\\.0s|${CLAUDE_SIXTY}s|${CLAUDE_NONZERO_SIXTY}m ${CLAUDE_SIXTY}s`
+  + `|${CLAUDE_NONZERO_HOURS}h ${CLAUDE_SIXTY}m ${CLAUDE_SIXTY}s|[1-9][0-9]*d ${CLAUDE_HOURS}h ${CLAUDE_SIXTY}m)`;
+const CLAUDE_CLOCK = "(?:(?:[1-9]|1[0-2]):[0-5][0-9] [AP]M|(?:[01][0-9]|2[0-3]):[0-5][0-9]Z?)";
+const CLAUDE_COMPLETION_ROW = new RegExp(`^✻ (?:${CLAUDE_COMPLETION_VERBS.join("|")}) for ${CLAUDE_DURATION} · done ${CLAUDE_CLOCK}$`);
+
+/** The idle allow-list. Each entry comes from real Claude Code 2.1.296 and Codex 0.160.0 frames
+ *  (test/fixtures/input-box, including idle seats OpenRig launched: openrig-seat-*), or, where no frame was captured,
+ *  from the Claude Code 2.1.296 bundle, the Codex 0.160.0 source or OpenRig's own launch code, as each entry says; a
+ *  frame that matches none of them is not proven idle. */
+const SEAT_IDLE_SHAPES: {
+  claude: {
+    openingRules: { plain: RegExp; named: (sessionName: string) => RegExp };
+    footers: Record<"bypassPermissions" | "acceptEdits" | "auto" | "dontAsk" | "plan" | "default", string>;
+    statusLineRows: string[];
+    boxes: RegExp[];
+    notices: string[];
+    statusSlot: RegExp[];
+  };
+  codex: { hints: RegExp[]; above: Record<"finishedTurn" | "freshSession", RowShape> };
+} = {
+  claude: {
+    // The box's opening rule. Plain (the captured frames: a seat started without a name), or carrying this seat's
+    // own session name: OpenRig launches every Claude seat with `--name <session>` (claude-code-adapter.ts), which
+    // Claude Code draws on the box's top border as `─…─ <name> ─`, as wide as the closing rule (2.1.296 bundle:
+    // the prompt-border banner draws the rule, the name padded by one space each side, then one `─`). Real frames
+    // of OpenRig seats from earlier Claude Code versions end it with `──` (session-transport.test.ts,
+    // fixtures/walk-staged-specimen), so one or two are accepted; real 2.1.296 OpenRig seats (openrig-seat-*) draw
+    // one. Any other name, or a truncated one, is unknown.
+    openingRules: {
+      plain: /^─{10,}$/,
+      named: (sessionName: string) => new RegExp(`^─+ ${escapeRegExp(sessionName)} ─{1,2}$`),
+    },
+    // The footer under an empty box when no turn runs, one per permission posture claudePostureFlag can launch
+    // (yolo-mode.ts: --dangerously-skip-permissions, or --permission-mode with any mode Claude Code 2.1.296 offers).
+    // Bypass and accept edits are real (openrig-seat-*; bypass also after-enter-15s.J, idle-fresh-suggestion). The
+    // others are drawn by the 2.1.296 bundle's footer (the mode's symbol and indicator plus ` on`,
+    // ` (shift+tab to cycle)` for every mode but default, then ` · ← for agents` while the box is empty); accept edits
+    // also matches a real 2.1.220 capture (claude-warning-footer-readiness.test.ts). OpenRig's statusLine makes the footer drop its hints
+    // (`? for shortcuts`, `esc to interrupt`), so these rows are the same whether or not a turn runs: the status
+    // slot above the box (`statusSlot` below) is what tells a running turn apart.
+    footers: {
+      bypassPermissions: "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+      acceptEdits: "⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
+      auto: "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+      dontAsk: "⏵⏵ don't ask on (shift+tab to cycle) · ← for agents",
+      plan: "⏸ plan mode on (shift+tab to cycle) · ← for agents",
+      default: "⏸ manual mode on · ← for agents",
+    },
+    // The rows OpenRig's statusLine collector (provisionContextCollector, assets/claude-statusline-context.cjs) draws
+    // between the closing rule and the footer: none. It prints nothing to stdout, and Claude Code 2.1.296 draws no
+    // row for an empty statusLine in the classic renderer OpenRig launches with (CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1).
+    // A statusLine that prints anything (a person's own command) is not on this list.
+    statusLineRows: [],
+    // The one row between the box's two rules: empty (after-enter-15s.J), or the Try suggestion (idle-fresh-suggestion).
+    boxes: [/^❯$/, /^❯\s+Try "[^"]*"$/],
+    // The row just above the opening rule: blank (after-enter-15s.J), the effort row (idle-fresh-suggestion), or a
+    // tmux notice (cleared-without-enter.J, staged-short).
+    notices: ["", "◐ medium · /effort",
+      "tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on' to ~/.tmux.conf for wheel scroll",
+      "tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tracking"],
+    // The status slot, the row above that. Blank (after-enter-15s.J: fullscreen, the box pinned to the bottom of the
+    // screen), or the completion row at column 0 (CLAUDE_COMPLETION_ROW): in the classic renderer OpenRig launches
+    // Claude with, the box follows the transcript, so an idle seat that has finished a turn shows that turn's
+    // completion row there (openrig-seat-*: real OpenRig-launched seats). With OpenRig's statusLine the footer shows
+    // no running signal. A running turn draws its live status row in this slot, but not always: while streamed text
+    // is shown, Claude Code 2.1.296 hides that row and draws nothing in its place, so the slot holds the last streamed
+    // row. The guard is that assistant text never starts at column 0: Claude Code draws it behind a two-cell `● `
+    // column (continuation rows two spaces in), the user's echo after `❯ `, tool output indented, so no transcript
+    // row matches CLAUDE_COMPLETION_ROW. Any other row reads unknown.
+    statusSlot: [/^$/, CLAUDE_COMPLETION_ROW],
+  },
+  codex: {
+    // The hint row under the status line of an empty box (product-path-idle.J, idle).
+    hints: [/^\? for shortcuts$/, /^\? for shortcuts\s+⚠ \d+ warnings? · f2 to view$/],
+    // The last non-blank row above the empty box: the completion row Codex adds when a turn completes
+    // (after-enter-15s.J; its grammar is CODEX_COMPLETION_ROW above), or the greeting under the session header
+    // before any turn (idle, product-path-idle.J, cleared-without-enter.J). A running or streaming turn draws rows
+    // below either.
+    above: {
+      finishedTurn: (lines: string[], at: number) => CODEX_COMPLETION_ROW.test(lines[at] ?? ""),
+      freshSession: (lines: string[], at: number) => {
+        if (!/^ {2}\S/.test(lines[at] ?? "")) return false;
+        let i = at - 1;
+        while (i >= 0 && !lines[i]!.trim()) i--;
+        return i >= 2 && i < at - 1 && /^ {2}permissions: \S/.test(lines[i]!) && /^ {5}[~/]/.test(lines[i - 1]!)
+          && /^ {2}>_ OpenAI Codex \(v0\.160\.0\)$/.test(lines[i - 2]!);
+      },
+    },
+  },
+};
+
+function claudeSeatIdle(lines: string[], sessionName?: string): boolean {
+  const idle = SEAT_IDLE_SHAPES.claude;
+  let footer = lines.length - 1;
+  while (footer >= 0 && !lines[footer]!.trim()) footer--;
+  const closing = footer - 1 - idle.statusLineRows.length;
+  if (closing < 4) return false;
+  const width = (row: string) => [...row].length;
+  const plainRule = (row: string) => idle.openingRules.plain.test(row);
+  const openingRule = (row: string) => plainRule(row)
+    || (!!sessionName && idle.openingRules.named(sessionName).test(row) && width(row) === width(lines[closing]!));
+  return Object.values(idle.footers).includes(lines[footer]!.trim())
+    && idle.statusLineRows.every((row, i) => lines[closing + 1 + i]!.trim() === row) && plainRule(lines[closing]!)
+    && idle.boxes.some((box) => box.test(lines[closing - 1]!)) && openingRule(lines[closing - 2]!)
+    && idle.notices.includes(lines[closing - 3]!.trim()) && idle.statusSlot.some((row) => row.test(lines[closing - 4]!));
+}
+
+function codexSeatIdle(pane: string): boolean {
+  const box = codexInputBox(pane);
+  if (box === null || box.text) return false;
+  const lines = box.lines.map((row) => row.trimEnd());
+  let hint = lines.length - 1;
+  while (hint >= 0 && !lines[hint]!.trim()) hint--;
+  if (!SEAT_IDLE_SHAPES.codex.hints.some((row) => row.test(lines[hint]!.trim()))) return false;
+  let above = box.inputAt - 1;
+  while (above >= 0 && !lines[above]!.trim()) above--;
+  return Object.values(SEAT_IDLE_SHAPES.codex.above).some((shape) => shape(lines, above));
+}
+
+/** The seat before the paste (see SeatReading), read from the capture the transport already takes before it.
+ *  `sessionName` is the seat's own session name, which a Claude Code seat launched by OpenRig draws on its box. */
+export function readSeatBeforePaste(pane: string | null, runtime: "claude-code" | "codex", sessionName?: string): SeatReading {
+  if (!pane?.trim()) return "unknown";
+  const lines = pane.split("\n").map((row) => row.trimEnd());
+  if (lines.some((row) => SEAT_NOT_IDLE_ROWS[runtime].some((pattern) => pattern.test(row.trim())))) return "not-idle";
+  return (runtime === "codex" ? codexSeatIdle(pane) : claudeSeatIdle(lines, sessionName)) ? "idle" : "unknown";
+}
+
+/** What a Claude Code or Codex input box shows, read from the input box only (never the transcript), with
+ *  whitespace ignored. Labels and placeholders (Claude's queued label and Try suggestion, collapsed pastes,
+ *  Codex's empty-box placeholder) are checked before the sent text, so none of them can read as `exact`.
+ *
+ *  An empty box also reads `queued` where the frames say the message may wait behind a turn: Codex's
+ *  pending-input rows above the box, rows between Codex's running-turn status row and the box, or
+ *  `beforeEnter` (the frame read just before Enter) showing a running turn (Codex's status row, or
+ *  `claudeTurnRunning`). These readings decide the verdict: verified needs `empty` after Enter. For a seat that
+ *  was not idle before the paste they only say why the send is unconfirmed (readSeatBeforePaste already rules it
+ *  out), but for a seat that was idle they are the only check that rejects a message queued behind a turn that
+ *  started after the pre-paste capture and shows in the frame read before Enter.
+ *  Used only to report a send with transport.verify_input_box on. */
+export function readInputBox(pane: string | null, runtime: "claude-code" | "codex", text: string, beforeEnter?: string | null): InputBoxReading {
+  if (!pane?.trim()) return "unavailable";
+  if (runtime === "codex") {
+    const box = codexInputBox(pane);
+    if (box === null) return "unrecognized";
+    if (!box.text) {
+      const before = beforeEnter ? codexInputBox(beforeEnter) : null;
+      const status = codexTurnStatusAt(box);
+      const rowsBehindTurn = status >= 0 && box.lines.slice(status + 1, box.inputAt).some((row) => row.trim());
+      const pendingInput = box.lines.slice(0, box.inputAt).some((row) => CODEX_PENDING_INPUT_ROW.test(row.trim()));
+      return pendingInput || rowsBehindTurn || (before !== null && codexTurnStatusAt(before) >= 0) ? "queued" : "empty";
+    }
+    if (CODEX_COLLAPSED_PASTE.test(box.text)) return "hidden";
+    return box.text === text.replace(/\s+/g, "") ? "exact" : "other";
+  }
+  const body = composerRegion(pane, runtime).body;
+  if (body === null) return "unrecognized";
+  if (!body) return beforeEnter && claudeTurnRunning(beforeEnter) ? "queued" : "empty";
+  if (body === QUEUED_PLACEHOLDER) return "queued";
+  if (COLLAPSED_PASTE.test(body)) return "hidden";
+  if (CLAUDE_TRY_SUGGESTION.test(body)) return "other";
+  return body === text.replace(/\s+/g, "") ? "exact" : "other";
+}
+
 export interface SendOpts {
   /** Internal managed lifecycle prerequisite; never accepted from HTTP send options. */
   beforeWrite?: () => void;
@@ -996,6 +1295,25 @@ export interface SendResult {
   waitedMs?: number;
   attempts?: number;
   sent?: boolean;
+  /** Present only when transport.verify_input_box applied to this send. */
+  inputBox?: InputBoxEvidence;
+}
+
+/** One reading of a Claude Code or Codex input box: `exact` (the sent text), `empty`, `queued` (Claude's
+ *  queued-messages label, or an empty box while a turn was running, so the message may wait behind it),
+ *  `hidden` (a collapsed paste label), `other` (any other text), `unrecognized` (no recognized input box) or
+ *  `unavailable` (no capture, or none in time). */
+export type InputBoxReading = "exact" | "empty" | "queued" | "hidden" | "other" | "unrecognized" | "unavailable";
+
+/** With transport.verify_input_box on: what the seat showed before the paste, and what a Claude Code or Codex
+ *  input box showed before and after Enter. Reporting only. `verified` is true only for a seat proven idle
+ *  before the paste, then exact, then empty, on the same pane process (`#{pane_pid}`, the pane's root process);
+ *  that means the box was cleared after holding the text, normally by our Enter, never that the model read it. */
+export interface InputBoxEvidence {
+  seat: SeatReading;
+  before: InputBoxReading;
+  after: InputBoxReading;
+  sameProcess: boolean;
 }
 
 export interface CaptureResult {
@@ -1034,6 +1352,8 @@ interface SessionTransportDeps {
   /** S01/S02 P2: optional read-only capture observer. Absent by default (no activation). */
   captureObserver?: CaptureObserverSink;
   listProcesses?: NativeProcessLister;
+  /** transport.verify_input_box, read per verified Claude Code or Codex send. Absent means off. */
+  verifyInputBox?: () => boolean;
 }
 
 interface SessionRow { node_id: string; session_name: string; }
@@ -1058,6 +1378,7 @@ export class SessionTransport {
   private activityEndpointFile: () => { baseUrl: string; token: string } | null;
   private captureObserver?: CaptureObserverSink;
   private listProcesses?: NativeProcessLister;
+  private verifyInputBox?: () => boolean;
 
   constructor(deps: SessionTransportDeps) {
     this.db = deps.db;
@@ -1074,6 +1395,7 @@ export class SessionTransport {
     this.activityEndpointFile = deps.activityEndpointFile ?? (() => null);
     this.captureObserver = deps.captureObserver;
     this.listProcesses = deps.listProcesses;
+    this.verifyInputBox = deps.verifyInputBox;
   }
 
   /** Freeze the registration and binding before asking tmux about this name. */
@@ -1999,6 +2321,11 @@ export class SessionTransport {
       // idle (or running/unknown — now advisory-and-proceed) → proceed to send.
     }
 
+    // transport.verify_input_box: a verified Claude Code or Codex send reports on input-box evidence. The
+    // setting is read only for those sends; everything else keeps today's path.
+    const inputBoxRuntime = opts?.verify && (runtime === "claude-code" || runtime === "codex") && this.inputBoxSettingOn()
+      ? runtime : null;
+
     if (opts?.verify) {
       const captureSeq = observed ? nextCaptureSeq++ : 0;
       try {
@@ -2050,6 +2377,19 @@ export class SessionTransport {
 
     // 4. Wait 200ms (spike-proven delay)
     await this.sleep(200);
+
+    // With transport.verify_input_box on, one bounded read of the input box and its pane process before
+    // Enter. It only reports: nothing here decides whether Enter is sent.
+    // The seat is read from the existing --verify capture taken before the paste (the whole screen); no new read.
+    let boxBefore: { seat: SeatReading; reading: InputBoxReading; pid: number | null; pane: string | null } | null = null;
+    if (inputBoxRuntime && !promptOverride) {
+      const read = await this.readWithinDeadline("session_transport.input_box_capture", () => Promise.all([
+        this.tmuxAdapter.getPanePid(sessionName).catch(() => null),
+        this.tmuxAdapter.capturePaneContent(sessionName, 30).catch(() => null),
+      ]));
+      boxBefore = { seat: readSeatBeforePaste(preVerifyContent, inputBoxRuntime, sessionName),
+        reading: readInputBox(read?.[1] ?? null, inputBoxRuntime, text), pid: read?.[0] ?? null, pane: read?.[1] ?? null };
+    }
 
     if (runtime === "claude-code" && bindingChanged()) return observe(changedRecipient(true));
 
@@ -2109,17 +2449,63 @@ export class SessionTransport {
         const count = envelope ? (pane: string, expected: string) => countEnvelopeOccurrences(pane, expected, promptClass) : countOccurrences;
         const preCount = count(transcript(preVerifyContent), snippet);
         const postCount = count(transcript(content), snippet);
-        const verified = postCount > preCount;
-        return observe({ ok: true, sessionName, ...interaction, verified, outcome: verified ? "delivered" : "rendered-unconfirmed", ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
+        const inputBox = boxBefore && inputBoxRuntime
+          ? await this.inputBoxEvidence(sessionName, sessionMeta, boxBefore, readInputBox(content, inputBoxRuntime, text, boxBefore.pane)) : undefined;
+        // With the setting on, only a seat proven idle before the paste and input-box evidence verify: exact before
+        // Enter, empty after, same process. A not-idle or unknown seat always reads unconfirmed.
+        const verified = inputBoxRuntime
+          ? inputBox?.seat === "idle" && inputBox.before === "exact" && inputBox.after === "empty" && inputBox.sameProcess
+          : postCount > preCount;
+        return observe({ ok: true, sessionName, ...interaction, verified, outcome: verified ? "delivered" : "rendered-unconfirmed", ...(inputBox ? { inputBox } : {}), ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
       } catch {
         if (observed && observed.post.state === "not_reached") {
           observed.post = { state: "unavailable", cause: "capture_error", capturedAt: this.now().toISOString(), captureSeq };
         }
-        return observe({ ok: true, sessionName, ...interaction, verified: false, outcome: "rendered-unconfirmed", ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
+        const inputBox: InputBoxEvidence | undefined = boxBefore
+          ? { seat: boxBefore.seat, before: boxBefore.reading, after: "unavailable", sameProcess: false } : undefined;
+        return observe({ ok: true, sessionName, ...interaction, verified: false, outcome: "rendered-unconfirmed", ...(inputBox ? { inputBox } : {}), ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
       }
     }
 
     return observe({ ok: true, sessionName, ...interaction, ...(sendAdvisory ? { warning: sendAdvisory } : {}), ...(waitMode ? { sent: true, ...waitEvidence } : {}) });
+  }
+
+  private inputBoxSettingOn(): boolean {
+    try { return this.verifyInputBox?.() === true; } catch { return false; }
+  }
+
+  /** One input-box read, timed by the slow-op recorder and raced against the deadline. Null on timeout or
+   *  error; an abandoned read is ignored. A read never decides whether Enter is sent. */
+  private async readWithinDeadline<T>(site: string, read: () => Promise<T>): Promise<T | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const pending = this.runStage(site, read);
+      pending.catch(() => undefined);
+      return await Promise.race([
+        pending,
+        new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), INPUT_BOX_READ_DEADLINE_MS); }),
+      ]);
+    } catch {
+      return null;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /** After the post-Enter capture: the same pane process (pid read before Enter and now) and the same binding. */
+  private async inputBoxEvidence(
+    sessionName: string,
+    meta: { nodeId: string | null; pane: string | null; occupant: string | null },
+    before: { seat: SeatReading; reading: InputBoxReading; pid: number | null },
+    after: InputBoxReading,
+  ): Promise<InputBoxEvidence> {
+    const pid = await this.readWithinDeadline("session_transport.input_box_pane_pid", () => this.tmuxAdapter.getPanePid(sessionName));
+    let sameBinding = false;
+    try {
+      const now = this.getSessionMeta(sessionName);
+      sameBinding = now.nodeId === meta.nodeId && now.pane === meta.pane && now.occupant === meta.occupant;
+    } catch { /* unknown binding is not the same binding */ }
+    return { seat: before.seat, before: before.reading, after, sameProcess: before.pid !== null && pid !== null && pid === before.pid && sameBinding };
   }
 
   private runStage<T>(

@@ -118,15 +118,125 @@ Routes: `packages/daemon/src/routes/{transport,transcripts,ask,chat,whoami}.ts`
    without `-p` (`session-transport.ts:1541`) and Enter is pressed only if the
    whole answer is still staged (`:1562`–`1570`). A successful paste proves
    transport execution, not runtime consumption.
-5. Optional `--verify`: capture the last 30 pane lines before and after the
-   send (after a 500 ms wait, `:1597`) and count the message's first 40
-   characters in each. A higher count after the send reports
-   `outcome: "delivered"`; otherwise the outcome is `rendered-unconfirmed` —
-   text and Enter landed but the capture could not re-confirm the render,
-   which is not a failure at the daemon (`session-transport.ts:700`
-   `verify?`; `:1596` `if (opts?.verify)`; `:1608`
-   `verified = postCount > preCount`). The outcome values are `delivered`,
-   `rendered-unconfirmed`, `failed` and `retained` (`:772`).
+5. Optional `--verify`: capture the last 30 pane lines before the paste and,
+   500 ms after Enter, again, leaving out the current input box (the last
+   prompt line and its continuation, `verificationTranscript`). A send
+   carrying OpenRig's From/To header is matched as the whole message with
+   whitespace normalized (`countEnvelopeOccurrences`); a raw send is matched
+   by its first 40 characters (`verificationSnippet`). More occurrences after
+   the send report `outcome: "delivered"`; otherwise the outcome is
+   `rendered-unconfirmed`: text and Enter landed but the capture could not
+   re-confirm the render, which is not a failure. The outcome values are
+   `delivered`, `rendered-unconfirmed`, `failed` and `retained`.
+   With `transport.verify_input_box` on (off by default), a Claude Code or
+   Codex send is verified only when the seat was proven idle before the paste
+   and the input box shows the message, and is unconfirmed otherwise:
+
+   - **Seat idle before the paste** (`readSeatBeforePaste`). The `--verify`
+     capture taken before the paste (the whole screen) must match an idle
+     allow-list (`SEAT_IDLE_SHAPES`) built from real Claude Code 2.1.296 and
+     Codex 0.160.0 frames and, where no frame was captured, from the Claude
+     Code 2.1.296 bundle, the Codex 0.160.0 source and OpenRig's own launch
+     code. Claude Code: the empty box or its `Try "…"` suggestion between two
+     rules; the opening rule plain, or carrying this seat's own session name
+     the way Claude Code draws `--name` (`─…─ <session> ─`, or `──` as in
+     earlier versions, as wide as the closing rule; OpenRig launches every
+     Claude seat with `--name`); the footer row of the seat's permission
+     posture, one for each mode OpenRig can launch: bypass
+     (`⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents`), accept
+     edits (OpenRig's default), auto, don't ask, plan, and default
+     (`⏸ manual mode on · ← for agents`); no statusLine row between the
+     closing rule and the footer (OpenRig's statusLine collector prints
+     nothing); a blank, effort or tmux-notice row above the box; and above
+     that, in the status slot, a blank row or the completion row of the
+     seat's last turn
+     (`✻ <verb> for <duration> · done <time>` at column 0, matched by the
+     Claude Code 2.1.296 bundle's grammar: one of its eight past-tense verbs,
+     its duration format, and the time of a turn finished today on a 12- or
+     24-hour en-US clock). OpenRig launches Claude in the classic renderer,
+     where the box follows the transcript, so an idle seat that has finished
+     a turn shows that turn's completion row in the slot; real frames of idle
+     seats OpenRig launched show it. A configured statusLine, which OpenRig
+     installs on every Claude seat, makes Claude Code drop the footer's hints,
+     so a running turn draws the same footer row as an idle one, without
+     `esc to interrupt`: the status slot is what tells them apart. A running
+     turn draws its live status row there, but while streamed text is shown
+     Claude Code hides that row, and the slot holds the last streamed row.
+     The guard is then that assistant text never starts at column 0: Claude
+     Code draws it behind its `● ` column, so it cannot match the completion
+     row. Codex: the empty box over its status line and a
+     `? for shortcuts` hint row, with the completion row or the fresh
+     session's greeting as the last row above the box. The completion row is
+     matched by the grammar Codex 0.160.0 prints it with
+     (`Worked for <elapsed> • <time>`, a 12- or 24-hour clock, a date before
+     the time on another day, runtime metrics after it). No row anywhere may
+     be a running, streaming, queued, pending-input or paste-hint row (a live
+     status row, `esc to interrupt`, `paste again to expand`, a queued label,
+     Codex's pending-input headers or `↳` rows, a spinner). Any other frame,
+     including every running, streaming, steer-preview, paste-hint or unknown
+     layout, another seat's name, a statusLine that prints a row, a background
+     shell in the footer, a fullscreen renderer and other versions, reads
+     `seat: not-idle` or `unknown`, and the send reads unconfirmed. This holds
+     when a running turn hides its signal (Codex hides its `• Working` row
+     while it streams; Claude Code shows only `paste again to expand` in its
+     footer for 8 s after a paste, and no `esc to interrupt` under a
+     statusLine). So a send to a busy or unknown seat always reads
+     unconfirmed. Which Claude seats OpenRig launches can verify: an idle
+     Claude Code 2.1.296 seat in any posture OpenRig launches, fresh or after
+     any number of turns, whose status slot is blank or holds its last turn's
+     completion row as above. It reads `unknown` when that row is anything
+     else: a completion row with more after the time (a still-running note,
+     hidden messages, a budget), the weekday or date of a turn that
+     finished on an earlier day, another locale's or a custom time format, an
+     interrupted turn, or a row printed after the turn. And only a text Claude
+     Code shows inline in its box can verify (see the box reading below): a
+     multi-line text, which includes every `rig send` envelope and every
+     queue wake, collapses to a paste label and stays unconfirmed.
+   - **The box held exactly this message before Enter.** One extra capture
+     between the paste and Enter must show exactly the sent text in the input
+     box (whitespace, including Unicode spaces, aside; `readInputBox`). A
+     collapsed paste label, Claude's queued-messages label or `Try "…"`
+     suggestion, or another draft is never the message.
+   - **The box is empty after Enter on the same pane process.** The capture
+     after Enter must show the box empty, with the pane process
+     (`#{pane_pid}`) and the seat's binding unchanged.
+
+   The result's `inputBox: { seat, before, after, sameProcess }` says which
+   reading failed. An empty box reads `queued` instead of `empty` where the
+   frames say the message may wait behind a turn: Codex's pending-input rows
+   or a row under its running-turn status, or a running turn in the frame
+   read before Enter (Codex's `• Working` row; for Claude Code,
+   `esc to interrupt` or a live status row above the box, including above a
+   box of several rows). The verdict uses these readings: verified needs
+   `empty`, so for a seat that was idle before the paste they are the only
+   check that rejects a message queued behind a turn that started after the
+   pre-paste capture.
+   It reports only: the seat is read from the capture `--verify` already
+   takes, the extra reads are bounded at 500 ms each and none of them decides
+   whether Enter is sent, though a slow pre-Enter read delays Enter by up to
+   that bound. Limits: the seat is read once, before the paste, and Enter
+   follows about 200 ms later. A turn can start in that window, from a person
+   typing in the pane or from the agent itself (Claude Code and Codex start
+   turns on their own when a background task finishes, a scheduled wake-up
+   fires or a teammate's message arrives). Such a turn is caught only when
+   the frame read before Enter shows it; a Codex turn already streaming
+   there hides its `• Working` row and is not seen. An empty box after an
+   exact one means the box was cleared, normally by our Enter; a clear by
+   something else at that moment (a person's C-c) looks the same, and so
+   does a text the TUI runs as a command (a Claude Code `/command`, a Codex
+   `!command`), which clears the box without the model reading a message.
+   `#{pane_pid}` is the pane's root process
+   (the shell for most launches), so an agent restarted under the same shell
+   between the reads is caught only when the binding records a new occupant.
+   An empty box means the TUI took the text, not that the model read it.
+   Consumers see only the report: a queue wake that reads unconfirmed records
+   `delivered-ack-pending` as today, so with the setting on a Claude Code wake
+   (its multi-line envelope shows as a collapsed paste label) or a wake to a
+   busy or not-proven-idle Claude Code or Codex seat enters the wake ladder's
+   existing unconfirmed path: after
+   `queue.wake_unconfirmed_window_minutes` (default 30) with no pickup, the
+   baton escalates to the orchestrator rung and then the operator rung.
+   Nothing in the send path retries or re-sends.
 6. CLI `--verify` goes further (`packages/cli/src/commands/send.ts:596`): it
    looks for the text still unsubmitted at the prompt, makes one guarded
    Enter-only retry through the daemon's `submitOnly` path
@@ -297,10 +407,14 @@ The intentional limits in this layer (numbered as in
 - Note 5 — transcript search prefers `rg` but falls back to `grep -E`;
   search quality/performance varies by backend.
 - Note 6 — chat is rig-scoped only: no cross-rig channels or DMs.
-- Note 7 — `--verify` on `rig send` checks the pane for the message by
-  comparing snippet counts before and after the send (§3 step 4); when the
-  capture cannot re-confirm the render it reports `rendered-unconfirmed`,
-  not a failure.
+- Note 7 — `--verify` on `rig send` reports what the pane shows, not agent
+  acknowledgement. By default it compares the message (whole for a
+  header-carrying send, the first 40 characters for a raw one) in captures
+  before and after the send, leaving out the current input box; with
+  `transport.verify_input_box` on, Claude Code and Codex sends are verified
+  only for a seat proven idle before the paste and on input-box evidence; a
+  busy or unknown seat reads unconfirmed (§3 step 5). When it cannot confirm,
+  it reports `rendered-unconfirmed`, not a failure.
 
 (The full compatibility-notes list lives in
 `architecture-rules-and-event-system.md`.)
