@@ -151,11 +151,13 @@ that gateway side too. For the pane side, read:
 
 A claim isn't proof that the body was read or that the terminal render was
 verified, and closing a task isn't a new delivery receipt: a claimed task that
-is later closed still reads `claimed`. `rig queue create --verify` says so for
-a claimed item: "Terminal receipt unconfirmed, but the seat has claimed the
-item (claimed)." and "A claim shows the seat took the item; it does not prove
-the body was read." (`terminalDeliveryResult`,
-`packages/cli/src/commands/queue.ts`).
+is later closed still reads `claimed` when its stored result was unconfirmed
+(`delivered-ack-pending` or `indeterminate:…`); a `verified` or `failed:…`
+result reads as stored. For such an unconfirmed, claimed item,
+`rig queue create --verify` says "Terminal receipt unconfirmed, but the seat
+has claimed the item (claimed)."; for any claimed item it adds "A claim shows
+the seat took the item; it does not prove the body was read."
+(`terminalDeliveryResult`, `packages/cli/src/commands/queue.ts`).
 
 The standing detector in `queue-stuck-sweep.ts` creates findings through the
 queue repository, with `evidenceRef: rig queue show <source-qitem-id>`
